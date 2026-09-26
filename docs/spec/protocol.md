@@ -144,6 +144,8 @@ WELCOME (relay -> node)   final handshake message from the relay carries
 
 In IK the node's payload rides message 1 and the relay's rides message 2; in XX the node's payload rides message 3 and the relay's message 2. The node verifies `relay_cert.node_id` equals the `id` of its connection information and `relay_cert.x25519_pub` equals the relay static key of the handshake, and remembers the highest relay serial. During rotation a relay accepts handshakes to both its old and new static key for 30 days and always returns the newest NodeCert. WELCOME `time` is informational and never extends any validity.
 
+`caps` is a list of capability strings from the registry in `menzil-proto`; version 1 defines `dgram` (the node accepts datagram channels), `docs` (the node serves `menzil:docs`), `share-blind` and `share-terminated` (the node can host shares of that mode). Unknown strings are ignored.
+
 The relay verifies the NodeCert and rejects a serial lower than the highest it has seen or lower than any Roster's `min_serial` for that node, rejects a `timestamp` not greater than the last accepted for that NodeId, and checks each claimed network against its Rosters: unknown network, unlisted node or revoked node fails with ERROR. A node may claim no network; it may then only redeem an invite.
 
 After WELCOME all records are Noise transport messages. The new session is not routable and does not supersede an existing one until the node's first transport record, ATTACH, is decrypted. Then the previous session for that NodeId receives GOAWAY `superseded`. Noise `Rekey()` runs in both directions on REKEY (section 4.2) every hour; there is no forced daily reconnect.
@@ -179,7 +181,7 @@ Forwarding rule: the relay forwards a SEND as a RECV to `dst` only if `src` and 
 
 Flow control and queues: the relay keeps one bounded queue per (source session, destination session), default 4 MiB. It never stops reading one session because another destination is slow. Reliable SENDs consume credit granted by CREDIT records for that peer (initial credit `limits.credit`, default 1 MiB, replenished as bytes are written to the destination socket); a reliable SEND beyond credit is a protocol violation and closes the session. Droppable SENDs are not credited, pass through a token bucket per (source, destination) and are the first records dropped when a queue is full. Senders order their output: control records, then reliable SEND, then droppable SEND.
 
-Error codes are a registry in `menzil-proto`; version 1 defines at least `bad_cert`, `stale_serial`, `stale_timestamp`, `unknown_network`, `not_member`, `revoked`, `roster_expired`, `forbidden`, `peer_offline`, `unknown_e2e`, `credit_exceeded`, `too_large`, `rate_limited`, `label_taken`, `label_unclaimed`, `owner_offline`, `bad_invite`, `bad_tag`.
+Error codes are a registry in `menzil-proto`; version 1 defines at least `bad_cert`, `stale_serial`, `stale_timestamp`, `unknown_network`, `not_member`, `revoked`, `roster_expired`, `forbidden`, `peer_offline`, `unknown_e2e`, `credit_exceeded`, `too_large`, `rate_limited`, `label_taken`, `label_unclaimed`, `bad_invite`, `bad_tag`. An admission that cannot be delivered yet is not an error; ADMIT_RESULT `{ pending: true }` reports it.
 
 ### 4.3 Documents
 
@@ -191,7 +193,9 @@ A node sends DOC(roster) to a relay when it holds a newer Roster than the relay'
 ADVERTISE = CBOR{ v: 1, shares: [ { name: str, mode: "blind" | "terminated", service: ServiceId, alpn: [str] } ], accept_peers: bool }
 ```
 
-A relay accepts a `name` only if the Roster of one of the node's networks lists that name for this NodeId in `labels`. Labels under the relay's share domain are one LDH label each (letters, digits, hyphen, 1 to 63 characters, not starting or ending with a hyphen), not in the relay's reserved list (`www`, `mail`, `admin`, `api`, `relay`, `t`, the operator's own names). Custom domains are fully qualified names whose DNS TXT record `_menzil.<domain>` equals the NetworkId hex, checked at ADVERTISE and daily, exact match only. Quotas per network per relay: 20 names, and at most 5 new names per week. A name is released by an owner signed Roster that drops it, or after 90 days without a session; a released name is quarantined for 180 days before another network may claim it. Operators of multi tenant relays put the share domain on the Public Suffix List so tenants are not same site.
+`alpn` lists the ALPN protocol identifiers the node terminates for a blind name (for example `h2`, `http/1.1`, `acme-tls/1`); an empty list means any. The relay uses it for one decision only: a ClientHello for the name whose ALPN is `acme-tls/1` is routed to the node only if the node listed it, so that a node that does not run TLS-ALPN-01 receives no challenge connections. Ignored for terminated shares.
+
+A relay accepts a `name` only if the Roster of one of the node's networks lists that name for this NodeId in `labels`. Labels under the relay's share domain are one LDH label each (letters, digits, hyphen, 1 to 63 characters, not starting or ending with a hyphen), not in the relay's reserved list (`www`, `mail`, `admin`, `api`, `relay`, `t`, the operator's own names). Custom domains are fully qualified names whose DNS TXT record `_menzil.<domain>` equals the NetworkId hex, checked at ADVERTISE and daily, exact match only. Quotas per network per relay: 20 names, and at most 5 new names per week. A name is released by an owner signed Roster that drops it, or after 90 days without a session; a released name is quarantined for 180 days before another network may claim it. Operators of multi tenant relays put the share domain on the Public Suffix List so tenants are not same site. On a personal relay the operator may instead pin labels statically in the relay configuration (a fixed list of name to NodeId), which bypasses claims and quotas and is the simplest setup when relay operator and network owner are the same person.
 
 ## 5. End to end session (L4)
 
@@ -333,7 +337,7 @@ The subprotocol `menzil.v1`, both Noise prologues, and every CBOR body's `v` car
 
 ## 11. Configuration surface (informative)
 
-Node: identity path, relays (connection information), networks, services, shares, egress listener. Relay: listen addresses, domains for blind and terminated zones, ACME account, the NetworkIds it serves, WebSocket path, limits, static site directory, reserved names. Phase 1 commands: `menzil init`, `agent`, `admit`, `invite`, `relay`, `node`, `expose`, `reach`, `proxy`, `stdio`. Their flags are not part of this protocol.
+Node: identity path, relays (connection information), networks, services, shares, egress listener. Relay: listen addresses, domains for blind and terminated zones, ACME account, the NetworkIds it serves, WebSocket path, limits, static site directory, reserved names. Phase 1 commands: `menzil init`, `agent`, `admit`, `relay`, `node`, `expose`, `reach`, `stdio`. Phase 2 adds `invite` and `proxy`. Their flags are not part of this protocol.
 
 ## 12. The agent and local IPC
 
