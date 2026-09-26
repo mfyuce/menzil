@@ -1,6 +1,6 @@
 # 0001. Relay path transport: own stack (WebSocket, Noise, yamux) first, QUIC later behind an opaque relay
 
-Date: 2026-09-26. Status: accepted for phase 1, to be revisited after phase 1 with measurements.
+Date: 2026-09-26. Status: accepted for phase 1, amended the same day after the red team review (spec v0.2), to be revisited after phase 1 with measurements.
 
 ## Context
 
@@ -17,11 +17,11 @@ Build option 1 for phase 1, with one structural rule that keeps option 2 open at
 Two consequences are accepted knowingly:
 
 1. Relay reconnects tear down L4 sessions in phase 1. Client commands (`reach`, `stdio`, `proxy`) re establish their listeners automatically; applications see a dropped connection, as they do with ngrok and cloudflared today.
-2. The direct path in phase 3 will most likely be QUIC, which means the L4 stream layer changes at that point (yamux to QUIC streams). The L5 OPEN and OPEN_ACK headers and the service model are defined independently of the mux so that this change stays below them.
+2. The direct path in phase 3 will most likely be QUIC, which means the L4 stream layer changes at that point (yamux to QUIC streams). L4 version 1 is therefore defined for the relay path: its reliable record class requires contiguous counters (a gap ends the session rather than corrupting a yamux stream), and only the datagram class tolerates loss and reordering. The L5 OPEN and OPEN_ACK headers and the service model are defined independently of the mux so that the QUIC change stays below them.
 
 ## Why not option 2 now
 
-The office network is the case that must work and it is exactly the case where iroh's advantages (hole punching, migration) are unusable. Starting with option 1 keeps the phase 1 dependency set small (tokio, hyper, rustls, tokio-tungstenite, snow, yamux, ciborium, ed25519-dalek, x25519-dalek) and every byte on the wire specified in this repository.
+The office network is the case that must work and it is exactly the case where iroh's advantages (hole punching, migration) are unusable. Starting with option 1 keeps the phase 1 dependency set small (tokio, hyper, rustls, tokio-tungstenite, snow, yamux, ciborium, blake2, ed25519-dalek, x25519-dalek) and every byte on the wire specified in this repository.
 
 ## Revisit criteria (after phase 1)
 
@@ -29,4 +29,4 @@ Measure on a real relay with an intercontinental client: throughput per stream a
 
 ## Related
 
-`protocol.md` sections 1, 4.2, 5.2, 9. Review sections 4.2, 4.4, 6.3, 6.6.
+`protocol.md` sections 1, 4.2, 5.1, 5.2, 9 and 13. Review sections 4.2, 4.4, 6.3, 6.6. Red team findings 1, 9 and 25 (`reviews/2026-09-26-red-team.md`).
