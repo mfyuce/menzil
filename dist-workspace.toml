@@ -1,0 +1,21 @@
+# Hand written cargo-dist configuration for the menzil binary.
+#
+# This file has not been produced or validated by the dist tool itself.
+# Run `dist generate` (formerly `cargo dist generate`) once cargo-dist is
+# available, so it can fill in and reconcile this file and the release
+# CI workflow, then review the diff before relying on it.
+
+[dist]
+cargo-dist-version = "0.28.0"
+ci = "github"
+installers = ["shell", "powershell"]
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "x86_64-apple-darwin",
+    "aarch64-apple-darwin",
+    "x86_64-pc-windows-msvc",
+]
+
+[workspace]
+members = ["cargo:menzil"]

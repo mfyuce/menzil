@@ -1,0 +1,36 @@
+# cargo-deny configuration (schema version 2): https://embarkstudios.github.io/cargo-deny/
+# Not yet run locally (cargo-deny is not installed here); CI runs it on every push.
+
+[advisories]
+version = 2
+db-urls = ["https://github.com/rustsec/advisory-db"]
+yanked = "deny"
+ignore = []
+
+[licenses]
+version = 2
+# Allow list model: anything not listed, including GPL and LGPL, is denied by omission.
+allow = [
+    "Apache-2.0",
+    "MIT",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "Zlib",
+    "MPL-2.0",   # only acceptable for leaf dependencies that we do not modify
+    "CC0-1.0",
+    "0BSD",
+    "OpenSSL",
+]
+confidence-threshold = 0.8
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

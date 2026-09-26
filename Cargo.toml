@@ -1,0 +1,24 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/menzil-proto",
+    "crates/menzil-carrier",
+    "crates/menzil-relay",
+    "crates/menzil-node",
+    "crates/menzil",
+]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2024"
+license = "Apache-2.0 OR MIT"
+repository = "https://github.com/mfyuce/menzil"
+rust-version = "1.91"
+
+[workspace.dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+anyhow = "1"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap = { version = "4", features = ["derive"] }
