@@ -1,0 +1,21 @@
+# Rust
+/target
+**/*.rs.bk
+
+# local secrets and editor files
+.env
+*.pem
+*.key
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
+# working notes live in the private menzil-prv repository (shared work tree)
+CLAUDE.md
+AGENTS.md
+TODO.md
+TOBEDECIDED.md
+DONE.md
+HANDOVER.md
+docs/private/
