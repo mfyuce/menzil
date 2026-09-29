@@ -6,4 +6,22 @@ license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 
+[features]
+default = ["aws-lc-rs"]
+# rustls crypto provider, mirroring menzil-carrier's own choice
+# (TOBEDECIDED.md item 3) for the relay's server-side TLS.
+aws-lc-rs = ["rustls/aws-lc-rs", "tokio-rustls/aws-lc-rs"]
+ring = ["rustls/ring", "tokio-rustls/ring"]
+
 [dependencies]
+futures-util.workspace = true
+menzil-carrier = { path = "../menzil-carrier" }
+rustls.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["net", "io-util"] }
+tokio-rustls.workspace = true
+tokio-tungstenite.workspace = true
+
+[dev-dependencies]
+rcgen = "0.14.10"
+tokio = { workspace = true, features = ["test-util"] }
