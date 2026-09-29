@@ -7,3 +7,11 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+blake2.workspace = true
+ciborium.workspace = true
+ed25519-dalek.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+rand = "0.10.3"
