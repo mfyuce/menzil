@@ -6,4 +6,29 @@ license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 
+[features]
+default = ["aws-lc-rs"]
+# rustls crypto provider, personal binary default (TOBEDECIDED.md item 3).
+aws-lc-rs = ["rustls/aws-lc-rs", "tokio-rustls/aws-lc-rs"]
+# Alternative for consumers (e.g. ng_sdwan) standardized on ring:
+# `default-features = false, features = ["ring"]`.
+ring = ["rustls/ring", "tokio-rustls/ring"]
+
 [dependencies]
+base64.workspace = true
+fastrand.workspace = true
+futures-util.workspace = true
+httparse.workspace = true
+menzil-proto = { path = "../menzil-proto" }
+rustls.workspace = true
+rustls-platform-verifier.workspace = true
+socket2.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["net", "io-util", "time", "sync"] }
+tokio-rustls.workspace = true
+tokio-tungstenite.workspace = true
+tracing.workspace = true
+url.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
