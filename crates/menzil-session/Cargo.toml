@@ -1,0 +1,16 @@
+[package]
+name = "menzil-session"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+menzil-proto = { path = "../menzil-proto" }
+snow = "0.10.0"
+thiserror.workspace = true
+
+[dev-dependencies]
+ed25519-dalek.workspace = true
+rand = "0.10.3"
