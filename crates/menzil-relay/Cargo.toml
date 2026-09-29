@@ -14,14 +14,21 @@ aws-lc-rs = ["rustls/aws-lc-rs", "tokio-rustls/aws-lc-rs"]
 ring = ["rustls/ring", "tokio-rustls/ring"]
 
 [dependencies]
+ed25519-dalek.workspace = true
+fastrand.workspace = true
 futures-util.workspace = true
 menzil-carrier = { path = "../menzil-carrier" }
+menzil-proto = { path = "../menzil-proto" }
+menzil-session = { path = "../menzil-session" }
 rustls.workspace = true
 thiserror.workspace = true
-tokio = { workspace = true, features = ["net", "io-util"] }
+tokio = { workspace = true, features = ["net", "io-util", "sync", "time"] }
 tokio-rustls.workspace = true
 tokio-tungstenite.workspace = true
+tracing.workspace = true
 
 [dev-dependencies]
+rand = "0.10.3"
 rcgen = "0.14.10"
+snow = "0.10.0"
 tokio = { workspace = true, features = ["test-util"] }

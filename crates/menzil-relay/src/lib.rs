@@ -19,12 +19,27 @@
 
 mod connection;
 mod error;
+mod hello;
+mod identity;
 mod listener;
+mod node_history;
+mod registry;
+mod relay;
+mod roster_store;
+mod session;
+#[cfg(test)]
+mod session_tests;
 #[cfg(test)]
 mod tests_support;
 mod tls;
 
 pub use connection::InboundConnection;
 pub use error::RelayError;
+pub use hello::{HelloRejection, check_hello};
+pub use identity::RelayIdentity;
 pub use listener::Listener;
+pub use node_history::{HistoryViolation, NodeHistory};
+pub use registry::SessionRegistry;
+pub use relay::Relay;
+pub use roster_store::RosterStore;
 pub use tls::server_config;

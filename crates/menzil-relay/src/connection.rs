@@ -14,11 +14,33 @@ use crate::error::RelayError;
 /// One accepted, upgraded connection to the relay's own hostname.
 pub struct InboundConnection {
     ws: WebSocketStream<TlsStream<TcpStream>>,
+    /// The exact `Sec-WebSocket-Protocol` request header value the client
+    /// sent, byte for byte. The L3 Noise prologue (protocol.md 4.1) binds
+    /// this in; it must match whatever string the client itself used to
+    /// build its own prologue, so this is the raw header value, not an
+    /// assumption that it was exactly [`menzil_carrier::SUBPROTOCOL`]
+    /// (our own client never sends anything else, but a byte-for-byte
+    /// echo is correct regardless of what any client sends).
+    pub offered_subprotocol: String,
+    /// The `Sec-WebSocket-Protocol` response header value this relay
+    /// echoed back. [`crate::listener::Listener`] only ever completes an
+    /// upgrade by echoing [`menzil_carrier::SUBPROTOCOL`], so this is
+    /// always that value, but it is threaded through explicitly rather
+    /// than assumed for the same reason as `offered_subprotocol`.
+    pub selected_subprotocol: String,
 }
 
 impl InboundConnection {
-    pub(crate) fn new(ws: WebSocketStream<TlsStream<TcpStream>>) -> Self {
-        Self { ws }
+    pub(crate) fn new(
+        ws: WebSocketStream<TlsStream<TcpStream>>,
+        offered_subprotocol: String,
+        selected_subprotocol: String,
+    ) -> Self {
+        Self {
+            ws,
+            offered_subprotocol,
+            selected_subprotocol,
+        }
     }
 
     /// Sends one binary L3 record (protocol.md 3.3: "one message is one

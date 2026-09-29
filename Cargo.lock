@@ -1027,6 +1027,18 @@ dependencies = [
 [[package]]
 name = "menzil-node"
 version = "0.0.1"
+dependencies = [
+ "ed25519-dalek",
+ "fastrand",
+ "menzil-carrier",
+ "menzil-proto",
+ "menzil-session",
+ "rand",
+ "snow",
+ "thiserror",
+ "tokio",
+ "tracing",
+]
 
 [[package]]
 name = "menzil-proto"
@@ -1044,14 +1056,21 @@ dependencies = [
 name = "menzil-relay"
 version = "0.0.1"
 dependencies = [
+ "ed25519-dalek",
+ "fastrand",
  "futures-util",
  "menzil-carrier",
+ "menzil-proto",
+ "menzil-session",
+ "rand",
  "rcgen",
  "rustls",
+ "snow",
  "thiserror",
  "tokio",
  "tokio-rustls",
  "tokio-tungstenite",
+ "tracing",
 ]
 
 [[package]]

@@ -64,6 +64,17 @@ impl Listener {
         let (tcp, _peer) = self.tcp.accept().await?;
         let tls = self.acceptor.accept(tcp).await?;
         let expected_path = self.expected_path.clone();
+        // `validate_upgrade` only has borrowed access to the request
+        // inside the callback tungstenite drives; the offered
+        // subprotocol string it validates has to escape that closure to
+        // reach `InboundConnection`, so it's captured into this shared
+        // slot rather than returned from the callback (whose `Ok` type
+        // is fixed by `accept_hdr_async`'s own signature). `Arc<Mutex<_>>`
+        // rather than `Rc<RefCell<_>>`: the closure is `move`d into
+        // `accept_hdr_async`, whose bounds this crate doesn't control, so
+        // this stays correct whether or not that requires `Send`.
+        let offered = Arc::new(std::sync::Mutex::new(None));
+        let offered_for_closure = Arc::clone(&offered);
         let ws = tokio_tungstenite::accept_hdr_async(
             tls,
             // `accept_hdr_async`'s callback trait requires exactly
@@ -72,32 +83,51 @@ impl Listener {
             // large-error case can't be avoided at this boundary the way
             // `validate_upgrade` avoids it internally by boxing.
             move |req: &Request, resp: Response| -> Result<Response, ErrorResponse> {
-                validate_upgrade(req, resp, &expected_path).map_err(|e| *e)
+                let outcome = validate_upgrade(req, resp, &expected_path).map_err(|e| *e)?;
+                *offered_for_closure.lock().unwrap() = Some(outcome.offered_subprotocol);
+                Ok(outcome.response)
             },
         )
         .await?;
-        Ok(InboundConnection::new(ws))
+        let offered_subprotocol = offered
+            .lock()
+            .unwrap()
+            .take()
+            .expect("validate_upgrade always records the offered subprotocol before Ok");
+        Ok(InboundConnection::new(
+            ws,
+            offered_subprotocol,
+            menzil_carrier::SUBPROTOCOL.to_string(),
+        ))
     }
+}
+
+/// [`validate_upgrade`]'s success case: the response to send, plus the
+/// exact subprotocol string the client offered (for the L3 prologue,
+/// protocol.md 4.1).
+struct UpgradeOutcome {
+    response: Response,
+    offered_subprotocol: String,
 }
 
 fn validate_upgrade(
     req: &Request,
     mut resp: Response,
     expected_path: &str,
-) -> Result<Response, Box<ErrorResponse>> {
+) -> Result<UpgradeOutcome, Box<ErrorResponse>> {
     if req.uri().path() != expected_path {
         return Err(not_found());
     }
-    let offers_menzil = req
+    let offered_header = req
         .headers()
         .get("Sec-WebSocket-Protocol")
-        .and_then(|v| v.to_str().ok())
-        .is_some_and(|offered| {
-            offered
-                .split(',')
-                .map(str::trim)
-                .any(|p| p == menzil_carrier::SUBPROTOCOL)
-        });
+        .and_then(|v| v.to_str().ok());
+    let offers_menzil = offered_header.is_some_and(|offered| {
+        offered
+            .split(',')
+            .map(str::trim)
+            .any(|p| p == menzil_carrier::SUBPROTOCOL)
+    });
     if !offers_menzil {
         return Err(not_found());
     }
@@ -107,7 +137,13 @@ fn validate_upgrade(
             .parse()
             .expect("SUBPROTOCOL is a valid header value"),
     );
-    Ok(resp)
+    Ok(UpgradeOutcome {
+        response: resp,
+        // `offers_menzil` is only true when `offered_header` is `Some`.
+        offered_subprotocol: offered_header
+            .expect("offers_menzil being true implies offered_header is Some")
+            .to_string(),
+    })
 }
 
 fn not_found() -> Box<ErrorResponse> {

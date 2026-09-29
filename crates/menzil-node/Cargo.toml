@@ -7,3 +7,16 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+ed25519-dalek.workspace = true
+fastrand.workspace = true
+menzil-carrier = { path = "../menzil-carrier" }
+menzil-proto = { path = "../menzil-proto" }
+menzil-session = { path = "../menzil-session" }
+thiserror.workspace = true
+tokio = { workspace = true, features = ["sync", "time"] }
+tracing.workspace = true
+
+[dev-dependencies]
+rand = "0.10.3"
+snow = "0.10.0"
+tokio = { workspace = true, features = ["test-util"] }
