@@ -1,7 +1,7 @@
 //! Live end-to-end tests of the session lifecycle (`relay.rs`,
-//! `session.rs`, `hello.rs`, `registry.rs` together): a real self-signed
-//! certificate, a real TLS+WebSocket connection, and a real Noise
-//! handshake driven directly against `menzil-session`'s public API,
+//! `session.rs`, `hello.rs`, `registry.rs`, `doc.rs` together): a real
+//! self-signed certificate, a real TLS+WebSocket connection, and a real
+//! Noise handshake driven directly against `menzil-session`'s public API,
 //! bypassing `menzil-carrier::Carrier::dial` entirely (it hardcodes the
 //! platform TLS verifier with no way to trust a test-only certificate;
 //! this is the workaround, not a limitation of this test — see
@@ -15,8 +15,9 @@ use std::net::SocketAddr;
 use ed25519_dalek::SigningKey;
 use futures_util::{SinkExt, StreamExt};
 use menzil_proto::{
-    ErrorCode, HelloBody, Limits, NetworkId, NodeCert, NodeCertBody, NodeId, PROTOCOL_VERSION,
-    Record, Roster, RosterBody, RosterMember, Tai64N, WelcomeBody, X25519PublicKey,
+    DocReassembler, DocType, ErrorCode, HelloBody, Limits, NetworkId, NodeCert, NodeCertBody,
+    NodeId, PROTOCOL_VERSION, Record, Roster, RosterBody, RosterMember, Tai64N, WelcomeBody,
+    X25519PublicKey,
 };
 use menzil_session::{HandshakePattern, NodeHandshake, Transport, prologue};
 use rustls::pki_types::CertificateDer;
@@ -108,12 +109,14 @@ struct TestClient {
 }
 
 impl TestClient {
+    #[allow(clippy::too_many_arguments)]
     async fn connect(
         addr: SocketAddr,
         cert: CertificateDer<'static>,
         client_identity: &TestIdentity,
         relay_x25519: X25519PublicKey,
         networks: Vec<NetworkId>,
+        roster_seq: HashMap<NetworkId, u64>,
         serial: u32,
         timestamp_byte: u8,
     ) -> (Self, WelcomeBody) {
@@ -127,7 +130,7 @@ impl TestClient {
             node_cert: node_cert_for(client_identity, serial),
             networks,
             timestamp: Tai64N::from(timestamp),
-            roster_seq: HashMap::new(),
+            roster_seq,
             caps: vec![],
             e2e_protos: vec![0x01],
         };
@@ -171,6 +174,27 @@ impl TestClient {
             Some(Err(_)) => None,
         }
     }
+
+    /// Reads records until a complete DOC transfer reassembles, decoding
+    /// it as a Roster (protocol.md 4.3: at L3 this is the only doc_type a
+    /// relay ever sends). Panics if the connection ends, or a
+    /// non-`Doc` record arrives, before one completes — every test that
+    /// calls this already knows a DOC push is exactly what should be
+    /// happening next.
+    async fn recv_roster_doc(&mut self) -> Roster {
+        let mut reassembler = DocReassembler::new();
+        loop {
+            match self.recv().await {
+                Some(Record::Doc(body)) => {
+                    if let Some((doc_type, bytes)) = reassembler.accept(&body).unwrap() {
+                        assert_eq!(doc_type, DocType::Roster);
+                        return Roster::decode_strict(&bytes).unwrap();
+                    }
+                }
+                other => panic!("expected a DOC(roster) chunk, got {other:?}"),
+            }
+        }
+    }
 }
 
 async fn ping_pong(client: &mut TestClient, nonce: [u8; 8]) {
@@ -186,8 +210,17 @@ async fn attach_registers_the_session() {
     tokio::spawn(async move { serve_relay.serve(&listener).await });
 
     let client_identity = generate_identity();
-    let (mut client, welcome) =
-        TestClient::connect(addr, cert, &client_identity, relay_x25519, vec![], 1, 10).await;
+    let (mut client, welcome) = TestClient::connect(
+        addr,
+        cert,
+        &client_identity,
+        relay_x25519,
+        vec![],
+        HashMap::new(),
+        1,
+        10,
+    )
+    .await;
     assert_eq!(welcome.v, PROTOCOL_VERSION);
     assert_eq!(
         relay.registry.attached_session_id(&client_identity.node_id),
@@ -220,6 +253,7 @@ async fn a_second_attach_supersedes_the_first() {
         &client_identity,
         relay_x25519,
         vec![],
+        HashMap::new(),
         1,
         10,
     )
@@ -230,8 +264,17 @@ async fn a_second_attach_supersedes_the_first() {
     // Same identity, a second connection: serial stays the same
     // (allowed — only a *lower* serial is rejected) but the timestamp
     // must still strictly advance (protocol.md 4.1).
-    let (mut client2, _) =
-        TestClient::connect(addr, cert, &client_identity, relay_x25519, vec![], 1, 20).await;
+    let (mut client2, _) = TestClient::connect(
+        addr,
+        cert,
+        &client_identity,
+        relay_x25519,
+        vec![],
+        HashMap::new(),
+        1,
+        20,
+    )
+    .await;
     client2.send(Record::Attach).await;
     ping_pong(&mut client2, [2; 8]).await;
 
@@ -255,6 +298,7 @@ async fn an_unknown_claimed_network_gets_an_error_then_the_connection_ends() {
         &client_identity,
         relay_x25519,
         vec![unknown_network],
+        HashMap::new(),
         1,
         10,
     )
@@ -293,9 +337,10 @@ async fn a_member_of_a_held_roster_attaches_successfully() {
         stewards: vec![],
         labels: vec![],
     };
-    // Seeding a Roster this way, directly through `RosterStore`, is the
-    // whole point of `Relay::rosters` for now: DOC-based propagation
-    // isn't built yet.
+    // Seeding a Roster this way, directly through `RosterStore`, is
+    // still how an operator gives a relay its very first Roster for a
+    // network (protocol.md 4.3 covers propagation once one exists, not
+    // how the first one arrives).
     relay
         .rosters()
         .set(&Roster::sign(&owner, &roster_body).unwrap())
@@ -310,16 +355,159 @@ async fn a_member_of_a_held_roster_attaches_successfully() {
         &client_identity,
         relay_x25519,
         vec![network_id],
+        HashMap::new(),
         1,
         10,
     )
     .await;
     client.send(Record::Attach).await;
+    // This client's HELLO claimed no roster_seq at all for `network_id`,
+    // and the relay already holds seq 1: the attach-time catch-up
+    // (protocol.md 4.3, see `crate::doc`) pushes it right away, ahead of
+    // any other traffic.
+    let caught_up = client.recv_roster_doc().await;
+    assert_eq!(caught_up.decode().unwrap(), roster_body);
+
     ping_pong(&mut client, [3; 8]).await;
     assert_eq!(
         relay.registry.attached_session_id(&client_identity.node_id),
         Some(1)
     );
+}
+
+#[tokio::test]
+async fn an_already_caught_up_node_gets_no_unsolicited_doc_push() {
+    let (relay, listener, cert, relay_x25519) = bind_test_relay().await;
+    let addr = listener.local_addr().unwrap();
+
+    let client_identity = generate_identity();
+    let owner = SigningKey::generate(&mut rand::rng());
+    let network_id = NetworkId::from(owner.verifying_key().to_bytes());
+    let roster_body = RosterBody {
+        v: PROTOCOL_VERSION,
+        network_id,
+        seq: 1,
+        issued: 0,
+        expires: 4_000_000_000,
+        members: vec![RosterMember {
+            node_id: client_identity.node_id,
+            min_serial: 1,
+        }],
+        revoked: vec![],
+        stewards: vec![],
+        labels: vec![],
+    };
+    relay
+        .rosters()
+        .set(&Roster::sign(&owner, &roster_body).unwrap())
+        .unwrap();
+
+    let serve_relay = relay.clone();
+    tokio::spawn(async move { serve_relay.serve(&listener).await });
+
+    let mut roster_seq = HashMap::new();
+    roster_seq.insert(network_id, 1);
+    let (mut client, _) = TestClient::connect(
+        addr,
+        cert,
+        &client_identity,
+        relay_x25519,
+        vec![network_id],
+        roster_seq,
+        1,
+        10,
+    )
+    .await;
+    client.send(Record::Attach).await;
+    // Already at seq 1, matching what the relay holds: no catch-up push
+    // is owed, so the very next thing on the wire is the PONG, not a
+    // DOC.
+    ping_pong(&mut client, [4; 8]).await;
+}
+
+#[tokio::test]
+async fn a_newer_roster_from_one_member_propagates_to_another_attached_member() {
+    let (relay, listener, cert, relay_x25519) = bind_test_relay().await;
+    let addr = listener.local_addr().unwrap();
+
+    let owner = SigningKey::generate(&mut rand::rng());
+    let network_id = NetworkId::from(owner.verifying_key().to_bytes());
+    let identity_a = generate_identity();
+    let identity_b = generate_identity();
+    let roster_v1 = RosterBody {
+        v: PROTOCOL_VERSION,
+        network_id,
+        seq: 1,
+        issued: 0,
+        expires: 4_000_000_000,
+        members: vec![
+            RosterMember {
+                node_id: identity_a.node_id,
+                min_serial: 1,
+            },
+            RosterMember {
+                node_id: identity_b.node_id,
+                min_serial: 1,
+            },
+        ],
+        revoked: vec![],
+        stewards: vec![],
+        labels: vec![],
+    };
+    relay
+        .rosters()
+        .set(&Roster::sign(&owner, &roster_v1).unwrap())
+        .unwrap();
+
+    let serve_relay = relay.clone();
+    tokio::spawn(async move { serve_relay.serve(&listener).await });
+
+    let (mut client_a, _) = TestClient::connect(
+        addr,
+        cert.clone(),
+        &identity_a,
+        relay_x25519,
+        vec![network_id],
+        HashMap::new(),
+        1,
+        10,
+    )
+    .await;
+    client_a.send(Record::Attach).await;
+    assert_eq!(client_a.recv_roster_doc().await.decode().unwrap().seq, 1);
+
+    let (mut client_b, _) = TestClient::connect(
+        addr,
+        cert,
+        &identity_b,
+        relay_x25519,
+        vec![network_id],
+        HashMap::new(),
+        1,
+        10,
+    )
+    .await;
+    client_b.send(Record::Attach).await;
+    assert_eq!(client_b.recv_roster_doc().await.decode().unwrap().seq, 1);
+
+    // client_a now pushes a newer Roster to the relay over DOC.
+    let roster_v2 = RosterBody {
+        seq: 2,
+        ..roster_v1.clone()
+    };
+    let signed_v2 = Roster::sign(&owner, &roster_v2).unwrap();
+    for record in menzil_proto::split_into_doc_records(DocType::Roster, &signed_v2.encode()) {
+        client_a.send(record).await;
+    }
+
+    // client_b, still attached and a claimed member of this network,
+    // receives the fan-out.
+    let propagated = client_b.recv_roster_doc().await;
+    assert_eq!(propagated.decode().unwrap(), roster_v2);
+
+    // client_a, the sender, is excluded from its own fan-out: the next
+    // thing it sees is an ordinary PONG, not a stray DOC echoed back.
+    ping_pong(&mut client_a, [9; 8]).await;
 }
 
 #[tokio::test]
@@ -329,8 +517,17 @@ async fn rekey_from_the_client_is_applied_before_the_next_record() {
     tokio::spawn(async move { relay.serve(&listener).await });
 
     let client_identity = generate_identity();
-    let (mut client, _) =
-        TestClient::connect(addr, cert, &client_identity, relay_x25519, vec![], 1, 10).await;
+    let (mut client, _) = TestClient::connect(
+        addr,
+        cert,
+        &client_identity,
+        relay_x25519,
+        vec![],
+        HashMap::new(),
+        1,
+        10,
+    )
+    .await;
     client.send(Record::Attach).await;
     ping_pong(&mut client, [1; 8]).await;
 

@@ -3,11 +3,12 @@
 //! NetworkId) and refuse Rosters of other networks."
 //!
 //! How a Roster gets into this store over the wire (DOC records, in
-//! both directions) is TODO.md L3f's job, not here: this only verifies
-//! and holds whatever it's handed — an operator seeding a relay's
-//! initial Rosters out of band today, or a DOC handler calling
-//! [`RosterStore::set`] once L3f exists — and answers the queries HELLO
-//! validation (protocol.md 4.1) needs against it.
+//! both directions, TODO.md L3f) is `crate::doc`'s job, not here: this
+//! only verifies and holds whatever it's handed — an operator seeding a
+//! relay's initial Rosters out of band, or the DOC handler calling
+//! [`RosterStore::set`] once a transfer completes — and answers the
+//! queries HELLO validation (protocol.md 4.1) and DOC propagation
+//! (protocol.md 4.3) need against it.
 
 use std::collections::HashMap;
 use std::sync::RwLock;
@@ -19,13 +20,13 @@ use crate::error::RelayError;
 
 /// The relay's held Rosters, at most one per network. Each is verified
 /// against its own claimed `network_id` (protocol.md 2.3: `NetworkId`
-/// *is* the network owner's Ed25519 public key) before it is accepted;
-/// only the decoded body is retained; L3f will need to keep the signed
-/// bytes too, for forwarding them verbatim (protocol.md 2.1), but nothing
-/// in this item reads a Roster back out for that, so it isn't stored yet.
+/// *is* the network owner's Ed25519 public key) before it is accepted.
+/// The signed `Roster` itself is kept, not just its decoded body: DOC
+/// propagation (protocol.md 4.3) forwards the signed bytes verbatim
+/// (protocol.md 2.1), never re-encoding them.
 #[derive(Default)]
 pub struct RosterStore {
-    by_network: RwLock<HashMap<NetworkId, RosterBody>>,
+    by_network: RwLock<HashMap<NetworkId, (Roster, RosterBody)>>,
 }
 
 impl RosterStore {
@@ -35,28 +36,59 @@ impl RosterStore {
     }
 
     /// Verifies `roster`'s signature against its own claimed
-    /// `network_id`, then stores it — unless a Roster already held for
+    /// `network_id`, then stores it unless a Roster already held for
     /// that network has an equal or higher `seq` (protocol.md 2.3: "it
     /// never accepts a lower seq"; equal is treated the same as lower,
-    /// since there is nothing newer to adopt).
-    pub fn set(&self, roster: &Roster) -> Result<(), RelayError> {
+    /// since there is nothing newer to adopt). Returns whether it was
+    /// actually stored, so a caller knows whether this is genuinely news
+    /// worth propagating (protocol.md 4.3) or a stale/duplicate resend.
+    ///
+    /// Rejects a Roster whose encoded form exceeds
+    /// [`menzil_proto::MAX_DOC_BYTES`] before ever storing it: a Roster
+    /// this large could never actually be forwarded over DOC
+    /// (`menzil_proto::split_into_doc_records` treats that limit as a
+    /// hard invariant, not something it can fail gracefully on), so
+    /// storing it anyway would only defer the failure to every later
+    /// attempt at propagating or catching a member up on it.
+    pub fn set(&self, roster: &Roster) -> Result<bool, RelayError> {
         let body = roster.decode()?;
         let verifying_key = VerifyingKey::from_bytes(&<[u8; 32]>::from(body.network_id))?;
         roster.verify(&verifying_key)?;
+        let encoded_len = roster.encode().len();
+        if encoded_len > menzil_proto::MAX_DOC_BYTES {
+            return Err(RelayError::DocumentTooLarge {
+                len: encoded_len,
+                max: menzil_proto::MAX_DOC_BYTES,
+            });
+        }
 
         let mut guard = self.by_network.write().unwrap();
-        if let Some(existing) = guard.get(&body.network_id)
+        if let Some((_, existing)) = guard.get(&body.network_id)
             && body.seq <= existing.seq
         {
-            return Ok(());
+            return Ok(false);
         }
-        guard.insert(body.network_id, body);
-        Ok(())
+        guard.insert(body.network_id, (roster.clone(), body));
+        Ok(true)
     }
 
     /// The currently held Roster body for `network_id`, if any.
     pub fn get(&self, network_id: &NetworkId) -> Option<RosterBody> {
-        self.by_network.read().unwrap().get(network_id).cloned()
+        self.by_network
+            .read()
+            .unwrap()
+            .get(network_id)
+            .map(|(_, body)| body.clone())
+    }
+
+    /// The currently held *signed* Roster for `network_id`, if any — the
+    /// verbatim bytes DOC propagation sends on (protocol.md 2.1, 4.3).
+    pub fn signed(&self, network_id: &NetworkId) -> Option<Roster> {
+        self.by_network
+            .read()
+            .unwrap()
+            .get(network_id)
+            .map(|(signed, _)| signed.clone())
     }
 
     /// Every held network's current `seq`, for WELCOME's `rosters` field
@@ -66,7 +98,7 @@ impl RosterStore {
             .read()
             .unwrap()
             .iter()
-            .map(|(id, body)| (*id, body.seq))
+            .map(|(id, (_, body))| (*id, body.seq))
             .collect()
     }
 
@@ -83,7 +115,7 @@ impl RosterStore {
             .read()
             .unwrap()
             .values()
-            .filter_map(|body| {
+            .filter_map(|(_, body)| {
                 body.members
                     .iter()
                     .find(|member| &member.node_id == node_id)
@@ -122,9 +154,19 @@ mod tests {
         let owner = SigningKey::generate(&mut rand::rng());
         let network_id = NetworkId::from(owner.verifying_key().to_bytes());
         let store = RosterStore::new();
-        store.set(&signed_roster(&owner, network_id, 1)).unwrap();
+        assert!(store.set(&signed_roster(&owner, network_id, 1)).unwrap());
         let body = store.get(&network_id).unwrap();
         assert_eq!(body.seq, 1);
+    }
+
+    #[test]
+    fn signed_returns_the_verbatim_roster() {
+        let owner = SigningKey::generate(&mut rand::rng());
+        let network_id = NetworkId::from(owner.verifying_key().to_bytes());
+        let store = RosterStore::new();
+        let roster = signed_roster(&owner, network_id, 1);
+        store.set(&roster).unwrap();
+        assert_eq!(store.signed(&network_id).unwrap(), roster);
     }
 
     #[test]
@@ -141,9 +183,9 @@ mod tests {
         let owner = SigningKey::generate(&mut rand::rng());
         let network_id = NetworkId::from(owner.verifying_key().to_bytes());
         let store = RosterStore::new();
-        store.set(&signed_roster(&owner, network_id, 5)).unwrap();
-        store.set(&signed_roster(&owner, network_id, 5)).unwrap();
-        store.set(&signed_roster(&owner, network_id, 3)).unwrap();
+        assert!(store.set(&signed_roster(&owner, network_id, 5)).unwrap());
+        assert!(!store.set(&signed_roster(&owner, network_id, 5)).unwrap());
+        assert!(!store.set(&signed_roster(&owner, network_id, 3)).unwrap());
         assert_eq!(store.get(&network_id).unwrap().seq, 5);
     }
 
@@ -153,7 +195,7 @@ mod tests {
         let network_id = NetworkId::from(owner.verifying_key().to_bytes());
         let store = RosterStore::new();
         store.set(&signed_roster(&owner, network_id, 1)).unwrap();
-        store.set(&signed_roster(&owner, network_id, 2)).unwrap();
+        assert!(store.set(&signed_roster(&owner, network_id, 2)).unwrap());
         assert_eq!(store.get(&network_id).unwrap().seq, 2);
     }
 
@@ -203,5 +245,39 @@ mod tests {
 
         assert_eq!(store.min_serial_for(&node_id), Some(7));
         assert_eq!(store.min_serial_for(&NodeId::from([1u8; 32])), None);
+    }
+
+    #[test]
+    fn a_roster_over_the_document_size_limit_is_rejected_not_stored() {
+        let owner = SigningKey::generate(&mut rand::rng());
+        let network_id = NetworkId::from(owner.verifying_key().to_bytes());
+        // Comfortably over menzil_proto::MAX_DOC_BYTES (1 MiB) once
+        // encoded; a real Roster this large could never be sent back out
+        // over DOC (`split_into_doc_records` panics past that limit), so
+        // `set` must catch it before storing, not after.
+        let members: Vec<RosterMember> = (0..40_000)
+            .map(|i| RosterMember {
+                node_id: NodeId::from([(i % 256) as u8; 32]),
+                min_serial: i,
+            })
+            .collect();
+        let body = RosterBody {
+            v: menzil_proto::PROTOCOL_VERSION,
+            network_id,
+            seq: 1,
+            issued: 0,
+            expires: 1_000_000_000,
+            members,
+            revoked: vec![],
+            stewards: vec![],
+            labels: vec![],
+        };
+        let roster = Roster::sign(&owner, &body).unwrap();
+        assert!(roster.encode().len() > menzil_proto::MAX_DOC_BYTES);
+
+        let store = RosterStore::new();
+        let err = store.set(&roster).unwrap_err();
+        assert!(matches!(err, RelayError::DocumentTooLarge { .. }));
+        assert!(store.get(&network_id).is_none());
     }
 }

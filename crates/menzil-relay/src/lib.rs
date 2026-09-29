@@ -10,14 +10,15 @@
 //!   phase 2 per protocol.md 13).
 //! - ACME certificate provisioning (protocol.md 11); certificate and key
 //!   material is supplied to this crate already loaded.
-//! - The multi-session registry, HELLO validation, and
-//!   forwarding/credit/queue logic (TODO.md L3e).
+//! - SEND->RECV forwarding, credit enforcement, and bounded
+//!   per-(source,destination) queues (TODO.md L3h).
 //! - Relay-terminated HTTP serving for terminated shares (its own
 //!   TODO.md line, protocol.md 6.3).
 
 #![forbid(unsafe_code)]
 
 mod connection;
+mod doc;
 mod error;
 mod hello;
 mod identity;

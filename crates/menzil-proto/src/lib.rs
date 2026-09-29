@@ -13,6 +13,7 @@
 #![forbid(unsafe_code)]
 
 mod bytes;
+mod doc;
 mod error;
 mod handshake;
 mod identity;
@@ -25,6 +26,9 @@ mod strict;
 
 pub use bytes::{
     ByteArray, DocId, InviteId, NetworkId, NodeId, SecretHash, StewardKey, Tai64N, X25519PublicKey,
+};
+pub use doc::{
+    DocReassembler, DocReassemblyError, MAX_DOC_BYTES, MAX_DOC_CHUNK_BYTES, split_into_doc_records,
 };
 pub use error::{ErrorCode, ProtoError};
 pub use handshake::{Capability, HelloBody, Limits, WelcomeBody};

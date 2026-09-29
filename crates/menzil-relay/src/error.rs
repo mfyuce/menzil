@@ -73,4 +73,22 @@ pub enum RelayError {
         /// Free-text detail, also sent back to the node.
         message: String,
     },
+
+    /// A signed document (a Roster) exceeded
+    /// [`menzil_proto::MAX_DOC_BYTES`] once encoded. Refused before it is
+    /// stored: `menzil_proto::split_into_doc_records` enforces the same
+    /// limit as a hard invariant (it panics, not a `Result`), since
+    /// nothing this crate signs and encodes is ever meant to approach it
+    /// — so anything over the limit reaching this far is either an
+    /// operator error seeding a roster that could never actually be
+    /// forwarded over DOC, or a bug, and either way must be caught here
+    /// rather than only discovered later, mid-panic, while trying to
+    /// propagate it.
+    #[error("document of {len} bytes exceeds the {max} byte limit")]
+    DocumentTooLarge {
+        /// The size that was rejected.
+        len: usize,
+        /// The limit it exceeded.
+        max: usize,
+    },
 }

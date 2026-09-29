@@ -3,6 +3,18 @@
 //! `menzil-session`, verify the relay's identity, send ATTACH, and stay
 //! attached.
 //!
+//! DOC(roster) propagation both directions (protocol.md 4.3; TODO.md
+//! L3f) is handled transparently here too, the same way PING/REKEY/
+//! GOAWAY already were: an inbound DOC is reassembled and, once complete,
+//! verified and stored into this session's [`RosterStore`]
+//! (`Engine::accept_doc`); right after ATTACH, [`Session::connect`] pushes
+//! DOC(roster) for every network where this node's own store already
+//! holds something newer than WELCOME's `rosters` reported (protocol.md
+//! 4.3's literal node-to-relay rule, via `push_records_for_newer_rosters`).
+//! `RosterStore` is owned by the caller and threaded through, not rebuilt
+//! per reconnect, so a node does not forget what it holds just because
+//! the link dropped.
+//!
 //! Split in two: [`Engine`] is the pure protocol logic (decrypt, classify
 //! a record, track the liveness/rekey clocks) with no `Carrier` and no
 //! I/O, so it can be driven and tested with any source of ciphertext —
@@ -18,6 +30,7 @@
 //! against protocol.md 4.1's exact message sequence rather than run.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use ed25519_dalek::VerifyingKey;
@@ -25,8 +38,8 @@ use tokio::sync::mpsc;
 
 use menzil_carrier::{Backoff, Carrier, ConnectionInfo, DialConfig};
 use menzil_proto::{
-    Capability, GoawayBody, HelloBody, NetworkId, PROTOCOL_VERSION, Record, Tai64N, WelcomeBody,
-    X25519PublicKey,
+    Capability, DocBody, DocReassembler, DocType, GoawayBody, HelloBody, NetworkId,
+    PROTOCOL_VERSION, Record, Roster, Tai64N, WelcomeBody, X25519PublicKey,
 };
 use menzil_session::{
     HandshakePattern, Liveness, NodeHandshake, RekeySchedule, Transport, prologue,
@@ -34,6 +47,7 @@ use menzil_session::{
 
 use crate::error::NodeError;
 use crate::identity::LocalIdentity;
+use crate::roster_store::RosterStore;
 
 /// Everything [`Session::connect`] needs beyond what
 /// [`Carrier::dial`] itself takes.
@@ -46,9 +60,6 @@ pub struct SessionConfig {
     /// Networks this node claims membership in; empty to redeem an
     /// invite only (protocol.md 4.1).
     pub networks: Vec<NetworkId>,
-    /// The newest Roster `seq` this node already holds, per network
-    /// (protocol.md 4.1, 4.3).
-    pub roster_seq: HashMap<NetworkId, u64>,
     /// Capabilities this node offers (protocol.md 4.1).
     pub caps: Vec<Capability>,
     /// `e2e_proto` tags this node supports (protocol.md 4.2, 9).
@@ -64,20 +75,28 @@ struct Engine {
     transport: Transport,
     liveness: Liveness,
     rekey: RekeySchedule,
+    roster_store: Arc<RosterStore>,
+    doc_reassembler: DocReassembler,
+    /// This node's own claimed networks (`SessionConfig::networks`),
+    /// checked before an inbound DOC(roster) is stored — see
+    /// `Engine::accept_doc` for why.
+    claimed_networks: Vec<NetworkId>,
 }
 
 /// What [`Engine::on_message`] learned from one inbound ciphertext.
 #[derive(Debug)]
 enum EngineEvent {
-    /// Handled internally (an incoming REKEY, or a bare PONG — liveness
-    /// activity is already recorded for every decrypted record, so a
-    /// PONG needs nothing further); nothing to do.
+    /// Handled internally (an incoming REKEY, a DOC chunk — whether it
+    /// completed a transfer or not, see `Engine::accept_doc` — or a bare
+    /// PONG; liveness activity is already recorded for every decrypted
+    /// record, so a PONG needs nothing further); nothing to do.
     None,
     /// Send this record straight back (a PONG for a PING).
     Reply(Record),
     /// Not something this crate interprets itself (SEND/RECV/ADVERTISE*/
-    /// DOC/PEER_STATE/CREDIT/ADMIT_*/ERROR — protocol.md 4.3, 4.4, 7.2;
-    /// TODO.md L3f, L3g, L4's job); hand it to the caller.
+    /// PEER_STATE/CREDIT/ADMIT_*/ERROR — protocol.md 4.2, 4.4, 7.2;
+    /// TODO.md L3g, L4's job); hand it to the caller. DOC never reaches
+    /// here (protocol.md 4.3; TODO.md L3f) — see `Engine::accept_doc`.
     Deliver(Record),
     /// The relay ended the session (protocol.md 4.2).
     Goaway(GoawayBody),
@@ -102,11 +121,19 @@ enum TickEvent {
 }
 
 impl Engine {
-    fn new(transport: Transport, now: Instant) -> Self {
+    fn new(
+        transport: Transport,
+        now: Instant,
+        roster_store: Arc<RosterStore>,
+        claimed_networks: Vec<NetworkId>,
+    ) -> Self {
         Self {
             transport,
             liveness: Liveness::new(now),
             rekey: RekeySchedule::new(now),
+            roster_store,
+            doc_reassembler: DocReassembler::new(),
+            claimed_networks,
         }
     }
 
@@ -124,8 +151,72 @@ impl Engine {
                 EngineEvent::None
             }
             Record::Goaway(body) => EngineEvent::Goaway(body),
+            Record::Doc(body) => {
+                self.accept_doc(&body);
+                EngineEvent::None
+            }
             other => EngineEvent::Deliver(other),
         })
+    }
+
+    /// Feeds one DOC chunk (protocol.md 4.2, 4.3) into this session's
+    /// reassembler; once a transfer completes, decodes and verifies it
+    /// as a Roster for a network this node itself claims, and stores it
+    /// via `roster_store`. Any other `doc_type` is logged and ignored
+    /// without attempting to decode it as one (at L3, a relay only ever
+    /// sends Roster; Policy is end to end only). A malformed chunk, or a
+    /// reassembled payload that fails to decode or verify, is likewise
+    /// logged and ignored rather than ending the session.
+    ///
+    /// The relay is already cryptographically authenticated by this
+    /// point (WELCOME's `relay_cert` check, `verify_relay_identity`), but
+    /// that only proves *which* relay this is, not that it will only ever
+    /// send well-behaved DOC traffic — a relay this node dialed is still
+    /// a much less trusted party than this node's own key material, and
+    /// nothing about DOC's own framing bounds how many distinct networks
+    /// a relay could claim to be pushing Rosters for. Restricting storage
+    /// to `claimed_networks` (mirroring the equivalent restriction
+    /// `crate::doc` enforces on the relay's own side, for the same
+    /// reason) keeps a relay from growing this node's roster store
+    /// without bound, and keeps `roster_store`'s content meaningful: it
+    /// should only ever answer for networks this node actually claims.
+    fn accept_doc(&mut self, body: &DocBody) {
+        let (doc_type, bytes) = match self.doc_reassembler.accept(body) {
+            Ok(Some(done)) => done,
+            Ok(None) => return,
+            Err(err) => {
+                tracing::debug!(error = %err, "DOC chunk rejected");
+                return;
+            }
+        };
+        if doc_type != DocType::Roster {
+            tracing::debug!(?doc_type, "ignoring a non-Roster DOC transfer at L3");
+            return;
+        }
+        let roster = match Roster::decode_strict(&bytes) {
+            Ok(roster) => roster,
+            Err(err) => {
+                tracing::warn!(error = %err, "reassembled DOC did not decode as a Roster");
+                return;
+            }
+        };
+        let decoded = match roster.decode() {
+            Ok(decoded) => decoded,
+            Err(err) => {
+                tracing::warn!(error = %err, "reassembled DOC's Roster body did not decode");
+                return;
+            }
+        };
+        if !self.claimed_networks.contains(&decoded.network_id) {
+            tracing::warn!(
+                network_id = %decoded.network_id,
+                "ignoring a DOC(roster) for a network this node does not claim"
+            );
+            return;
+        }
+        if let Err(err) = self.roster_store.set(&roster) {
+            tracing::warn!(error = %err, "reassembled DOC did not verify as a Roster");
+        }
     }
 
     /// Checks the liveness and rekey clocks against `now`; a dead link
@@ -179,23 +270,39 @@ pub struct Session {
 impl Session {
     /// One connection attempt: dial via `menzil-carrier`, run the L3
     /// handshake via `menzil-session`, verify the relay's identity
-    /// (protocol.md 4.1), then send ATTACH ("the new session is not
+    /// (protocol.md 4.1), send ATTACH ("the new session is not
     /// routable... until the node's first transport record, ATTACH, is
-    /// decrypted"). Does not retry; see [`run_session`] for the reconnect
-    /// loop.
+    /// decrypted"), then push DOC(roster) for any network where
+    /// `roster_store` already holds something newer than WELCOME
+    /// reported (protocol.md 4.3). Does not retry; see [`run_session`]
+    /// for the reconnect loop.
     pub async fn connect(
         config: &SessionConfig,
         env: &HashMap<String, String>,
+        roster_store: Arc<RosterStore>,
     ) -> Result<Self, NodeError> {
         let mut carrier = Carrier::dial(&config.dial, env).await?;
-        let (transport, welcome) = run_handshake(&mut carrier, config).await?;
+        let (transport, welcome) = run_handshake(&mut carrier, config, &roster_store).await?;
         let mut session = Self {
             carrier,
-            engine: Engine::new(transport, Instant::now()),
+            engine: Engine::new(
+                transport,
+                Instant::now(),
+                Arc::clone(&roster_store),
+                config.networks.clone(),
+            ),
             welcome,
             tick: tokio::time::interval(TICK),
         };
         session.send(Record::Attach).await?;
+        let catch_up = push_records_for_newer_rosters(
+            &config.networks,
+            &roster_store,
+            &session.welcome.rosters,
+        );
+        for record in catch_up {
+            session.send(record).await?;
+        }
         Ok(session)
     }
 
@@ -213,11 +320,11 @@ impl Session {
     }
 
     /// Waits for the next record meant for the caller, transparently
-    /// answering PING with PONG, applying an incoming REKEY, and sending
-    /// this side's own PING or REKEY as their clocks come due. Returns
-    /// an error — ending this connection — on GOAWAY, a dead link, or a
-    /// carrier failure; [`run_session`] is what turns that into a
-    /// reconnect.
+    /// answering PING with PONG, applying an incoming REKEY, ingesting an
+    /// incoming DOC (protocol.md 4.3), and sending this side's own PING
+    /// or REKEY as their clocks come due. Returns an error — ending this
+    /// connection — on GOAWAY, a dead link, or a carrier failure;
+    /// [`run_session`] is what turns that into a reconnect.
     pub async fn recv(&mut self) -> Result<Record, NodeError> {
         loop {
             tokio::select! {
@@ -252,11 +359,58 @@ impl Session {
     }
 }
 
+/// DOC(roster) chunk records to send for every network in `networks`
+/// where `roster_store` holds something newer than `welcome_rosters`
+/// reports the relay already has (protocol.md 4.3: "A node sends
+/// DOC(roster) to a relay when it holds a newer Roster than the relay's
+/// WELCOME `rosters` shows"). A network this node claims but holds no
+/// Roster for at all (nothing to push yet — e.g. before ever being
+/// admitted) is silently skipped, not an error.
+///
+/// Compares `welcome_rosters`'s entry as an `Option`, not
+/// `seq > welcome_rosters.get(..).unwrap_or(0)`: a legitimate Roster can
+/// have `seq: 0` (protocol.md never forbids it), and folding "the relay
+/// has nothing at all for this network" into the same value as "the relay
+/// explicitly holds seq 0" would silently swallow exactly that push.
+fn push_records_for_newer_rosters(
+    networks: &[NetworkId],
+    roster_store: &RosterStore,
+    welcome_rosters: &HashMap<NetworkId, u64>,
+) -> Vec<Record> {
+    let mut records = Vec::new();
+    for network_id in networks {
+        let Some(seq) = roster_store.seq(network_id) else {
+            continue;
+        };
+        let relay_is_current = welcome_rosters
+            .get(network_id)
+            .is_some_and(|&relay_seq| relay_seq >= seq);
+        if relay_is_current {
+            continue;
+        }
+        // `seq` and `get` are independent reads of `roster_store`; a
+        // concurrent update between them could in principle make this
+        // `None` even though `seq` just succeeded. Skipping it here (not
+        // panicking) is correct either way: the update that raced this
+        // one is itself newer still, and gets its own chance to be
+        // noticed and pushed the next time this runs.
+        let Some(roster) = roster_store.get(network_id) else {
+            continue;
+        };
+        records.extend(menzil_proto::split_into_doc_records(
+            DocType::Roster,
+            &roster.encode(),
+        ));
+    }
+    records
+}
+
 /// Runs [`NodeHandshake`] to completion over `carrier` and verifies the
 /// result (protocol.md 4.1).
 async fn run_handshake(
     carrier: &mut Carrier,
     config: &SessionConfig,
+    roster_store: &RosterStore,
 ) -> Result<(Transport, WelcomeBody), NodeError> {
     let info = &config.dial.connection_info;
     // "`key` is a cache that enables the one round trip IK handshake;
@@ -279,12 +433,17 @@ async fn run_handshake(
             })?;
     let prologue_bytes = prologue(&carrier.offered_subprotocol, &selected, pattern);
 
+    let roster_seq = config
+        .networks
+        .iter()
+        .filter_map(|network_id| roster_store.seq(network_id).map(|seq| (*network_id, seq)))
+        .collect();
     let hello = HelloBody {
         v: PROTOCOL_VERSION,
         node_cert: config.identity.node_cert.clone(),
         networks: config.networks.clone(),
         timestamp: tai64n_now(),
-        roster_seq: config.roster_seq.clone(),
+        roster_seq,
         caps: config.caps.clone(),
         e2e_protos: config.e2e_protos.clone(),
     };
@@ -368,18 +527,21 @@ fn tai64n_now() -> Tai64N {
 
 /// Dials, attaches, and stays attached indefinitely: reconnects through
 /// [`Backoff`] on any error, honoring GOAWAY's `retry_after_ms` hint when
-/// that was the reason (protocol.md 3.3, 4.1). Records this crate does
-/// not interpret itself (everything but ATTACH/PING/PONG/REKEY/GOAWAY)
-/// are sent to `events`; interpreting them is a later item's job
-/// (TODO.md L3f, L3g, L4). Returns once `events`'s receiver is dropped.
+/// that was the reason (protocol.md 3.3, 4.1). `roster_store` is shared
+/// across every reconnect attempt (protocol.md 4.3; TODO.md L3f), not
+/// rebuilt per attempt. Records this crate does not interpret itself
+/// (everything but ATTACH/PING/PONG/REKEY/GOAWAY/DOC) are sent to
+/// `events`; interpreting them is a later item's job (TODO.md L3g, L4).
+/// Returns once `events`'s receiver is dropped.
 pub async fn run_session(
     config: SessionConfig,
     env: HashMap<String, String>,
     events: mpsc::Sender<Record>,
+    roster_store: Arc<RosterStore>,
 ) {
     let mut backoff = Backoff::new();
     loop {
-        let mut session = match Session::connect(&config, &env).await {
+        let mut session = match Session::connect(&config, &env, Arc::clone(&roster_store)).await {
             Ok(session) => session,
             Err(err) => {
                 let delay = backoff.next_delay();
@@ -422,7 +584,7 @@ pub async fn run_session(
 mod tests {
     use super::*;
     use ed25519_dalek::SigningKey;
-    use menzil_proto::{Limits, NodeCert, NodeCertBody, NodeId};
+    use menzil_proto::{Limits, NodeCert, NodeCertBody, NodeId, RosterBody, RosterMember};
 
     fn node_cert(seed: u8) -> NodeCert {
         let key = SigningKey::generate(&mut rand::rng());
@@ -435,6 +597,28 @@ mod tests {
             not_after: 1_000_000_000,
         };
         NodeCert::sign(&key, &body).unwrap()
+    }
+
+    fn test_roster_store() -> Arc<RosterStore> {
+        Arc::new(RosterStore::new())
+    }
+
+    fn signed_roster(owner: &SigningKey, network_id: NetworkId, seq: u64) -> Roster {
+        let body = RosterBody {
+            v: PROTOCOL_VERSION,
+            network_id,
+            seq,
+            issued: 0,
+            expires: 1_000_000_000,
+            members: vec![RosterMember {
+                node_id: NodeId::from([1u8; 32]),
+                min_serial: 1,
+            }],
+            revoked: vec![],
+            stewards: vec![],
+            labels: vec![],
+        };
+        Roster::sign(owner, &body).unwrap()
     }
 
     /// A real, live `Ik` handshake producing two interoperable
@@ -514,7 +698,7 @@ mod tests {
     fn on_message_replies_to_ping_and_updates_liveness() {
         let (node_transport, mut relay_transport) = two_live_transports();
         let now = Instant::now();
-        let mut engine = Engine::new(node_transport, now);
+        let mut engine = Engine::new(node_transport, now, test_roster_store(), vec![]);
 
         let ciphertext = relay_transport
             .encrypt_record(&Record::Ping { nonce: [7; 8] })
@@ -530,7 +714,7 @@ mod tests {
     fn on_message_treats_a_bare_pong_as_activity_only() {
         let (node_transport, mut relay_transport) = two_live_transports();
         let now = Instant::now();
-        let mut engine = Engine::new(node_transport, now);
+        let mut engine = Engine::new(node_transport, now, test_roster_store(), vec![]);
         let ciphertext = relay_transport
             .encrypt_record(&Record::Pong { nonce: [1; 8] })
             .unwrap();
@@ -542,7 +726,7 @@ mod tests {
     fn on_message_rekeys_incoming_on_rekey_record() {
         let (node_transport, mut relay_transport) = two_live_transports();
         let now = Instant::now();
-        let mut engine = Engine::new(node_transport, now);
+        let mut engine = Engine::new(node_transport, now, test_roster_store(), vec![]);
 
         let ciphertext = relay_transport.encrypt_record(&Record::Rekey).unwrap();
         assert!(matches!(
@@ -564,7 +748,7 @@ mod tests {
     #[test]
     fn on_message_surfaces_goaway() {
         let (node_transport, mut relay_transport) = two_live_transports();
-        let mut engine = Engine::new(node_transport, Instant::now());
+        let mut engine = Engine::new(node_transport, Instant::now(), test_roster_store(), vec![]);
         let goaway = GoawayBody {
             reason: "superseded".to_string(),
             retry_after_ms: 250,
@@ -582,7 +766,7 @@ mod tests {
     #[test]
     fn on_message_delivers_everything_else() {
         let (node_transport, mut relay_transport) = two_live_transports();
-        let mut engine = Engine::new(node_transport, Instant::now());
+        let mut engine = Engine::new(node_transport, Instant::now(), test_roster_store(), vec![]);
         let record = Record::Credit(menzil_proto::CreditBody {
             peer: NodeId::from([9u8; 32]),
             bytes: 1024,
@@ -596,10 +780,109 @@ mod tests {
     }
 
     #[test]
+    fn on_message_stores_a_roster_completed_over_doc_and_returns_none() {
+        let (node_transport, mut relay_transport) = two_live_transports();
+        let roster_store = test_roster_store();
+        let owner = SigningKey::generate(&mut rand::rng());
+        let network_id = NetworkId::from(owner.verifying_key().to_bytes());
+        let mut engine = Engine::new(
+            node_transport,
+            Instant::now(),
+            Arc::clone(&roster_store),
+            vec![network_id],
+        );
+
+        let roster = signed_roster(&owner, network_id, 1);
+        let records = menzil_proto::split_into_doc_records(DocType::Roster, &roster.encode());
+
+        let mut last_event = None;
+        for record in records {
+            let ciphertext = relay_transport.encrypt_record(&record).unwrap();
+            last_event = Some(engine.on_message(&ciphertext, Instant::now()).unwrap());
+        }
+        assert!(matches!(last_event, Some(EngineEvent::None)));
+        assert_eq!(roster_store.seq(&network_id), Some(1));
+    }
+
+    #[test]
+    fn on_message_ignores_a_stale_roster_over_doc() {
+        let (node_transport, mut relay_transport) = two_live_transports();
+        let roster_store = test_roster_store();
+        let owner = SigningKey::generate(&mut rand::rng());
+        let network_id = NetworkId::from(owner.verifying_key().to_bytes());
+        roster_store
+            .set(&signed_roster(&owner, network_id, 5))
+            .unwrap();
+        let mut engine = Engine::new(
+            node_transport,
+            Instant::now(),
+            Arc::clone(&roster_store),
+            vec![network_id],
+        );
+
+        let stale = signed_roster(&owner, network_id, 3);
+        for record in menzil_proto::split_into_doc_records(DocType::Roster, &stale.encode()) {
+            let ciphertext = relay_transport.encrypt_record(&record).unwrap();
+            engine.on_message(&ciphertext, Instant::now()).unwrap();
+        }
+        assert_eq!(roster_store.seq(&network_id), Some(5));
+    }
+
+    #[test]
+    fn on_message_ignores_a_roster_over_doc_for_a_network_this_node_does_not_claim() {
+        // Regression test: a relay this node dialed is authenticated
+        // (WELCOME's `relay_cert` check), but that alone must not let it
+        // grow this node's roster store with networks the node never
+        // asked to claim (see `Engine::accept_doc`'s docs).
+        let (node_transport, mut relay_transport) = two_live_transports();
+        let roster_store = test_roster_store();
+        let owner = SigningKey::generate(&mut rand::rng());
+        let network_id = NetworkId::from(owner.verifying_key().to_bytes());
+        // `claimed_networks` is empty: this node never claimed
+        // `network_id` at all.
+        let mut engine = Engine::new(
+            node_transport,
+            Instant::now(),
+            Arc::clone(&roster_store),
+            vec![],
+        );
+
+        let roster = signed_roster(&owner, network_id, 1);
+        for record in menzil_proto::split_into_doc_records(DocType::Roster, &roster.encode()) {
+            let ciphertext = relay_transport.encrypt_record(&record).unwrap();
+            engine.on_message(&ciphertext, Instant::now()).unwrap();
+        }
+        assert_eq!(roster_store.seq(&network_id), None);
+    }
+
+    #[test]
+    fn on_message_ignores_a_policy_doc_type_at_l3() {
+        let (node_transport, mut relay_transport) = two_live_transports();
+        let roster_store = test_roster_store();
+        let mut engine = Engine::new(
+            node_transport,
+            Instant::now(),
+            Arc::clone(&roster_store),
+            vec![],
+        );
+
+        let record = Record::Doc(menzil_proto::DocBody {
+            doc_type: DocType::Policy,
+            doc_id: menzil_proto::DocId::from([1u8; 16]),
+            index: 0,
+            count: 1,
+            chunk: vec![1, 2, 3],
+        });
+        let ciphertext = relay_transport.encrypt_record(&record).unwrap();
+        let event = engine.on_message(&ciphertext, Instant::now()).unwrap();
+        assert!(matches!(event, EngineEvent::None));
+    }
+
+    #[test]
     fn on_tick_is_none_when_fresh() {
         let (node_transport, _relay_transport) = two_live_transports();
         let now = Instant::now();
-        let mut engine = Engine::new(node_transport, now);
+        let mut engine = Engine::new(node_transport, now, test_roster_store(), vec![]);
         assert!(matches!(engine.on_tick(now), TickEvent::None));
     }
 
@@ -607,7 +890,7 @@ mod tests {
     fn on_tick_sends_ping_after_one_interval() {
         let (node_transport, _relay_transport) = two_live_transports();
         let now = Instant::now();
-        let mut engine = Engine::new(node_transport, now);
+        let mut engine = Engine::new(node_transport, now, test_roster_store(), vec![]);
         let event = engine.on_tick(now + Duration::from_secs(25));
         assert!(matches!(event, TickEvent::Send(Record::Ping { .. })));
     }
@@ -616,7 +899,7 @@ mod tests {
     fn on_tick_reports_dead_after_two_intervals() {
         let (node_transport, _relay_transport) = two_live_transports();
         let now = Instant::now();
-        let mut engine = Engine::new(node_transport, now);
+        let mut engine = Engine::new(node_transport, now, test_roster_store(), vec![]);
         assert!(matches!(
             engine.on_tick(now + Duration::from_secs(50)),
             TickEvent::Dead
@@ -627,7 +910,7 @@ mod tests {
     fn on_tick_rekeys_after_an_hour_of_sustained_activity() {
         let (node_transport, mut relay_transport) = two_live_transports();
         let now = Instant::now();
-        let mut engine = Engine::new(node_transport, now);
+        let mut engine = Engine::new(node_transport, now, test_roster_store(), vec![]);
 
         // Keep the link alive right up to the hour mark so `is_dead`
         // doesn't preempt the rekey check.
@@ -649,7 +932,7 @@ mod tests {
     #[test]
     fn encrypt_round_trips_with_the_peer() {
         let (node_transport, mut relay_transport) = two_live_transports();
-        let mut engine = Engine::new(node_transport, Instant::now());
+        let mut engine = Engine::new(node_transport, Instant::now(), test_roster_store(), vec![]);
         let bytes = engine.encrypt(&Record::Attach).unwrap();
         assert_eq!(
             relay_transport.decrypt_record(&bytes).unwrap(),
@@ -748,5 +1031,78 @@ mod tests {
         std::thread::sleep(Duration::from_millis(2));
         let b = <[u8; 12]>::from(tai64n_now());
         assert!(b > a);
+    }
+
+    #[test]
+    fn push_records_for_newer_rosters_pushes_only_when_this_node_is_ahead() {
+        let owner_a = SigningKey::generate(&mut rand::rng());
+        let owner_b = SigningKey::generate(&mut rand::rng());
+        let network_a = NetworkId::from(owner_a.verifying_key().to_bytes());
+        let network_b = NetworkId::from(owner_b.verifying_key().to_bytes());
+        let unheld = NetworkId::from([0x33; 32]);
+
+        let store = test_roster_store();
+        store.set(&signed_roster(&owner_a, network_a, 3)).unwrap();
+        store.set(&signed_roster(&owner_b, network_b, 2)).unwrap();
+
+        let mut welcome_rosters = HashMap::new();
+        welcome_rosters.insert(network_a, 1); // we're ahead: push
+        welcome_rosters.insert(network_b, 2); // even: nothing to push
+
+        let records = push_records_for_newer_rosters(
+            &[network_a, network_b, unheld],
+            &store,
+            &welcome_rosters,
+        );
+        assert!(!records.is_empty());
+        let mut reassembler = DocReassembler::new();
+        let mut pushed_networks = Vec::new();
+        for record in records {
+            let Record::Doc(body) = record else {
+                unreachable!()
+            };
+            if let Some((doc_type, bytes)) = reassembler.accept(&body).unwrap() {
+                assert_eq!(doc_type, DocType::Roster);
+                let roster = Roster::decode_strict(&bytes).unwrap();
+                pushed_networks.push(roster.decode().unwrap().network_id);
+            }
+        }
+        assert_eq!(pushed_networks, vec![network_a]);
+    }
+
+    #[test]
+    fn push_records_for_newer_rosters_is_empty_when_relay_is_ahead_or_equal() {
+        let owner = SigningKey::generate(&mut rand::rng());
+        let network_id = NetworkId::from(owner.verifying_key().to_bytes());
+        let store = test_roster_store();
+        store.set(&signed_roster(&owner, network_id, 2)).unwrap();
+
+        let mut welcome_rosters = HashMap::new();
+        welcome_rosters.insert(network_id, 5);
+        assert!(push_records_for_newer_rosters(&[network_id], &store, &welcome_rosters).is_empty());
+
+        welcome_rosters.insert(network_id, 2);
+        assert!(push_records_for_newer_rosters(&[network_id], &store, &welcome_rosters).is_empty());
+    }
+
+    #[test]
+    fn push_records_for_newer_rosters_is_empty_for_a_claimed_but_unheld_network() {
+        let network_id = NetworkId::from([1u8; 32]);
+        let store = test_roster_store();
+        assert!(push_records_for_newer_rosters(&[network_id], &store, &HashMap::new()).is_empty());
+    }
+
+    #[test]
+    fn push_records_for_newer_rosters_pushes_a_seq_zero_roster_when_welcome_has_no_entry() {
+        // Regression test: comparing against `.unwrap_or(0)` would make
+        // this indistinguishable from "the relay already holds seq 0",
+        // silently skipping a push the relay genuinely needs.
+        let owner = SigningKey::generate(&mut rand::rng());
+        let network_id = NetworkId::from(owner.verifying_key().to_bytes());
+        let store = test_roster_store();
+        store.set(&signed_roster(&owner, network_id, 0)).unwrap();
+
+        let records = push_records_for_newer_rosters(&[network_id], &store, &HashMap::new());
+        assert!(!records.is_empty());
     }
 }

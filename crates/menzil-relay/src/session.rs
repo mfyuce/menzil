@@ -2,25 +2,34 @@
 //! completes the inbound handshake, validates HELLO against a held
 //! Roster, answers WELCOME, then drives the session's liveness and
 //! REKEY schedule until it is attached, superseded, idle, or closed.
+//! Also drives DOC(roster) propagation (protocol.md 4.3; TODO.md L3f, see
+//! `crate::doc`) both on receipt and as an attach-time catch-up, and
+//! delivers anything `crate::doc`'s fan-out hands this session through
+//! `SessionRegistry::send_to`.
 //!
 //! Deliberately not here — a separate, later item's job (protocol.md
-//! 4.2's flow-control paragraph): SEND -> RECV forwarding, credit
-//! enforcement, and the per-(source,destination) queues. SEND and CREDIT
-//! (and everything else this build doesn't yet act on: DOC, ADVERTISE,
+//! 4.2's flow-control paragraph, TODO.md L3h): SEND -> RECV forwarding,
+//! credit enforcement, and the per-(source,destination) queues. SEND and
+//! CREDIT (and everything else this build doesn't yet act on: ADVERTISE,
 //! ADVERTISE_ACK, PEER_STATE, ADMIT_*, and a GOAWAY received from a node,
 //! which is a protocol violation since that record is relay-to-node only
 //! — not specially detected as such yet, just as unhandled as the rest)
 //! are decrypted, logged, and otherwise ignored.
 
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use menzil_proto::{ErrorBody, GoawayBody, NodeId, Record, WelcomeBody};
+use menzil_proto::{
+    DocReassembler, ErrorBody, ErrorCode, GoawayBody, HelloBody, NetworkId, NodeId, Record,
+    WelcomeBody,
+};
 use menzil_session::{
     HandshakePattern, Liveness, RekeySchedule, RelayHandshake, RelayHandshakeStep, Transport,
     prologue,
 };
 
 use crate::connection::InboundConnection;
+use crate::doc::{self, AcceptOutcome};
 use crate::error::RelayError;
 use crate::hello::check_hello;
 use crate::relay::Relay;
@@ -87,7 +96,7 @@ async fn run_handshake_and_validate(
     mut conn: InboundConnection,
     relay: &Relay,
     session_id: u32,
-) -> Result<(InboundConnection, Transport, NodeId), RelayError> {
+) -> Result<(InboundConnection, Transport, NodeId, HelloBody), RelayError> {
     let message1 = conn.recv().await?;
     let pattern = detect_pattern(&message1);
     let prologue_bytes = prologue(
@@ -125,7 +134,7 @@ async fn run_handshake_and_validate(
         &relay.history,
         unix_now(),
     ) {
-        Ok(node_id) => Ok((conn, transport, node_id)),
+        Ok(node_id) => Ok((conn, transport, node_id, hello)),
         Err(rejection) => {
             let error_record = Record::Error(ErrorBody {
                 code: rejection.code,
@@ -152,6 +161,17 @@ async fn send_record(
     Ok(())
 }
 
+/// Encrypts and sends every record in `records`, best effort (matching
+/// this module's existing `let _ =` treatment of PING/REKEY/GOAWAY sends:
+/// a send failure here means the connection is on its way out regardless,
+/// and the next `conn.recv()` will surface that through the normal
+/// `Dispatch::End` path rather than needing a second error path here).
+async fn send_all(conn: &mut InboundConnection, transport: &mut Transport, records: Vec<Record>) {
+    for record in records {
+        let _ = send_record(conn, transport, record).await;
+    }
+}
+
 /// What [`dispatch`] learned from one inbound record.
 #[derive(Debug, PartialEq, Eq)]
 enum Dispatch {
@@ -167,11 +187,17 @@ enum Dispatch {
 /// pre-attach and post-attach phases of [`run_attached_loop`]: PING gets
 /// a PONG, REKEY rekeys the receiving cipher, ATTACH is reported to the
 /// caller (idempotent either side of it — see this module's doc
-/// comment), and everything else is logged and otherwise ignored.
+/// comment), DOC(roster) is fed to `crate::doc` and, if it completed with
+/// something newer, fanned out to this network's other attached members,
+/// and everything else is logged and otherwise ignored.
+#[allow(clippy::too_many_arguments)]
 async fn dispatch(
     conn: &mut InboundConnection,
     transport: &mut Transport,
     liveness: &mut Liveness,
+    doc_reassembler: &mut DocReassembler,
+    relay: &Relay,
+    node_id: &NodeId,
     incoming: Result<Vec<u8>, RelayError>,
 ) -> Dispatch {
     let bytes = match incoming {
@@ -200,6 +226,33 @@ async fn dispatch(
             Dispatch::Continue
         }
         Record::Attach => Dispatch::Attach,
+        Record::Doc(body) => {
+            match doc::accept_roster_chunk(doc_reassembler, &body, &relay.rosters) {
+                AcceptOutcome::NewRoster(network_id) => {
+                    if let Some(records) = doc::roster_doc_records(&relay.rosters, &network_id) {
+                        doc::fan_out(&relay.registry, &network_id, node_id, &records);
+                    }
+                }
+                AcceptOutcome::TooLarge => {
+                    let error = Record::Error(ErrorBody {
+                        code: ErrorCode::TooLarge,
+                        msg: "DOC transfer exceeded the size limit".to_string(),
+                    });
+                    let _ = send_record(conn, transport, error).await;
+                }
+                AcceptOutcome::NetworkNotServed(_) => {
+                    let error = Record::Error(ErrorBody {
+                        code: ErrorCode::UnknownNetwork,
+                        msg: "this relay does not serve that network".to_string(),
+                    });
+                    let _ = send_record(conn, transport, error).await;
+                }
+                AcceptOutcome::Nothing
+                | AcceptOutcome::IgnoredDocType(_)
+                | AcceptOutcome::Invalid => {}
+            }
+            Dispatch::Continue
+        }
         other => {
             tracing::debug!(
                 ?other,
@@ -251,17 +304,23 @@ const TICK: Duration = Duration::from_secs(1);
 /// Drives one handshaken connection from "not yet routable" through
 /// attachment (protocol.md 4.1) to however it ends: idle, closed, or
 /// superseded by a newer session for the same NodeId (protocol.md 10:
-/// "Sessions per NodeId: 1 attached").
+/// "Sessions per NodeId: 1 attached"). `claimed_networks` and
+/// `their_roster_seq` are this node's own HELLO `networks`/`roster_seq`
+/// (protocol.md 4.1), used for DOC propagation targeting and the
+/// attach-time catch-up (protocol.md 4.3; `crate::doc`).
 async fn run_attached_loop(
     mut conn: InboundConnection,
     mut transport: Transport,
     node_id: NodeId,
     session_id: u32,
     relay: &Relay,
+    claimed_networks: Vec<NetworkId>,
+    their_roster_seq: HashMap<NetworkId, u64>,
 ) {
     let mut liveness = Liveness::new(Instant::now());
     let mut rekey = RekeySchedule::new(Instant::now());
     let mut tick = tokio::time::interval(TICK);
+    let mut doc_reassembler = DocReassembler::new();
 
     // Phase 1: not yet routable, waiting for ATTACH as the node's first
     // transport record. Liveness and REKEY are already driven here too,
@@ -270,7 +329,11 @@ async fn run_attached_loop(
     loop {
         tokio::select! {
             incoming = conn.recv() => {
-                match dispatch(&mut conn, &mut transport, &mut liveness, incoming).await {
+                let outcome = dispatch(
+                    &mut conn, &mut transport, &mut liveness, &mut doc_reassembler, relay,
+                    &node_id, incoming,
+                ).await;
+                match outcome {
                     Dispatch::Attach => break,
                     Dispatch::Continue => {}
                     Dispatch::End => return,
@@ -285,14 +348,30 @@ async fn run_attached_loop(
     }
 
     tracing::info!(session_id, node_id = %node_id, "relay session attached");
-    let mut supersede_rx = relay.registry.attach(node_id, session_id);
+    let (mut supersede_rx, mut outbound_rx) =
+        relay
+            .registry
+            .attach(node_id, session_id, claimed_networks.clone());
+
+    // Attach-time catch-up (protocol.md 4.3, extended — see `crate::doc`'s
+    // module doc comment for why): this node may be attaching already
+    // behind what this relay holds for a network it just claimed.
+    for network_id in doc::catch_up_targets(&relay.rosters, &claimed_networks, &their_roster_seq) {
+        if let Some(records) = doc::roster_doc_records(&relay.rosters, &network_id) {
+            send_all(&mut conn, &mut transport, records).await;
+        }
+    }
 
     // Phase 2: attached and routable; stay alive until idle, closed, or
     // superseded.
     loop {
         tokio::select! {
             incoming = conn.recv() => {
-                match dispatch(&mut conn, &mut transport, &mut liveness, incoming).await {
+                let outcome = dispatch(
+                    &mut conn, &mut transport, &mut liveness, &mut doc_reassembler, relay,
+                    &node_id, incoming,
+                ).await;
+                match outcome {
                     Dispatch::Attach | Dispatch::Continue => {}
                     Dispatch::End => break,
                 }
@@ -312,10 +391,25 @@ async fn run_attached_loop(
                 tracing::info!(session_id, node_id = %node_id, "relay session superseded");
                 break;
             }
+            Some(record) = outbound_rx.recv() => {
+                let _ = send_record(&mut conn, &mut transport, record).await;
+            }
         }
     }
 
     relay.registry.detach(&node_id, session_id);
+}
+
+/// Deduplicates HELLO's `networks` before it becomes this session's
+/// `claimed_networks`. `check_hello` validates each claim independently
+/// and never rejects a repeated one, but every entry here later drives
+/// its own catch-up lookup and, if triggered, its own full DOC resend
+/// (`crate::doc::catch_up_targets`); without this, one real NetworkId
+/// repeated many times in a single HELLO would get that network's whole
+/// Roster pushed once per repetition instead of once.
+fn dedup_networks(networks: Vec<NetworkId>) -> Vec<NetworkId> {
+    let mut seen = HashSet::with_capacity(networks.len());
+    networks.into_iter().filter(|id| seen.insert(*id)).collect()
 }
 
 /// The whole life of one accepted connection: handshake, HELLO
@@ -324,8 +418,17 @@ async fn run_attached_loop(
 /// no result to collect.
 pub(crate) async fn handle_connection(conn: InboundConnection, relay: Relay, session_id: u32) {
     match run_handshake_and_validate(conn, &relay, session_id).await {
-        Ok((conn, transport, node_id)) => {
-            run_attached_loop(conn, transport, node_id, session_id, &relay).await;
+        Ok((conn, transport, node_id, hello)) => {
+            run_attached_loop(
+                conn,
+                transport,
+                node_id,
+                session_id,
+                &relay,
+                dedup_networks(hello.networks),
+                hello.roster_seq,
+            )
+            .await;
         }
         Err(err) => {
             tracing::warn!(error = %err, session_id, "relay inbound session failed before attaching");

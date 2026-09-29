@@ -10,6 +10,7 @@ rust-version.workspace = true
 blake2.workspace = true
 ciborium.workspace = true
 ed25519-dalek.workspace = true
+fastrand.workspace = true
 serde.workspace = true
 thiserror.workspace = true
 

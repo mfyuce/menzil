@@ -140,6 +140,38 @@ impl<T> Signed<T> {
     pub fn signature_bytes(&self) -> &[u8; 64] {
         &self.signature
     }
+
+    /// Encodes this standalone, top-level `Signed<T>` to its own CBOR
+    /// bytes (the `[body_bytes, sig]` array) — the counterpart to
+    /// [`Signed::decode_strict`], for wherever a `Signed<T>` travels as
+    /// its own top-level wire value rather than nested inside another
+    /// record body (which instead serializes it inline through
+    /// `Serialize`, e.g. `ciborium::into_writer` over a struct that
+    /// embeds one).
+    pub fn encode(&self) -> Vec<u8> {
+        let mut buf = Vec::new();
+        ciborium::into_writer(self, &mut buf)
+            .expect("CBOR encoding into a Vec<u8> writer cannot fail");
+        buf
+    }
+
+    /// Strictly decodes a standalone, top-level `Signed<T>` from its own
+    /// CBOR encoding: the same definite-lengths structural scan
+    /// [`Signed::decode`] already applies to the *inner* body bytes,
+    /// applied here to the *outer* `[body_bytes, sig]` array itself.
+    /// Every other place a `Signed<T>` appears on the wire is nested
+    /// inside some other record body, whose own decode already runs this
+    /// scan over the whole thing recursively (see
+    /// `crate::record::decode_cbor_body`); a reassembled DOC transfer
+    /// (protocol.md 4.2, 4.3) is the first place a `Signed<T>` exists as
+    /// its own top-level wire value, hence this.
+    pub fn decode_strict(bytes: &[u8]) -> Result<Self, ProtoError>
+    where
+        Self: DeserializeOwned,
+    {
+        strict::check_definite_lengths(bytes)?;
+        ciborium::from_reader(bytes).map_err(|e| ProtoError::Decode(e.to_string()))
+    }
 }
 
 /// Serializes as a plain CBOR byte string, bypassing serde's generic
@@ -178,7 +210,19 @@ impl<'de> Deserialize<'de> for RawBytesBuf {
                 Ok(RawBytesBuf(v))
             }
         }
-        deserializer.deserialize_bytes(V)
+        // `deserialize_byte_buf`, not `deserialize_bytes`: ciborium's
+        // `deserialize_bytes` only succeeds when the byte string fits its
+        // fixed 4,096-byte scratch buffer (`ciborium::de::from_reader`'s
+        // own `scratch = [0; 4096]`), erroring on anything longer rather
+        // than truncating it — confirmed by reading ciborium 0.2.2's
+        // source. A `Signed<T>`'s `body_bytes` routinely exceeds that once
+        // a document is nontrivially sized (a Roster with more than
+        // roughly 70 members, for one), so `deserialize_bytes` here would
+        // make `Signed<T>` fail to decode for exactly the realistically
+        // sized documents this type exists to carry. `deserialize_byte_buf`
+        // has no such limit (it accumulates into a growable `Vec`
+        // regardless of length).
+        deserializer.deserialize_byte_buf(V)
     }
 }
 
@@ -258,6 +302,34 @@ mod tests {
         let signed = Signed::sign(&signing_key, &body).unwrap();
         signed.verify(&signing_key.verifying_key()).unwrap();
         assert_eq!(signed.decode().unwrap(), body);
+    }
+
+    #[test]
+    fn a_body_over_the_4096_byte_ciborium_scratch_buffer_still_decodes() {
+        // Regression test: `RawBytesBuf` must use `deserialize_byte_buf`,
+        // not `deserialize_bytes` — the latter silently only supports
+        // byte strings up to ciborium's fixed 4,096-byte scratch buffer
+        // and errors on anything longer, which would make `Signed<T>`
+        // fail to decode for exactly the realistically sized documents
+        // (e.g. a Roster with more than about 70 members) it exists to
+        // carry. `text` alone is comfortably over 4,096 bytes once
+        // encoded, pushing the whole `Greeting` body (and so `body_bytes`
+        // as a CBOR byte string) well past the scratch buffer.
+        let signing_key = keypair();
+        let body = Greeting {
+            v: 1,
+            text: "x".repeat(10_000),
+        };
+        let signed = Signed::sign(&signing_key, &body).unwrap();
+        assert!(signed.body_bytes().len() > 4096);
+        signed.verify(&signing_key.verifying_key()).unwrap();
+        assert_eq!(signed.decode().unwrap(), body);
+
+        // Also through the standalone top-level path DOC reassembly uses.
+        let encoded = signed.encode();
+        let decoded: Signed<Greeting> = Signed::decode_strict(&encoded).unwrap();
+        assert_eq!(decoded, signed);
+        assert_eq!(decoded.decode().unwrap(), body);
     }
 
     #[test]

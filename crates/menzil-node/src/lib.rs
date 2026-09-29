@@ -7,10 +7,13 @@
 //! GOAWAY's `retry_after_ms` hint, replying to PING, and rekeying on its
 //! own hourly schedule.
 //!
-//! Not here: interpreting anything the relay forwards beyond PING/REKEY/
-//! GOAWAY (SEND/RECV/ADVERTISE*/DOC/PEER_STATE/CREDIT/ADMIT_* — later
-//! items' job, TODO.md L3f, L3g, L4), the local service registry, the
-//! SOCKS executor, and the SSH stdio mode the client-side commands need
+//! DOC(roster) propagation both directions (protocol.md 4.3; TODO.md L3f)
+//! is handled transparently by [`Session`]/`Engine`, the same way PING/
+//! REKEY/GOAWAY already were — see `session`'s module doc comment and
+//! [`RosterStore`]. Not here: interpreting anything else the relay
+//! forwards (SEND/RECV/ADVERTISE*/PEER_STATE/CREDIT/ADMIT_* — later
+//! items' job, TODO.md L3g, L4), the local service registry, the SOCKS
+//! executor, and the SSH stdio mode the client-side commands need
 //! (protocol.md 8, 12) — those are still to come. Generating and
 //! persisting a node's own identity (protocol.md 2.2) is also a separate,
 //! not-yet-built concern; [`LocalIdentity`] only carries it, already
@@ -21,8 +24,10 @@
 
 mod error;
 mod identity;
+mod roster_store;
 mod session;
 
 pub use error::NodeError;
 pub use identity::LocalIdentity;
+pub use roster_store::RosterStore;
 pub use session::{Session, SessionConfig, run_session};

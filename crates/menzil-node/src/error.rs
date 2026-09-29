@@ -57,4 +57,18 @@ pub enum NodeError {
     /// two ping intervals").
     #[error("link idle too long, presumed dead")]
     LinkDead,
+
+    /// A signed document (a Roster) exceeded
+    /// [`menzil_proto::MAX_DOC_BYTES`] once encoded. Refused before it is
+    /// stored — see `menzil-relay`'s identical
+    /// `RelayError::DocumentTooLarge` for why this must be caught here
+    /// rather than only discovered later, mid-panic, while trying to
+    /// propagate it.
+    #[error("document of {len} bytes exceeds the {max} byte limit")]
+    DocumentTooLarge {
+        /// The size that was rejected.
+        len: usize,
+        /// The limit it exceeded.
+        max: usize,
+    },
 }

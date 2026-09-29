@@ -47,10 +47,12 @@ impl Relay {
         }
     }
 
-    /// This relay's held Rosters. How they get populated over the wire
-    /// (DOC records, protocol.md 4.3) is TODO.md L3f's job; until then,
-    /// an operator or test harness seeds them directly through this
-    /// handle.
+    /// This relay's held Rosters. An operator or test harness seeds the
+    /// very first Roster for a network directly through this handle
+    /// (`crate::doc`'s DOC handling, protocol.md 4.3, only ever *updates*
+    /// a network already held this way — see `crate::doc::accept_roster_chunk`'s
+    /// docs for why introducing a brand new network is deliberately not
+    /// possible over the wire).
     pub fn rosters(&self) -> &RosterStore {
         &self.rosters
     }
