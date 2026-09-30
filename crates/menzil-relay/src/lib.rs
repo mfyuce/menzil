@@ -17,6 +17,7 @@
 
 #![forbid(unsafe_code)]
 
+mod advertise;
 mod connection;
 mod doc;
 mod error;
@@ -34,6 +35,7 @@ mod session_tests;
 mod tests_support;
 mod tls;
 
+pub use advertise::{DEFAULT_RESERVED_LABELS, LabelRegistry};
 pub use connection::InboundConnection;
 pub use error::RelayError;
 pub use hello::{HelloRejection, check_hello};

@@ -7,14 +7,24 @@
 //! delivers anything `crate::doc`'s fan-out hands this session through
 //! `SessionRegistry::send_to`.
 //!
+//! Also handles ADVERTISE / ADVERTISE_ACK label claiming against a held
+//! Roster (protocol.md 4.4; TODO.md L3g, see `crate::advertise`) — only
+//! for a connection `SessionRegistry::is_current` confirms is still
+//! `node_id`'s current session, checked fresh on every ADVERTISE, not
+//! just at attach time — and resets a node's advertised labels both
+//! right after a fresh attach (so they never silently carry over from a
+//! prior, possibly-superseded session) and on a genuine detach (not
+//! merely superseded — see `SessionRegistry::detach`'s own return
+//! value), so a node that goes fully idle eventually frees its names.
+//!
 //! Deliberately not here — a separate, later item's job (protocol.md
 //! 4.2's flow-control paragraph, TODO.md L3h): SEND -> RECV forwarding,
 //! credit enforcement, and the per-(source,destination) queues. SEND and
-//! CREDIT (and everything else this build doesn't yet act on: ADVERTISE,
-//! ADVERTISE_ACK, PEER_STATE, ADMIT_*, and a GOAWAY received from a node,
-//! which is a protocol violation since that record is relay-to-node only
-//! — not specially detected as such yet, just as unhandled as the rest)
-//! are decrypted, logged, and otherwise ignored.
+//! CREDIT (and everything else this build doesn't yet act on: PEER_STATE,
+//! ADMIT_*, and an ADVERTISE_ACK or GOAWAY received from a node, both
+//! protocol violations since those records are relay-to-node only — not
+//! specially detected as such yet, just as unhandled as the rest) are
+//! decrypted, logged, and otherwise ignored.
 
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -189,7 +199,10 @@ enum Dispatch {
 /// caller (idempotent either side of it — see this module's doc
 /// comment), DOC(roster) is fed to `crate::doc` and, if it completed with
 /// something newer, fanned out to this network's other attached members,
-/// and everything else is logged and otherwise ignored.
+/// ADVERTISE is validated and acknowledged via `crate::advertise` but
+/// only while `session_id` is still current (see this function's own
+/// call site below), and everything else is logged and otherwise
+/// ignored.
 #[allow(clippy::too_many_arguments)]
 async fn dispatch(
     conn: &mut InboundConnection,
@@ -198,6 +211,8 @@ async fn dispatch(
     doc_reassembler: &mut DocReassembler,
     relay: &Relay,
     node_id: &NodeId,
+    session_id: u32,
+    claimed_networks: &[NetworkId],
     incoming: Result<Vec<u8>, RelayError>,
 ) -> Dispatch {
     let bytes = match incoming {
@@ -250,6 +265,32 @@ async fn dispatch(
                 AcceptOutcome::Nothing
                 | AcceptOutcome::IgnoredDocType(_)
                 | AcceptOutcome::Invalid => {}
+            }
+            Dispatch::Continue
+        }
+        Record::Advertise(body) => {
+            // Only for a connection that is still `node_id`'s current
+            // session (protocol.md 4.1: not routable, and — by this
+            // build's own choice, see `crate::advertise`'s doc comment —
+            // not yet eligible to claim anything, until ATTACH; and no
+            // longer eligible at all once a newer session has superseded
+            // this one, even if this connection has not yet noticed and
+            // stops on its own). A red team review found that skipping
+            // this check let a pre-attach ADVERTISE both leak a claim
+            // forever if that connection then simply disappeared, and
+            // let an already-superseded connection's late-arriving
+            // ADVERTISE overwrite a newer session's own claims.
+            if relay.registry.is_current(node_id, session_id) {
+                let ack = relay
+                    .labels
+                    .advertise(&relay.rosters, claimed_networks, node_id, &body);
+                let _ = send_record(conn, transport, Record::AdvertiseAck(ack)).await;
+            } else {
+                tracing::debug!(
+                    session_id,
+                    node_id = %node_id,
+                    "ignoring ADVERTISE from a session that is not (or no longer) current"
+                );
             }
             Dispatch::Continue
         }
@@ -331,7 +372,7 @@ async fn run_attached_loop(
             incoming = conn.recv() => {
                 let outcome = dispatch(
                     &mut conn, &mut transport, &mut liveness, &mut doc_reassembler, relay,
-                    &node_id, incoming,
+                    &node_id, session_id, &claimed_networks, incoming,
                 ).await;
                 match outcome {
                     Dispatch::Attach => break,
@@ -352,6 +393,12 @@ async fn run_attached_loop(
         relay
             .registry
             .attach(node_id, session_id, claimed_networks.clone());
+    // A freshly attached session starts with no inherited label claims
+    // — see `crate::advertise::LabelRegistry::clear_for`'s doc comment
+    // for why this runs here, before this session gets a chance to send
+    // its own ADVERTISE, rather than relying only on the old session's
+    // own eventual detach.
+    relay.labels.clear_for(&node_id);
 
     // Attach-time catch-up (protocol.md 4.3, extended — see `crate::doc`'s
     // module doc comment for why): this node may be attaching already
@@ -369,7 +416,7 @@ async fn run_attached_loop(
             incoming = conn.recv() => {
                 let outcome = dispatch(
                     &mut conn, &mut transport, &mut liveness, &mut doc_reassembler, relay,
-                    &node_id, incoming,
+                    &node_id, session_id, &claimed_networks, incoming,
                 ).await;
                 match outcome {
                     Dispatch::Attach | Dispatch::Continue => {}
@@ -397,7 +444,9 @@ async fn run_attached_loop(
         }
     }
 
-    relay.registry.detach(&node_id, session_id);
+    if relay.registry.detach(&node_id, session_id) {
+        relay.labels.clear_for(&node_id);
+    }
 }
 
 /// Deduplicates HELLO's `networks` before it becomes this session's

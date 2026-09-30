@@ -95,14 +95,22 @@ impl SessionRegistry {
     /// Removes `node_id`'s registration, but only if it still belongs to
     /// `session_id`: a session that already lost a supersede race must
     /// not delete the newer registration that replaced it on its own way
-    /// out.
-    pub fn detach(&self, node_id: &NodeId, session_id: u32) {
+    /// out. Returns whether it actually removed anything: `crate::session`
+    /// uses this to decide whether releasing this NodeId's advertised
+    /// labels (`crate::advertise::LabelRegistry::clear_for`) is safe — a
+    /// stale detach call from a session that already lost that race must
+    /// not clear labels the newer, still-attached session has since
+    /// re-claimed.
+    pub fn detach(&self, node_id: &NodeId, session_id: u32) -> bool {
         let mut guard = self.by_node.write().unwrap();
         if guard
             .get(node_id)
             .is_some_and(|registration| registration.session_id == session_id)
         {
             guard.remove(node_id);
+            true
+        } else {
+            false
         }
     }
 
@@ -116,6 +124,26 @@ impl SessionRegistry {
             .unwrap()
             .get(node_id)
             .is_some_and(|registration| registration.outbound.try_send(record).is_ok())
+    }
+
+    /// Whether `session_id` is still `node_id`'s currently registered
+    /// session — `false` before it has ever attached, and `false` again
+    /// once a newer session for the same NodeId has superseded it.
+    /// `crate::session` checks this before acting on a record whose
+    /// effect reaches beyond this one connection (ADVERTISE, TODO.md
+    /// L3g): a connection that is not, or is no longer, the current one
+    /// for its NodeId must not still be able to mutate state a newer
+    /// session owns — a stale connection can otherwise keep processing
+    /// buffered input for a little while after being superseded (see
+    /// this module's own doc comment on [`SessionRegistry::attach`]),
+    /// and a record decrypted during that window is still genuinely
+    /// authentic, just no longer current.
+    pub fn is_current(&self, node_id: &NodeId, session_id: u32) -> bool {
+        self.by_node
+            .read()
+            .unwrap()
+            .get(node_id)
+            .is_some_and(|registration| registration.session_id == session_id)
     }
 
     /// Every currently attached NodeId that claimed `network_id` in its
@@ -158,7 +186,7 @@ mod tests {
         let node_id = NodeId::from([1u8; 32]);
         let _handles = registry.attach(node_id, 1, vec![]);
         assert_eq!(registry.attached_session_id(&node_id), Some(1));
-        registry.detach(&node_id, 1);
+        assert!(registry.detach(&node_id, 1));
         assert_eq!(registry.attached_session_id(&node_id), None);
     }
 
@@ -185,7 +213,10 @@ mod tests {
         let _new_handles = registry.attach(node_id, 2, vec![]);
 
         // Session 1's own cleanup runs after it was already superseded.
-        registry.detach(&node_id, 1);
+        assert!(
+            !registry.detach(&node_id, 1),
+            "a stale detach must report it removed nothing"
+        );
         assert_eq!(
             registry.attached_session_id(&node_id),
             Some(2),
@@ -218,6 +249,31 @@ mod tests {
     fn send_to_a_node_with_no_attached_session_is_a_no_op() {
         let registry = SessionRegistry::new();
         assert!(!registry.send_to(&NodeId::from([9u8; 32]), Record::Rekey));
+    }
+
+    #[test]
+    fn is_current_is_false_before_any_attach() {
+        let registry = SessionRegistry::new();
+        assert!(!registry.is_current(&NodeId::from([1u8; 32]), 1));
+    }
+
+    #[test]
+    fn is_current_is_true_for_the_attached_session_and_false_for_any_other_id() {
+        let registry = SessionRegistry::new();
+        let node_id = NodeId::from([1u8; 32]);
+        let _handles = registry.attach(node_id, 1, vec![]);
+        assert!(registry.is_current(&node_id, 1));
+        assert!(!registry.is_current(&node_id, 2));
+    }
+
+    #[test]
+    fn is_current_is_false_for_a_session_that_has_been_superseded() {
+        let registry = SessionRegistry::new();
+        let node_id = NodeId::from([1u8; 32]);
+        let _old = registry.attach(node_id, 1, vec![]);
+        let _new = registry.attach(node_id, 2, vec![]);
+        assert!(!registry.is_current(&node_id, 1));
+        assert!(registry.is_current(&node_id, 2));
     }
 
     #[test]

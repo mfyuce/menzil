@@ -9,6 +9,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 use menzil_proto::Limits;
 
+use crate::advertise::LabelRegistry;
 use crate::identity::RelayIdentity;
 use crate::listener::Listener;
 use crate::node_history::NodeHistory;
@@ -25,6 +26,7 @@ pub struct Relay {
     pub(crate) rosters: Arc<RosterStore>,
     pub(crate) history: Arc<NodeHistory>,
     pub(crate) registry: Arc<SessionRegistry>,
+    pub(crate) labels: Arc<LabelRegistry>,
     pub(crate) limits: Limits,
     next_session_id: Arc<AtomicU32>,
 }
@@ -42,6 +44,7 @@ impl Relay {
             rosters: Arc::new(RosterStore::new()),
             history: Arc::new(NodeHistory::new()),
             registry: Arc::new(SessionRegistry::new()),
+            labels: Arc::new(LabelRegistry::new()),
             limits,
             next_session_id: Arc::new(AtomicU32::new(1)),
         }

@@ -15,9 +15,9 @@ use std::net::SocketAddr;
 use ed25519_dalek::SigningKey;
 use futures_util::{SinkExt, StreamExt};
 use menzil_proto::{
-    DocReassembler, DocType, ErrorCode, HelloBody, Limits, NetworkId, NodeCert, NodeCertBody,
-    NodeId, PROTOCOL_VERSION, Record, Roster, RosterBody, RosterMember, Tai64N, WelcomeBody,
-    X25519PublicKey,
+    AdvertiseBody, DocReassembler, DocType, ErrorCode, HelloBody, Label, Limits, NetworkId,
+    NodeCert, NodeCertBody, NodeId, PROTOCOL_VERSION, Record, Roster, RosterBody, RosterMember,
+    Share, ShareMode, Tai64N, WelcomeBody, X25519PublicKey,
 };
 use menzil_session::{HandshakePattern, NodeHandshake, Transport, prologue};
 use rustls::pki_types::CertificateDer;
@@ -537,6 +537,213 @@ async fn rekey_from_the_client_is_applied_before_the_next_record() {
     // this PING would fail to decrypt on the relay's side and no PONG
     // would come back.
     ping_pong(&mut client, [2; 8]).await;
+}
+
+fn roster_with_label(
+    owner: &SigningKey,
+    network_id: NetworkId,
+    node_id: NodeId,
+    name: &str,
+) -> Roster {
+    let body = RosterBody {
+        v: PROTOCOL_VERSION,
+        network_id,
+        seq: 1,
+        issued: 0,
+        expires: 4_000_000_000,
+        members: vec![RosterMember {
+            node_id,
+            min_serial: 1,
+        }],
+        revoked: vec![],
+        stewards: vec![],
+        labels: vec![Label {
+            name: name.to_string(),
+            node_id,
+        }],
+    };
+    Roster::sign(owner, &body).unwrap()
+}
+
+fn advertise_one(name: &str) -> Record {
+    Record::Advertise(AdvertiseBody {
+        v: PROTOCOL_VERSION,
+        shares: vec![Share {
+            name: name.to_string(),
+            mode: ShareMode::Terminated,
+            service: "tcp:ssh".parse().unwrap(),
+            alpn: vec![],
+        }],
+        accept_peers: true,
+    })
+}
+
+#[tokio::test]
+async fn advertise_before_attach_is_ignored() {
+    let (relay, listener, cert, relay_x25519) = bind_test_relay().await;
+    let addr = listener.local_addr().unwrap();
+
+    let owner = SigningKey::generate(&mut rand::rng());
+    let network_id = NetworkId::from(owner.verifying_key().to_bytes());
+    let identity = generate_identity();
+    relay
+        .rosters()
+        .set(&roster_with_label(
+            &owner,
+            network_id,
+            identity.node_id,
+            "example",
+        ))
+        .unwrap();
+
+    let serve_relay = relay.clone();
+    tokio::spawn(async move { serve_relay.serve(&listener).await });
+
+    let (mut client, _) = TestClient::connect(
+        addr,
+        cert,
+        &identity,
+        relay_x25519,
+        vec![network_id],
+        HashMap::new(),
+        1,
+        10,
+    )
+    .await;
+    // Deliberately no ATTACH here: this is exactly the gap a red team
+    // review found — a pre-attach ADVERTISE being processed anyway, with
+    // no attached session ever registered for `SessionRegistry::detach`
+    // to later release it through.
+    client.send(advertise_one("example")).await;
+    // A PING/PONG round trip is a deterministic synchronization point,
+    // as elsewhere in this file: both travel over one ordered stream
+    // into the relay's single per-connection recv loop, so if the
+    // ADVERTISE had produced an ADVERTISE_ACK, it would have arrived
+    // before this PONG.
+    client.send(Record::Ping { nonce: [9; 8] }).await;
+    assert_eq!(client.recv().await, Some(Record::Pong { nonce: [9; 8] }));
+
+    assert!(
+        relay.labels.shares_for(&identity.node_id).is_empty(),
+        "a pre-attach ADVERTISE must never be processed at all"
+    );
+}
+
+#[tokio::test]
+async fn advertise_after_attach_is_accepted_and_acknowledged() {
+    let (relay, listener, cert, relay_x25519) = bind_test_relay().await;
+    let addr = listener.local_addr().unwrap();
+
+    let owner = SigningKey::generate(&mut rand::rng());
+    let network_id = NetworkId::from(owner.verifying_key().to_bytes());
+    let identity = generate_identity();
+    relay
+        .rosters()
+        .set(&roster_with_label(
+            &owner,
+            network_id,
+            identity.node_id,
+            "example",
+        ))
+        .unwrap();
+
+    let serve_relay = relay.clone();
+    tokio::spawn(async move { serve_relay.serve(&listener).await });
+
+    let (mut client, _) = TestClient::connect(
+        addr,
+        cert,
+        &identity,
+        relay_x25519,
+        vec![network_id],
+        HashMap::new(),
+        1,
+        10,
+    )
+    .await;
+    client.send(Record::Attach).await;
+    // This client's HELLO claimed no roster_seq at all for `network_id`,
+    // so the attach-time catch-up (protocol.md 4.3, `crate::doc`) pushes
+    // the just-seeded Roster right away, ahead of anything else —
+    // consume it before expecting the ADVERTISE_ACK.
+    let _ = client.recv_roster_doc().await;
+    client.send(advertise_one("example")).await;
+
+    match client.recv().await {
+        Some(Record::AdvertiseAck(ack)) => {
+            assert_eq!(ack.accepted, vec!["example"]);
+            assert!(ack.rejected.is_empty());
+        }
+        other => panic!("expected an ADVERTISE_ACK, got {other:?}"),
+    }
+    assert_eq!(relay.labels.shares_for(&identity.node_id).len(), 1);
+}
+
+#[tokio::test]
+async fn a_reconnecting_session_does_not_inherit_the_previous_sessions_claims() {
+    let (relay, listener, cert, relay_x25519) = bind_test_relay().await;
+    let addr = listener.local_addr().unwrap();
+
+    let owner = SigningKey::generate(&mut rand::rng());
+    let network_id = NetworkId::from(owner.verifying_key().to_bytes());
+    let identity = generate_identity();
+    relay
+        .rosters()
+        .set(&roster_with_label(
+            &owner,
+            network_id,
+            identity.node_id,
+            "example",
+        ))
+        .unwrap();
+
+    let serve_relay = relay.clone();
+    tokio::spawn(async move { serve_relay.serve(&listener).await });
+
+    let (mut client1, _) = TestClient::connect(
+        addr,
+        cert.clone(),
+        &identity,
+        relay_x25519,
+        vec![network_id],
+        HashMap::new(),
+        1,
+        10,
+    )
+    .await;
+    client1.send(Record::Attach).await;
+    // Same attach-time catch-up as `advertise_after_attach_is_accepted_and_acknowledged`.
+    let _ = client1.recv_roster_doc().await;
+    client1.send(advertise_one("example")).await;
+    match client1.recv().await {
+        Some(Record::AdvertiseAck(ack)) => assert_eq!(ack.accepted, vec!["example"]),
+        other => panic!("expected an ADVERTISE_ACK, got {other:?}"),
+    }
+    assert_eq!(relay.labels.shares_for(&identity.node_id).len(), 1);
+
+    // Same identity reconnects (the serial may stay the same; only the
+    // timestamp must still strictly advance, protocol.md 4.1) and
+    // attaches, superseding the first session — but never re-sends its
+    // own ADVERTISE this time.
+    let (mut client2, _) = TestClient::connect(
+        addr,
+        cert,
+        &identity,
+        relay_x25519,
+        vec![network_id],
+        HashMap::new(),
+        1,
+        20,
+    )
+    .await;
+    client2.send(Record::Attach).await;
+    let _ = client2.recv_roster_doc().await;
+    ping_pong(&mut client2, [1; 8]).await;
+
+    assert!(
+        relay.labels.shares_for(&identity.node_id).is_empty(),
+        "a freshly attached session must not silently inherit a prior session's claims"
+    );
 }
 
 #[tokio::test]

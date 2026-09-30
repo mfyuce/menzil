@@ -10,7 +10,7 @@
 //! queries HELLO validation (protocol.md 4.1) and DOC propagation
 //! (protocol.md 4.3) need against it.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::RwLock;
 
 use ed25519_dalek::VerifyingKey;
@@ -122,6 +122,56 @@ impl RosterStore {
                     .map(|member| member.min_serial)
             })
             .max()
+    }
+
+    /// Every name granted to `node_id` in the Roster of any of
+    /// `networks` this relay holds (protocol.md 4.4: "the Roster of one
+    /// of the node's networks lists that name for this NodeId in
+    /// labels" — read as one of the networks *this node itself claimed*,
+    /// the same restriction `min_serial_for`'s own doc comment discusses
+    /// for a different check: a relay may happen to serve a network this
+    /// node never claimed in HELLO, and that network's Roster granting
+    /// the name to this NodeId must not let it claim the name through a
+    /// session that never asked to be part of that network at all).
+    /// Names come back ASCII-lowercased, for case-insensitive membership
+    /// testing by the caller: two Rosters could otherwise grant what a
+    /// viewer would consider "the same" name to two different nodes just
+    /// by differing in case.
+    ///
+    /// A network's `labels` only counts if `node_id` is *currently* a
+    /// member of that same Roster and not revoked from it — mirroring
+    /// `crate::hello::check_hello`'s own membership/revocation checks
+    /// (checked in the same order, revocation first: a Roster naming a
+    /// node in both `revoked` and `members` is possible to construct,
+    /// nothing here assumes an owner's tooling always keeps `labels` in
+    /// sync with a later revocation, and revocation must still win).
+    /// protocol.md 4.4's "lists that name for this NodeId in labels" is
+    /// read together with 2.3's membership model, not as a bare,
+    /// unconditional lookup into `labels` alone: a `labels` entry
+    /// surviving a Roster update that also revoked or dropped the same
+    /// NodeId must not still authorize a claim.
+    ///
+    /// Returns the whole set in one call rather than answering one name
+    /// at a time, so a caller validating a whole ADVERTISE body's share
+    /// list only pays for one scan of the held Rosters, not one scan per
+    /// share (see `crate::advertise::LabelRegistry::advertise`'s own doc
+    /// comment for why the difference mattered in practice).
+    pub fn labels_granted_to(&self, networks: &[NetworkId], node_id: &NodeId) -> HashSet<String> {
+        let guard = self.by_network.read().unwrap();
+        networks
+            .iter()
+            .filter_map(|id| guard.get(id))
+            .filter(|(_, body)| {
+                !body
+                    .revoked
+                    .iter()
+                    .any(|revoked| &revoked.node_id == node_id)
+                    && body.members.iter().any(|member| &member.node_id == node_id)
+            })
+            .flat_map(|(_, body)| body.labels.iter())
+            .filter(|label| &label.node_id == node_id)
+            .map(|label| label.name.to_ascii_lowercase())
+            .collect()
     }
 }
 
@@ -279,5 +329,147 @@ mod tests {
         let err = store.set(&roster).unwrap_err();
         assert!(matches!(err, RelayError::DocumentTooLarge { .. }));
         assert!(store.get(&network_id).is_none());
+    }
+
+    fn roster_with_label(owner: &SigningKey, network_id: NetworkId, node_id: NodeId) -> Roster {
+        roster_with_label_and_status(owner, network_id, node_id, true, false)
+    }
+
+    fn roster_with_label_and_status(
+        owner: &SigningKey,
+        network_id: NetworkId,
+        node_id: NodeId,
+        is_member: bool,
+        is_revoked: bool,
+    ) -> Roster {
+        use menzil_proto::{Label, RevokedMember};
+        let body = RosterBody {
+            v: menzil_proto::PROTOCOL_VERSION,
+            network_id,
+            seq: 1,
+            issued: 0,
+            expires: 1_000_000_000,
+            members: if is_member {
+                vec![RosterMember {
+                    node_id,
+                    min_serial: 1,
+                }]
+            } else {
+                vec![]
+            },
+            revoked: if is_revoked {
+                vec![RevokedMember { node_id, since: 0 }]
+            } else {
+                vec![]
+            },
+            stewards: vec![],
+            labels: vec![Label {
+                name: "Example".to_string(),
+                node_id,
+            }],
+        };
+        Roster::sign(owner, &body).unwrap()
+    }
+
+    #[test]
+    fn labels_granted_to_finds_a_claim_in_one_of_the_given_networks() {
+        let owner = SigningKey::generate(&mut rand::rng());
+        let network_id = NetworkId::from(owner.verifying_key().to_bytes());
+        let node_id = NodeId::from([9u8; 32]);
+        let store = RosterStore::new();
+        store
+            .set(&roster_with_label(&owner, network_id, node_id))
+            .unwrap();
+
+        let granted = store.labels_granted_to(&[network_id], &node_id);
+        assert!(granted.contains("example"), "{granted:?}");
+    }
+
+    #[test]
+    fn labels_granted_to_lowercases_the_name() {
+        let owner = SigningKey::generate(&mut rand::rng());
+        let network_id = NetworkId::from(owner.verifying_key().to_bytes());
+        let node_id = NodeId::from([9u8; 32]);
+        let store = RosterStore::new();
+        // `roster_with_label` grants the mixed-case "Example".
+        store
+            .set(&roster_with_label(&owner, network_id, node_id))
+            .unwrap();
+
+        let granted = store.labels_granted_to(&[network_id], &node_id);
+        assert_eq!(granted, HashSet::from(["example".to_string()]));
+    }
+
+    #[test]
+    fn labels_granted_to_excludes_a_different_node_id() {
+        let owner = SigningKey::generate(&mut rand::rng());
+        let network_id = NetworkId::from(owner.verifying_key().to_bytes());
+        let node_id = NodeId::from([9u8; 32]);
+        let other = NodeId::from([8u8; 32]);
+        let store = RosterStore::new();
+        store
+            .set(&roster_with_label(&owner, network_id, node_id))
+            .unwrap();
+
+        assert!(store.labels_granted_to(&[network_id], &other).is_empty());
+    }
+
+    #[test]
+    fn labels_granted_to_ignores_a_network_not_in_the_given_list() {
+        let owner = SigningKey::generate(&mut rand::rng());
+        let network_id = NetworkId::from(owner.verifying_key().to_bytes());
+        let node_id = NodeId::from([9u8; 32]);
+        let unclaimed_other_network = NetworkId::from([0x22; 32]);
+        let store = RosterStore::new();
+        store
+            .set(&roster_with_label(&owner, network_id, node_id))
+            .unwrap();
+
+        // The relay holds a Roster granting this label, but the caller
+        // did not list `network_id` among the node's own claimed
+        // networks (e.g. its HELLO never claimed it) — must not count.
+        assert!(
+            store
+                .labels_granted_to(&[unclaimed_other_network], &node_id)
+                .is_empty()
+        );
+        assert!(store.labels_granted_to(&[], &node_id).is_empty());
+    }
+
+    #[test]
+    fn labels_granted_to_excludes_a_revoked_node_even_if_still_labeled() {
+        let owner = SigningKey::generate(&mut rand::rng());
+        let network_id = NetworkId::from(owner.verifying_key().to_bytes());
+        let node_id = NodeId::from([9u8; 32]);
+        let store = RosterStore::new();
+        // A Roster that names the same node in both `members` and
+        // `revoked` (an owner's tooling might not always keep `labels`
+        // in sync with a later revocation) — revocation must still win,
+        // the same as `check_hello` checks it before membership.
+        store
+            .set(&roster_with_label_and_status(
+                &owner, network_id, node_id, true, true,
+            ))
+            .unwrap();
+
+        assert!(store.labels_granted_to(&[network_id], &node_id).is_empty());
+    }
+
+    #[test]
+    fn labels_granted_to_excludes_a_node_no_longer_a_member() {
+        let owner = SigningKey::generate(&mut rand::rng());
+        let network_id = NetworkId::from(owner.verifying_key().to_bytes());
+        let node_id = NodeId::from([9u8; 32]);
+        let store = RosterStore::new();
+        // Not a member and not explicitly revoked either: a `labels`
+        // entry surviving a member's outright removal must not still
+        // authorize a claim.
+        store
+            .set(&roster_with_label_and_status(
+                &owner, network_id, node_id, false, false,
+            ))
+            .unwrap();
+
+        assert!(store.labels_granted_to(&[network_id], &node_id).is_empty());
     }
 }
