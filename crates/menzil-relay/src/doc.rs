@@ -426,9 +426,9 @@ mod tests {
         let sender = NodeId::from([10u8; 32]);
         let member = NodeId::from([11u8; 32]);
         let stranger = NodeId::from([12u8; 32]);
-        let (_s1, mut sender_rx) = registry.attach(sender, 1, vec![network_id]);
-        let (_s2, mut member_rx) = registry.attach(member, 2, vec![network_id]);
-        let (_s3, mut stranger_rx) = registry.attach(stranger, 3, vec![]);
+        let (_s1, mut sender_rx, _s1_fwd) = registry.attach(sender, 1, vec![network_id]);
+        let (_s2, mut member_rx, _s2_fwd) = registry.attach(member, 2, vec![network_id]);
+        let (_s3, mut stranger_rx, _s3_fwd) = registry.attach(stranger, 3, vec![]);
 
         fan_out(
             &registry,

@@ -4,24 +4,33 @@
 //! ATTACH, is decrypted. Then the previous session for that NodeId
 //! receives GOAWAY `superseded`"; protocol.md 10: "Sessions per NodeId: 1
 //! attached"), and lets another connection's task hand a record to an
-//! attached session's own connection for it to actually send
-//! (`crate::doc`'s DOC propagation, protocol.md 4.3, is the first user of
-//! this; TODO.md L3h's SEND->RECV forwarding will be a later one).
+//! attached session's own connection for it to actually send.
 //!
-//! Forwarding a SEND to whatever session is registered here, with credit
-//! enforcement and bounded per-(source,destination) queues, is a
-//! separate, later item's job (TODO.md L3h, the flow-control paragraph of
-//! protocol.md 4.2): [`SessionRegistry::send_to`] is deliberately a
-//! simple, best-effort, non-credited channel, correctly scoped to DOC's
-//! own low-volume, best-effort-is-fine control traffic — not a
-//! foundation L3h's higher-stakes SEND/RECV data plane should build on
-//! without its own credit/backpressure design.
+//! Two separate channels do this, deliberately kept apart rather than
+//! shared:
+//!
+//! - [`SessionRegistry::send_to`] is a simple, best-effort, non-credited,
+//!   bounded-by-item-count channel: correctly scoped to DOC propagation
+//!   (protocol.md 4.3, TODO.md L3f) and ADVERTISE_ACK/control traffic,
+//!   where dropping an occasional message under backpressure is
+//!   acceptable and a resend or the next state sync recovers it.
+//! - [`SessionRegistry::deliver`] is the SEND->RECV data-plane path
+//!   (protocol.md 4.2's flow-control paragraph, TODO.md L3h,
+//!   `crate::forward`): unbounded, because `crate::forward::ForwardTable`
+//!   already performs its own credit/queue-budget/token-bucket admission
+//!   control before ever calling it, and a second, independent,
+//!   item-count-based bound on top would risk rejecting traffic that
+//!   admission control already approved, for reasons unrelated to actual
+//!   memory pressure (e.g. many small reliable records, none of which
+//!   individually matter, arriving in a burst).
 
 use std::collections::HashMap;
 use std::sync::RwLock;
 
 use menzil_proto::{NetworkId, NodeId, Record};
 use tokio::sync::{mpsc, oneshot};
+
+use crate::forward::ForwardItem;
 
 /// How many records [`SessionRegistry::send_to`] will queue for one
 /// attached session before further sends start being dropped. A full 1
@@ -40,6 +49,10 @@ struct Registration {
     claimed_networks: Vec<NetworkId>,
     supersede: oneshot::Sender<()>,
     outbound: mpsc::Sender<Record>,
+    /// The SEND->RECV data-plane delivery path (TODO.md L3h,
+    /// `crate::forward`), deliberately separate from `outbound` above —
+    /// see this module's own doc comment.
+    forward: mpsc::UnboundedSender<ForwardItem>,
 }
 
 /// The relay's currently-attached sessions, at most one per NodeId.
@@ -59,24 +72,38 @@ impl SessionRegistry {
     /// Returns a receiver that fires once — with no payload, since the
     /// only thing to communicate is that it happened — when *this*
     /// registration is later superseded (it is simply dropped, and never
-    /// fires, if that never happens), and a receiver of records handed to
-    /// [`SessionRegistry::send_to`] for this NodeId, which the caller
-    /// must keep polling and actually send over its own connection for
-    /// as long as it stays attached.
+    /// fires, if that never happens); a receiver of records handed to
+    /// [`SessionRegistry::send_to`] for this NodeId; and a receiver of
+    /// items handed to [`SessionRegistry::deliver`] for this NodeId
+    /// (TODO.md L3h) — the caller must keep polling both for as long as
+    /// it stays attached, and actually send what they yield over its own
+    /// connection.
     ///
     /// If another session was already registered for this NodeId, its
     /// own supersede receiver fires immediately and it is replaced right
-    /// away, dropping its outbound sender too (so its receiver simply
-    /// ends); callers do not wait for the old session to actually finish
+    /// away, dropping its outbound senders too (so its receivers simply
+    /// end); callers do not wait for the old session to actually finish
     /// leaving before this returns.
-    pub fn attach(
+    ///
+    /// Crate-visible only, not `pub`: unlike this type's other methods,
+    /// its return type now carries [`ForwardItem`] (TODO.md L3h), which
+    /// is itself crate-internal plumbing (`crate::forward`'s own drain
+    /// bookkeeping) with no reason to ever be nameable outside this
+    /// crate — nothing external can reach a `SessionRegistry` to call
+    /// this anyway, since `Relay::registry` is itself crate-visible only.
+    pub(crate) fn attach(
         &self,
         node_id: NodeId,
         session_id: u32,
         claimed_networks: Vec<NetworkId>,
-    ) -> (oneshot::Receiver<()>, mpsc::Receiver<Record>) {
+    ) -> (
+        oneshot::Receiver<()>,
+        mpsc::Receiver<Record>,
+        mpsc::UnboundedReceiver<ForwardItem>,
+    ) {
         let (supersede_tx, supersede_rx) = oneshot::channel();
         let (outbound_tx, outbound_rx) = mpsc::channel(OUTBOUND_CAPACITY);
+        let (forward_tx, forward_rx) = mpsc::unbounded_channel();
         let mut guard = self.by_node.write().unwrap();
         if let Some(previous) = guard.insert(
             node_id,
@@ -85,11 +112,12 @@ impl SessionRegistry {
                 claimed_networks,
                 supersede: supersede_tx,
                 outbound: outbound_tx,
+                forward: forward_tx,
             },
         ) {
             let _ = previous.supersede.send(());
         }
-        (supersede_rx, outbound_rx)
+        (supersede_rx, outbound_rx, forward_rx)
     }
 
     /// Removes `node_id`'s registration, but only if it still belongs to
@@ -124,6 +152,31 @@ impl SessionRegistry {
             .unwrap()
             .get(node_id)
             .is_some_and(|registration| registration.outbound.try_send(record).is_ok())
+    }
+
+    /// Hands `item` to `node_id`'s attached connection to send as a RECV
+    /// record (TODO.md L3h's SEND->RECV data plane, `crate::forward`) —
+    /// see this module's own doc comment for why this is a separate
+    /// channel from [`SessionRegistry::send_to`], not the same one.
+    /// Returns whether `node_id` was actually attached to receive it.
+    pub(crate) fn deliver(&self, node_id: &NodeId, item: ForwardItem) -> bool {
+        self.by_node
+            .read()
+            .unwrap()
+            .get(node_id)
+            .is_some_and(|registration| registration.forward.send(item).is_ok())
+    }
+
+    /// Whether `node_id` currently has an attached session (protocol.md
+    /// 4.2's forwarding rule: "dst is online and attached").
+    /// `crate::forward::ForwardTable::forward` checks this only *after*
+    /// confirming `src` is authorized to reach `dst` at all — never
+    /// before — so that an unauthorized sender can never use this to
+    /// learn whether an arbitrary NodeId is currently online (an opus red
+    /// team review's finding M2, fixed by reordering the checks; see
+    /// `crate::forward`'s module doc comment).
+    pub(crate) fn is_attached(&self, node_id: &NodeId) -> bool {
+        self.by_node.read().unwrap().contains_key(node_id)
     }
 
     /// Whether `session_id` is still `node_id`'s currently registered
@@ -194,7 +247,7 @@ mod tests {
     fn attaching_again_supersedes_the_previous_registration() {
         let registry = SessionRegistry::new();
         let node_id = NodeId::from([1u8; 32]);
-        let (mut old_rx, _old_outbound) = registry.attach(node_id, 1, vec![]);
+        let (mut old_rx, _old_outbound, _old_forward) = registry.attach(node_id, 1, vec![]);
         assert!(old_rx.try_recv().is_err(), "not superseded yet");
 
         let _new_handles = registry.attach(node_id, 2, vec![]);
@@ -240,7 +293,7 @@ mod tests {
     fn send_to_delivers_to_an_attached_sessions_outbound_receiver() {
         let registry = SessionRegistry::new();
         let node_id = NodeId::from([1u8; 32]);
-        let (_supersede_rx, mut outbound_rx) = registry.attach(node_id, 1, vec![]);
+        let (_supersede_rx, mut outbound_rx, _forward_rx) = registry.attach(node_id, 1, vec![]);
         assert!(registry.send_to(&node_id, Record::Rekey));
         assert_eq!(outbound_rx.try_recv().unwrap(), Record::Rekey);
     }
@@ -249,6 +302,49 @@ mod tests {
     fn send_to_a_node_with_no_attached_session_is_a_no_op() {
         let registry = SessionRegistry::new();
         assert!(!registry.send_to(&NodeId::from([9u8; 32]), Record::Rekey));
+    }
+
+    fn forward_item(charge: u32) -> ForwardItem {
+        ForwardItem::Recv {
+            record: Box::new(Record::Recv {
+                src: NodeId::from([7u8; 32]),
+                e2e_proto: 0x01,
+                flags: 0,
+                payload: vec![0u8; charge as usize],
+            }),
+            src: NodeId::from([7u8; 32]),
+            charge,
+            reliable: true,
+        }
+    }
+
+    #[test]
+    fn deliver_hands_off_to_an_attached_sessions_forward_receiver() {
+        let registry = SessionRegistry::new();
+        let node_id = NodeId::from([1u8; 32]);
+        let (_supersede_rx, _outbound_rx, mut forward_rx) = registry.attach(node_id, 1, vec![]);
+        assert!(registry.deliver(&node_id, forward_item(3)));
+        match forward_rx.try_recv() {
+            Ok(ForwardItem::Recv { charge, .. }) => assert_eq!(charge, 3),
+            _ => panic!("expected a Recv item"),
+        }
+    }
+
+    #[test]
+    fn deliver_to_a_node_with_no_attached_session_is_a_no_op() {
+        let registry = SessionRegistry::new();
+        assert!(!registry.deliver(&NodeId::from([9u8; 32]), forward_item(3)));
+    }
+
+    #[test]
+    fn is_attached_reflects_whether_a_session_is_currently_registered() {
+        let registry = SessionRegistry::new();
+        let node_id = NodeId::from([1u8; 32]);
+        assert!(!registry.is_attached(&node_id));
+        let _handles = registry.attach(node_id, 1, vec![]);
+        assert!(registry.is_attached(&node_id));
+        registry.detach(&node_id, 1);
+        assert!(!registry.is_attached(&node_id));
     }
 
     #[test]

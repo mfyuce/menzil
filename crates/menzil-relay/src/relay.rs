@@ -10,6 +10,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use menzil_proto::Limits;
 
 use crate::advertise::LabelRegistry;
+use crate::forward::ForwardTable;
 use crate::identity::RelayIdentity;
 use crate::listener::Listener;
 use crate::node_history::NodeHistory;
@@ -27,6 +28,7 @@ pub struct Relay {
     pub(crate) history: Arc<NodeHistory>,
     pub(crate) registry: Arc<SessionRegistry>,
     pub(crate) labels: Arc<LabelRegistry>,
+    pub(crate) forwarding: Arc<ForwardTable>,
     pub(crate) limits: Limits,
     next_session_id: Arc<AtomicU32>,
 }
@@ -36,15 +38,31 @@ impl Relay {
     /// seed Rosters through [`Relay::rosters`] before or while calling
     /// [`Relay::serve`]. protocol.md 10 gives no stated default for
     /// `Limits.max_peers` (only `max_record` and `credit` have one), so
-    /// `limits` is always the caller's explicit choice, never invented
-    /// here.
-    pub fn new(identity: RelayIdentity, limits: Limits) -> Self {
+    /// `limits.max_peers` is always the caller's explicit choice, never
+    /// invented here.
+    ///
+    /// `limits.credit` is the one exception, and is clamped (never
+    /// raised, only ever lowered) to [`crate::forward::MAX_QUEUE_BYTES`]
+    /// before being stored — not inventing a value where the caller gave
+    /// none, but correcting an internally-inconsistent one: an opus red
+    /// team review (finding M1) caught that WELCOME advertised whatever
+    /// `credit` the caller passed, unclamped, while
+    /// `crate::forward::ForwardTable` separately clamped its own ledger
+    /// to the same figure — so a caller configuring `credit` above the
+    /// queue's own byte cap got a relay that told a node it had more
+    /// credit than the relay would actually honor, killing an entirely
+    /// compliant node's session the first time it believed WELCOME.
+    /// Clamping once, here, is what keeps WELCOME and the ledger unable
+    /// to disagree by construction.
+    pub fn new(identity: RelayIdentity, mut limits: Limits) -> Self {
+        limits.credit = limits.credit.min(crate::forward::MAX_QUEUE_BYTES as u32);
         Self {
             identity: Arc::new(identity),
             rosters: Arc::new(RosterStore::new()),
             history: Arc::new(NodeHistory::new()),
             registry: Arc::new(SessionRegistry::new()),
             labels: Arc::new(LabelRegistry::new()),
+            forwarding: Arc::new(ForwardTable::new()),
             limits,
             next_session_id: Arc::new(AtomicU32::new(1)),
         }

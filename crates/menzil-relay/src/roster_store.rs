@@ -173,6 +173,82 @@ impl RosterStore {
             .map(|label| label.name.to_ascii_lowercase())
             .collect()
     }
+
+    /// Whether one of `src`'s own claimed networks (`src_claimed`, its
+    /// HELLO's `networks`) has a Roster this relay holds that is not yet
+    /// expired at `now` and lists both `src` and `dst` as current,
+    /// unrevoked members (protocol.md 4.2's forwarding rule: "`src` and
+    /// `dst` are both listed and unrevoked in one common, unexpired
+    /// Roster the relay holds").
+    ///
+    /// Deliberately asymmetric — requiring only `src` to have claimed the
+    /// network, not `dst` too — and this is a *correction* of this
+    /// method's own original, symmetric design (which required both
+    /// sides to have claimed it, reasoning from protocol.md 4.1's "a node
+    /// may claim no network; it may then only redeem an invite"). An
+    /// opus red team review found that reading, combined with checking
+    /// `dst`'s attachment before authorization, created a presence
+    /// oracle: since the symmetric check needed `dst`'s own claimed
+    /// networks, `crate::forward::ForwardTable::forward` had to fetch
+    /// `dst`'s attachment state *before* it could even run this check,
+    /// letting anyone who can complete a bare handshake — including a
+    /// revoked ex-member, since a zero-claim HELLO gets no roster
+    /// scrutiny at all — learn whether an arbitrary known NodeId is
+    /// currently online, with no standing of their own required. This
+    /// version needs only `src`'s already-known claims, so
+    /// `crate::forward::ForwardTable::forward` can and does check this
+    /// *before* ever touching `dst`'s attachment state: an unauthorized
+    /// `src` (one with no claimed network whose Roster also lists `dst`)
+    /// gets `Forbidden` whether `dst` exists, is attached, or is offline,
+    /// leaking nothing.
+    ///
+    /// This still honors 4.1's "may only redeem an invite" sentence — a
+    /// `src` with no claimed networks at all can never satisfy this
+    /// (`src_claimed` empty means nothing to iterate) — while no longer
+    /// also requiring `dst` to have separately re-claimed the same
+    /// network in its own *current* HELLO: RECV records carry no
+    /// network_id for `dst` to attribute them to, and protocol.md 5.1
+    /// makes the end-to-end (L4) handshake the actual authority on
+    /// membership and grants, verified independently by each peer against
+    /// its own held Roster and Policy — this check exists to keep an
+    /// unrelated stranger from using the relay as a delivery vector
+    /// against an arbitrary target, not to duplicate L4's own
+    /// authorization.
+    ///
+    /// This is also where a claimed network's Roster `expires` is finally
+    /// checked at all: neither `check_hello` (protocol.md 4.1) nor
+    /// [`RosterStore::labels_granted_to`] (protocol.md 4.4) do, both
+    /// deliberately, each leaving it to "forwarding" per protocol.md 2.3
+    /// — this is that forwarding.
+    pub fn grants_forwarding(
+        &self,
+        src: &NodeId,
+        src_claimed: &[NetworkId],
+        dst: &NodeId,
+        now: u64,
+    ) -> bool {
+        let guard = self.by_network.read().unwrap();
+        src_claimed.iter().any(|network_id| {
+            guard.get(network_id).is_some_and(|(_, body)| {
+                body.expires > now
+                    && is_unrevoked_member(body, src)
+                    && is_unrevoked_member(body, dst)
+            })
+        })
+    }
+}
+
+/// Revocation checked before, and independently of, membership — the
+/// same order `crate::hello::check_hello` and
+/// `RosterStore::labels_granted_to` already use, for the same reason: a
+/// Roster naming a node in both `members` and `revoked` at once is
+/// possible to construct, and revocation must still win.
+fn is_unrevoked_member(body: &RosterBody, node_id: &NodeId) -> bool {
+    !body
+        .revoked
+        .iter()
+        .any(|revoked| &revoked.node_id == node_id)
+        && body.members.iter().any(|member| &member.node_id == node_id)
 }
 
 #[cfg(test)]
@@ -471,5 +547,165 @@ mod tests {
             .unwrap();
 
         assert!(store.labels_granted_to(&[network_id], &node_id).is_empty());
+    }
+
+    fn roster_for_pair(
+        owner: &SigningKey,
+        network_id: NetworkId,
+        a: NodeId,
+        b: NodeId,
+        expires: u64,
+    ) -> Roster {
+        let body = RosterBody {
+            v: menzil_proto::PROTOCOL_VERSION,
+            network_id,
+            seq: 1,
+            issued: 0,
+            expires,
+            members: vec![
+                RosterMember {
+                    node_id: a,
+                    min_serial: 1,
+                },
+                RosterMember {
+                    node_id: b,
+                    min_serial: 1,
+                },
+            ],
+            revoked: vec![],
+            stewards: vec![],
+            labels: vec![],
+        };
+        Roster::sign(owner, &body).unwrap()
+    }
+
+    #[test]
+    fn grants_forwarding_is_true_when_src_claimed_a_network_whose_roster_lists_both() {
+        let owner = SigningKey::generate(&mut rand::rng());
+        let network_id = NetworkId::from(owner.verifying_key().to_bytes());
+        let a = NodeId::from([1u8; 32]);
+        let b = NodeId::from([2u8; 32]);
+        let store = RosterStore::new();
+        store
+            .set(&roster_for_pair(&owner, network_id, a, b, 4_000_000_000))
+            .unwrap();
+
+        assert!(store.grants_forwarding(&a, &[network_id], &b, 1_000));
+    }
+
+    #[test]
+    fn grants_forwarding_is_false_once_the_roster_has_expired() {
+        let owner = SigningKey::generate(&mut rand::rng());
+        let network_id = NetworkId::from(owner.verifying_key().to_bytes());
+        let a = NodeId::from([1u8; 32]);
+        let b = NodeId::from([2u8; 32]);
+        let store = RosterStore::new();
+        store
+            .set(&roster_for_pair(&owner, network_id, a, b, 500))
+            .unwrap();
+
+        assert!(!store.grants_forwarding(&a, &[network_id], &b, 1_000));
+    }
+
+    #[test]
+    fn grants_forwarding_is_false_when_src_claimed_nothing() {
+        // protocol.md 4.1: "a node may claim no network; it may then
+        // only redeem an invite" — an empty `src_claimed` can never find
+        // a network to check, regardless of what either side's Roster
+        // membership actually is.
+        let owner = SigningKey::generate(&mut rand::rng());
+        let network_id = NetworkId::from(owner.verifying_key().to_bytes());
+        let a = NodeId::from([1u8; 32]);
+        let b = NodeId::from([2u8; 32]);
+        let store = RosterStore::new();
+        store
+            .set(&roster_for_pair(&owner, network_id, a, b, 4_000_000_000))
+            .unwrap();
+
+        assert!(!store.grants_forwarding(&a, &[], &b, 1_000));
+    }
+
+    #[test]
+    fn grants_forwarding_does_not_require_dst_to_have_separately_claimed_it() {
+        // Deliberate, corrected behavior (see `grants_forwarding`'s own
+        // doc comment): only `src`'s claim is consulted. `dst` need not
+        // have claimed this network in its own (possibly unrelated, e.g.
+        // invite-redemption-only) current HELLO to be a legitimate
+        // forwarding target, as long as the Roster `src` claimed still
+        // lists `dst` as an unrevoked member.
+        let owner = SigningKey::generate(&mut rand::rng());
+        let network_id = NetworkId::from(owner.verifying_key().to_bytes());
+        let a = NodeId::from([1u8; 32]);
+        let b = NodeId::from([2u8; 32]);
+        let store = RosterStore::new();
+        store
+            .set(&roster_for_pair(&owner, network_id, a, b, 4_000_000_000))
+            .unwrap();
+
+        assert!(store.grants_forwarding(&a, &[network_id], &b, 1_000));
+    }
+
+    #[test]
+    fn grants_forwarding_is_false_for_a_revoked_dst_even_if_still_listed() {
+        let owner = SigningKey::generate(&mut rand::rng());
+        let network_id = NetworkId::from(owner.verifying_key().to_bytes());
+        let a = NodeId::from([1u8; 32]);
+        let b = NodeId::from([2u8; 32]);
+        let mut roster = roster_for_pair(&owner, network_id, a, b, 4_000_000_000)
+            .decode()
+            .unwrap();
+        roster.revoked.push(menzil_proto::RevokedMember {
+            node_id: b,
+            since: 0,
+        });
+        let store = RosterStore::new();
+        store.set(&Roster::sign(&owner, &roster).unwrap()).unwrap();
+
+        assert!(!store.grants_forwarding(&a, &[network_id], &b, 1_000));
+    }
+
+    #[test]
+    fn grants_forwarding_is_false_for_a_revoked_src_even_if_still_listed() {
+        let owner = SigningKey::generate(&mut rand::rng());
+        let network_id = NetworkId::from(owner.verifying_key().to_bytes());
+        let a = NodeId::from([1u8; 32]);
+        let b = NodeId::from([2u8; 32]);
+        let mut roster = roster_for_pair(&owner, network_id, a, b, 4_000_000_000)
+            .decode()
+            .unwrap();
+        roster.revoked.push(menzil_proto::RevokedMember {
+            node_id: a,
+            since: 0,
+        });
+        let store = RosterStore::new();
+        store.set(&Roster::sign(&owner, &roster).unwrap()).unwrap();
+
+        assert!(!store.grants_forwarding(&a, &[network_id], &b, 1_000));
+    }
+
+    #[test]
+    fn grants_forwarding_ignores_a_network_src_never_claimed() {
+        let owner_a = SigningKey::generate(&mut rand::rng());
+        let owner_b = SigningKey::generate(&mut rand::rng());
+        let network_a = NetworkId::from(owner_a.verifying_key().to_bytes());
+        let network_b = NetworkId::from(owner_b.verifying_key().to_bytes());
+        let a = NodeId::from([1u8; 32]);
+        let b = NodeId::from([2u8; 32]);
+        let store = RosterStore::new();
+        // `a` is a member of both networks' Rosters, but only claims
+        // network_a in its own HELLO; network_b's Roster (which also
+        // lists both `a` and `b`) must not count just because `a`
+        // happens to be a member of it too.
+        store
+            .set(&roster_for_pair(&owner_a, network_a, a, b, 4_000_000_000))
+            .unwrap();
+        store
+            .set(&roster_for_pair(&owner_b, network_b, a, b, 4_000_000_000))
+            .unwrap();
+
+        assert!(store.grants_forwarding(&a, &[network_a, network_b], &b, 1_000));
+        // Claiming only an unrelated third network finds nothing.
+        let unclaimed = NetworkId::from([0x55; 32]);
+        assert!(!store.grants_forwarding(&a, &[unclaimed], &b, 1_000));
     }
 }

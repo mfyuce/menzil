@@ -10,8 +10,6 @@
 //!   phase 2 per protocol.md 13).
 //! - ACME certificate provisioning (protocol.md 11); certificate and key
 //!   material is supplied to this crate already loaded.
-//! - SEND->RECV forwarding, credit enforcement, and bounded
-//!   per-(source,destination) queues (TODO.md L3h).
 //! - Relay-terminated HTTP serving for terminated shares (its own
 //!   TODO.md line, protocol.md 6.3).
 
@@ -21,6 +19,7 @@ mod advertise;
 mod connection;
 mod doc;
 mod error;
+mod forward;
 mod hello;
 mod identity;
 mod listener;

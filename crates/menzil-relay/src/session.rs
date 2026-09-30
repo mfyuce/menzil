@@ -17,21 +17,30 @@
 //! merely superseded — see `SessionRegistry::detach`'s own return
 //! value), so a node that goes fully idle eventually frees its names.
 //!
-//! Deliberately not here — a separate, later item's job (protocol.md
-//! 4.2's flow-control paragraph, TODO.md L3h): SEND -> RECV forwarding,
-//! credit enforcement, and the per-(source,destination) queues. SEND and
-//! CREDIT (and everything else this build doesn't yet act on: PEER_STATE,
-//! ADMIT_*, and an ADVERTISE_ACK or GOAWAY received from a node, both
+//! Also handles SEND -> RECV forwarding, credit enforcement, and the
+//! bounded per-(source,destination) queues (protocol.md 4.2's flow
+//! control paragraph; TODO.md L3h, see `crate::forward`) — the same
+//! `is_current` guard as ADVERTISE gates a SEND from ever being processed
+//! before ATTACH or after this session has been superseded, and
+//! `crate::forward::ForwardTable`'s own drain (once a queued RECV record
+//! is actually handed to its destination's connection to send) is what
+//! grants credit back and sends the resulting CREDIT record, over
+//! [`crate::registry::SessionRegistry::deliver`], a channel kept
+//! separate from DOC/ADVERTISE_ACK's own for the reasons `crate::registry`'s
+//! module doc comment gives.
+//!
+//! Everything else this build doesn't yet act on (PEER_STATE, ADMIT_*,
+//! and an ADVERTISE_ACK, CREDIT, or GOAWAY received from a node, all
 //! protocol violations since those records are relay-to-node only — not
-//! specially detected as such yet, just as unhandled as the rest) are
+//! specially detected as such yet, just as unhandled as the rest) is
 //! decrypted, logged, and otherwise ignored.
 
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use menzil_proto::{
-    DocReassembler, ErrorBody, ErrorCode, GoawayBody, HelloBody, NetworkId, NodeId, Record,
-    WelcomeBody,
+    CreditBody, DocReassembler, ErrorBody, ErrorCode, GoawayBody, HelloBody, NetworkId, NodeId,
+    Record, WelcomeBody,
 };
 use menzil_session::{
     HandshakePattern, Liveness, RekeySchedule, RelayHandshake, RelayHandshakeStep, Transport,
@@ -41,6 +50,7 @@ use menzil_session::{
 use crate::connection::InboundConnection;
 use crate::doc::{self, AcceptOutcome};
 use crate::error::RelayError;
+use crate::forward::{ForwardItem, ForwardOutcome};
 use crate::hello::check_hello;
 use crate::relay::Relay;
 
@@ -294,6 +304,50 @@ async fn dispatch(
             }
             Dispatch::Continue
         }
+        Record::Send {
+            dst,
+            e2e_proto,
+            flags,
+            payload,
+        } => {
+            // Same guard, same reasoning as ADVERTISE just above: a
+            // session that is not yet, or no longer, current for
+            // `node_id` must not be able to move data through the relay
+            // on its behalf.
+            if relay.registry.is_current(node_id, session_id) {
+                let outcome = relay.forwarding.forward(
+                    &relay.rosters,
+                    &relay.registry,
+                    &relay.labels,
+                    &relay.limits,
+                    node_id,
+                    claimed_networks,
+                    &dst,
+                    e2e_proto,
+                    flags,
+                    payload,
+                    unix_now(),
+                );
+                match outcome {
+                    ForwardOutcome::Queued | ForwardOutcome::Dropped => Dispatch::Continue,
+                    ForwardOutcome::Refused(error) => {
+                        let _ = send_record(conn, transport, Record::Error(error)).await;
+                        Dispatch::Continue
+                    }
+                    ForwardOutcome::CreditViolation(error) => {
+                        let _ = send_record(conn, transport, Record::Error(error)).await;
+                        Dispatch::End
+                    }
+                }
+            } else {
+                tracing::debug!(
+                    session_id,
+                    node_id = %node_id,
+                    "ignoring SEND from a session that is not (or no longer) current"
+                );
+                Dispatch::Continue
+            }
+        }
         other => {
             tracing::debug!(
                 ?other,
@@ -389,7 +443,7 @@ async fn run_attached_loop(
     }
 
     tracing::info!(session_id, node_id = %node_id, "relay session attached");
-    let (mut supersede_rx, mut outbound_rx) =
+    let (mut supersede_rx, mut outbound_rx, mut forward_rx) =
         relay
             .registry
             .attach(node_id, session_id, claimed_networks.clone());
@@ -397,8 +451,13 @@ async fn run_attached_loop(
     // — see `crate::advertise::LabelRegistry::clear_for`'s doc comment
     // for why this runs here, before this session gets a chance to send
     // its own ADVERTISE, rather than relying only on the old session's
-    // own eventual detach.
+    // own eventual detach. Likewise for SEND/RECV credit and queue state
+    // (protocol.md 4.2 scopes both to "(source session, destination
+    // session)", not to the NodeId across reconnects — an opus red team
+    // review's finding H2): `node_id` needs clearing in both its possible
+    // roles, see `ForwardTable::clear_for`'s own doc comment for why.
     relay.labels.clear_for(&node_id);
+    relay.forwarding.clear_for(&node_id);
 
     // Attach-time catch-up (protocol.md 4.3, extended — see `crate::doc`'s
     // module doc comment for why): this node may be attaching already
@@ -441,6 +500,61 @@ async fn run_attached_loop(
             Some(record) = outbound_rx.recv() => {
                 let _ = send_record(&mut conn, &mut transport, record).await;
             }
+            Some(item) = forward_rx.recv() => {
+                match item {
+                    ForwardItem::Recv { record, src, charge, reliable } => {
+                        // Only now — once this RECV record has actually
+                        // been handed to this (destination) connection to
+                        // send, not merely admitted into `ForwardTable`
+                        // — does the sending side's credit get granted
+                        // back (protocol.md 4.2: "replenished as bytes
+                        // are written to the destination socket") and a
+                        // CREDIT record queued for it (see `drained`'s
+                        // own doc comment for why that record travels
+                        // this same reliable channel, not `send_to`'s
+                        // lossy one).
+                        let _ = send_record(&mut conn, &mut transport, *record).await;
+                        relay.forwarding.drained(&relay.registry, &src, &node_id, charge, reliable);
+                    }
+                    ForwardItem::Credit { peer, bytes } => {
+                        let _ = send_record(
+                            &mut conn, &mut transport, Record::Credit(CreditBody { peer, bytes }),
+                        ).await;
+                    }
+                }
+            }
+        }
+    }
+
+    // Anything still sitting in `forward_rx` at this point will never be
+    // handed to this connection to send — it is ending regardless of
+    // whether `detach` below actually finds it still current. Draining it
+    // here (rather than letting `forward_rx` simply drop, discarding
+    // whatever it still held) is the fix for an opus red team review's
+    // finding H1: undrained items silently leaked their share of the
+    // sender's credit and the pair's queue budget forever, surviving even
+    // the destination's next reconnect (until `clear_for` closed that
+    // specific gap for the *reconnect* case above; this closes it for the
+    // *in-flight-at-teardown* case, which is not the same window — a
+    // session can end this way without anyone ever reconnecting again for
+    // a while, or at all). Only `Recv` items carry anything to release; a
+    // stranded `Credit` item is simply dropped (no ledger state to
+    // reconcile, and `node_id`, its intended recipient, is the one whose
+    // credit that item was reporting — not `src`'s of any `Recv` also
+    // found here — so there is nothing further to do for it here either
+    // way).
+    forward_rx.close();
+    while let Ok(item) = forward_rx.try_recv() {
+        if let ForwardItem::Recv {
+            src,
+            charge,
+            reliable,
+            ..
+        } = item
+        {
+            relay
+                .forwarding
+                .drained(&relay.registry, &src, &node_id, charge, reliable);
         }
     }
 

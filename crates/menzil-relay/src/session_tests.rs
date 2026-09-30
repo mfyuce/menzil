@@ -76,11 +76,13 @@ fn test_limits() -> Limits {
     }
 }
 
-/// Binds a real `Listener` on a self-signed cert and a `Relay` to go
-/// with it, and returns the relay's own X25519 public key (needed by
+/// Binds a real `Listener` on a self-signed cert and a `Relay` with
+/// `limits`, and returns the relay's own X25519 public key (needed by
 /// [`TestClient::connect`]'s `Ik` handshake) alongside everything a
 /// caller needs to spawn `relay.serve(&listener)`.
-async fn bind_test_relay() -> (Relay, Listener, CertificateDer<'static>, X25519PublicKey) {
+async fn bind_test_relay_with_limits(
+    limits: Limits,
+) -> (Relay, Listener, CertificateDer<'static>, X25519PublicKey) {
     let (chain, key) = self_signed_cert("localhost");
     let cert = chain[0].clone();
     let tls_config = crate::tls::server_config(chain, key).unwrap();
@@ -95,9 +97,15 @@ async fn bind_test_relay() -> (Relay, Listener, CertificateDer<'static>, X25519P
             node_cert,
             x25519_private: raw.x25519_private,
         },
-        test_limits(),
+        limits,
     );
     (relay, listener, cert, relay_x25519)
+}
+
+/// [`bind_test_relay_with_limits`] with this file's own default
+/// [`test_limits`].
+async fn bind_test_relay() -> (Relay, Listener, CertificateDer<'static>, X25519PublicKey) {
+    bind_test_relay_with_limits(test_limits()).await
 }
 
 /// One end of a live, real Noise `Ik` session with the relay under test:
@@ -743,6 +751,535 @@ async fn a_reconnecting_session_does_not_inherit_the_previous_sessions_claims() 
     assert!(
         relay.labels.shares_for(&identity.node_id).is_empty(),
         "a freshly attached session must not silently inherit a prior session's claims"
+    );
+}
+
+fn send_record(dst: NodeId, payload: Vec<u8>) -> Record {
+    Record::Send {
+        dst,
+        e2e_proto: 0x01,
+        flags: 0,
+        payload,
+    }
+}
+
+/// Two identities, both members of one freshly seeded Roster, both
+/// already attached to `relay` and past their attach-time DOC catch-up —
+/// ready for a SEND/RECV/CREDIT test (TODO.md L3h) to act on directly.
+async fn two_attached_members(
+    relay: &Relay,
+    addr: SocketAddr,
+    cert: CertificateDer<'static>,
+    relay_x25519: X25519PublicKey,
+) -> (TestClient, NodeId, TestClient, NodeId) {
+    let owner = SigningKey::generate(&mut rand::rng());
+    let network_id = NetworkId::from(owner.verifying_key().to_bytes());
+    let identity_a = generate_identity();
+    let identity_b = generate_identity();
+    let roster = RosterBody {
+        v: PROTOCOL_VERSION,
+        network_id,
+        seq: 1,
+        issued: 0,
+        expires: 4_000_000_000,
+        members: vec![
+            RosterMember {
+                node_id: identity_a.node_id,
+                min_serial: 1,
+            },
+            RosterMember {
+                node_id: identity_b.node_id,
+                min_serial: 1,
+            },
+        ],
+        revoked: vec![],
+        stewards: vec![],
+        labels: vec![],
+    };
+    relay
+        .rosters()
+        .set(&Roster::sign(&owner, &roster).unwrap())
+        .unwrap();
+
+    let (mut client_a, _) = TestClient::connect(
+        addr,
+        cert.clone(),
+        &identity_a,
+        relay_x25519,
+        vec![network_id],
+        HashMap::new(),
+        1,
+        10,
+    )
+    .await;
+    client_a.send(Record::Attach).await;
+    let _ = client_a.recv_roster_doc().await;
+
+    let (mut client_b, _) = TestClient::connect(
+        addr,
+        cert,
+        &identity_b,
+        relay_x25519,
+        vec![network_id],
+        HashMap::new(),
+        1,
+        10,
+    )
+    .await;
+    client_b.send(Record::Attach).await;
+    let _ = client_b.recv_roster_doc().await;
+
+    (client_a, identity_a.node_id, client_b, identity_b.node_id)
+}
+
+#[tokio::test]
+async fn a_send_between_attached_common_members_is_forwarded_and_credited() {
+    let (relay, listener, cert, relay_x25519) = bind_test_relay().await;
+    let addr = listener.local_addr().unwrap();
+    let serve_relay = relay.clone();
+    tokio::spawn(async move { serve_relay.serve(&listener).await });
+
+    let (mut client_a, node_a, mut client_b, node_b) =
+        two_attached_members(&relay, addr, cert, relay_x25519).await;
+
+    let payload = vec![9u8; 100];
+    client_a.send(send_record(node_b, payload.clone())).await;
+
+    match client_b.recv().await {
+        Some(Record::Recv {
+            src,
+            e2e_proto,
+            flags,
+            payload: got,
+        }) => {
+            assert_eq!(src, node_a);
+            assert_eq!(e2e_proto, 0x01);
+            assert_eq!(flags, 0);
+            assert_eq!(got, payload);
+        }
+        other => panic!("expected RECV, got {other:?}"),
+    }
+
+    // Once the RECV above was actually handed to client_b's own
+    // connection to send, the relay grants the consumed credit back to
+    // client_a and reports it (protocol.md 4.2).
+    match client_a.recv().await {
+        Some(Record::Credit(body)) => {
+            assert_eq!(body.peer, node_b);
+            assert_eq!(body.bytes, payload.len() as u32);
+        }
+        other => panic!("expected CREDIT, got {other:?}"),
+    }
+
+    // Also assert the relay's own ledger, not just the wire record's
+    // shape: an opus red team review found (finding L2) that a mutation
+    // deleting the actual credit-granting call still left every test in
+    // this suite passing, because nothing checked the ledger itself was
+    // restored — only that *a* CREDIT record with the right numbers
+    // arrived, which the record's own construction guarantees regardless
+    // of whether the ledger agrees.
+    assert_eq!(
+        relay.forwarding.remaining_credit(&node_a, &node_b),
+        Some(test_limits().credit),
+        "the relay's own ledger, not just the CREDIT record sent, must reflect the grant"
+    );
+}
+
+#[tokio::test]
+async fn credit_granted_back_is_genuinely_usable_for_a_further_send() {
+    // A stronger regression test for the same finding (L2): prove
+    // replenished credit can actually be *spent* again, which the
+    // mutation described above would still fail even if the previous
+    // test's ledger assertion were removed — a session that treats
+    // `drained` as a no-op would let this second SEND exceed the small
+    // credit configured here and get its session closed instead of a
+    // second, successful RECV.
+    // Comfortably above MIN_FORWARD_CHARGE_BYTES (64) so the numbers below
+    // reflect the payload size chosen, not that floor.
+    let payload_len = 200usize;
+    let small_credit = Limits {
+        max_record: 65_535,
+        max_peers: 10,
+        credit: 300,
+    };
+    let (relay, listener, cert, relay_x25519) = bind_test_relay_with_limits(small_credit).await;
+    let addr = listener.local_addr().unwrap();
+    let serve_relay = relay.clone();
+    tokio::spawn(async move { serve_relay.serve(&listener).await });
+
+    let (mut client_a, _node_a, mut client_b, node_b) =
+        two_attached_members(&relay, addr, cert, relay_x25519).await;
+
+    client_a
+        .send(send_record(node_b, vec![0u8; payload_len]))
+        .await;
+    match client_b.recv().await {
+        Some(Record::Recv { .. }) => {}
+        other => panic!("expected the first RECV, got {other:?}"),
+    }
+    match client_a.recv().await {
+        Some(Record::Credit(body)) => assert_eq!(body.bytes, payload_len as u32),
+        other => panic!("expected the first CREDIT, got {other:?}"),
+    }
+
+    // Credit is back to the full 300; a second 200-byte send would exceed
+    // the original 300 - 200 = 100 remaining if replenishment were a
+    // no-op, but must succeed now that it has genuinely been granted
+    // back.
+    client_a
+        .send(send_record(node_b, vec![1u8; payload_len]))
+        .await;
+    match client_b.recv().await {
+        Some(Record::Recv { payload, .. }) => assert_eq!(payload, vec![1u8; payload_len]),
+        other => panic!("expected the second RECV — credit was not really replenished: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn a_reconnecting_destination_gets_a_fresh_credit_ledger_not_its_previous_sessions_leftovers()
+{
+    // Regression test for finding H2: `ForwardTable`'s pairs used to be
+    // keyed only by NodeId, so a destination's fresh WELCOME credit could
+    // land on top of, or be shrunk by, whatever a *previous* session for
+    // the same NodeId had left consumed and never (or not yet) granted
+    // back. `forward.rs`'s own unit tests already prove
+    // `ForwardTable::clear_for` is correct in isolation; this proves the
+    // real attach flow in `crate::session` actually calls it, over a
+    // genuine reconnect, the same way
+    // `a_reconnecting_session_does_not_inherit_the_previous_sessions_claims`
+    // already does for label claims via the identical, adjacent call.
+    let small_credit = Limits {
+        max_record: 65_535,
+        max_peers: 10,
+        credit: 100,
+    };
+    let (relay, listener, cert, relay_x25519) = bind_test_relay_with_limits(small_credit).await;
+    let addr = listener.local_addr().unwrap();
+    let serve_relay = relay.clone();
+    tokio::spawn(async move { serve_relay.serve(&listener).await });
+
+    let owner = SigningKey::generate(&mut rand::rng());
+    let network_id = NetworkId::from(owner.verifying_key().to_bytes());
+    let identity_a = generate_identity();
+    let identity_b = generate_identity();
+    let roster = RosterBody {
+        v: PROTOCOL_VERSION,
+        network_id,
+        seq: 1,
+        issued: 0,
+        expires: 4_000_000_000,
+        members: vec![
+            RosterMember {
+                node_id: identity_a.node_id,
+                min_serial: 1,
+            },
+            RosterMember {
+                node_id: identity_b.node_id,
+                min_serial: 1,
+            },
+        ],
+        revoked: vec![],
+        stewards: vec![],
+        labels: vec![],
+    };
+    relay
+        .rosters()
+        .set(&Roster::sign(&owner, &roster).unwrap())
+        .unwrap();
+
+    let (mut client_a, _) = TestClient::connect(
+        addr,
+        cert.clone(),
+        &identity_a,
+        relay_x25519,
+        vec![network_id],
+        HashMap::new(),
+        1,
+        10,
+    )
+    .await;
+    client_a.send(Record::Attach).await;
+    let _ = client_a.recv_roster_doc().await;
+
+    let (mut client_b1, _) = TestClient::connect(
+        addr,
+        cert.clone(),
+        &identity_b,
+        relay_x25519,
+        vec![network_id],
+        HashMap::new(),
+        1,
+        10,
+    )
+    .await;
+    client_b1.send(Record::Attach).await;
+    let _ = client_b1.recv_roster_doc().await;
+
+    // Send once and fully drain it (read both the RECV and the CREDIT)
+    // so the (identity_a, identity_b) pair genuinely exists in
+    // `ForwardTable` — not a race-prone attempt to catch it mid-flight,
+    // which `forward.rs`'s own unit tests already cover deterministically
+    // by calling `ForwardTable::clear_for` directly; this test only needs
+    // to prove the real attach flow *calls* it.
+    client_a
+        .send(send_record(identity_b.node_id, vec![0u8; 90]))
+        .await;
+    match client_b1.recv().await {
+        Some(Record::Recv { .. }) => {}
+        other => panic!("expected the RECV, got {other:?}"),
+    }
+    match client_a.recv().await {
+        Some(Record::Credit(_)) => {}
+        other => panic!("expected the CREDIT, got {other:?}"),
+    }
+    assert!(
+        relay
+            .forwarding
+            .remaining_credit(&identity_a.node_id, &identity_b.node_id)
+            .is_some(),
+        "the pair must exist in ForwardTable after a completed send, for this test to mean anything"
+    );
+
+    // client_b reconnects (same identity — protocol.md 4.1 only requires
+    // the timestamp to strictly advance, not the serial to change).
+    drop(client_b1);
+    let (mut client_b2, _) = TestClient::connect(
+        addr,
+        cert,
+        &identity_b,
+        relay_x25519,
+        vec![network_id],
+        HashMap::new(),
+        1,
+        20,
+    )
+    .await;
+    client_b2.send(Record::Attach).await;
+    let _ = client_b2.recv_roster_doc().await;
+
+    // Without H2's fix, this pair's now-stale entry (from client_b1's
+    // ended session) would still be sitting in `ForwardTable`,
+    // unaffected by client_b2's fresh attach.
+    assert!(
+        relay
+            .forwarding
+            .remaining_credit(&identity_a.node_id, &identity_b.node_id)
+            .is_none(),
+        "a fresh attach for identity_b must reset (remove) every pair it appears in, \
+         not leave its previous session's ledger entry behind"
+    );
+
+    // And a send against the fresh session succeeds using the fresh,
+    // full WELCOME credit, not whatever the old session's ledger held.
+    client_a
+        .send(send_record(identity_b.node_id, vec![7u8; 100]))
+        .await;
+    match client_b2.recv().await {
+        Some(Record::Recv { payload, .. }) => assert_eq!(payload, vec![7u8; 100]),
+        other => panic!(
+            "expected the post-reconnect RECV to succeed on a fresh credit ledger, got {other:?}"
+        ),
+    }
+}
+
+#[tokio::test]
+async fn a_send_to_an_authorized_but_unattached_node_gets_peer_offline() {
+    let (relay, listener, cert, relay_x25519) = bind_test_relay().await;
+    let addr = listener.local_addr().unwrap();
+    let serve_relay = relay.clone();
+    tokio::spawn(async move { serve_relay.serve(&listener).await });
+
+    // `offline_member` is a legitimate Roster member (unlike an
+    // unrelated stranger, who gets Forbidden instead — see
+    // `a_send_to_an_unauthorized_stranger_gets_forbidden_not_peer_offline`,
+    // finding M2) that simply never attaches.
+    let owner = SigningKey::generate(&mut rand::rng());
+    let network_id = NetworkId::from(owner.verifying_key().to_bytes());
+    let identity = generate_identity();
+    let offline_member = generate_identity();
+    let roster = RosterBody {
+        v: PROTOCOL_VERSION,
+        network_id,
+        seq: 1,
+        issued: 0,
+        expires: 4_000_000_000,
+        members: vec![
+            RosterMember {
+                node_id: identity.node_id,
+                min_serial: 1,
+            },
+            RosterMember {
+                node_id: offline_member.node_id,
+                min_serial: 1,
+            },
+        ],
+        revoked: vec![],
+        stewards: vec![],
+        labels: vec![],
+    };
+    relay
+        .rosters()
+        .set(&Roster::sign(&owner, &roster).unwrap())
+        .unwrap();
+
+    let (mut client, _) = TestClient::connect(
+        addr,
+        cert,
+        &identity,
+        relay_x25519,
+        vec![network_id],
+        HashMap::new(),
+        1,
+        10,
+    )
+    .await;
+    client.send(Record::Attach).await;
+    let _ = client.recv_roster_doc().await;
+
+    client
+        .send(send_record(offline_member.node_id, vec![1, 2, 3]))
+        .await;
+
+    match client.recv().await {
+        Some(Record::Error(body)) => assert_eq!(body.code, ErrorCode::PeerOffline),
+        other => panic!("expected ERROR(PeerOffline), got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn a_send_to_an_unauthorized_stranger_gets_forbidden_not_peer_offline() {
+    // Regression test for finding M2: a sender with no legitimate
+    // standing gets the same Forbidden answer whether the target NodeId
+    // is real, attached, or offline — never a PeerOffline that would
+    // leak the target's online status to someone unauthorized to ask.
+    let (relay, listener, cert, relay_x25519) = bind_test_relay().await;
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { relay.serve(&listener).await });
+
+    let identity = generate_identity();
+    let (mut client, _) = TestClient::connect(
+        addr,
+        cert,
+        &identity,
+        relay_x25519,
+        vec![],
+        HashMap::new(),
+        1,
+        10,
+    )
+    .await;
+    client.send(Record::Attach).await;
+
+    let stranger = NodeId::from([0x77; 32]);
+    client.send(send_record(stranger, vec![1, 2, 3])).await;
+
+    match client.recv().await {
+        Some(Record::Error(body)) => assert_eq!(body.code, ErrorCode::Forbidden),
+        other => panic!("expected ERROR(Forbidden), got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn a_send_with_no_common_roster_membership_is_forbidden() {
+    let (relay, listener, cert, relay_x25519) = bind_test_relay().await;
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { relay.serve(&listener).await });
+
+    // Two independently attached nodes claiming no networks at all: no
+    // Roster lists the two of them together.
+    let identity_a = generate_identity();
+    let identity_b = generate_identity();
+    let (mut client_a, _) = TestClient::connect(
+        addr,
+        cert.clone(),
+        &identity_a,
+        relay_x25519,
+        vec![],
+        HashMap::new(),
+        1,
+        10,
+    )
+    .await;
+    client_a.send(Record::Attach).await;
+    let (mut client_b, _) = TestClient::connect(
+        addr,
+        cert,
+        &identity_b,
+        relay_x25519,
+        vec![],
+        HashMap::new(),
+        1,
+        10,
+    )
+    .await;
+    client_b.send(Record::Attach).await;
+
+    client_a
+        .send(send_record(identity_b.node_id, vec![1]))
+        .await;
+    match client_a.recv().await {
+        Some(Record::Error(body)) => assert_eq!(body.code, ErrorCode::Forbidden),
+        other => panic!("expected ERROR(Forbidden), got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn a_send_to_a_destination_that_opted_out_of_peer_traffic_is_forbidden() {
+    let (relay, listener, cert, relay_x25519) = bind_test_relay().await;
+    let addr = listener.local_addr().unwrap();
+    let serve_relay = relay.clone();
+    tokio::spawn(async move { serve_relay.serve(&listener).await });
+
+    let (mut client_a, _node_a, mut client_b, node_b) =
+        two_attached_members(&relay, addr, cert, relay_x25519).await;
+
+    client_b
+        .send(Record::Advertise(AdvertiseBody {
+            v: PROTOCOL_VERSION,
+            shares: vec![],
+            accept_peers: false,
+        }))
+        .await;
+    match client_b.recv().await {
+        Some(Record::AdvertiseAck(_)) => {}
+        other => panic!("expected an ADVERTISE_ACK, got {other:?}"),
+    }
+
+    client_a.send(send_record(node_b, vec![1, 2, 3])).await;
+    match client_a.recv().await {
+        Some(Record::Error(body)) => assert_eq!(body.code, ErrorCode::Forbidden),
+        other => panic!("expected ERROR(Forbidden), got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn a_reliable_send_beyond_credit_closes_the_session() {
+    let small_credit = Limits {
+        max_record: 65_535,
+        max_peers: 10,
+        credit: 50,
+    };
+    let (relay, listener, cert, relay_x25519) = bind_test_relay_with_limits(small_credit).await;
+    let addr = listener.local_addr().unwrap();
+    let serve_relay = relay.clone();
+    tokio::spawn(async move { serve_relay.serve(&listener).await });
+
+    let (mut client_a, _node_a, _client_b, node_b) =
+        two_attached_members(&relay, addr, cert, relay_x25519).await;
+
+    // Credit is only 50 bytes; this single SEND already exceeds it
+    // (protocol.md 4.2: "a reliable SEND beyond credit is a protocol
+    // violation and closes the session").
+    client_a.send(send_record(node_b, vec![0u8; 51])).await;
+
+    match client_a.recv().await {
+        Some(Record::Error(body)) => assert_eq!(body.code, ErrorCode::CreditExceeded),
+        other => panic!("expected ERROR(CreditExceeded), got {other:?}"),
+    }
+    assert_eq!(
+        client_a.recv().await,
+        None,
+        "the relay closes the connection after a credit violation"
     );
 }
 
