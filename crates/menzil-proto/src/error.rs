@@ -29,6 +29,16 @@ pub enum ProtoError {
     /// protocol.md 4.2 table.
     #[error("unknown record type byte {0:#04x}")]
     UnknownRecordType(u8),
+    /// An L4 frame's leading tag byte matched none of `init`/`resp`/`data`
+    /// (protocol.md 5.1).
+    #[error("unknown L4 frame tag byte {0:#04x}")]
+    UnknownE2eFrameTag(u8),
+    /// An L4 `data` frame's `kind` byte matched none of MUX/DGRAM/CLOSE/
+    /// KEEP/REKEY (protocol.md 5.2). Per protocol.md 9, the caller must
+    /// treat this as session-ending, not tolerate it the way an unknown
+    /// L3 record type is tolerated.
+    #[error("unknown L4 data record kind byte {0:#04x}")]
+    UnknownE2eDataKind(u8),
     /// A record's fixed-layout (non-CBOR) fields did not fit the bytes
     /// available.
     #[error("malformed record: {0}")]
@@ -81,6 +91,12 @@ pub enum ErrorCode {
     /// `unknown_type` (protocol.md section 9): an L3 record's type byte
     /// was not recognized.
     UnknownType,
+    /// `no_grant` (protocol.md 5.1): an L4 CLOSE sent right after the
+    /// handshake because the responder has no grant for the initiator.
+    NoGrant,
+    /// `grant_removed` (protocol.md 5.3): an L5 stream or channel closed
+    /// because the grant that authorized it no longer exists.
+    GrantRemoved,
     /// A code this build does not recognize, preserved verbatim.
     Unknown(u16),
 }
@@ -104,6 +120,8 @@ impl ErrorCode {
     const BAD_INVITE: u16 = 16;
     const BAD_TAG: u16 = 17;
     const UNKNOWN_TYPE: u16 = 18;
+    const NO_GRANT: u16 = 19;
+    const GRANT_REMOVED: u16 = 20;
 
     /// The symbolic name from protocol.md, e.g. `"bad_cert"`.
     pub fn name(self) -> &'static str {
@@ -126,6 +144,8 @@ impl ErrorCode {
             Self::BadInvite => "bad_invite",
             Self::BadTag => "bad_tag",
             Self::UnknownType => "unknown_type",
+            Self::NoGrant => "no_grant",
+            Self::GrantRemoved => "grant_removed",
             Self::Unknown(_) => "unknown",
         }
     }
@@ -152,6 +172,8 @@ impl From<ErrorCode> for u16 {
             ErrorCode::BadInvite => ErrorCode::BAD_INVITE,
             ErrorCode::BadTag => ErrorCode::BAD_TAG,
             ErrorCode::UnknownType => ErrorCode::UNKNOWN_TYPE,
+            ErrorCode::NoGrant => ErrorCode::NO_GRANT,
+            ErrorCode::GrantRemoved => ErrorCode::GRANT_REMOVED,
             ErrorCode::Unknown(code) => code,
         }
     }
@@ -178,6 +200,8 @@ impl From<u16> for ErrorCode {
             Self::BAD_INVITE => Self::BadInvite,
             Self::BAD_TAG => Self::BadTag,
             Self::UNKNOWN_TYPE => Self::UnknownType,
+            Self::NO_GRANT => Self::NoGrant,
+            Self::GRANT_REMOVED => Self::GrantRemoved,
             other => Self::Unknown(other),
         }
     }
@@ -220,6 +244,8 @@ mod tests {
             ErrorCode::BadInvite,
             ErrorCode::BadTag,
             ErrorCode::UnknownType,
+            ErrorCode::NoGrant,
+            ErrorCode::GrantRemoved,
         ];
         for code in codes {
             let wire: u16 = code.into();

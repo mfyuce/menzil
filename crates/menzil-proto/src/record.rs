@@ -368,8 +368,68 @@ fn decode_cbor_body<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T, P
 }
 
 /// Length of the raw `bytes32 node_id | u8 e2e_proto | u8 flags` prefix
-/// shared by SEND and RECV, before the opaque payload.
-const SEND_RECV_PREFIX_LEN: usize = 32 + 1 + 1;
+/// shared by SEND and RECV, before the opaque payload. `pub(crate)` so
+/// [`crate::e2e`] can size an L4 data record's usable plaintext budget
+/// without duplicating this number.
+pub(crate) const SEND_RECV_PREFIX_LEN: usize = 32 + 1 + 1;
+
+/// `ChaCha20-Poly1305`'s AEAD tag for the *L3* Noise session (protocol.md
+/// 1's cipher suite), appended to every L3 transport message — the
+/// entire `u8 type | body` record this module frames, not just SEND/
+/// RECV's own `payload` field. `pub` so [`max_send_payload`]'s formula
+/// (and anything built on it, e.g. [`crate::e2e::max_e2e_data_plaintext`])
+/// is independently checkable against this crate's own stated cipher
+/// suite rather than a bare number.
+pub const L3_AEAD_TAG_LEN: usize = 16;
+
+/// The largest SEND/RECV `payload` that fits in one L3 record bound by
+/// `max_record` (WELCOME `limits.max_record`, protocol.md 4.1, 10):
+/// what remains after the record type tag, [`SEND_RECV_PREFIX_LEN`], and
+/// the L3 Noise session's own [`L3_AEAD_TAG_LEN`]. Saturates at 0 for a
+/// `max_record` too small to carry that fixed overhead at all.
+///
+/// protocol.md 10 states "L3 record: 65,535 bytes payload" and 4.2
+/// computes a SEND's own budget as "65,535 minus 35" (the type tag plus
+/// `SEND_RECV_PREFIX_LEN`) — neither sentence accounts for the AEAD tag
+/// actually consumed inside that same 65,535-byte ceiling once a record
+/// is actually encrypted (TODO.md L4b's own review, live-verified
+/// against a real relay: 65,484 bytes of payload is the largest that
+/// round-trips at the default `max_record`, not 65,500). This function
+/// uses the verified number; the spec prose above it is one byte short
+/// of correct and worth fixing there too.
+pub fn max_send_payload(max_record: u32) -> usize {
+    (max_record as usize).saturating_sub(1 + SEND_RECV_PREFIX_LEN + L3_AEAD_TAG_LEN)
+}
+
+#[cfg(test)]
+mod send_payload_tests {
+    use super::*;
+
+    #[test]
+    fn max_send_payload_matches_the_live_verified_figure() {
+        assert_eq!(max_send_payload(65_535), 65_484);
+    }
+
+    #[test]
+    fn max_send_payload_saturates_instead_of_underflowing() {
+        assert_eq!(max_send_payload(0), 0);
+        assert_eq!(max_send_payload(10), 0);
+    }
+}
+
+/// The floor a reliable SEND's charge against credit (and any queue
+/// budget) is clamped to (protocol.md 4.2's flow-control paragraph is
+/// silent on an exact number; this is this project's own choice).
+/// `pub` — shared here, not defined independently in both
+/// `menzil-relay` (which enforces it) and `menzil-node` (which must
+/// track the *same* number locally or its own credit bookkeeping
+/// silently drifts from what the relay actually charges it for). A
+/// near-empty payload (a `KEEP`, one byte) would otherwise cost nothing
+/// against either side's limits while still consuming a real, boxed
+/// queue entry — see `menzil-relay`'s own `forward` module for the
+/// original finding. Comfortably above [`SEND_RECV_PREFIX_LEN`] plus a
+/// minimal real payload.
+pub const MIN_SEND_CHARGE_BYTES: u32 = 64;
 
 fn encode_send_recv(
     record_type: RecordType,
@@ -403,7 +463,9 @@ fn decode_send_recv(bytes: &[u8]) -> Result<(NodeId, u8, u8, Vec<u8>), ProtoErro
 
 const DOC_HEADER_LEN: usize = 1 + 16 + 2 + 2;
 
-fn require_empty(bytes: &[u8], what: &str) -> Result<(), ProtoError> {
+/// `pub(crate)` so [`crate::e2e`] can reuse it for KEEP/REKEY's own
+/// empty-body check rather than duplicating it.
+pub(crate) fn require_empty(bytes: &[u8], what: &str) -> Result<(), ProtoError> {
     if bytes.is_empty() {
         Ok(())
     } else {
