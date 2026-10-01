@@ -17,6 +17,11 @@ tokio = { workspace = true, features = ["sync", "time"] }
 tracing.workspace = true
 
 [dev-dependencies]
+# menzil-relay, rcgen, rustls: tests/live_session.rs's in-process relay and
+# its self-signed test certificate.
+menzil-relay = { path = "../menzil-relay" }
 rand = "0.10.3"
+rcgen = "0.14.10"
+rustls.workspace = true
 snow = "0.10.0"
 tokio = { workspace = true, features = ["test-util"] }

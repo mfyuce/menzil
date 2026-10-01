@@ -216,10 +216,10 @@ impl SessionRegistry {
     }
 
     /// Whether `node_id` currently has an attached session, and if so,
-    /// its session id. Exposed mainly for tests (crate-visible so the
-    /// live end-to-end suite can use it too); nothing in this item's own
-    /// scope needs to query it beyond attach/detach.
-    #[cfg(test)]
+    /// its session id. Used by `crate::forward::ForwardTable::forward` to
+    /// capture `src`'s own session id at admission time (TODO.md L4b's
+    /// own second review round), independently of tests, which also use
+    /// it (crate-visible so the live end-to-end suite can too).
     pub(crate) fn attached_session_id(&self, node_id: &NodeId) -> Option<u32> {
         self.by_node
             .read()
@@ -315,6 +315,8 @@ mod tests {
             src: NodeId::from([7u8; 32]),
             charge,
             reliable: true,
+            generation: 0,
+            src_session_id: 0,
         }
     }
 

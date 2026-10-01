@@ -15,6 +15,15 @@
 //! per reconnect, so a node does not forget what it holds just because
 //! the link dropped.
 //!
+//! The node side of protocol.md 4.2's SEND/RECV/CREDIT data plane
+//! (TODO.md L4b) lives here too, in [`run_session`]'s own attached loop:
+//! before this, nothing let a caller send anything into a running L3
+//! session at all, only receive (this module's own former doc comment
+//! said as much). [`crate::outbound::OutboundQueue`] does the actual
+//! per-peer credit and queueing logic, kept separate and I/O-free the
+//! same way [`Engine`] is; `run_session` only drains it and feeds it
+//! inbound CREDIT records.
+//!
 //! Split in two: [`Engine`] is the pure protocol logic (decrypt, classify
 //! a record, track the liveness/rekey clocks) with no `Carrier` and no
 //! I/O, so it can be driven and tested with any source of ciphertext —
@@ -47,6 +56,7 @@ use menzil_session::{
 
 use crate::error::NodeError;
 use crate::identity::LocalIdentity;
+use crate::outbound::{EnqueueOutcome, OutboundQueue, OutboundSend};
 use crate::roster_store::RosterStore;
 
 /// Everything [`Session::connect`] needs beyond what
@@ -93,10 +103,14 @@ enum EngineEvent {
     None,
     /// Send this record straight back (a PONG for a PING).
     Reply(Record),
-    /// Not something this crate interprets itself (SEND/RECV/ADVERTISE*/
-    /// PEER_STATE/CREDIT/ADMIT_*/ERROR — protocol.md 4.2, 4.4, 7.2;
-    /// TODO.md L3g, L4's job); hand it to the caller. DOC never reaches
-    /// here (protocol.md 4.3; TODO.md L3f) — see `Engine::accept_doc`.
+    /// Not something `Engine` itself interprets (SEND/RECV/ADVERTISE*/
+    /// PEER_STATE/CREDIT/ADMIT_*/ERROR — protocol.md 4.2, 4.4, 7.2).
+    /// DOC never reaches here (protocol.md 4.3; TODO.md L3f) — see
+    /// `Engine::accept_doc`. Everything else this variant carries is
+    /// handed to [`run_session`]'s own caller as-is, except `Credit`:
+    /// `run_session` intercepts that one itself (TODO.md L4b) to update
+    /// its [`OutboundQueue`] rather than forwarding a raw CREDIT record
+    /// onward, since by L4b the caller has no direct use for one.
     Deliver(Record),
     /// The relay ended the session (protocol.md 4.2).
     Goaway(GoawayBody),
@@ -257,6 +271,29 @@ impl Engine {
 /// which would otherwise starve the hourly REKEY.
 const TICK: Duration = Duration::from_secs(1);
 
+/// How long [`run_session`]'s drain loop waits for one queued outbound
+/// send to actually complete before giving up on this attachment and
+/// reconnecting (TODO.md L4b's own review, finding 7, live-reproduced
+/// against a real relay under two-way saturated traffic with a slow
+/// reader): the drain loop does not read the carrier at all while it is
+/// draining, so a write that blocks because the *relay* has stopped
+/// reading from this node — itself possible if the relay is meanwhile
+/// stuck writing to this same node, `menzil-relay`'s own pre-existing,
+/// documented no-write-timeout gap — would otherwise hang forever with
+/// nothing left to interrupt it: this loop runs outside [`Session::recv`],
+/// so the liveness clock that would normally notice a dead link never
+/// gets to run either. Ending the attachment on a stall, rather than
+/// waiting indefinitely, is a partial mitigation, not the complete fix
+/// (a true fix needs the relay side timed out too, and ideally a
+/// priority split between control and data sends on both ends — a
+/// bigger change than this item's scope, mirroring
+/// `menzil-relay::forward`'s own module doc comment's identical
+/// judgment call about its matching gap). No protocol.md default exists
+/// for this; chosen well under the 60s idle-session default (protocol.md
+/// 10) so a genuine stall is noticed and reconnected well before the
+/// liveness mechanism would otherwise have had a chance to.
+const SEND_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// One attached L3 relay session: dial, handshake, verify, ATTACH
 /// (protocol.md 3, 4.1, 4.2). Owns the live [`Carrier`] plus the pure
 /// [`Engine`] logic that runs on top of it.
@@ -319,6 +356,39 @@ impl Session {
         Ok(())
     }
 
+    /// Encrypts and sends `record` (always [`Record::Rekey`]), then
+    /// rekeys this session's own sending state — but, unlike
+    /// [`Self::send`] followed by a separate [`Engine::rekey_outgoing`]
+    /// call, with *no `.await` between encrypting and rekeying*.
+    ///
+    /// TODO.md L4b's own review (finding 6, live-reproduced against a
+    /// real relay): once [`Self::recv`] is driven from inside an outer
+    /// `tokio::select!` that can also complete a *different* branch
+    /// (`run_session`'s own `outbound` channel), any `.await` inside
+    /// `recv` becomes a point where the whole call can be cancelled —
+    /// dropped mid-future, never resumed. The record's ciphertext is
+    /// still delivered regardless (`tokio-tungstenite` commits it to its
+    /// own write buffer at the very first poll of the send), but a
+    /// cancellation *between* that send completing and a separate
+    /// `rekey_outgoing()` call afterward would leave this session still
+    /// encrypting with the *old* key for whatever it sends next, while
+    /// the relay — which rekeys its receiving side the instant it reads
+    /// this REKEY record — expects the new one; every following record
+    /// then fails to decrypt on the relay's side, and this session's own
+    /// connection is dropped and has to reconnect from a genuine
+    /// protocol desync, not merely a lost race. Rust's async model can
+    /// only ever suspend (and so only ever let a caller cancel) at an
+    /// actual `.await` point: putting the rekey *before* the one
+    /// `.await` this method has, immediately after the synchronous
+    /// encrypt, makes it unconditionally happen before the record can
+    /// ever be observed as sent, no matter what cancels the send itself.
+    async fn send_rekey(&mut self, record: Record) -> Result<(), NodeError> {
+        let bytes = self.engine.encrypt(&record)?;
+        self.engine.rekey_outgoing();
+        self.carrier.send(bytes).await?;
+        Ok(())
+    }
+
     /// Waits for the next record meant for the caller, transparently
     /// answering PING with PONG, applying an incoming REKEY, ingesting an
     /// incoming DOC (protocol.md 4.3), and sending this side's own PING
@@ -348,10 +418,7 @@ impl Session {
                         TickEvent::None => {}
                         TickEvent::Dead => return Err(NodeError::LinkDead),
                         TickEvent::Send(record) => self.send(record).await?,
-                        TickEvent::SendThenRekey(record) => {
-                            self.send(record).await?;
-                            self.engine.rekey_outgoing();
-                        }
+                        TickEvent::SendThenRekey(record) => self.send_rekey(record).await?,
                     }
                 }
             }
@@ -529,14 +596,44 @@ fn tai64n_now() -> Tai64N {
 /// [`Backoff`] on any error, honoring GOAWAY's `retry_after_ms` hint when
 /// that was the reason (protocol.md 3.3, 4.1). `roster_store` is shared
 /// across every reconnect attempt (protocol.md 4.3; TODO.md L3f), not
-/// rebuilt per attempt. Records this crate does not interpret itself
-/// (everything but ATTACH/PING/PONG/REKEY/GOAWAY/DOC) are sent to
-/// `events`; interpreting them is a later item's job (TODO.md L3g, L4).
-/// Returns once `events`'s receiver is dropped.
+/// rebuilt per attempt; a fresh [`OutboundQueue`] is *not* shared the
+/// same way — it is rebuilt on every attach, deliberately, mirroring
+/// `menzil-relay::forward::ForwardTable::clear_for`'s own per-attach
+/// reset (L3h's finding H2: stale credit must not silently outlive a
+/// reconnect). Inbound records this crate does not interpret itself
+/// (everything but ATTACH/PING/PONG/REKEY/GOAWAY/DOC/CREDIT) are sent to
+/// `events`; CREDIT is intercepted here instead, to update the
+/// `OutboundQueue` (TODO.md L4b). Outbound SEND requests arrive through
+/// `outbound`; once its sender end is dropped, that side simply goes
+/// quiet (no more sends can be queued) without ending the function —
+/// only `events`'s receiver being dropped does that, unchanged from
+/// before L4b. Returns once `events`'s receiver is dropped.
+///
+/// At most one delivered record is ever held outstanding, in
+/// `pending_deliver`, waiting for room in `events` via
+/// [`mpsc::Sender::reserve`] rather than `events.send(...).await`
+/// directly inside the same `tokio::select!` that also has to keep
+/// servicing `outbound` (TODO.md L4b's own review, finding 5,
+/// live-reproduced against a real relay: a caller that both reads
+/// `events` and writes `outbound` from the same task — the natural
+/// shape for something that replies to what it receives — can leave
+/// `events.send(...).await` permanently blocked on a full channel while
+/// that same caller is itself blocked trying to write a now-full
+/// `outbound`, with nothing left to break the cycle; `reserve` lets this
+/// loop keep draining `outbound` and running the send loop below while
+/// a delivery is stalled, instead of stopping dead). While a delivery is
+/// pending, `session.recv()` is not polled again either — new inbound
+/// records simply wait in the carrier's own buffer, ordinary TCP-level
+/// backpressure, not a loss — which also means the liveness/rekey clocks
+/// `session.recv()` drives internally pause for that same stretch;
+/// sustained backpressure long enough to blow past the liveness window
+/// once resumed reconnects this attachment, a real but accepted trade
+/// far short of finding 5's original permanent hang.
 pub async fn run_session(
     config: SessionConfig,
     env: HashMap<String, String>,
     events: mpsc::Sender<Record>,
+    mut outbound: mpsc::Receiver<OutboundSend>,
     roster_store: Arc<RosterStore>,
 ) {
     let mut backoff = Backoff::new();
@@ -552,31 +649,88 @@ pub async fn run_session(
         };
         tracing::info!("node session attached");
         let attached_at = Instant::now();
+        let limits = session.welcome().limits;
+        let mut outbound_queue = OutboundQueue::new(limits.credit, limits.max_record);
+        let mut pending_deliver: Option<Record> = None;
 
-        loop {
-            match session.recv().await {
-                Ok(record) => {
-                    if events.send(record).await.is_err() {
-                        return;
+        // `retry_after_ms`: `Some(hint)` only for a GOAWAY-caused break,
+        // matching the two different backoff calls the loop used to make
+        // inline before L4b added a second way to leave it (a send
+        // failure, or a send timeout, while draining `outbound_queue`).
+        let retry_after_ms = 'attached: loop {
+            tokio::select! {
+                recv_result = session.recv(), if pending_deliver.is_none() => {
+                    match recv_result {
+                        Ok(Record::Credit(body)) => {
+                            outbound_queue.note_credit(body.peer, body.bytes);
+                        }
+                        Ok(record) => {
+                            pending_deliver = Some(record);
+                        }
+                        Err(NodeError::Goaway { reason, retry_after_ms }) => {
+                            tracing::info!(reason, retry_after_ms, "relay sent GOAWAY, reconnecting");
+                            break 'attached Some(retry_after_ms);
+                        }
+                        Err(err) => {
+                            tracing::warn!(error = %err, "node session ended, reconnecting");
+                            break 'attached None;
+                        }
                     }
                 }
-                Err(NodeError::Goaway {
-                    reason,
-                    retry_after_ms,
-                }) => {
-                    tracing::info!(reason, retry_after_ms, "relay sent GOAWAY, reconnecting");
-                    backoff.note_connection_uptime(attached_at.elapsed());
-                    tokio::time::sleep(backoff.next_delay_with_hint(retry_after_ms)).await;
-                    break;
+                permit = events.reserve(), if pending_deliver.is_some() => {
+                    match permit {
+                        Ok(permit) => {
+                            let record = pending_deliver.take().expect(
+                                "this branch only runs while pending_deliver is Some",
+                            );
+                            permit.send(record);
+                        }
+                        Err(_) => return,
+                    }
                 }
-                Err(err) => {
-                    tracing::warn!(error = %err, "node session ended, reconnecting");
-                    backoff.note_connection_uptime(attached_at.elapsed());
-                    tokio::time::sleep(backoff.next_delay()).await;
-                    break;
+                Some(req) = outbound.recv() => {
+                    let dst = req.dst;
+                    let payload_len = req.payload.len();
+                    let outcome = outbound_queue.enqueue(req.dst, req.e2e_proto, req.flags, req.payload);
+                    match outcome {
+                        EnqueueOutcome::QueueFull => {
+                            tracing::warn!(dst = %dst, "node outbound queue full, reliable send refused");
+                        }
+                        EnqueueOutcome::TooLarge => {
+                            tracing::warn!(
+                                dst = %dst,
+                                payload_len,
+                                "outbound send exceeds the max L3 SEND payload, refused"
+                            );
+                        }
+                        EnqueueOutcome::Accepted | EnqueueOutcome::Dropped => {}
+                    }
                 }
             }
-        }
+
+            while let Some(record) = outbound_queue.next_ready_to_send() {
+                match tokio::time::timeout(SEND_TIMEOUT, session.send(record)).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(err)) => {
+                        tracing::warn!(error = %err, "node session ended while draining outbound sends, reconnecting");
+                        break 'attached None;
+                    }
+                    Err(_elapsed) => {
+                        tracing::warn!(
+                            "node session outbound send stalled past the write timeout, reconnecting"
+                        );
+                        break 'attached None;
+                    }
+                }
+            }
+        };
+
+        backoff.note_connection_uptime(attached_at.elapsed());
+        let delay = match retry_after_ms {
+            Some(hint) => backoff.next_delay_with_hint(hint),
+            None => backoff.next_delay(),
+        };
+        tokio::time::sleep(delay).await;
     }
 }
 

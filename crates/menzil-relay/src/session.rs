@@ -502,7 +502,7 @@ async fn run_attached_loop(
             }
             Some(item) = forward_rx.recv() => {
                 match item {
-                    ForwardItem::Recv { record, src, charge, reliable } => {
+                    ForwardItem::Recv { record, src, charge, reliable, generation, src_session_id } => {
                         // Only now — once this RECV record has actually
                         // been handed to this (destination) connection to
                         // send, not merely admitted into `ForwardTable`
@@ -514,7 +514,7 @@ async fn run_attached_loop(
                         // this same reliable channel, not `send_to`'s
                         // lossy one).
                         let _ = send_record(&mut conn, &mut transport, *record).await;
-                        relay.forwarding.drained(&relay.registry, &src, &node_id, charge, reliable);
+                        relay.forwarding.drained(&relay.registry, &src, &node_id, charge, reliable, generation, src_session_id);
                     }
                     ForwardItem::Credit { peer, bytes } => {
                         let _ = send_record(
@@ -549,12 +549,20 @@ async fn run_attached_loop(
             src,
             charge,
             reliable,
+            generation,
+            src_session_id,
             ..
         } = item
         {
-            relay
-                .forwarding
-                .drained(&relay.registry, &src, &node_id, charge, reliable);
+            relay.forwarding.drained(
+                &relay.registry,
+                &src,
+                &node_id,
+                charge,
+                reliable,
+                generation,
+                src_session_id,
+            );
         }
     }
 

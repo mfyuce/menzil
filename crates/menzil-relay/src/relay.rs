@@ -41,12 +41,14 @@ impl Relay {
     /// `limits.max_peers` is always the caller's explicit choice, never
     /// invented here.
     ///
-    /// `limits.credit` is the one exception, and is clamped (never
-    /// raised, only ever lowered) to [`crate::forward::MAX_QUEUE_BYTES`]
-    /// before being stored — not inventing a value where the caller gave
-    /// none, but correcting an internally-inconsistent one: an opus red
-    /// team review (finding M1) caught that WELCOME advertised whatever
-    /// `credit` the caller passed, unclamped, while
+    /// `limits.credit` and `limits.max_record` are the two exceptions,
+    /// each clamped (never raised, only ever lowered) before being
+    /// stored — not inventing a value where the caller gave none, but
+    /// correcting an internally-inconsistent one.
+    ///
+    /// `credit` is clamped to [`crate::forward::MAX_QUEUE_BYTES`]: an
+    /// opus red team review (finding M1) caught that WELCOME advertised
+    /// whatever `credit` the caller passed, unclamped, while
     /// `crate::forward::ForwardTable` separately clamped its own ledger
     /// to the same figure — so a caller configuring `credit` above the
     /// queue's own byte cap got a relay that told a node it had more
@@ -54,8 +56,25 @@ impl Relay {
     /// compliant node's session the first time it believed WELCOME.
     /// Clamping once, here, is what keeps WELCOME and the ledger unable
     /// to disagree by construction.
+    ///
+    /// `max_record` is clamped to `menzil_carrier::MAX_MESSAGE_BYTES`
+    /// (65,535 — the same figure protocol.md 10 states as `max_record`'s
+    /// own default), a gap TODO.md L4b's own second review round found
+    /// live: nothing stopped an operator from configuring `max_record`
+    /// *above* what `Carrier::send` will actually transmit in one L2
+    /// message, and WELCOME would then advertise a size a node could
+    /// believe, try, and have fail to even encrypt — tearing down an
+    /// otherwise healthy session the same way an unclamped `credit`
+    /// once did (finding M1). Unlike `credit`, this is not a caller
+    /// choice with a legitimate reason to exceed the clamp — 65,535 is
+    /// the wire's own hard ceiling (`menzil-carrier::carrier::MAX_MESSAGE_BYTES`),
+    /// not merely this crate's own policy, so clamping here can only
+    /// ever correct a misconfiguration, never narrow a legitimate one.
     pub fn new(identity: RelayIdentity, mut limits: Limits) -> Self {
         limits.credit = limits.credit.min(crate::forward::MAX_QUEUE_BYTES as u32);
+        limits.max_record = limits
+            .max_record
+            .min(menzil_carrier::MAX_MESSAGE_BYTES as u32);
         Self {
             identity: Arc::new(identity),
             rosters: Arc::new(RosterStore::new()),

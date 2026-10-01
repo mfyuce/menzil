@@ -135,6 +135,7 @@
 
 use std::collections::HashMap;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use menzil_proto::{ErrorBody, ErrorCode, Limits, NetworkId, NodeId, Record};
@@ -164,7 +165,13 @@ const DGRAM_BUCKET_BURST_BYTES: f64 = 256.0 * 1024.0;
 /// of heap regardless, so this also keeps the number of items a fixed
 /// credit/queue budget can ever admit bounded to a sane figure rather
 /// than however many zero-length records fit in a `u32`.
-const MIN_FORWARD_CHARGE_BYTES: u32 = 64;
+///
+/// Promoted to `menzil_proto::MIN_SEND_CHARGE_BYTES` (TODO.md L4b) so
+/// the node side's own local credit tracking floors a reliable SEND's
+/// charge by the exact same number rather than an independently
+/// maintained copy that could silently drift from what this module
+/// actually enforces.
+const MIN_FORWARD_CHARGE_BYTES: u32 = menzil_proto::MIN_SEND_CHARGE_BYTES;
 
 /// A byte-metered token bucket, refilled lazily from elapsed wall-clock
 /// time on each [`TokenBucket::try_take`] call (no background timer),
@@ -216,16 +223,29 @@ struct PairState {
     initial_credit: u32,
     queued_bytes: usize,
     dgram_bucket: TokenBucket,
+    /// Distinguishes *this* `PairState` instance from any other that has
+    /// ever occupied the same `(src, dst)` map key (TODO.md L4b's own
+    /// review: a stale [`ForwardItem::Recv`] admitted under a pair that
+    /// [`ForwardTable::clear_for`] has since reset — `src` reconnected in
+    /// the meantime — must not apply its [`ForwardTable::drained`] effects
+    /// to the *new* `PairState` that replaced it: crediting `charge` back
+    /// to a fresh ledger that never actually spent it overstates `src`'s
+    /// real balance, and a CREDIT record for it corrupts `src`'s own
+    /// fresh, unrelated local tracking). Assigned once, at construction,
+    /// from [`ForwardTable`]'s own monotonic counter; never compared for
+    /// ordering, only equality.
+    generation: u64,
 }
 
 impl PairState {
-    fn new(initial_credit: u32, now: Instant) -> Self {
+    fn new(initial_credit: u32, now: Instant, generation: u64) -> Self {
         let initial_credit = initial_credit.min(MAX_QUEUE_BYTES as u32);
         Self {
             credit: CreditLedger::new(initial_credit),
             initial_credit,
             queued_bytes: 0,
             dgram_bucket: TokenBucket::new(now),
+            generation,
         }
     }
 }
@@ -236,6 +256,7 @@ impl PairState {
 /// record to send as-is. Both travel the same reliable, unbounded channel
 /// — CREDIT deliberately does not use [`SessionRegistry::send_to`]'s
 /// lossy one (finding H3; see this module's own doc comment).
+#[derive(Debug)]
 pub(crate) enum ForwardItem {
     /// Deliver `record` (always a `Record::Recv { .. }`) to this
     /// session's connection to send. Boxed per clippy's own
@@ -254,6 +275,33 @@ pub(crate) enum ForwardItem {
         /// what was reserved.
         charge: u32,
         reliable: bool,
+        /// The `(src, dst)` `PairState`'s generation at admission time
+        /// (see [`PairState::generation`]'s own doc comment); carried
+        /// through so [`ForwardTable::drained`] can tell whether *this
+        /// pair's own* bookkeeping (`queued_bytes`, `credit`) is still the
+        /// same instance this item was admitted against, or has since
+        /// been reset and recreated by a reconnect on either side.
+        generation: u64,
+        /// `src`'s own `SessionRegistry` session id at admission time —
+        /// deliberately a *different* question from `generation` above.
+        /// `generation` resets whenever *either* `src` or `dst`
+        /// reconnects (`ForwardTable::clear_for` clears a pair in both
+        /// roles), but a CREDIT record is owed to `src` regardless of
+        /// what `dst` does: `src`'s own local credit tracking
+        /// (`menzil-node::outbound::OutboundQueue`) spent this charge
+        /// under a ledger scoped to `src`'s own session, not to any
+        /// particular incarnation of the pair, and has no visibility
+        /// into `dst`'s reconnects at all. [`ForwardTable::drained`]
+        /// checks this against [`SessionRegistry::is_current`] to decide
+        /// whether to emit the CREDIT record at all — independently of
+        /// whether `generation` says this pair's own internal ledger
+        /// should be touched (TODO.md L4b's own second review round,
+        /// which live-reproduced a real bug in the first version of this
+        /// fix: gating the CREDIT record on `generation` alone meant a
+        /// `dst`-only reconnect could permanently strand `src`'s credit
+        /// for items that were in flight at the time, even though `src`
+        /// itself never reconnected and had every right to be reimbursed).
+        src_session_id: u32,
     },
     /// Send this CREDIT record as-is (protocol.md 4.2).
     Credit { peer: NodeId, bytes: u32 },
@@ -282,6 +330,11 @@ pub(crate) enum ForwardOutcome {
 #[derive(Default)]
 pub(crate) struct ForwardTable {
     pairs: Mutex<HashMap<(NodeId, NodeId), PairState>>,
+    /// Source of [`PairState::generation`] values: incremented every time
+    /// a `PairState` is actually constructed, never reset, never reused —
+    /// uniqueness across the table's lifetime is all `drained`'s
+    /// equality check needs.
+    next_generation: AtomicU64,
 }
 
 impl ForwardTable {
@@ -317,6 +370,20 @@ impl ForwardTable {
     /// `SessionRegistry::attach`'s and `crate::advertise`'s own doc
     /// comments describe for an analogous check-then-act window elsewhere
     /// in this crate.
+    ///
+    /// Every refusal (`Refused`, including this method's own internal
+    /// disconnect-race rollback) also reimburses `src` for `charge` when
+    /// the send was reliable (TODO.md L4b's own review): `src`'s *local*
+    /// credit tracking has no ACK to wait for — protocol.md 4.2 gives it
+    /// no way to learn a SEND's outcome before spending the credit it
+    /// optimistically charges the moment a record is handed to the wire
+    /// (`menzil-node::outbound::OutboundQueue::next_ready_to_send`) — so
+    /// this relay's own ledger never actually being touched by a refusal
+    /// is not enough; `src` must be told to put the credit back too, and
+    /// ERROR carries no destination for it to do that itself. A
+    /// `CreditViolation` is deliberately exempt: it ends `src`'s session
+    /// (the caller's job, once this returns), and there is no reason to
+    /// reimburse a session about to close.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn forward(
         &self,
@@ -332,11 +399,26 @@ impl ForwardTable {
         payload: Vec<u8>,
         now_unix: u64,
     ) -> ForwardOutcome {
+        let reliable = flags & 0x01 == 0;
+        let charge = (payload.len() as u32).max(MIN_FORWARD_CHARGE_BYTES);
+        let refuse = |code: ErrorCode, msg: String| {
+            if reliable {
+                registry.deliver(
+                    src,
+                    ForwardItem::Credit {
+                        peer: *dst,
+                        bytes: charge,
+                    },
+                );
+            }
+            ForwardOutcome::Refused(ErrorBody { code, msg })
+        };
+
         if e2e_proto != 0x01 && e2e_proto != 0x02 {
-            return ForwardOutcome::Refused(ErrorBody {
-                code: ErrorCode::UnknownE2e,
-                msg: format!("unrecognized e2e_proto {e2e_proto:#04x}"),
-            });
+            return refuse(
+                ErrorCode::UnknownE2e,
+                format!("unrecognized e2e_proto {e2e_proto:#04x}"),
+            );
         }
 
         // Authorization first, using only `src`'s own already-known
@@ -344,34 +426,35 @@ impl ForwardTable {
         // attachment before authorization let anyone probe any NodeId's
         // online status with no standing of their own).
         if !rosters.grants_forwarding(src, src_claimed, dst, now_unix) {
-            return ForwardOutcome::Refused(ErrorBody {
-                code: ErrorCode::Forbidden,
-                msg: "sender has no claimed, unexpired network membership in common with the destination"
+            return refuse(
+                ErrorCode::Forbidden,
+                "sender has no claimed, unexpired network membership in common with the destination"
                     .to_string(),
-            });
+            );
         }
 
         if !registry.is_attached(dst) {
-            return ForwardOutcome::Refused(ErrorBody {
-                code: ErrorCode::PeerOffline,
-                msg: "destination is not attached".to_string(),
-            });
+            return refuse(
+                ErrorCode::PeerOffline,
+                "destination is not attached".to_string(),
+            );
         }
         if !labels.accepts_peers(dst) {
-            return ForwardOutcome::Refused(ErrorBody {
-                code: ErrorCode::Forbidden,
-                msg: "destination is not accepting peer traffic".to_string(),
-            });
+            return refuse(
+                ErrorCode::Forbidden,
+                "destination is not accepting peer traffic".to_string(),
+            );
         }
 
-        let reliable = flags & 0x01 == 0;
-        let charge = (payload.len() as u32).max(MIN_FORWARD_CHARGE_BYTES);
         let now = Instant::now();
+        let generation;
         {
             let mut pairs = self.pairs.lock().unwrap();
-            let pair = pairs
-                .entry((*src, *dst))
-                .or_insert_with(|| PairState::new(limits.credit, now));
+            let pair = pairs.entry((*src, *dst)).or_insert_with(|| {
+                let generation = self.next_generation.fetch_add(1, Ordering::Relaxed);
+                PairState::new(limits.credit, now, generation)
+            });
+            generation = pair.generation;
 
             if reliable {
                 if let Err(err) = pair.credit.consume(charge) {
@@ -398,6 +481,15 @@ impl ForwardTable {
             pair.queued_bytes += charge as usize;
         }
 
+        // `src` is necessarily attached right now — this call is
+        // processing a SEND it just sent — so `None` here would mean it
+        // detached in the instant between; using a sentinel rather than
+        // panicking, `is_current` then correctly reports `false` for it
+        // regardless (no registration at all is no more "current" than a
+        // mismatched id), which is the same fail-safe direction
+        // `ForwardTable::drained` already needs for a genuine reconnect.
+        let src_session_id = registry.attached_session_id(src).unwrap_or(u32::MAX);
+
         let delivered = registry.deliver(
             dst,
             ForwardItem::Recv {
@@ -410,6 +502,8 @@ impl ForwardTable {
                 src: *src,
                 charge,
                 reliable,
+                generation,
+                src_session_id,
             },
         );
         if delivered {
@@ -419,7 +513,17 @@ impl ForwardTable {
         // `dst` disconnected between the `is_attached` check above and
         // this handoff (see this method's own doc comment) — undo what
         // was reserved so this pair's accounting does not leak credit or
-        // queue budget nothing will ever drain.
+        // queue budget nothing will ever drain, and reimburse `src`'s own
+        // local tracking the same way every other refusal above does.
+        if reliable {
+            registry.deliver(
+                src,
+                ForwardItem::Credit {
+                    peer: *dst,
+                    bytes: charge,
+                },
+            );
+        }
         let mut pairs = self.pairs.lock().unwrap();
         if let Some(pair) = pairs.get_mut(&(*src, *dst)) {
             pair.queued_bytes = pair.queued_bytes.saturating_sub(charge as usize);
@@ -437,19 +541,40 @@ impl ForwardTable {
     /// `dst`'s own connection to send — or once it's known it never will
     /// be, because that connection ended with items still queued
     /// (`crate::session`'s teardown drain; finding H1) — passing the
-    /// exact `charge`/`reliable` it was admitted with: frees its share of
-    /// the pair's queue budget and, if it was reliable, grants `charge`
-    /// bytes of credit back to `src` and hands `registry` a
-    /// [`ForwardItem::Credit`] for `src`'s own connection to send
-    /// (protocol.md 4.2: "replenished as bytes are written to the
-    /// destination socket") — over the same reliable channel the RECV
-    /// record itself traveled on, not [`SessionRegistry::send_to`]'s
-    /// lossy one (finding H3). A no-op on the ledger if the pair is
-    /// somehow unknown (it cannot be, in practice: [`ForwardTable::forward`]
-    /// always creates it before a [`ForwardItem`] naming that pair can
-    /// exist); if `src` is no longer attached to receive the CREDIT
-    /// record, [`SessionRegistry::deliver`] silently drops it, which is
-    /// fine — a `src` that is gone has nothing left to tell.
+    /// exact `charge`/`reliable`/`generation`/`src_session_id` it was
+    /// admitted with. Two independent questions, gated separately (see
+    /// [`ForwardItem::Recv::src_session_id`]'s own doc comment for the
+    /// full story of why these must not be the same check):
+    ///
+    /// 1. Does *this pair's own* bookkeeping (`queued_bytes`, and
+    ///    `credit` if reliable) still get touched? Only if `generation`
+    ///    still matches the `PairState` on file — `ForwardTable::clear_for`
+    ///    can remove and later recreate this exact `(src, dst)` key (a
+    ///    reconnect by *either* side), and applying a stale item's
+    ///    effects to whatever fresh instance now occupies that key would
+    ///    corrupt it regardless of direction: granting `charge` back
+    ///    overstates a fresh ledger that never actually spent it, and
+    ///    subtracting `charge` from a fresh `queued_bytes` (already 0, or
+    ///    already counting unrelated fresh admissions) corrupts it the
+    ///    same way.
+    /// 2. Does `src` get sent a CREDIT record at all? Only if
+    ///    `src_session_id` still names `src`'s *current* session
+    ///    ([`SessionRegistry::is_current`]) — regardless of what answer
+    ///    question 1 got. `src`'s own local credit tracking has no
+    ///    visibility into `dst`'s reconnects and is owed reimbursement
+    ///    for a charge it genuinely spent as long as `src` itself is
+    ///    still the same session; only `src`'s *own* reconnect (a fresh
+    ///    ledger with nothing to do with what the old one spent) makes
+    ///    reimbursing it wrong.
+    ///
+    /// A `src` that is still attached but happens to have no ledger at
+    /// all for this exact pair cannot occur in practice
+    /// ([`ForwardTable::forward`] always creates the pair, and so its
+    /// generation, before a [`ForwardItem`] naming it can exist); a `src`
+    /// no longer attached at all is the ordinary, harmless case
+    /// [`SessionRegistry::deliver`] already handles by silently dropping
+    /// the record — nothing left to tell.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn drained(
         &self,
         registry: &SessionRegistry,
@@ -457,17 +582,21 @@ impl ForwardTable {
         dst: &NodeId,
         charge: u32,
         reliable: bool,
+        generation: u64,
+        src_session_id: u32,
     ) {
         {
             let mut pairs = self.pairs.lock().unwrap();
-            if let Some(pair) = pairs.get_mut(&(*src, *dst)) {
+            if let Some(pair) = pairs.get_mut(&(*src, *dst))
+                && pair.generation == generation
+            {
                 pair.queued_bytes = pair.queued_bytes.saturating_sub(charge as usize);
                 if reliable {
                     pair.credit.grant(charge);
                 }
             }
         }
-        if reliable {
+        if reliable && registry.is_current(src, src_session_id) {
             registry.deliver(
                 src,
                 ForwardItem::Credit {
@@ -524,6 +653,19 @@ impl ForwardTable {
             .unwrap()
             .get(&(*src, *dst))
             .map(|pair| pair.queued_bytes)
+    }
+
+    /// `src`->`dst`'s current `PairState::generation`, or `None` if this
+    /// pair has never sent anything. Exposed for tests, so a test can
+    /// call [`Self::drained`] with the actual current value rather than
+    /// assuming this table's internal numbering.
+    #[cfg(test)]
+    pub(crate) fn generation_of(&self, src: &NodeId, dst: &NodeId) -> Option<u64> {
+        self.pairs
+            .lock()
+            .unwrap()
+            .get(&(*src, *dst))
+            .map(|pair| pair.generation)
     }
 }
 
@@ -962,24 +1104,67 @@ mod tests {
         let after_send = table.remaining_credit(&f.src, &f.dst).unwrap();
         assert_eq!(after_send, test_limits().credit - 1_000);
 
-        table.drained(&f.registry, &f.src, &f.dst, 1_000, true);
+        let generation = table.generation_of(&f.src, &f.dst).unwrap();
+        let src_session_id = f.registry.attached_session_id(&f.src).unwrap();
+        table.drained(
+            &f.registry,
+            &f.src,
+            &f.dst,
+            1_000,
+            true,
+            generation,
+            src_session_id,
+        );
         let after_drain = table.remaining_credit(&f.src, &f.dst).unwrap();
         assert_eq!(after_drain, test_limits().credit);
     }
 
     #[test]
     fn drained_delivers_a_credit_item_to_srcs_own_channel() {
-        let registry = SessionRegistry::new();
-        let src = NodeId::from([1u8; 32]);
-        let dst = NodeId::from([2u8; 32]);
-        let (_supersede_rx, _outbound_rx, mut forward_rx) = registry.attach(src, 1, vec![]);
+        // `drained` only ever applies its effects to a pair `forward`
+        // itself already created (see `drained`'s own doc comment on the
+        // generation check added for TODO.md L4b), so this test goes
+        // through a real `forward` call first rather than fabricating a
+        // bare `drained` call against a table that never admitted
+        // anything.
+        let mut f = fixture(4_000_000_000);
         let table = ForwardTable::new();
+        let (e2e, flags, payload) = reliable_send(500);
+        table.forward(
+            &f.rosters,
+            &f.registry,
+            &f.labels,
+            &test_limits(),
+            &f.src,
+            &[f.network_id],
+            &f.dst,
+            e2e,
+            flags,
+            payload,
+            1_000,
+        );
+        // Drain the RECV item `forward` itself already queued for `dst`,
+        // so it cannot be mistaken for `drained`'s own CREDIT item below.
+        assert!(matches!(
+            f._dst_handles.2.try_recv(),
+            Ok(ForwardItem::Recv { .. })
+        ));
 
-        table.drained(&registry, &src, &dst, 500, true);
+        let generation = table.generation_of(&f.src, &f.dst).unwrap();
+        let src_session_id = f.registry.attached_session_id(&f.src).unwrap();
+        table.drained(
+            &f.registry,
+            &f.src,
+            &f.dst,
+            500,
+            true,
+            generation,
+            src_session_id,
+        );
 
-        match forward_rx.try_recv() {
+        match f._src_handles.2.try_recv() {
             Ok(ForwardItem::Credit { peer, bytes }) => {
-                assert_eq!(peer, dst);
+                assert_eq!(peer, f.dst);
                 assert_eq!(bytes, 500);
             }
             Ok(ForwardItem::Recv { .. }) => panic!("expected a Credit item, got a Recv item"),
@@ -989,16 +1174,41 @@ mod tests {
 
     #[test]
     fn drained_does_not_deliver_a_credit_item_for_droppable_traffic() {
-        let registry = SessionRegistry::new();
-        let src = NodeId::from([1u8; 32]);
-        let dst = NodeId::from([2u8; 32]);
-        let (_supersede_rx, _outbound_rx, mut forward_rx) = registry.attach(src, 1, vec![]);
+        let mut f = fixture(4_000_000_000);
         let table = ForwardTable::new();
+        let (e2e, flags, payload) = reliable_send(10);
+        table.forward(
+            &f.rosters,
+            &f.registry,
+            &f.labels,
+            &test_limits(),
+            &f.src,
+            &[f.network_id],
+            &f.dst,
+            e2e,
+            flags,
+            payload,
+            1_000,
+        );
+        assert!(matches!(
+            f._dst_handles.2.try_recv(),
+            Ok(ForwardItem::Recv { .. })
+        ));
+        let generation = table.generation_of(&f.src, &f.dst).unwrap();
+        let src_session_id = f.registry.attached_session_id(&f.src).unwrap();
 
-        table.drained(&registry, &src, &dst, 500, false);
+        table.drained(
+            &f.registry,
+            &f.src,
+            &f.dst,
+            500,
+            false,
+            generation,
+            src_session_id,
+        );
 
         assert!(
-            forward_rx.try_recv().is_err(),
+            f._src_handles.2.try_recv().is_err(),
             "droppable traffic was never credited in the first place, so draining it must not \
              send a CREDIT record either"
         );
@@ -1250,5 +1460,335 @@ mod tests {
         );
         table.clear_for(&stranger);
         assert!(table.remaining_credit(&f.src, &f.dst).is_some());
+    }
+
+    #[test]
+    fn a_refused_reliable_send_reimburses_the_senders_local_credit_tracking() {
+        // Regression test for TODO.md L4b's own review: `src`'s local
+        // credit tracking (`menzil-node::outbound::OutboundQueue`)
+        // optimistically spends `charge` the moment it hands a reliable
+        // SEND to the wire, with no ACK to wait for and no way to learn
+        // in advance whether the relay will actually forward it. Every
+        // refusal must reimburse it via a CREDIT record, or its local
+        // view of its own credit permanently drifts low — exactly what
+        // the review live-reproduced against a peer that went offline.
+        let owner = SigningKey::generate(&mut rand::rng());
+        let network_id = NetworkId::from(owner.verifying_key().to_bytes());
+        let src = NodeId::from([1u8; 32]);
+        let offline_member = NodeId::from([2u8; 32]);
+        let rosters = RosterStore::new();
+        rosters
+            .set(&roster_with_members(
+                &owner,
+                network_id,
+                vec![src, offline_member],
+                4_000_000_000,
+            ))
+            .unwrap();
+        let registry = SessionRegistry::new();
+        let (_supersede_rx, _outbound_rx, mut forward_rx) =
+            registry.attach(src, 1, vec![network_id]);
+        let labels = LabelRegistry::new();
+        let table = ForwardTable::new();
+        let (e2e, flags, payload) = reliable_send(1_234);
+
+        let outcome = table.forward(
+            &rosters,
+            &registry,
+            &labels,
+            &test_limits(),
+            &src,
+            &[network_id],
+            &offline_member,
+            e2e,
+            flags,
+            payload,
+            1_000,
+        );
+        assert!(matches!(
+            outcome,
+            ForwardOutcome::Refused(ErrorBody {
+                code: ErrorCode::PeerOffline,
+                ..
+            })
+        ));
+
+        match forward_rx.try_recv() {
+            Ok(ForwardItem::Credit { peer, bytes }) => {
+                assert_eq!(peer, offline_member);
+                assert_eq!(bytes, 1_234);
+            }
+            Ok(ForwardItem::Recv { .. }) => panic!("expected a Credit item, got a Recv item"),
+            Err(_) => panic!("expected a Credit reimbursement, got nothing"),
+        }
+    }
+
+    #[test]
+    fn a_refused_droppable_send_reimburses_nothing() {
+        // The mirror of the test above: a droppable SEND never consumed
+        // any of `src`'s local credit in the first place (protocol.md
+        // 4.2: only reliable SENDs are credited), so a refusal of one
+        // must not fabricate a CREDIT record either.
+        let rosters = RosterStore::new();
+        let registry = SessionRegistry::new();
+        let src = NodeId::from([1u8; 32]);
+        let (_supersede_rx, _outbound_rx, mut forward_rx) = registry.attach(src, 1, vec![]);
+        let labels = LabelRegistry::new();
+        let table = ForwardTable::new();
+        let (e2e, flags, payload) = droppable_send(10);
+
+        // No roster at all: refused as Forbidden, the very first check
+        // after the e2e_proto one.
+        let outcome = table.forward(
+            &rosters,
+            &registry,
+            &labels,
+            &test_limits(),
+            &src,
+            &[],
+            &NodeId::from([2u8; 32]),
+            e2e,
+            flags,
+            payload,
+            1_000,
+        );
+        assert!(matches!(
+            outcome,
+            ForwardOutcome::Refused(ErrorBody {
+                code: ErrorCode::Forbidden,
+                ..
+            })
+        ));
+        assert!(forward_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn a_credit_violation_reimburses_nothing() {
+        // Unlike every other refusal, CreditViolation ends `src`'s
+        // session (the caller's job once `forward` returns it) — there
+        // is nothing to reimburse a session that is about to close, and
+        // doing so would be meaningless besides.
+        let mut f = fixture(4_000_000_000);
+        let table = ForwardTable::new();
+        let limits = Limits {
+            max_record: 65_535,
+            max_peers: 10,
+            credit: 100,
+        };
+        let (e2e, flags, payload) = reliable_send(101);
+        let outcome = table.forward(
+            &f.rosters,
+            &f.registry,
+            &f.labels,
+            &limits,
+            &f.src,
+            &[f.network_id],
+            &f.dst,
+            e2e,
+            flags,
+            payload,
+            1_000,
+        );
+        assert!(matches!(outcome, ForwardOutcome::CreditViolation(_)));
+        assert!(f._src_handles.2.try_recv().is_err());
+    }
+
+    #[test]
+    fn a_stale_pair_generation_drain_never_touches_a_fresh_pairs_own_ledger() {
+        // Regression test for TODO.md L4b's own review (finding 4b): a
+        // `ForwardItem::Recv` admitted under one `PairState` generation,
+        // drained only after `clear_for` plus a fresh `forward` recreated
+        // the same `(src, dst)` key, must not apply its effects to the
+        // *new* generation's own bookkeeping — neither granting credit
+        // it never actually spent against the fresh ledger, nor
+        // shrinking the fresh queue occupancy. Whether the wire CREDIT
+        // record itself still reaches `src` is a separate question,
+        // gated on `src`'s own session currency, not this pair's
+        // generation — see the two tests below, added after this fix's
+        // first version turned out to have a real bug of its own (a
+        // second review round, live-reproduced): gating the CREDIT
+        // record on the pair's generation alone meant a `dst`-only
+        // reconnect could permanently strand `src`'s credit too, even
+        // though `src` itself never reconnected.
+        let mut f = fixture(4_000_000_000);
+        let table = ForwardTable::new();
+        let (e2e, flags, payload) = reliable_send(1_000);
+        table.forward(
+            &f.rosters,
+            &f.registry,
+            &f.labels,
+            &test_limits(),
+            &f.src,
+            &[f.network_id],
+            &f.dst,
+            e2e,
+            flags,
+            payload,
+            1_000,
+        );
+        let stale_generation = table.generation_of(&f.src, &f.dst).unwrap();
+        let src_session_id = f.registry.attached_session_id(&f.src).unwrap();
+
+        // `src` reconnects: its pairs are cleared (mirroring
+        // `crate::session`'s real call on a fresh attach), then it sends
+        // again, creating a fresh `PairState` — a fresh generation — at
+        // the same key.
+        table.clear_for(&f.src);
+        let (e2e, flags, payload) = reliable_send(1);
+        table.forward(
+            &f.rosters,
+            &f.registry,
+            &f.labels,
+            &test_limits(),
+            &f.src,
+            &[f.network_id],
+            &f.dst,
+            e2e,
+            flags,
+            payload,
+            1_000,
+        );
+        let fresh_generation = table.generation_of(&f.src, &f.dst).unwrap();
+        assert_ne!(
+            stale_generation, fresh_generation,
+            "a pair recreated after clear_for must get a new generation"
+        );
+        let fresh_credit_before = table.remaining_credit(&f.src, &f.dst).unwrap();
+        let fresh_queued_before = table.queued_bytes(&f.src, &f.dst).unwrap();
+        while f._dst_handles.2.try_recv().is_ok() {}
+
+        // The stale item, admitted before the reconnect, finally drains.
+        table.drained(
+            &f.registry,
+            &f.src,
+            &f.dst,
+            1_000,
+            true,
+            stale_generation,
+            src_session_id,
+        );
+
+        assert_eq!(
+            table.remaining_credit(&f.src, &f.dst).unwrap(),
+            fresh_credit_before,
+            "a stale drain must not grant credit to the fresh generation's own ledger"
+        );
+        assert_eq!(
+            table.queued_bytes(&f.src, &f.dst).unwrap(),
+            fresh_queued_before,
+            "a stale drain must not shrink the fresh generation's own queue occupancy"
+        );
+    }
+
+    #[test]
+    fn a_stale_drain_still_credits_src_when_only_dst_reconnected() {
+        // The regression this fix's second round exists for: `dst`
+        // reconnecting resets the (src, dst) pair too (`clear_for`
+        // clears a NodeId's pairs in both roles), but `src` itself never
+        // reconnected — its own local credit tracking has no visibility
+        // into `dst`'s reconnects at all and genuinely spent this
+        // charge, so it is still owed reimbursement regardless of what
+        // happened to the pair's own generation.
+        let mut f = fixture(4_000_000_000);
+        let table = ForwardTable::new();
+        let (e2e, flags, payload) = reliable_send(1_000);
+        table.forward(
+            &f.rosters,
+            &f.registry,
+            &f.labels,
+            &test_limits(),
+            &f.src,
+            &[f.network_id],
+            &f.dst,
+            e2e,
+            flags,
+            payload,
+            1_000,
+        );
+        let stale_generation = table.generation_of(&f.src, &f.dst).unwrap();
+        let src_session_id = f.registry.attached_session_id(&f.src).unwrap();
+        while f._dst_handles.2.try_recv().is_ok() {}
+
+        // `dst` reconnects: a fresh registry session and, via
+        // `clear_for(dst)` (mirroring `crate::session`'s real call on a
+        // fresh attach), a fresh `PairState` for (src, dst). `src`
+        // itself is untouched throughout.
+        let _new_dst_handles = f.registry.attach(f.dst, 99, vec![f.network_id]);
+        table.clear_for(&f.dst);
+
+        // The item admitted before dst's reconnect finally drains (dst's
+        // old connection either handed it off just before tearing down,
+        // or tore down with it still queued — either way, from src's own
+        // perspective this charge was genuinely spent and is genuinely
+        // owed back).
+        table.drained(
+            &f.registry,
+            &f.src,
+            &f.dst,
+            1_000,
+            true,
+            stale_generation,
+            src_session_id,
+        );
+
+        match f._src_handles.2.try_recv() {
+            Ok(ForwardItem::Credit { peer, bytes }) => {
+                assert_eq!(peer, f.dst);
+                assert_eq!(bytes, 1_000);
+            }
+            other => {
+                panic!("expected src to be reimbursed regardless of dst's reconnect, got {other:?}")
+            }
+        }
+    }
+
+    #[test]
+    fn a_stale_drain_does_not_credit_a_superseded_src_session() {
+        // The genuine positive case finding 4a/4b's original fix was
+        // for: `src` itself reconnects (a real new `SessionRegistry`
+        // session, not just a `ForwardTable` reset), so its *local*
+        // ledger is fresh and has nothing to do with what the old
+        // session spent; a stale drain must not credit the new session
+        // for the old one's spending.
+        let mut f = fixture(4_000_000_000);
+        let table = ForwardTable::new();
+        let (e2e, flags, payload) = reliable_send(1_000);
+        table.forward(
+            &f.rosters,
+            &f.registry,
+            &f.labels,
+            &test_limits(),
+            &f.src,
+            &[f.network_id],
+            &f.dst,
+            e2e,
+            flags,
+            payload,
+            1_000,
+        );
+        let stale_generation = table.generation_of(&f.src, &f.dst).unwrap();
+        let stale_src_session_id = f.registry.attached_session_id(&f.src).unwrap();
+        while f._dst_handles.2.try_recv().is_ok() {}
+
+        // `src` reconnects: a genuinely new registry session id.
+        let _new_src_handles =
+            f.registry
+                .attach(f.src, stale_src_session_id + 1, vec![f.network_id]);
+
+        table.drained(
+            &f.registry,
+            &f.src,
+            &f.dst,
+            1_000,
+            true,
+            stale_generation,
+            stale_src_session_id,
+        );
+
+        assert!(
+            f._src_handles.2.try_recv().is_err(),
+            "the old, superseded src session must not receive a credit meant for whatever \
+             session is current"
+        );
     }
 }
