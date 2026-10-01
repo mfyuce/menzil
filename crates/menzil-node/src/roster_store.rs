@@ -12,17 +12,23 @@
 //! not be forgotten and relearned every time.
 
 use std::collections::HashMap;
-use std::sync::RwLock;
+use std::sync::{Arc, RwLock};
 
 use ed25519_dalek::VerifyingKey;
 use menzil_proto::{NetworkId, ProtoError, Roster, RosterBody};
 
 use crate::error::NodeError;
 
-/// This node's held Rosters, at most one per network.
+/// This node's held Rosters, at most one per network. The decoded
+/// [`RosterBody`] is kept behind an [`Arc`] (not inline) so [`Self::body`]
+/// is a cheap pointer clone regardless of document size — a red-team
+/// review of `crate::policy_store` (TODO.md L4c) measured an inline clone
+/// of a near-[`menzil_proto::MAX_DOC_BYTES`] document at several
+/// milliseconds, a real cost once something calls this on every OPEN
+/// rather than only at the rate-limited L4 handshake.
 #[derive(Default)]
 pub struct RosterStore {
-    by_network: RwLock<HashMap<NetworkId, (Roster, RosterBody)>>,
+    by_network: RwLock<HashMap<NetworkId, (Roster, Arc<RosterBody>)>>,
 }
 
 impl RosterStore {
@@ -59,7 +65,7 @@ impl RosterStore {
         {
             return Ok(false);
         }
-        guard.insert(body.network_id, (roster.clone(), body));
+        guard.insert(body.network_id, (roster.clone(), Arc::new(body)));
         Ok(true)
     }
 
@@ -82,6 +88,20 @@ impl RosterStore {
             .unwrap()
             .get(network_id)
             .map(|(_, body)| body.seq)
+    }
+
+    /// The currently held, decoded [`RosterBody`] for `network_id`, if
+    /// any — for a caller (`crate::policy_store`) that needs to inspect
+    /// `members`, `revoked`, or `expires` directly rather than only `seq`
+    /// or the verbatim signed form. An [`Arc`] clone out from under the
+    /// lock rather than a guard, matching [`Self::get`]; cheap regardless
+    /// of call frequency (see this struct's own doc comment).
+    pub fn body(&self, network_id: &NetworkId) -> Option<Arc<RosterBody>> {
+        self.by_network
+            .read()
+            .unwrap()
+            .get(network_id)
+            .map(|(_, body)| body.clone())
     }
 }
 

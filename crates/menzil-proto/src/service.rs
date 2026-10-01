@@ -111,6 +111,16 @@ impl ServiceId {
             label: label.into(),
         }
     }
+
+    /// Whether `self` is matched by `pattern` as a [`ServicePattern`]
+    /// (protocol.md 2.4: "`ServicePattern` allows `*` in the label
+    /// position only"). `kind` must match exactly; `label` matches
+    /// exactly, or `pattern.label` is the literal string `"*"`. Used to
+    /// check a [`crate::network::Grant`]'s `services` against the
+    /// specific service an OPEN names (protocol.md 5.3).
+    pub fn matches_pattern(&self, pattern: &ServicePattern) -> bool {
+        self.kind == pattern.kind && (pattern.label == "*" || pattern.label == self.label)
+    }
 }
 
 impl fmt::Display for ServiceId {
@@ -174,6 +184,27 @@ mod tests {
     #[test]
     fn rejects_missing_separator() {
         assert!("tcpssh".parse::<ServiceId>().is_err());
+    }
+
+    #[test]
+    fn matches_pattern_requires_exact_kind_and_exact_or_star_label() {
+        let ssh: ServiceId = "tcp:ssh".parse().unwrap();
+        assert!(ssh.matches_pattern(&"tcp:ssh".parse().unwrap()));
+        assert!(ssh.matches_pattern(&"tcp:*".parse().unwrap()));
+        assert!(!ssh.matches_pattern(&"tcp:web".parse().unwrap()));
+        assert!(!ssh.matches_pattern(&"udp:*".parse().unwrap()));
+    }
+
+    #[test]
+    fn matches_pattern_a_wildcard_pattern_matches_the_literal_wildcard_service() {
+        // `egress:*` is a real ServiceId (protocol.md 2.4), not only a
+        // pattern; a pattern of `egress:*` must still match it. (Not a
+        // test of the exact-label branch specifically — with `self.label`
+        // literally `"*"` too, `pattern.label == "*"` and
+        // `pattern.label == self.label` are both true at once here, so
+        // this exercises the `||` as a whole, not one arm in isolation.)
+        let egress: ServiceId = "egress:*".parse().unwrap();
+        assert!(egress.matches_pattern(&"egress:*".parse().unwrap()));
     }
 
     #[test]
