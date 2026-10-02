@@ -1025,6 +1025,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "menzil-e2e"
+version = "0.0.1"
+dependencies = [
+ "ed25519-dalek",
+ "menzil-proto",
+ "rand",
+ "snow",
+ "thiserror",
+]
+
+[[package]]
 name = "menzil-node"
 version = "0.0.1"
 dependencies = [

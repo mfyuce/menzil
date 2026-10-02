@@ -4,6 +4,7 @@ members = [
     "crates/menzil-proto",
     "crates/menzil-carrier",
     "crates/menzil-session",
+    "crates/menzil-e2e",
     "crates/menzil-relay",
     "crates/menzil-node",
     "crates/menzil",
