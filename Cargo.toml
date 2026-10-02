@@ -5,6 +5,7 @@ members = [
     "crates/menzil-carrier",
     "crates/menzil-session",
     "crates/menzil-e2e",
+    "crates/menzil-stream",
     "crates/menzil-relay",
     "crates/menzil-node",
     "crates/menzil",

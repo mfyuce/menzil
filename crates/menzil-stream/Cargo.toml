@@ -1,0 +1,17 @@
+[package]
+name = "menzil-stream"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+menzil-proto = { path = "../menzil-proto" }
+yamux = "0.14.1"
+futures-util = { version = "0.3.34", default-features = false, features = ["std", "io"] }
+futures-channel = "0.3.34"
+thiserror.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "macros", "time"] }
