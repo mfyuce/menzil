@@ -97,6 +97,14 @@ pub enum ErrorCode {
     /// `grant_removed` (protocol.md 5.3): an L5 stream or channel closed
     /// because the grant that authorized it no longer exists.
     GrantRemoved,
+    /// `invalid_target` (protocol.md 5.3): an OPEN named a non-null
+    /// `target` for a `service` other than `egress:*`, which the spec
+    /// states is never valid ("`target` must be null unless `service` is
+    /// `egress:*`"). Not named by the spec as a literal OPEN_ACK string
+    /// (menzil-proto's own `stream` module doc comment leaves this check,
+    /// and so its refusal code, to TODO.md L4g); this crate assigns it a
+    /// number the same way it does for every other code in this registry.
+    InvalidTarget,
     /// A code this build does not recognize, preserved verbatim.
     Unknown(u16),
 }
@@ -122,6 +130,7 @@ impl ErrorCode {
     const UNKNOWN_TYPE: u16 = 18;
     const NO_GRANT: u16 = 19;
     const GRANT_REMOVED: u16 = 20;
+    const INVALID_TARGET: u16 = 21;
 
     /// The symbolic name from protocol.md, e.g. `"bad_cert"`.
     pub fn name(self) -> &'static str {
@@ -146,6 +155,7 @@ impl ErrorCode {
             Self::UnknownType => "unknown_type",
             Self::NoGrant => "no_grant",
             Self::GrantRemoved => "grant_removed",
+            Self::InvalidTarget => "invalid_target",
             Self::Unknown(_) => "unknown",
         }
     }
@@ -174,6 +184,7 @@ impl From<ErrorCode> for u16 {
             ErrorCode::UnknownType => ErrorCode::UNKNOWN_TYPE,
             ErrorCode::NoGrant => ErrorCode::NO_GRANT,
             ErrorCode::GrantRemoved => ErrorCode::GRANT_REMOVED,
+            ErrorCode::InvalidTarget => ErrorCode::INVALID_TARGET,
             ErrorCode::Unknown(code) => code,
         }
     }
@@ -202,6 +213,7 @@ impl From<u16> for ErrorCode {
             Self::UNKNOWN_TYPE => Self::UnknownType,
             Self::NO_GRANT => Self::NoGrant,
             Self::GRANT_REMOVED => Self::GrantRemoved,
+            Self::INVALID_TARGET => Self::InvalidTarget,
             other => Self::Unknown(other),
         }
     }
@@ -246,6 +258,7 @@ mod tests {
             ErrorCode::UnknownType,
             ErrorCode::NoGrant,
             ErrorCode::GrantRemoved,
+            ErrorCode::InvalidTarget,
         ];
         for code in codes {
             let wire: u16 = code.into();

@@ -9,22 +9,23 @@
 //! directly (this crate does not depend on `menzil-e2e` at all; a caller
 //! decrypts a `data` frame itself, and only ever hands this crate the
 //! `Vec<u8>` out of a decoded `E2eDataBody::Mux(_)`, or receives one back
-//! to encrypt as a fresh one). What this crate deliberately does *not* do,
-//! left to later TODO.md items building on top of it: the OPEN/OPEN_ACK
-//! exchange and the `Authorizer`/`ServiceHandler` service model (L4g);
-//! joining this into a running node, path-pinning it to an L3 epoch, or
-//! deciding what an ended [`Driver`] means for the L4 session it rode on
-//! (L4h); dispatching an opened stream to a local `tcp:`/`http:`/`tls:`
-//! target (L4i). [`StreamMux::feed_inbound`]/[`OutboundFrames::next_frame`]
-//! are this crate's only seam to whatever carries `Mux` records over the
-//! wire — intentionally not even aware that the carrier is Noise over a
-//! relay-forwarded SEND/RECV record, so a future QUIC-based L4 (decision
-//! 0001's `e2e_proto 0x02`) could in principle reuse the OPEN/OPEN_ACK and
-//! service-model layer above this crate without this crate itself
-//! changing, by swapping its concrete [`Stream`] type for a QUIC one —
-//! the structural goal decision 0001 states directly ("the L5 OPEN and
-//! OPEN_ACK headers and the service model are defined independently of
-//! the mux so that the QUIC change stays below them").
+//! to encrypt as a fresh one). [`StreamMux::feed_inbound`]/
+//! [`OutboundFrames::next_frame`] are this crate's only seam to whatever
+//! carries `Mux` records over the wire — intentionally not even aware
+//! that the carrier is Noise over a relay-forwarded SEND/RECV record.
+//!
+//! This crate also now holds the L5 OPEN/OPEN_ACK exchange and the
+//! `Authorizer`/`ServiceHandler` service model (TODO.md L4g, this
+//! crate's [`open`] module) — generic over any stream, not only this
+//! crate's own [`Stream`], so a future QUIC-based L4 (decision 0001's
+//! `e2e_proto 0x02`) reuses that layer unchanged by supplying its own
+//! stream type, the structural goal decision 0001 states directly ("the
+//! L5 OPEN and OPEN_ACK headers and the service model are defined
+//! independently of the mux so that the QUIC change stays below them").
+//! Still left to later TODO.md items: joining this into a running node,
+//! path-pinning it to an L3 epoch, or deciding what an ended [`Driver`]
+//! means for the L4 session it rode on (L4h); dispatching an opened
+//! stream to a local `tcp:`/`http:`/`tls:` target (L4i).
 //!
 //! **Why this crate is async (`futures`-native) rather than sans-IO like
 //! `menzil-session`/`menzil-e2e`**: those two crates are synchronous and
@@ -97,9 +98,14 @@
 mod driver;
 mod error;
 mod frame_format;
+mod open;
 mod record_io;
 
 pub use driver::{Driver, Inbound, OutboundFrames, StreamMux, new};
 pub use error::StreamMuxError;
 pub use frame_format::FrameFormatError;
+pub use open::{
+    Authorizer, OpenDecision, OpenError, OpenRefusal, OpenRequest, Responded, ServiceHandler,
+    initiate_open, respond_to_open,
+};
 pub use yamux::{Mode, Stream};
