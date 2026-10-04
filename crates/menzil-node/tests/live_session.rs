@@ -39,14 +39,17 @@ use std::time::Duration;
 
 use ed25519_dalek::SigningKey;
 use menzil_carrier::{ConnectionInfo, DialConfig, ProxyOverride};
-use menzil_node::{LocalIdentity, OutboundSend, RosterStore, SessionConfig, run_session};
+use menzil_node::{
+    EnqueueOutcome, Epoch, LocalIdentity, OutboundSend, RosterStore, Session, SessionConfig,
+    SessionEvent, run_session,
+};
 use menzil_proto::{
     Limits, NetworkId, NodeCert, NodeCertBody, NodeId, PROTOCOL_VERSION, Record, Roster,
     RosterBody, RosterMember, X25519PublicKey,
 };
 use menzil_relay::{Listener, Relay, RelayIdentity, server_config};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio::time::timeout;
 
 /// Generous: nothing here is expected to take more than a second or two,
@@ -182,17 +185,13 @@ fn seed_roster(relay: &TestRelay, members: &[&Identity]) -> NetworkId {
     network_id
 }
 
-/// Runs [`run_session`] for `id` against `relay`, with the caller's ends
-/// of its `events` and `outbound` channels handed in and out explicitly so
-/// a test can size them, or pre-fill `outbound` before the node dials.
-fn spawn_node(
-    relay: &TestRelay,
-    id: &Identity,
-    network_id: NetworkId,
-    events: mpsc::Sender<Record>,
-    outbound: mpsc::Receiver<OutboundSend>,
-) -> tokio::task::JoinHandle<()> {
-    let config = SessionConfig {
+/// Everything [`Session::connect`] or [`spawn_node`] needs to dial
+/// `relay` as `id`, claiming `network_id`; split out of [`spawn_node`]
+/// so a test can also drive a raw, second [`Session::connect`] under the
+/// same identity (to force a supersede-triggered reconnect) without
+/// duplicating this.
+fn session_config(relay: &TestRelay, id: &Identity, network_id: NetworkId) -> SessionConfig {
+    SessionConfig {
         dial: DialConfig {
             connection_info: ConnectionInfo {
                 host: "localhost".to_string(),
@@ -210,9 +209,21 @@ fn spawn_node(
         networks: vec![network_id],
         caps: vec![],
         e2e_protos: vec![0x01],
-    };
+    }
+}
+
+/// Runs [`run_session`] for `id` against `relay`, with the caller's ends
+/// of its `events` and `outbound` channels handed in and out explicitly so
+/// a test can size them, or pre-fill `outbound` before the node dials.
+fn spawn_node(
+    relay: &TestRelay,
+    id: &Identity,
+    network_id: NetworkId,
+    events: mpsc::Sender<SessionEvent>,
+    outbound: mpsc::Receiver<OutboundSend>,
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(run_session(
-        config,
+        session_config(relay, id, network_id),
         HashMap::new(),
         events,
         outbound,
@@ -220,25 +231,63 @@ fn spawn_node(
     ))
 }
 
-fn reliable(dst: NodeId, payload: Vec<u8>) -> OutboundSend {
+/// `epoch` is [`Epoch::first`] for a send queued before `dst`'s very
+/// first attachment, or whatever epoch a prior [`SessionEvent::Attached`]
+/// reported. The admission outcome is resolved to nobody — see
+/// [`reliable_with_outcome`] for a test that wants to inspect it.
+fn reliable(dst: NodeId, epoch: Epoch, payload: Vec<u8>) -> OutboundSend {
+    let (outcome, _rx) = oneshot::channel();
     OutboundSend {
         dst,
         e2e_proto: 0x01,
         flags: 0x00,
         payload,
+        epoch,
+        outcome,
     }
 }
 
+/// Like [`reliable`], but also hands back the receiving half of this
+/// send's admission outcome.
+fn reliable_with_outcome(
+    dst: NodeId,
+    epoch: Epoch,
+    payload: Vec<u8>,
+) -> (OutboundSend, oneshot::Receiver<EnqueueOutcome>) {
+    let (outcome, rx) = oneshot::channel();
+    (
+        OutboundSend {
+            dst,
+            e2e_proto: 0x01,
+            flags: 0x00,
+            payload,
+            epoch,
+            outcome,
+        },
+        rx,
+    )
+}
+
 /// The next RECV on `events` from `src`, skipping anything else (a probe
-/// from someone else, an ERROR); `None` if none arrives within [`PATIENCE`].
-async fn next_recv_from(events: &mut mpsc::Receiver<Record>, src: NodeId) -> Option<Vec<u8>> {
+/// from someone else, an ERROR) *and* a literal `b"probe"` payload from
+/// `src` itself — `wait_until_routable`'s own probes share `src` with
+/// whatever real payload a test sends right after it, and its cleanup
+/// drain can only ever clear what is already sitting in `events`' own
+/// buffer, not whatever is still upstream in the prober's `outbound`
+/// queue or in flight; those trickle in later, well after cleanup, and
+/// would otherwise read back as real data here. `None` if nothing
+/// besides probes arrives within [`PATIENCE`].
+async fn next_recv_from(events: &mut mpsc::Receiver<SessionEvent>, src: NodeId) -> Option<Vec<u8>> {
     timeout(PATIENCE, async {
         loop {
-            match events.recv().await? {
-                Record::Recv {
+            if let SessionEvent::Record { record, .. } = events.recv().await?
+                && let Record::Recv {
                     src: from, payload, ..
-                } if from == src => return Some(payload),
-                _ => {}
+                } = *record
+                && from == src
+                && payload != b"probe"
+            {
+                return Some(payload);
             }
         }
     })
@@ -254,17 +303,18 @@ async fn next_recv_from(events: &mut mpsc::Receiver<Record>, src: NodeId) -> Opt
 async fn wait_until_routable(
     from_outbound: &mpsc::Sender<OutboundSend>,
     from: NodeId,
-    to_events: &mut mpsc::Receiver<Record>,
+    to_events: &mut mpsc::Receiver<SessionEvent>,
     to: NodeId,
 ) {
     let probed = timeout(PATIENCE, async {
         loop {
             from_outbound
-                .send(reliable(to, b"probe".to_vec()))
+                .send(reliable(to, Epoch::first(), b"probe".to_vec()))
                 .await
                 .unwrap();
-            if let Ok(Some(Record::Recv { src, .. })) =
+            if let Ok(Some(SessionEvent::Record { record, .. })) =
                 timeout(Duration::from_millis(100), to_events.recv()).await
+                && let Record::Recv { src, .. } = *record
                 && src == from
             {
                 return;
@@ -282,6 +332,7 @@ async fn run_session_over_a_live_relay() {
     let trust = trust_test_certificate();
     reliable_sends_to_one_peer_arrive_in_the_order_they_were_queued(&trust).await;
     a_caller_that_both_reads_events_and_writes_outbound_cannot_deadlock(&trust).await;
+    a_reconnect_gets_a_fresh_epoch_and_refuses_a_stale_tagged_send(&trust).await;
 }
 
 /// Regression test for TODO.md L4b's review, finding 1, at the wire: with
@@ -325,7 +376,7 @@ async fn reliable_sends_to_one_peer_arrive_in_the_order_they_were_queued(trust: 
     let (sender_outbound, sender_outbound_rx) = mpsc::channel(64);
     for (tag, len) in [(0u8, 60_000), (1, 50_000), (2, 100)] {
         sender_outbound
-            .send(reliable(receiver.node_id, vec![tag; len]))
+            .send(reliable(receiver.node_id, Epoch::first(), vec![tag; len]))
             .await
             .unwrap();
     }
@@ -363,6 +414,25 @@ async fn reliable_sends_to_one_peer_arrive_in_the_order_they_were_queued(trust: 
 /// `run_session` that awaited `events.send()` inside its select would stop
 /// draining `outbound` while that send is stuck, and the caller's second
 /// `outbound` write would then never complete: a permanent hang.
+///
+/// Also where TODO.md's own long-flaky `live_session.rs` entry traced
+/// its root cause: `wait_until_routable` must probe *from* `peer` here
+/// (not a dedicated third identity, unlike the order test above) to
+/// prove `peer` itself, not just `caller`, is attached before the real
+/// payload below is queued. `caller_events`' own capacity of 1 means its
+/// cleanup drain can only ever clear the single probe already sitting in
+/// that one slot; every earlier probe `wait_until_routable`'s loop also
+/// sent is still upstream at that point — queued in `peer`'s own
+/// `outbound`, mid-network, or mid-decrypt on `caller`'s side — and
+/// trickles in one at a time well *after* cleanup has already returned,
+/// landing in this very loop with the same `src` as the real payload,
+/// read back as `[112, ...]` (`b'p'`) instead of `0xB0..`. Fixed by
+/// filtering the literal probe payload out of `received` below, the fix
+/// this item's own TODO line named as the alternative to a separate
+/// prober identity; live A/B verified under artificial load (opus
+/// red-team review of this item, 2026-10-04): an unfiltered copy of this
+/// test failed 19 of 24 runs with exactly this shape, the shipped,
+/// filtered version 15 of 15.
 async fn a_caller_that_both_reads_events_and_writes_outbound_cannot_deadlock(trust: &TestTrust) {
     let relay = start_relay(trust, 1_048_576).await;
     let (caller, peer) = (identity(), identity());
@@ -390,7 +460,11 @@ async fn a_caller_that_both_reads_events_and_writes_outbound_cannot_deadlock(tru
 
     for i in 0..4u8 {
         peer_outbound
-            .send(reliable(caller.node_id, vec![0xB0 + i; 1_000]))
+            .send(reliable(
+                caller.node_id,
+                Epoch::first(),
+                vec![0xB0 + i; 1_000],
+            ))
             .await
             .unwrap();
     }
@@ -401,15 +475,20 @@ async fn a_caller_that_both_reads_events_and_writes_outbound_cannot_deadlock(tru
     let caller_loop = async move {
         for i in 0..4u8 {
             caller_outbound
-                .send(reliable(peer_id, vec![0xA0 + i; 1_000]))
+                .send(reliable(peer_id, Epoch::first(), vec![0xA0 + i; 1_000]))
                 .await
                 .unwrap();
         }
         let mut received = Vec::new();
         while received.len() < 4 {
             match caller_events.recv().await {
-                Some(Record::Recv { src, payload, .. }) if src == peer_id => {
-                    received.push(payload[0])
+                Some(SessionEvent::Record { record, .. }) => {
+                    if let Record::Recv { src, payload, .. } = *record
+                        && src == peer_id
+                        && payload != b"probe"
+                    {
+                        received.push(payload[0]);
+                    }
                 }
                 Some(_) => {}
                 None => break,
@@ -432,5 +511,96 @@ async fn a_caller_that_both_reads_events_and_writes_outbound_cannot_deadlock(tru
     assert_eq!(delivered, vec![0xA0, 0xA1, 0xA2, 0xA3]);
 
     caller_task.abort();
+    peer_task.abort();
+}
+
+/// Regression test for TODO.md L4h1: a fresh attachment's epoch is
+/// surfaced to the caller, in order, strictly before any record from it;
+/// a reconnect gets the next epoch, never a repeat of the last one; and
+/// an `OutboundSend` tagged for an epoch that is no longer current is
+/// refused with `EnqueueOutcome::WrongEpoch`, promptly, *during* the
+/// reconnect gap itself (not only once reattached) — the exact gap this
+/// item closes ("a send queued during a reconnect goes out on the next
+/// L3 session"). A send tagged for the new epoch is then shown to
+/// actually go through, as the positive control: were the refusal above
+/// not real (a stale send silently reaching `peer` anyway), it was
+/// queued first and would arrive first, so this would observe it instead
+/// of the fresh payload. The reconnect itself is forced the same way
+/// `menzil-relay`'s own `session_tests.rs` already proves reliable: a
+/// second, raw `Session::connect` under the identical identity
+/// supersedes the first, which the relay ends with GOAWAY.
+async fn a_reconnect_gets_a_fresh_epoch_and_refuses_a_stale_tagged_send(trust: &TestTrust) {
+    let relay = start_relay(trust, 100_000).await;
+    let (node, peer) = (identity(), identity());
+    let network_id = seed_roster(&relay, &[&node, &peer]);
+
+    let (node_events_tx, mut node_events) = mpsc::channel(64);
+    let (node_outbound, node_outbound_rx) = mpsc::channel(64);
+    let node_task = spawn_node(&relay, &node, network_id, node_events_tx, node_outbound_rx);
+    let (peer_events_tx, mut peer_events) = mpsc::channel(64);
+    let (_peer_outbound, peer_outbound_rx) = mpsc::channel(64);
+    let peer_task = spawn_node(&relay, &peer, network_id, peer_events_tx, peer_outbound_rx);
+
+    let (epoch1, limits) = match timeout(PATIENCE, node_events.recv()).await {
+        Ok(Some(SessionEvent::Attached { epoch, limits })) => (epoch, limits),
+        other => panic!("expected Attached as the very first event, got {other:?}"),
+    };
+    assert_eq!(epoch1, Epoch::first());
+    assert!(
+        limits.max_record > 0,
+        "WELCOME's own limits must actually reach the caller"
+    );
+    wait_until_routable(&node_outbound, node.node_id, &mut peer_events, peer.node_id).await;
+
+    let usurper = Session::connect(
+        &session_config(&relay, &node, network_id),
+        &HashMap::new(),
+        Arc::new(RosterStore::new()),
+    )
+    .await
+    .unwrap();
+    drop(usurper);
+
+    loop {
+        match timeout(PATIENCE, node_events.recv()).await {
+            Ok(Some(SessionEvent::Detached { epoch })) => {
+                assert_eq!(
+                    epoch, epoch1,
+                    "must detach from the epoch it was attached to"
+                );
+                break;
+            }
+            Ok(Some(_)) => continue,
+            other => panic!("expected Detached after being superseded, got {other:?}"),
+        }
+    }
+
+    // Queued right in the reconnect gap, strictly before the new epoch's
+    // own `Attached` is even observed.
+    let (stale, stale_outcome) = reliable_with_outcome(peer.node_id, epoch1, b"stale".to_vec());
+    node_outbound.send(stale).await.unwrap();
+    assert_eq!(
+        stale_outcome.await.unwrap(),
+        EnqueueOutcome::WrongEpoch,
+        "a send tagged for a past epoch must be refused during the reconnect gap itself"
+    );
+
+    let epoch2 = match timeout(PATIENCE, node_events.recv()).await {
+        Ok(Some(SessionEvent::Attached { epoch, .. })) => epoch,
+        other => panic!("expected a fresh Attached after reconnecting, got {other:?}"),
+    };
+    assert!(
+        epoch2 > epoch1,
+        "a reconnect must get a new epoch, never repeat the last one"
+    );
+
+    let fresh = reliable(peer.node_id, epoch2, b"fresh".to_vec());
+    node_outbound.send(fresh).await.unwrap();
+    let delivered = next_recv_from(&mut peer_events, node.node_id)
+        .await
+        .expect("a send tagged for the current epoch must actually be delivered");
+    assert_eq!(delivered, b"fresh");
+
+    node_task.abort();
     peer_task.abort();
 }

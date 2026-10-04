@@ -50,6 +50,38 @@ use std::collections::{HashMap, HashSet, VecDeque};
 
 use menzil_proto::{MIN_SEND_CHARGE_BYTES, NodeId, Record, max_send_payload};
 use menzil_session::CreditLedger;
+use tokio::sync::oneshot;
+
+/// One attachment to the relay (protocol.md 5.1's path pinning), counting
+/// from 1 and incrementing on every successful
+/// [`crate::session::Session::connect`] within one
+/// [`crate::session::run_session`] call; never reused or decremented. An
+/// L4 session built on top belongs to exactly the epoch it was opened
+/// under — see [`crate::session::SessionEvent::Attached`] — and must end
+/// rather than silently carry over to a later one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Epoch(u64);
+
+impl Epoch {
+    /// The well-known value for this node's very first attachment —
+    /// also the value a caller should tag an [`OutboundSend`] with when
+    /// queueing it before ever having observed a
+    /// [`crate::session::SessionEvent::Attached`] at all (e.g. a probe
+    /// sent before the node has dialed for the first time): correct as
+    /// long as that first attachment is still outstanding, and safely
+    /// refused with [`EnqueueOutcome::WrongEpoch`] rather than silently
+    /// sent if a reconnect actually happened before it was drained.
+    pub fn first() -> Self {
+        Epoch(1)
+    }
+
+    /// The next attachment's epoch; only [`crate::session::run_session`]
+    /// itself calls this, once per detach — a caller always learns its
+    /// current epoch from an `Attached` event, never by predicting one.
+    pub(crate) fn next(self) -> Self {
+        Epoch(self.0 + 1)
+    }
+}
 
 /// Total bytes this queue holds across every destination before a
 /// further reliable enqueue is refused, and beyond which a droppable
@@ -58,7 +90,7 @@ use menzil_session::CreditLedger;
 /// would not accept more than that from any one (source, destination)
 /// pair anyway, so holding more than that locally, waiting to send,
 /// could never actually be delivered regardless.
-const MAX_QUEUED_BYTES: usize = 4 * 1024 * 1024;
+pub(crate) const MAX_QUEUED_BYTES: usize = 4 * 1024 * 1024;
 
 /// Each destination's own share of [`MAX_QUEUED_BYTES`], capped
 /// separately so one congested peer cannot consume the whole shared
@@ -82,13 +114,10 @@ const MAX_QUEUED_BYTES: usize = 4 * 1024 * 1024;
 /// combined, closing the cross-peer starvation finding 2 is actually
 /// about, while a single busy peer keeps nearly all of its old headroom.
 /// This remains a real, documented trade-off, not a complete fix: the
-/// deeper gap the same review measured — a refused or dropped send has
-/// no way to tell its caller beyond a log line, `EnqueueOutcome` is
-/// silently discarded by `run_session` today — needs an actual
-/// caller-visible signal (a response channel on `OutboundSend`, most
-/// likely) to close properly, which is rightly a design question for
-/// whichever future item builds the first real caller (TODO.md L4d/L4h),
-/// not a number to keep retuning here.
+/// deeper gap the same review measured — a refused or dropped send had
+/// no way to tell its caller beyond a log line, `EnqueueOutcome` was
+/// silently discarded by `run_session` — is closed by `OutboundSend`'s
+/// own `outcome` oneshot (TODO.md L4h1).
 const MAX_QUEUED_BYTES_PER_DST: usize = 3 * MAX_QUEUED_BYTES / 4;
 
 /// One queued SEND, not yet written to the wire.
@@ -121,8 +150,9 @@ impl QueuedSend {
 
 /// A caller's request to send one SEND record (protocol.md 4.2) through
 /// a running L3 session; handed to [`crate::session::run_session`]
-/// through its `outbound` channel.
-#[derive(Debug, Clone)]
+/// through its `outbound` channel. Not [`Clone`]: `outcome` is a
+/// single-use handle.
+#[derive(Debug)]
 pub struct OutboundSend {
     /// The destination peer.
     pub dst: NodeId,
@@ -132,6 +162,34 @@ pub struct OutboundSend {
     pub flags: u8,
     /// Opaque L4 bytes.
     pub payload: Vec<u8>,
+    /// Which attachment this was produced for (protocol.md 5.1's path
+    /// pinning). Refused with [`EnqueueOutcome::WrongEpoch`], never sent,
+    /// once a *different* epoch is current by the time this is drained
+    /// from `outbound` — most often a send queued while reconnecting,
+    /// which before this type gained the field would go out on
+    /// whichever L3 session happened to attach next, as if nothing had
+    /// happened (TODO.md L4h1). See [`Epoch::first`] for what to use
+    /// before this node's very first attachment.
+    pub epoch: Epoch,
+    /// Resolved with this send's admission outcome, exactly once, for
+    /// every send `run_session` actually drains from its `outbound`
+    /// channel (TODO.md L4h1; L4b's own deferred half of its finding 2,
+    /// where this was only ever logged and discarded) — the one
+    /// exception being `run_session` itself returning or being aborted
+    /// while this is still waiting to be admitted: either still
+    /// buffered, undrained, in the `outbound` channel itself, or already
+    /// drained but held in `run_session`'s own small pre-attach queue
+    /// (a send tagged for an epoch that has not attached yet). Either
+    /// way it is simply dropped, along with its `outcome` sender, never
+    /// resolved at all, which a waiting [`oneshot::Receiver`] observes
+    /// as a disconnect, not a hang. Resolving a oneshot nobody
+    /// is listening for is not an error either — dropping the paired
+    /// `Receiver` is the normal way to opt out, not a bug — but a
+    /// caller that *is* listening must be told apart `Accepted` from
+    /// every refusal: an L4 record refused here after `menzil-e2e`
+    /// already assigned it a counter can only end that L4 session,
+    /// never be retried in place.
+    pub outcome: oneshot::Sender<EnqueueOutcome>,
 }
 
 /// Outcome of [`OutboundQueue::enqueue`].
@@ -156,10 +214,25 @@ pub enum EnqueueOutcome {
     /// A reliable send refused because either this destination's own
     /// share, or the shared [`MAX_QUEUED_BYTES`] total, is already
     /// spoken for. Unlike [`Self::Dropped`], this is a caller-visible
-    /// backpressure signal for data this queue will not silently lose
-    /// by discarding — the caller (not yet built, TODO.md L4d/L4h) is
-    /// expected to retry rather than assume it was sent.
+    /// backpressure signal (TODO.md L4h1's own `OutboundSend::outcome`)
+    /// for data this queue will not silently lose by discarding — but
+    /// "retry" means a fresh [`OutboundSend`], not this exact one
+    /// resubmitted: for a caller whose payload already carries an
+    /// `menzil-e2e`-assigned counter, this specific record can only end
+    /// that L4 session, the same as [`Self::WrongEpoch`] and
+    /// [`Self::TooLarge`] (TODO.md L4h1's own text is explicit that none
+    /// of the three are retried in place).
     QueueFull,
+    /// Refused before this queue was even consulted: the
+    /// [`OutboundSend`] this came from was tagged with an
+    /// [`Epoch`] that is no longer the current attachment (TODO.md
+    /// L4h1) — most often a send queued while reconnecting, which
+    /// would otherwise go out on the *next* L3 session as if nothing
+    /// had happened, the same path-pinning violation protocol.md 5.1
+    /// forbids. Retrying under the new epoch, if the caller still wants
+    /// to, is a fresh send with a fresh outcome, not an automatic retry
+    /// of this one.
+    WrongEpoch,
 }
 
 /// Per-destination credit plus one shared pending-send FIFO, all in

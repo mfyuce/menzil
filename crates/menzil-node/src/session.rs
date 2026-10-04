@@ -24,6 +24,18 @@
 //! same way [`Engine`] is; `run_session` only drains it and feeds it
 //! inbound CREDIT records.
 //!
+//! Protocol.md 5.1's path pinning (TODO.md L4h1) — an L4 session belongs
+//! to exactly the L3 attachment it was opened under, never silently
+//! surviving into whichever one attaches next — makes `run_session`
+//! surface each attachment to its own epoch, via [`SessionEvent`]: every
+//! [`Record`] delivery is now wrapped with the [`Epoch`] it arrived
+//! under, framed by `Attached`/`Detached` around it, and an
+//! [`OutboundSend`] carries the epoch it was produced for, refused with
+//! [`EnqueueOutcome::WrongEpoch`] rather than silently sent once that
+//! epoch is no longer current — closing the gap this module's own prior
+//! doc comment did not yet have a name for ("a send queued during a
+//! reconnect goes out on the next L3 session").
+//!
 //! Split in two: [`Engine`] is the pure protocol logic (decrypt, classify
 //! a record, track the liveness/rekey clocks) with no `Carrier` and no
 //! I/O, so it can be driven and tested with any source of ciphertext —
@@ -38,7 +50,7 @@
 //! [`Engine`] instead, and [`Session`]'s I/O glue was read by hand
 //! against protocol.md 4.1's exact message sequence rather than run.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -47,8 +59,9 @@ use tokio::sync::mpsc;
 
 use menzil_carrier::{Backoff, Carrier, ConnectionInfo, DialConfig};
 use menzil_proto::{
-    Capability, DocBody, DocReassembler, DocType, GoawayBody, HelloBody, NetworkId,
-    PROTOCOL_VERSION, Record, Roster, Tai64N, WelcomeBody, X25519PublicKey,
+    Capability, DocBody, DocReassembler, DocType, GoawayBody, HelloBody, Limits,
+    MIN_SEND_CHARGE_BYTES, NetworkId, PROTOCOL_VERSION, Record, Roster, Tai64N, WelcomeBody,
+    X25519PublicKey,
 };
 use menzil_session::{
     HandshakePattern, Liveness, NodeHandshake, RekeySchedule, Transport, prologue,
@@ -56,7 +69,7 @@ use menzil_session::{
 
 use crate::error::NodeError;
 use crate::identity::LocalIdentity;
-use crate::outbound::{EnqueueOutcome, OutboundQueue, OutboundSend};
+use crate::outbound::{EnqueueOutcome, Epoch, MAX_QUEUED_BYTES, OutboundQueue, OutboundSend};
 use crate::roster_store::RosterStore;
 
 /// Everything [`Session::connect`] needs beyond what
@@ -592,66 +605,298 @@ fn tai64n_now() -> Tai64N {
     Tai64N::from(bytes)
 }
 
+/// One event [`run_session`] delivers through `events`, in order:
+/// records interleaved with this L3 session's own attachment lifecycle
+/// (protocol.md 5.1's path pinning, TODO.md L4h1) — an L4 layer built on
+/// top needs this to know which attachment a given record arrived under,
+/// and when one it holds open has ended.
+#[derive(Debug)]
+pub enum SessionEvent {
+    /// This attachment's L3 handshake and ATTACH completed; always the
+    /// first event of `epoch`. `limits` is WELCOME's own (protocol.md
+    /// 4.1) — `limits.max_record` is what an `E2eTransport` or
+    /// `menzil_stream::new` built for this epoch must be sized with.
+    /// Every [`Record`] delivered until the matching `Detached` belongs
+    /// to this same epoch. Not a routability guarantee: the relay sends
+    /// WELCOME unconditionally, before HELLO is even checked, so a HELLO
+    /// this relay goes on to reject (an unknown network, a revoked or
+    /// stale-serial NodeCert) still produces `Attached`, immediately
+    /// followed by a `Record` carrying that rejection as an ERROR, then
+    /// `Detached` — a real but short-lived "phantom" epoch, not a bug in
+    /// this type.
+    Attached {
+        /// This attachment's epoch.
+        epoch: Epoch,
+        /// WELCOME's own limits (protocol.md 4.1).
+        limits: Limits,
+    },
+    /// This attachment ended; always the last event of `epoch`. Any
+    /// [`OutboundSend`] still tagged with it is now refused with
+    /// [`EnqueueOutcome::WrongEpoch`], never sent under whatever
+    /// attachment comes next — but a send already resolved
+    /// [`EnqueueOutcome::Accepted`] and still sitting in this epoch's own
+    /// `OutboundQueue`, never yet handed to the wire, is simply discarded
+    /// with it, the same already-accepted scope of loss
+    /// `OutboundQueue::next_ready_to_send`'s own doc comment describes
+    /// for a connection that just ends: `Accepted` means "admitted to
+    /// the local send queue," never "reached the wire or the peer."
+    Detached {
+        /// The attachment that just ended.
+        epoch: Epoch,
+    },
+    /// One L3 record delivered while `epoch` was attached. Boxed: a bare
+    /// `Record` makes this the largest variant by far (clippy's
+    /// `large_enum_variant`, the same lint `menzil-relay::forward`'s own
+    /// `ForwardItem::Recv` already hit and fixed the identical way).
+    Record {
+        /// Which attachment this arrived under.
+        epoch: Epoch,
+        /// The record itself.
+        record: Box<Record>,
+    },
+}
+
+/// Logs and resolves `req`'s `outcome` to [`EnqueueOutcome::WrongEpoch`]
+/// unconditionally — for a caller that already knows, by construction,
+/// that no epoch `req` could legitimately be tagged with is current
+/// right now (the detach-to-reconnect gap below, once the new epoch has
+/// already been decided but before any caller could possibly have been
+/// told it, since `Attached` for it has not been delivered yet).
+fn refuse_stale(req: OutboundSend) {
+    tracing::warn!(dst = %req.dst, "outbound send tagged for a past epoch, refused");
+    let _ = req.outcome.send(EnqueueOutcome::WrongEpoch);
+}
+
+/// Like [`refuse_stale`], but for the bootstrap window before this
+/// node's *own* next attachment: a send tagged with the epoch about to
+/// attach (`epoch`, not yet current) — most commonly [`Epoch::first`],
+/// queued before this node's very first attachment, exactly the pattern
+/// several live tests rely on — is held in `waiting` rather than refused,
+/// to be admitted once that attachment actually completes; anything else
+/// is refused immediately rather than left to wait out the rest of the
+/// outage unanswered (TODO.md L4h1's own review, finding 2). `waiting`
+/// has no `OutboundQueue` of its own yet to bound it, so `waiting_bytes`
+/// is charged and checked against the same [`MAX_QUEUED_BYTES`] total
+/// `OutboundQueue` itself enforces once one exists — a dial or
+/// handshake that never completes (nothing here has a timeout; a
+/// pre-existing, separate gap) must not let `waiting` grow without
+/// bound in the meantime (found red-teaming this item's own round-one
+/// fix, round two).
+fn hold_or_refuse(
+    req: OutboundSend,
+    epoch: Epoch,
+    waiting: &mut Vec<OutboundSend>,
+    waiting_bytes: &mut usize,
+) {
+    if req.epoch != epoch {
+        refuse_stale(req);
+        return;
+    }
+    let charge = req.payload.len().max(MIN_SEND_CHARGE_BYTES as usize);
+    if *waiting_bytes + charge > MAX_QUEUED_BYTES {
+        tracing::warn!(dst = %req.dst, "outbound queue full while dialing, reliable send refused");
+        let _ = req.outcome.send(EnqueueOutcome::QueueFull);
+        return;
+    }
+    *waiting_bytes += charge;
+    waiting.push(req);
+}
+
+/// Admits `req` into `outbound_queue` and resolves its `outcome`
+/// — the one place this happens, shared by the attached loop's own
+/// drain and by replaying whatever [`hold_or_refuse`] held in `waiting`
+/// once a fresh `outbound_queue` exists for it to be admitted into.
+fn admit(req: OutboundSend, epoch: Epoch, outbound_queue: &mut OutboundQueue) {
+    if req.epoch != epoch {
+        refuse_stale(req);
+        return;
+    }
+    let dst = req.dst;
+    let payload_len = req.payload.len();
+    let outcome = outbound_queue.enqueue(req.dst, req.e2e_proto, req.flags, req.payload);
+    match outcome {
+        EnqueueOutcome::QueueFull => {
+            tracing::warn!(dst = %dst, "node outbound queue full, reliable send refused");
+        }
+        EnqueueOutcome::TooLarge => {
+            tracing::warn!(
+                dst = %dst,
+                payload_len,
+                "outbound send exceeds the max L3 SEND payload, refused"
+            );
+        }
+        EnqueueOutcome::Accepted | EnqueueOutcome::Dropped => {}
+        EnqueueOutcome::WrongEpoch => {
+            unreachable!("OutboundQueue::enqueue never produces WrongEpoch; checked above")
+        }
+    }
+    let _ = req.outcome.send(outcome);
+}
+
+/// Dials with [`Backoff`] retry, servicing `outbound` throughout —
+/// TODO.md L4h1's own review, finding 2: a send is tagged with an epoch
+/// the instant it is produced, so one tagged for the epoch *about to*
+/// attach must not sit unanswered for the entire outage (`Session::connect`
+/// plus however many failed-attempt backoff sleeps) only to finally be
+/// resolved, however it resolves, once this finally returns; one tagged
+/// for any other, already-stale epoch must not either, even though the
+/// answer for that case is always the same `WrongEpoch` refusal.
+/// `connect`'s own future, and each backoff sleep's, is polled in place
+/// (pinned, not reconstructed) across however many times the other
+/// `select!` branch fires first — reconstructing either on every such
+/// poll would silently restart it from zero every time, the same bug
+/// class L3d's own liveness/rekey ticker already hit once. Returns
+/// `None` once `events`'s receiver is dropped, the same signal
+/// `run_session` already ends on once attached — without this, nothing
+/// here would ever notice a vanished caller and this would retry
+/// forever against a relay nobody is listening for the result of
+/// (found red-teaming this item's own round-one fix, round two).
+async fn connect_with_retry(
+    config: &SessionConfig,
+    env: &HashMap<String, String>,
+    roster_store: Arc<RosterStore>,
+    outbound: &mut mpsc::Receiver<OutboundSend>,
+    events: &mpsc::Sender<SessionEvent>,
+    backoff: &mut Backoff,
+    epoch: Epoch,
+) -> Option<(Session, Vec<OutboundSend>)> {
+    let mut waiting: Vec<OutboundSend> = Vec::new();
+    let mut waiting_bytes: usize = 0;
+    loop {
+        let dial = Session::connect(config, env, Arc::clone(&roster_store));
+        tokio::pin!(dial);
+        let result = loop {
+            tokio::select! {
+                result = &mut dial => break result,
+                Some(req) = outbound.recv() => hold_or_refuse(req, epoch, &mut waiting, &mut waiting_bytes),
+                () = events.closed() => return None,
+            }
+        };
+        match result {
+            Ok(session) => return Some((session, waiting)),
+            Err(err) => {
+                let delay = backoff.next_delay();
+                tracing::warn!(error = %err, delay_ms = delay.as_millis(), ?epoch, "node session connect failed, retrying");
+                let sleep = tokio::time::sleep(delay);
+                tokio::pin!(sleep);
+                loop {
+                    tokio::select! {
+                        _ = &mut sleep => break,
+                        Some(req) = outbound.recv() => hold_or_refuse(req, epoch, &mut waiting, &mut waiting_bytes),
+                        () = events.closed() => return None,
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Dials, attaches, and stays attached indefinitely: reconnects through
-/// [`Backoff`] on any error, honoring GOAWAY's `retry_after_ms` hint when
-/// that was the reason (protocol.md 3.3, 4.1). `roster_store` is shared
-/// across every reconnect attempt (protocol.md 4.3; TODO.md L3f), not
-/// rebuilt per attempt; a fresh [`OutboundQueue`] is *not* shared the
-/// same way — it is rebuilt on every attach, deliberately, mirroring
+/// [`connect_with_retry`] on any error, honoring GOAWAY's
+/// `retry_after_ms` hint when that was the reason (protocol.md 3.3,
+/// 4.1). `roster_store` is shared across every reconnect attempt
+/// (protocol.md 4.3; TODO.md L3f), not rebuilt per attempt; a fresh
+/// [`OutboundQueue`] is *not* shared the same way — it is rebuilt on
+/// every attach, deliberately, mirroring
 /// `menzil-relay::forward::ForwardTable::clear_for`'s own per-attach
 /// reset (L3h's finding H2: stale credit must not silently outlive a
 /// reconnect). Inbound records this crate does not interpret itself
 /// (everything but ATTACH/PING/PONG/REKEY/GOAWAY/DOC/CREDIT) are sent to
-/// `events`; CREDIT is intercepted here instead, to update the
-/// `OutboundQueue` (TODO.md L4b). Outbound SEND requests arrive through
-/// `outbound`; once its sender end is dropped, that side simply goes
-/// quiet (no more sends can be queued) without ending the function —
-/// only `events`'s receiver being dropped does that, unchanged from
-/// before L4b. Returns once `events`'s receiver is dropped.
+/// `events` as [`SessionEvent::Record`]; CREDIT is intercepted here
+/// instead, to update the `OutboundQueue` (TODO.md L4b). Outbound SEND
+/// requests arrive through `outbound`; once its sender end is dropped,
+/// that side simply goes quiet (no more sends can be queued) without
+/// ending the function — only `events`'s receiver being dropped does
+/// that, unchanged from before L4b. Returns once `events`'s receiver is
+/// dropped; any `OutboundSend` still sitting in `outbound`'s buffer at
+/// that point is simply dropped along with it, which a caller watching
+/// its own `outcome` oneshot observes as a disconnect, not a hang.
 ///
-/// At most one delivered record is ever held outstanding, in
-/// `pending_deliver`, waiting for room in `events` via
-/// [`mpsc::Sender::reserve`] rather than `events.send(...).await`
-/// directly inside the same `tokio::select!` that also has to keep
-/// servicing `outbound` (TODO.md L4b's own review, finding 5,
-/// live-reproduced against a real relay: a caller that both reads
-/// `events` and writes `outbound` from the same task — the natural
-/// shape for something that replies to what it receives — can leave
-/// `events.send(...).await` permanently blocked on a full channel while
-/// that same caller is itself blocked trying to write a now-full
-/// `outbound`, with nothing left to break the cycle; `reserve` lets this
-/// loop keep draining `outbound` and running the send loop below while
-/// a delivery is stalled, instead of stopping dead). While a delivery is
-/// pending, `session.recv()` is not polled again either — new inbound
-/// records simply wait in the carrier's own buffer, ordinary TCP-level
-/// backpressure, not a loss — which also means the liveness/rekey clocks
-/// `session.recv()` drives internally pause for that same stretch;
-/// sustained backpressure long enough to blow past the liveness window
-/// once resumed reconnects this attachment, a real but accepted trade
-/// far short of finding 5's original permanent hang.
+/// Each attachment gets the next [`Epoch`] (TODO.md L4h1; protocol.md
+/// 5.1's path pinning), starting at [`Epoch::first`]: `Attached` is
+/// pushed the moment [`connect_with_retry`] returns, before
+/// `session.recv()` is polled even once, so a caller can never see a
+/// record from an epoch before its own `Attached`; `Detached` is pushed
+/// the moment the attached loop below ends, for any reason, and `epoch`
+/// is advanced immediately after, before the reconnect gap even starts
+/// — not after it, so that gap's own `outbound` servicing (below, and
+/// inside `connect_with_retry`) already refuses against the *next*
+/// epoch, not the one that just ended. An [`OutboundSend`] drained from
+/// `outbound` whose own `epoch` no longer matches the current one is
+/// refused with [`EnqueueOutcome::WrongEpoch`] — resolved on its
+/// `outcome` oneshot like any other admission outcome — rather than
+/// silently enqueued to go out, as it used to, whenever this node next
+/// happens to attach.
+///
+/// At most one delivered event is ever held outstanding at a time, in
+/// `pending`, waiting for room in `events` via [`mpsc::Sender::reserve`]
+/// rather than `events.send(...).await` directly inside the same
+/// `tokio::select!` that also has to keep servicing `outbound` (TODO.md
+/// L4b's own review, finding 5, live-reproduced against a real relay: a
+/// caller that both reads `events` and writes `outbound` from the same
+/// task — the natural shape for something that replies to what it
+/// receives — can leave `events.send(...).await` permanently blocked on
+/// a full channel while that same caller is itself blocked trying to
+/// write a now-full `outbound`, with nothing left to break the cycle;
+/// `reserve` lets this loop keep draining `outbound` and running the
+/// send loop below while a delivery is stalled, instead of stopping
+/// dead). While a delivery is pending, `session.recv()` is not polled
+/// again either — new inbound records simply wait in the carrier's own
+/// buffer, ordinary TCP-level backpressure, not a loss — which also
+/// means the liveness/rekey clocks `session.recv()` drives internally
+/// pause for that same stretch; sustained backpressure long enough to
+/// blow past the liveness window once resumed reconnects this
+/// attachment, a real but accepted trade far short of finding 5's
+/// original permanent hang. `pending` can hold a second event only in
+/// the narrow case the attached loop ends while a `Record` is still
+/// waiting in it: `Detached` is pushed behind it, not instead of it,
+/// which also closes a smaller pre-existing gap (found while
+/// implementing TODO.md L4h1, not itself L4h1's own concern) where that
+/// still-pending record would otherwise simply be dropped, along with
+/// `pending_deliver` itself, the instant the attached loop ended. That
+/// drain, below, keeps servicing `outbound` throughout (refusing
+/// everything, unconditionally — nothing could legitimately be tagged
+/// for the new epoch yet, since its own `Attached` has not reached the
+/// caller) rather than running outside any `select!` at all, the same
+/// finding-5 deadlock this function already avoids elsewhere: an
+/// `events` of capacity 1 with one record already waiting in it, and a
+/// caller blocked writing a full `outbound` before it ever reads that
+/// record, reproduces the identical cycle here too if nothing drains
+/// `outbound` concurrently (found red-teaming this item, not merely
+/// theorized — live-reproduced as a genuine, permanent hang before this
+/// fix).
 pub async fn run_session(
     config: SessionConfig,
     env: HashMap<String, String>,
-    events: mpsc::Sender<Record>,
+    events: mpsc::Sender<SessionEvent>,
     mut outbound: mpsc::Receiver<OutboundSend>,
     roster_store: Arc<RosterStore>,
 ) {
     let mut backoff = Backoff::new();
+    let mut epoch = Epoch::first();
     loop {
-        let mut session = match Session::connect(&config, &env, Arc::clone(&roster_store)).await {
-            Ok(session) => session,
-            Err(err) => {
-                let delay = backoff.next_delay();
-                tracing::warn!(error = %err, delay_ms = delay.as_millis(), "node session connect failed, retrying");
-                tokio::time::sleep(delay).await;
-                continue;
-            }
+        let Some((mut session, waiting)) = connect_with_retry(
+            &config,
+            &env,
+            Arc::clone(&roster_store),
+            &mut outbound,
+            &events,
+            &mut backoff,
+            epoch,
+        )
+        .await
+        else {
+            return;
         };
-        tracing::info!("node session attached");
+        tracing::info!(?epoch, "node session attached");
         let attached_at = Instant::now();
         let limits = session.welcome().limits;
         let mut outbound_queue = OutboundQueue::new(limits.credit, limits.max_record);
-        let mut pending_deliver: Option<Record> = None;
+        for req in waiting {
+            admit(req, epoch, &mut outbound_queue);
+        }
+        let mut pending: VecDeque<SessionEvent> = VecDeque::new();
+        pending.push_back(SessionEvent::Attached { epoch, limits });
 
         // `retry_after_ms`: `Some(hint)` only for a GOAWAY-caused break,
         // matching the two different backoff calls the loop used to make
@@ -659,13 +904,16 @@ pub async fn run_session(
         // failure, or a send timeout, while draining `outbound_queue`).
         let retry_after_ms = 'attached: loop {
             tokio::select! {
-                recv_result = session.recv(), if pending_deliver.is_none() => {
+                recv_result = session.recv(), if pending.is_empty() => {
                     match recv_result {
                         Ok(Record::Credit(body)) => {
                             outbound_queue.note_credit(body.peer, body.bytes);
                         }
                         Ok(record) => {
-                            pending_deliver = Some(record);
+                            pending.push_back(SessionEvent::Record {
+                                epoch,
+                                record: Box::new(record),
+                            });
                         }
                         Err(NodeError::Goaway { reason, retry_after_ms }) => {
                             tracing::info!(reason, retry_after_ms, "relay sent GOAWAY, reconnecting");
@@ -677,34 +925,19 @@ pub async fn run_session(
                         }
                     }
                 }
-                permit = events.reserve(), if pending_deliver.is_some() => {
+                permit = events.reserve(), if !pending.is_empty() => {
                     match permit {
                         Ok(permit) => {
-                            let record = pending_deliver.take().expect(
-                                "this branch only runs while pending_deliver is Some",
+                            let event = pending.pop_front().expect(
+                                "this branch only runs while pending is non-empty",
                             );
-                            permit.send(record);
+                            permit.send(event);
                         }
                         Err(_) => return,
                     }
                 }
                 Some(req) = outbound.recv() => {
-                    let dst = req.dst;
-                    let payload_len = req.payload.len();
-                    let outcome = outbound_queue.enqueue(req.dst, req.e2e_proto, req.flags, req.payload);
-                    match outcome {
-                        EnqueueOutcome::QueueFull => {
-                            tracing::warn!(dst = %dst, "node outbound queue full, reliable send refused");
-                        }
-                        EnqueueOutcome::TooLarge => {
-                            tracing::warn!(
-                                dst = %dst,
-                                payload_len,
-                                "outbound send exceeds the max L3 SEND payload, refused"
-                            );
-                        }
-                        EnqueueOutcome::Accepted | EnqueueOutcome::Dropped => {}
-                    }
+                    admit(req, epoch, &mut outbound_queue);
                 }
             }
 
@@ -724,13 +957,50 @@ pub async fn run_session(
                 }
             }
         };
+        // Captured here, not after the drain below: that drain's own
+        // duration depends on how fast the caller reads `events`, which
+        // has nothing to do with how long this attachment actually
+        // lasted — using `attached_at.elapsed()` after it would let a
+        // slow reader inflate a short-lived connection's own uptime and
+        // wrongly reset `backoff` (found red-teaming this item's own
+        // round-one fix, round two).
+        let uptime = attached_at.elapsed();
 
-        backoff.note_connection_uptime(attached_at.elapsed());
+        pending.push_back(SessionEvent::Detached { epoch });
+        drop(outbound_queue);
+        drop(session);
+        epoch = epoch.next();
+        while !pending.is_empty() {
+            tokio::select! {
+                permit = events.reserve() => {
+                    match permit {
+                        Ok(permit) => {
+                            let event = pending.pop_front().expect(
+                                "loop guarded by !pending.is_empty()",
+                            );
+                            permit.send(event);
+                        }
+                        Err(_) => return,
+                    }
+                }
+                Some(req) = outbound.recv() => refuse_stale(req),
+            }
+        }
+
+        backoff.note_connection_uptime(uptime);
         let delay = match retry_after_ms {
             Some(hint) => backoff.next_delay_with_hint(hint),
             None => backoff.next_delay(),
         };
-        tokio::time::sleep(delay).await;
+        let sleep = tokio::time::sleep(delay);
+        tokio::pin!(sleep);
+        loop {
+            tokio::select! {
+                _ = &mut sleep => break,
+                Some(req) = outbound.recv() => refuse_stale(req),
+                () = events.closed() => return,
+            }
+        }
     }
 }
 

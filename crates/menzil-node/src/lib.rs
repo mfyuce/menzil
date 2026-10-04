@@ -12,7 +12,10 @@
 //! REKEY/GOAWAY already were — see `session`'s module doc comment and
 //! [`RosterStore`]. The node side of the SEND/RECV/CREDIT data plane
 //! (protocol.md 4.2; TODO.md L4b) is in [`outbound`] and wired up inside
-//! [`run_session`]. [`PolicyStore`] (protocol.md 2.3, 5.1, 5.3; TODO.md
+//! [`run_session`], which also surfaces each L3 attachment as an
+//! [`Epoch`] through [`SessionEvent`] (protocol.md 5.1's path pinning;
+//! TODO.md L4h1) for whatever L4 layer ends up built on top of it.
+//! [`PolicyStore`] (protocol.md 2.3, 5.1, 5.3; TODO.md
 //! L4c) holds this node's verified Policies and answers membership/
 //! grant questions, but — unlike `RosterStore` — is not yet wired into
 //! `run_session`/`Engine` at all: nothing drives an L4 handshake or OPEN
@@ -37,7 +40,7 @@ mod session;
 
 pub use error::NodeError;
 pub use identity::LocalIdentity;
-pub use outbound::{EnqueueOutcome, OutboundQueue, OutboundSend};
+pub use outbound::{EnqueueOutcome, Epoch, OutboundQueue, OutboundSend};
 pub use policy_store::PolicyStore;
 pub use roster_store::RosterStore;
-pub use session::{Session, SessionConfig, run_session};
+pub use session::{Session, SessionConfig, SessionEvent, run_session};
