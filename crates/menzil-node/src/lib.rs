@@ -17,10 +17,13 @@
 //! TODO.md L4h1) for whatever L4 layer ends up built on top of it.
 //! [`PolicyStore`] (protocol.md 2.3, 5.1, 5.3; TODO.md
 //! L4c) holds this node's verified Policies and answers membership/
-//! grant questions, but — unlike `RosterStore` — is not yet wired into
-//! `run_session`/`Engine` at all: nothing drives an L4 handshake or OPEN
-//! yet for it to gate (`menzil-e2e`/`menzil-stream`, TODO.md L4d/f/g, and
-//! the runtime wiring that joins them, L4h). Not here: interpreting
+//! grant questions. [`admission`] (TODO.md L4h2) is the glue from those
+//! questions to protocol.md 5.1's handshake checks/grant gate and 5.3's
+//! per-OPEN grant check (a `menzil_stream::Authorizer` impl) — still,
+//! like `PolicyStore` itself, not yet wired into `run_session`/`Engine`:
+//! nothing drives an actual L4 handshake or OPEN yet to call it
+//! (`menzil-e2e`/`menzil-stream` exist, TODO.md L4d/f/g, but the runtime
+//! wiring that joins them to this, L4h, is still mostly ahead). Not here: interpreting
 //! SEND/RECV/ADVERTISE*/PEER_STATE/ADMIT_* payloads themselves, the
 //! local service registry, the SOCKS executor, and the SSH stdio mode
 //! the client-side commands need (protocol.md 5, 8, 12) — those are
@@ -31,6 +34,7 @@
 
 #![forbid(unsafe_code)]
 
+mod admission;
 mod error;
 mod identity;
 mod outbound;
@@ -38,6 +42,10 @@ mod policy_store;
 mod roster_store;
 mod session;
 
+pub use admission::{
+    HandshakeAdmission, InitiatorAdmission, PolicyAuthorizer, decide_initiator_admission,
+    decide_responder_admission,
+};
 pub use error::NodeError;
 pub use identity::LocalIdentity;
 pub use outbound::{EnqueueOutcome, Epoch, OutboundQueue, OutboundSend};

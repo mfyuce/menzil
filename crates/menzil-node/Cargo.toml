@@ -12,6 +12,7 @@ fastrand.workspace = true
 menzil-carrier = { path = "../menzil-carrier" }
 menzil-proto = { path = "../menzil-proto" }
 menzil-session = { path = "../menzil-session" }
+menzil-stream = { path = "../menzil-stream" }
 thiserror.workspace = true
 tokio = { workspace = true, features = ["sync", "time"] }
 tracing.workspace = true

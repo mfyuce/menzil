@@ -1116,6 +1116,7 @@ dependencies = [
  "menzil-proto",
  "menzil-relay",
  "menzil-session",
+ "menzil-stream",
  "rand",
  "rcgen",
  "rustls",
