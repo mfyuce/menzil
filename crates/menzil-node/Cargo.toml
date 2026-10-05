@@ -9,7 +9,9 @@ rust-version.workspace = true
 [dependencies]
 ed25519-dalek.workspace = true
 fastrand.workspace = true
+futures-util = { version = "0.3.34", default-features = false, features = ["std", "io"] }
 menzil-carrier = { path = "../menzil-carrier" }
+menzil-e2e = { path = "../menzil-e2e" }
 menzil-proto = { path = "../menzil-proto" }
 menzil-session = { path = "../menzil-session" }
 menzil-stream = { path = "../menzil-stream" }

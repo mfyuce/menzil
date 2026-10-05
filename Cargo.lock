@@ -1112,7 +1112,9 @@ version = "0.0.1"
 dependencies = [
  "ed25519-dalek",
  "fastrand",
+ "futures-util",
  "menzil-carrier",
+ "menzil-e2e",
  "menzil-proto",
  "menzil-relay",
  "menzil-session",

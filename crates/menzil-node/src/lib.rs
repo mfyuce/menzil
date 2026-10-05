@@ -23,12 +23,20 @@
 //! like `PolicyStore` itself, not yet wired into `run_session`/`Engine`:
 //! nothing drives an actual L4 handshake or OPEN yet to call it
 //! (`menzil-e2e`/`menzil-stream` exist, TODO.md L4d/f/g, but the runtime
-//! wiring that joins them to this, L4h, is still mostly ahead). Not here: interpreting
-//! SEND/RECV/ADVERTISE*/PEER_STATE/ADMIT_* payloads themselves, the
-//! local service registry, the SOCKS executor, and the SSH stdio mode
-//! the client-side commands need (protocol.md 5, 8, 12) — those are
-//! still to come. Generating and persisting a node's own identity
-//! (protocol.md 2.2) is also a separate, not-yet-built concern;
+//! wiring that joins them to this, L4h, is still mostly ahead).
+//! [`l4_session`] (TODO.md L4h3) is the first piece of that wiring: one
+//! actor per L4 session, given an already-finished `menzil_e2e::
+//! E2eTransport`, that pumps a `menzil_stream` yamux connection's frames
+//! into epoch-tagged SENDs and back, runs REKEY/KEEP, and ends the
+//! session on any of the reasons protocol.md 5.2 or this node's own L3
+//! layer can produce — still not driven by anything real: no table
+//! allocates `sender_index`/`receiver_index` or routes an inbound
+//! `E2eFrame::Data` to the right one yet (TODO.md L4e1/L4h6). Not here:
+//! interpreting SEND/RECV/ADVERTISE*/PEER_STATE/ADMIT_* payloads
+//! themselves, the local service registry, the SOCKS executor, and the
+//! SSH stdio mode the client-side commands need (protocol.md 5, 8, 12) —
+//! those are still to come. Generating and persisting a node's own
+//! identity (protocol.md 2.2) is also a separate, not-yet-built concern;
 //! [`LocalIdentity`] only carries it, already assembled, the same way
 //! `menzil-relay` takes its TLS certificate material already loaded.
 
@@ -37,6 +45,7 @@
 mod admission;
 mod error;
 mod identity;
+mod l4_session;
 mod outbound;
 mod policy_store;
 mod roster_store;
@@ -48,6 +57,8 @@ pub use admission::{
 };
 pub use error::NodeError;
 pub use identity::LocalIdentity;
+pub use l4_session::new as new_l4_session;
+pub use l4_session::{CloseReason, EndReason, L4SessionConfig, L4SessionHandle};
 pub use outbound::{EnqueueOutcome, Epoch, OutboundQueue, OutboundSend};
 pub use policy_store::PolicyStore;
 pub use roster_store::RosterStore;
