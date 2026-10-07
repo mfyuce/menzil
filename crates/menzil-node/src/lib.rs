@@ -31,14 +31,19 @@
 //! session on any of the reasons protocol.md 5.2 or this node's own L3
 //! layer can produce — still not driven by anything real: no table
 //! allocates `sender_index`/`receiver_index` or routes an inbound
-//! `E2eFrame::Data` to the right one yet (TODO.md L4e1/L4h6). Not here:
-//! interpreting SEND/RECV/ADVERTISE*/PEER_STATE/ADMIT_* payloads
-//! themselves, the local service registry, the SOCKS executor, and the
-//! SSH stdio mode the client-side commands need (protocol.md 5, 8, 12) —
-//! those are still to come. Generating and persisting a node's own
-//! identity (protocol.md 2.2) is also a separate, not-yet-built concern;
-//! [`LocalIdentity`] only carries it, already assembled, the same way
-//! `menzil-relay` takes its TLS certificate material already loaded.
+//! `E2eFrame::Data` to the right one yet (TODO.md L4e1/L4h6). [`l5_stream`]
+//! (TODO.md L4h4) is the L5 stream layer riding on one established
+//! session: the outbound OPEN/OPEN_ACK exchange ([`open_stream`]) and the
+//! inbound accept loop ([`accept_loop`]), both under protocol.md 5.3's
+//! OPEN timeout, the latter with its own per-session admission control.
+//! Not here: interpreting SEND/RECV/ADVERTISE*/PEER_STATE/ADMIT_*
+//! payloads themselves, the local service registry, the SOCKS executor,
+//! and the SSH stdio mode the client-side commands need (protocol.md 5,
+//! 8, 12) — those are still to come. Generating and persisting a node's
+//! own identity (protocol.md 2.2) is also a separate, not-yet-built
+//! concern; [`LocalIdentity`] only carries it, already assembled, the
+//! same way `menzil-relay` takes its TLS certificate material already
+//! loaded.
 
 #![forbid(unsafe_code)]
 
@@ -46,6 +51,7 @@ mod admission;
 mod error;
 mod identity;
 mod l4_session;
+mod l5_stream;
 mod outbound;
 mod policy_store;
 mod roster_store;
@@ -58,7 +64,8 @@ pub use admission::{
 pub use error::NodeError;
 pub use identity::LocalIdentity;
 pub use l4_session::new as new_l4_session;
-pub use l4_session::{CloseReason, EndReason, L4SessionConfig, L4SessionHandle};
+pub use l4_session::{CloseReason, EndReason, L4SessionAcceptor, L4SessionConfig, L4SessionHandle};
+pub use l5_stream::{OpenStreamError, accept_loop, open as open_stream};
 pub use outbound::{EnqueueOutcome, Epoch, OutboundQueue, OutboundSend};
 pub use policy_store::PolicyStore;
 pub use roster_store::RosterStore;

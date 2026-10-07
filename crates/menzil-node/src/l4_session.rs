@@ -79,7 +79,7 @@
 //! the caller dropping [`L4SessionHandle`] entirely without ever calling
 //! `close()` (`EndReason::HandleDropped` — see the paragraph on that
 //! below). [`EndReason::ActorGone`] is not a `run()`-detected condition
-//! at all; it is [`L4SessionHandle::closed`]'s own fallback for "the
+//! at all; it is [`L4SessionAcceptor::closed`]'s own fallback for "the
 //! actor is gone and never told me why" (a panic, an aborted task), kept
 //! distinct from [`EndReason::OutboundGone`] rather than overloading that
 //! variant's meaning — a red-team review found the original code did
@@ -92,9 +92,13 @@
 //! `None` (every sender lives on [`L4SessionHandle`], so both close
 //! together) the same as "no more inbound data for now, everything else
 //! still matters" — correct for either channel alone being momentarily
-//! quiet, wrong once *both* are closed for good: with the handle gone,
-//! nothing can ever open a stream, accept one, feed inbound data, or
-//! close intentionally again, so the session cannot usefully continue.
+//! quiet, wrong once *both* are closed for good: with every clone of
+//! the handle gone, nothing can ever open a new stream, feed inbound
+//! data, or close intentionally again, so the session cannot usefully
+//! continue — the separate [`L4SessionAcceptor`] can still observe why
+//! (`closed()`), and `accept()` itself drains to `None` once the actor's
+//! own `Driver` ends alongside it, but accepting a *new* stream stops
+//! being possible from that point on too.
 //! The bug was not just the eventual outcome but the path there: both
 //! `recv()` calls return `Ready(None)` immediately and forever once
 //! closed, so the loop's `continue` on each spun on every single
@@ -236,13 +240,13 @@
 //! quickly for some other reason must still provide that drain, not
 //! shorten this module's own timeout to fit.
 //!
-//! **Why `L4SessionHandle::closed` returns `Arc<EndReason>` and caches
-//! it, rather than taking the receiver and returning `EndReason`
+//! **Why `L4SessionAcceptor::closed` returns `Arc<EndReason>` and
+//! caches it, rather than taking the receiver and returning `EndReason`
 //! directly**: the original version panicked the second time it was
 //! called, reasoning that a second observer meant two callers that
 //! should share one. A red-team review found a single, perfectly
-//! ordinary caller already trips this: `loop { select! { r = handle.
-//! closed() => ..., _ = other => {} } }` calls `handle.closed()` fresh
+//! ordinary caller already trips this: `loop { select! { r = acceptor.
+//! closed() => ..., _ = other => {} } }` calls `acceptor.closed()` fresh
 //! on every iteration of that loop (`select!` re-evaluates a branch
 //! expression that is not a reused `&mut` binding each time it runs),
 //! so losing just one race against `other` before the session has
@@ -374,7 +378,7 @@ fn clamp_close_msg(msg: &str, limit: usize) -> String {
 /// type is never itself put on the wire (only [`CloseReason`], when this
 /// side chooses to send one, is). Deliberately not [`Clone`]/`PartialEq`
 /// (several variants wrap types, like [`E2eError`], that are neither) —
-/// [`L4SessionHandle::closed`] wraps it in an [`Arc`] instead so a
+/// [`L4SessionAcceptor::closed`] wraps it in an [`Arc`] instead so a
 /// repeated or cancelled-and-retried call can still share one answer.
 #[derive(Debug)]
 pub enum EndReason {
@@ -422,12 +426,16 @@ pub enum EndReason {
     /// pinning) — reported by whoever constructed this session via the
     /// `epoch_ended` channel passed to [`new`], not detected internally.
     EpochEnded,
-    /// [`L4SessionHandle`] was dropped without ever calling
-    /// [`L4SessionHandle::close`] — see this module's own doc comment on
-    /// why this ends the session immediately rather than drifting into a
-    /// [`Self::PeerDead`] wait.
+    /// Every live clone of [`L4SessionHandle`] was dropped without any
+    /// of them calling [`L4SessionHandle::close`] first — see this
+    /// module's own doc comment on why this ends the session immediately
+    /// rather than drifting into a [`Self::PeerDead`] wait. A caller that
+    /// means to hold a clone indefinitely just to call
+    /// [`L4SessionHandle::feed_inbound`] (a future L4h6's own demux
+    /// table, say) should know this variant can then never fire for that
+    /// session — there is always at least one live clone.
     HandleDropped,
-    /// [`L4SessionHandle::closed`]'s own fallback when the actor ended
+    /// [`L4SessionAcceptor::closed`]'s own fallback when the actor ended
     /// (or never ran at all — a panic, an aborted task) without itself
     /// reporting why. Never produced by [`run`] itself; see this
     /// module's own doc comment for why this is kept distinct from
@@ -470,27 +478,26 @@ pub struct L4SessionConfig {
     pub epoch: Epoch,
 }
 
-/// A handle to one running [`run`] actor: open outbound streams, accept
-/// inbound ones, feed in inbound `Data` frames this session's receiver
-/// index routes here, close with a reason, and observe why it ended. Not
-/// [`Clone`] — [`menzil_stream::StreamMux::open`] itself is, and a caller
-/// needing to open from several places at once should clone *that*
-/// (reachable only through this handle today, since nothing has needed
-/// it directly yet).
+/// A cloneable handle to one running [`run`] actor's send side: open
+/// outbound streams, feed in inbound `Data` frames this session's
+/// receiver index routes here, and close with a reason. Cheap to clone
+/// (every field already is: [`menzil_stream::StreamMux::open`] is itself
+/// `Clone`, and both channel senders are `mpsc` senders) — every clone
+/// talks to the same [`run`] actor, so one can be handed to a task that
+/// needs to open or feed inbound data while a *different* task drives
+/// [`L4SessionAcceptor::accept`] on the other half this session's [`new`]
+/// returns, which cannot itself be cloned (see that type's own doc
+/// comment for why). A round-2 red-team review found the original,
+/// unsplit handle made that impossible: `accept`'s `&mut self` borrowed
+/// the whole struct, including this send side, so nothing else could
+/// open, feed, or close while an accept loop was running.
+#[derive(Clone)]
 pub struct L4SessionHandle {
     peer: NodeId,
     network_id: NetworkId,
     stream_mux: menzil_stream::StreamMux,
-    inbound: menzil_stream::Inbound,
     inbound_data_tx: mpsc::UnboundedSender<(u64, Vec<u8>)>,
     command_tx: mpsc::UnboundedSender<Command>,
-    // Never set back to `None`/consumed once seen resolved — `closed()`
-    // checks `ended_cached` first and never touches this again past
-    // that point, so there is no second state for it to hold (a round-2
-    // red-team review flagged the previous `Option<..>` wrapper here as
-    // vestigial for exactly this reason).
-    ended_rx: oneshot::Receiver<EndReason>,
-    ended_cached: Option<Arc<EndReason>>,
 }
 
 impl L4SessionHandle {
@@ -509,12 +516,6 @@ impl L4SessionHandle {
     /// the raw stream).
     pub async fn open_stream(&self) -> Result<Stream, StreamMuxError> {
         self.stream_mux.open().await
-    }
-
-    /// Waits for the next inbound L5 stream the peer opened, or `None`
-    /// once this session has ended.
-    pub async fn accept(&mut self) -> Option<Stream> {
-        self.inbound.accept().await
     }
 
     /// Hands this session one inbound `data` frame's already-routed
@@ -540,10 +541,53 @@ impl L4SessionHandle {
     /// ends; whether it actually reaches the peer is never this call's
     /// problem to report, since the session is ending either way.
     /// Fire-and-forget: a no-op, not an error, if the session has
-    /// already ended on its own. Await [`Self::closed`] separately for
-    /// confirmation.
+    /// already ended on its own. Await [`L4SessionAcceptor::closed`]
+    /// separately for confirmation.
     pub fn close(&self, reason: Option<CloseReason>) {
         let _ = self.command_tx.send(Command::Close(reason));
+    }
+}
+
+/// The unique other half of one running [`run`] actor, from [`new`]:
+/// accept inbound L5 streams the peer opened, and observe why the
+/// session ended. Not [`Clone`] — unlike [`L4SessionHandle`]'s fields,
+/// this type's `menzil_stream::Inbound` and `oneshot::Receiver` are not
+/// `Clone` themselves (a yamux `Stream` can only ever be delivered to one
+/// accepter, and an end reason can only ever be taken out of one
+/// `oneshot` channel), so this half stays single-owner — the caller
+/// driving an accept loop (TODO.md L4h4's `accept_loop`) owns it for as
+/// long as that loop runs. `peer`/`network_id` are duplicated from
+/// [`L4SessionHandle`] (both are cheap `Copy` session properties) so a
+/// caller holding only this half never needs the other one just to read
+/// them.
+pub struct L4SessionAcceptor {
+    peer: NodeId,
+    network_id: NetworkId,
+    inbound: menzil_stream::Inbound,
+    // Never set back to `None`/consumed once seen resolved — `closed()`
+    // checks `ended_cached` first and never touches this again past
+    // that point, so there is no second state for it to hold (a round-2
+    // red-team review flagged the previous `Option<..>` wrapper here as
+    // vestigial for exactly this reason).
+    ended_rx: oneshot::Receiver<EndReason>,
+    ended_cached: Option<Arc<EndReason>>,
+}
+
+impl L4SessionAcceptor {
+    /// This session's peer — see [`L4SessionHandle::peer`].
+    pub fn peer(&self) -> NodeId {
+        self.peer
+    }
+
+    /// This session's network — see [`L4SessionHandle::network_id`].
+    pub fn network_id(&self) -> NetworkId {
+        self.network_id
+    }
+
+    /// Waits for the next inbound L5 stream the peer opened, or `None`
+    /// once this session has ended.
+    pub async fn accept(&mut self) -> Option<Stream> {
+        self.inbound.accept().await
     }
 
     /// Waits for this session to end, returning why. Safe to call more
@@ -560,12 +604,13 @@ impl L4SessionHandle {
     }
 }
 
-/// Builds one L4 session actor: a handle, plus the future a caller must
-/// `tokio::spawn` for anything on that handle to make progress (see this
-/// module's own doc comment on why this crate never spawns it itself).
-/// That future's own output is `()`, not [`EndReason`] — the actor sends
-/// its end reason to [`L4SessionHandle::closed`] itself (the one place a
-/// caller should actually observe it) before returning, the same split
+/// Builds one L4 session actor: the send-side handle, the unique
+/// acceptor, plus the future a caller must `tokio::spawn` for anything on
+/// either one to make progress (see this module's own doc comment on why
+/// this crate never spawns it itself). That future's own output is `()`,
+/// not [`EndReason`] — the actor sends its end reason to
+/// [`L4SessionAcceptor::closed`] itself (the one place a caller should
+/// actually observe it) before returning, the same split
 /// `menzil_stream::Driver` leaves to a `JoinHandle` versus
 /// `StreamMuxError` any other method call on a dead driver reports
 /// instead. `outbound` is a clone of the same channel a running
@@ -580,7 +625,11 @@ pub fn new(
     config: L4SessionConfig,
     outbound: mpsc::Sender<OutboundSend>,
     epoch_ended: oneshot::Receiver<()>,
-) -> (L4SessionHandle, impl Future<Output = ()> + Send + 'static) {
+) -> (
+    L4SessionHandle,
+    L4SessionAcceptor,
+    impl Future<Output = ()> + Send + 'static,
+) {
     let (stream_mux, inbound, outbound_frames, driver) =
         menzil_stream::new(config.mode, config.max_record);
     let (inbound_data_tx, inbound_data_rx) = mpsc::unbounded_channel();
@@ -591,9 +640,13 @@ pub fn new(
         peer: config.peer,
         network_id: config.network_id,
         stream_mux: stream_mux.clone(),
-        inbound,
         inbound_data_tx,
         command_tx,
+    };
+    let acceptor = L4SessionAcceptor {
+        peer: config.peer,
+        network_id: config.network_id,
+        inbound,
         ended_rx,
         ended_cached: None,
     };
@@ -613,7 +666,7 @@ pub fn new(
         ended_tx,
     );
 
-    (handle, task)
+    (handle, acceptor, task)
 }
 
 /// Encrypts `body` and hands it to `outbound` as an epoch-tagged reliable
@@ -953,24 +1006,25 @@ mod tests {
         )
     }
 
-    /// Builds one [`L4SessionHandle`]/task pair from `side`, returning
-    /// the handle, the raw `outbound` receiver (for a test to drain
-    /// itself, or hand to [`pump`]), and the `epoch_ended` sender (kept
-    /// by the caller so the paired receiver does not immediately
-    /// disconnect — see [`TwoSessions`]'s own field doc comment for why
-    /// that matters).
+    /// Builds one [`L4SessionHandle`]/[`L4SessionAcceptor`]/task triple
+    /// from `side`, returning both halves, the raw `outbound` receiver
+    /// (for a test to drain itself, or hand to [`pump`]), and the
+    /// `epoch_ended` sender (kept by the caller so the paired receiver
+    /// does not immediately disconnect — see [`TwoSessions`]'s own field
+    /// doc comment for why that matters).
     fn one_session(
         side: OneSide,
         max_record: u32,
     ) -> (
         L4SessionHandle,
+        L4SessionAcceptor,
         mpsc::Receiver<OutboundSend>,
         oneshot::Sender<()>,
         tokio::task::JoinHandle<()>,
     ) {
         let (outbound_tx, outbound_rx) = mpsc::channel(64);
         let (epoch_ended_tx, epoch_ended_rx) = oneshot::channel();
-        let (handle, task) = new(
+        let (handle, acceptor, task) = new(
             L4SessionConfig {
                 transport: side.transport,
                 peer: side.peer,
@@ -982,7 +1036,13 @@ mod tests {
             outbound_tx,
             epoch_ended_rx,
         );
-        (handle, outbound_rx, epoch_ended_tx, tokio::spawn(task))
+        (
+            handle,
+            acceptor,
+            outbound_rx,
+            epoch_ended_tx,
+            tokio::spawn(task),
+        )
     }
 
     /// Runs a full live `menzil_e2e` handshake and builds one
@@ -993,7 +1053,9 @@ mod tests {
     /// (WELCOME's own wire ceiling) unless a test needs otherwise.
     struct TwoSessions {
         a: L4SessionHandle,
+        a_acceptor: L4SessionAcceptor,
         b: L4SessionHandle,
+        b_acceptor: L4SessionAcceptor,
         // Kept alive so each task's `outbound` channel has a live
         // receiver draining it into the *other* side's inbound feed.
         _pump_a_to_b: tokio::task::JoinHandle<()>,
@@ -1016,10 +1078,13 @@ mod tests {
     /// in-process stand-in for "the L3 relay delivered this SEND as a
     /// RECV," skipping L3 entirely. Always resolves the admission
     /// outcome `Accepted`, the same answer a real, healthy
-    /// `OutboundQueue` with ample credit would give.
+    /// `OutboundQueue` with ample credit would give. Takes `dst` by
+    /// value (a cloned [`L4SessionHandle`], cheap since `Clone` is just
+    /// cloning its own two channel senders and a `StreamMux`) rather
+    /// than borrowing the handle for the pump task's whole lifetime.
     fn pump(
         mut rx: mpsc::Receiver<OutboundSend>,
-        dst: mpsc::UnboundedSender<(u64, Vec<u8>)>,
+        dst: L4SessionHandle,
     ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
             while let Some(req) = rx.recv().await {
@@ -1030,7 +1095,7 @@ mod tests {
                     ..
                 } = frame
                 {
-                    let _ = dst.send((counter, ciphertext));
+                    dst.feed_inbound(counter, ciphertext);
                 }
                 let _ = req.outcome.send(EnqueueOutcome::Accepted);
             }
@@ -1039,15 +1104,19 @@ mod tests {
 
     fn two_sessions_with_max_record(max_record: u32) -> TwoSessions {
         let (a_side, b_side) = two_sides(1, max_record);
-        let (a_handle, a_outbound_rx, a_epoch_ended_tx, task_a) = one_session(a_side, max_record);
-        let (b_handle, b_outbound_rx, b_epoch_ended_tx, task_b) = one_session(b_side, max_record);
+        let (a_handle, a_acceptor, a_outbound_rx, a_epoch_ended_tx, task_a) =
+            one_session(a_side, max_record);
+        let (b_handle, b_acceptor, b_outbound_rx, b_epoch_ended_tx, task_b) =
+            one_session(b_side, max_record);
 
-        let pump_a_to_b = pump(a_outbound_rx, inbound_sender(&b_handle));
-        let pump_b_to_a = pump(b_outbound_rx, inbound_sender(&a_handle));
+        let pump_a_to_b = pump(a_outbound_rx, b_handle.clone());
+        let pump_b_to_a = pump(b_outbound_rx, a_handle.clone());
 
         TwoSessions {
             a: a_handle,
+            a_acceptor,
             b: b_handle,
+            b_acceptor,
             _pump_a_to_b: pump_a_to_b,
             _pump_b_to_a: pump_b_to_a,
             _task_a: task_a,
@@ -1059,15 +1128,6 @@ mod tests {
 
     fn two_sessions() -> TwoSessions {
         two_sessions_with_max_record(65_535)
-    }
-
-    /// This test module's own private channel into a handle's inbound
-    /// feed — reaches the same field [`L4SessionHandle::feed_inbound`]
-    /// (the real inbound-routing caller, TODO.md L4h6, will use) does,
-    /// just cloned directly so [`pump`] can hold its own sender rather
-    /// than borrowing the handle for the pump task's whole lifetime.
-    fn inbound_sender(handle: &L4SessionHandle) -> mpsc::UnboundedSender<(u64, Vec<u8>)> {
-        handle.inbound_data_tx.clone()
     }
 
     #[tokio::test]
@@ -1088,7 +1148,7 @@ mod tests {
             stream.write_all(b"x").await.unwrap();
             stream.flush().await.unwrap();
         };
-        let b_side = sessions.b.accept();
+        let b_side = sessions.b_acceptor.accept();
         let (opened, accepted) = tokio::join!(
             tokio::time::timeout(Duration::from_secs(5), a_side),
             tokio::time::timeout(Duration::from_secs(5), b_side),
@@ -1113,7 +1173,7 @@ mod tests {
             stream.flush().await.unwrap();
         };
         let b_side = async {
-            let mut stream = sessions.b.accept().await.unwrap();
+            let mut stream = sessions.b_acceptor.accept().await.unwrap();
             let mut buf = [0u8; 26];
             stream.read_exact(&mut buf).await.unwrap();
             buf
@@ -1154,10 +1214,11 @@ mod tests {
 
         let mut readers = Vec::new();
         for _ in 0..STREAMS {
-            let mut stream = tokio::time::timeout(Duration::from_secs(10), sessions.b.accept())
-                .await
-                .unwrap()
-                .unwrap();
+            let mut stream =
+                tokio::time::timeout(Duration::from_secs(10), sessions.b_acceptor.accept())
+                    .await
+                    .unwrap()
+                    .unwrap();
             readers.push(tokio::spawn(async move {
                 let mut buf = vec![0u8; BYTES_PER_STREAM];
                 stream.read_exact(&mut buf).await.unwrap();
@@ -1187,11 +1248,11 @@ mod tests {
             code: ErrorCode::GrantRemoved,
             msg: "revoked".to_string(),
         }));
-        let a_end = tokio::time::timeout(Duration::from_secs(5), sessions.a.closed())
+        let a_end = tokio::time::timeout(Duration::from_secs(5), sessions.a_acceptor.closed())
             .await
             .unwrap();
         assert!(matches!(a_end.as_ref(), EndReason::ClosedLocally(Some(_))));
-        let b_end = tokio::time::timeout(Duration::from_secs(5), sessions.b.closed())
+        let b_end = tokio::time::timeout(Duration::from_secs(5), sessions.b_acceptor.closed())
             .await
             .unwrap();
         match b_end.as_ref() {
@@ -1207,7 +1268,7 @@ mod tests {
     async fn closing_with_no_reason_sends_nothing_but_still_ends_locally() {
         let mut sessions = two_sessions();
         sessions.a.close(None);
-        let a_end = tokio::time::timeout(Duration::from_secs(5), sessions.a.closed())
+        let a_end = tokio::time::timeout(Duration::from_secs(5), sessions.a_acceptor.closed())
             .await
             .unwrap();
         assert!(matches!(a_end.as_ref(), EndReason::ClosedLocally(None)));
@@ -1228,7 +1289,7 @@ mod tests {
     #[tokio::test]
     async fn closed_is_safe_to_call_repeatedly_from_a_select_loop() {
         // Regression test for a red-team-found Medium: `select! { r =
-        // handle.closed() => ..., _ = other => {} }` calls `closed()`
+        // acceptor.closed() => ..., _ = other => {} }` calls `closed()`
         // fresh on every loop iteration (it is not a reused `&mut`
         // binding), so losing even one race against `other` before the
         // session ends used to panic on the very next iteration.
@@ -1238,7 +1299,7 @@ mod tests {
         let mut ticks = tokio::time::interval(Duration::from_millis(1));
         for _ in 0..50 {
             tokio::select! {
-                reason = sessions.a.closed() => {
+                reason = sessions.a_acceptor.closed() => {
                     observed = Some(reason);
                     break;
                 }
@@ -1251,7 +1312,7 @@ mod tests {
         ));
         // And a further call still answers the same way rather than
         // panicking.
-        let again = sessions.a.closed().await;
+        let again = sessions.a_acceptor.closed().await;
         assert!(matches!(again.as_ref(), EndReason::ClosedLocally(None)));
     }
 
@@ -1262,18 +1323,20 @@ mod tests {
         // spinning (a live-measured ~60x throughput hit to a sibling
         // task on the same runtime) until `Liveness::is_dead` finally
         // fired, tens of seconds later, rather than ending immediately.
-        // Dropping the handle removes the only way to later confirm
-        // *which* `EndReason` fired (`ended_tx` has nobody left
-        // listening by then either) — this test's own assertion is
-        // therefore specifically the prompt bound below, not the exact
-        // reason.
+        // Keeps the acceptor (a round-2 red-team review noted the
+        // handle/acceptor split, absent when this test was first
+        // written, now lets it assert the exact reason too, not only
+        // the prompt bound).
         let (a_side, _b_side) = two_sides(5, 65_535);
-        let (handle, _outbound_rx, _epoch_ended_tx, task) = one_session(a_side, 65_535);
+        let (handle, mut acceptor, _outbound_rx, _epoch_ended_tx, task) =
+            one_session(a_side, 65_535);
         drop(handle);
         tokio::time::timeout(Duration::from_secs(2), task)
             .await
             .expect("must end promptly, not drift into a later ~40s PeerDead wait")
             .unwrap();
+        let reason = acceptor.closed().await;
+        assert!(matches!(reason.as_ref(), EndReason::HandleDropped));
     }
 
     #[tokio::test]
@@ -1311,7 +1374,7 @@ mod tests {
             stream.write_all(b"still alive").await.unwrap();
             stream.flush().await.unwrap();
         };
-        let b_side = sessions.b.accept();
+        let b_side = sessions.b_acceptor.accept();
         let (opened, accepted) = tokio::join!(
             tokio::time::timeout(Duration::from_secs(5), a_side),
             tokio::time::timeout(Duration::from_secs(5), b_side),
@@ -1323,7 +1386,8 @@ mod tests {
     #[tokio::test]
     async fn a_refused_send_ends_the_session_as_send_refused() {
         let (a_side, _b_side) = two_sides(6, 65_535);
-        let (mut handle, mut outbound_rx, _epoch_ended_tx, task) = one_session(a_side, 65_535);
+        let (_handle, mut acceptor, mut outbound_rx, _epoch_ended_tx, task) =
+            one_session(a_side, 65_535);
         // Answer the very first send (yamux's own initial frame, see
         // this module's own doc comment) with an explicit refusal rather
         // than `Accepted`; the receiver then drops (the spawned task
@@ -1338,7 +1402,7 @@ mod tests {
             .await
             .expect("must not hang")
             .unwrap();
-        let observed = handle.closed().await;
+        let observed = acceptor.closed().await;
         assert!(matches!(
             observed.as_ref(),
             EndReason::SendRefused(EnqueueOutcome::QueueFull)
@@ -1363,7 +1427,8 @@ mod tests {
         for _ in 0..30 {
             let (a_side, b_side) = two_sides(9, 65_535);
             let mut b_transport = b_side.transport;
-            let (handle, mut outbound_rx, _epoch_ended_tx, task) = one_session(a_side, 65_535);
+            let (handle, _acceptor, mut outbound_rx, _epoch_ended_tx, task) =
+                one_session(a_side, 65_535);
             handle.close(Some(CloseReason {
                 code: ErrorCode::GrantRemoved,
                 msg: "bye".to_string(),
@@ -1413,7 +1478,8 @@ mod tests {
         // wall-clock time, satisfies the bound.
         tokio::time::pause();
         let (a_side, _b_side) = two_sides(11, 65_535);
-        let (handle, mut outbound_rx, _epoch_ended_tx, task) = one_session(a_side, 65_535);
+        let (handle, _acceptor, mut outbound_rx, _epoch_ended_tx, task) =
+            one_session(a_side, 65_535);
         // Accept every send into the channel (so each one's own
         // `outbound.send` succeeds) but never resolve any outcome —
         // `yamux::Connection::new`'s own initial frame (see this
@@ -1458,7 +1524,8 @@ mod tests {
         // real nonce), but out of sequence.
         let (a_side, b_side) = two_sides(7, 65_535);
         let mut a_transport = a_side.transport;
-        let (handle, mut outbound_rx, _epoch_ended_tx, task) = one_session(b_side, 65_535);
+        let (handle, mut acceptor, mut outbound_rx, _epoch_ended_tx, task) =
+            one_session(b_side, 65_535);
         let _drain = tokio::spawn(async move {
             while let Some(req) = outbound_rx.recv().await {
                 let _ = req.outcome.send(EnqueueOutcome::Accepted);
@@ -1481,8 +1548,7 @@ mod tests {
             .await
             .expect("must not hang")
             .unwrap();
-        let mut handle = handle;
-        let reason = handle.closed().await;
+        let reason = acceptor.closed().await;
         assert!(
             matches!(
                 reason.as_ref(),
@@ -1501,7 +1567,7 @@ mod tests {
         // automatic outbound frame cannot fit this session's plaintext
         // budget.
         let (a_side, _b_side) = two_sides(8, 90);
-        let (_handle, mut outbound_rx, _epoch_ended_tx, task) = one_session(a_side, 90);
+        let (_handle, _acceptor, mut outbound_rx, _epoch_ended_tx, task) = one_session(a_side, 90);
         let _drain = tokio::spawn(async move {
             while let Some(req) = outbound_rx.recv().await {
                 let _ = req.outcome.send(EnqueueOutcome::Accepted);
@@ -1526,14 +1592,15 @@ mod tests {
     #[tokio::test]
     async fn reliable_send_failure_ends_the_session_as_outbound_gone() {
         let (a_side, _b_side) = two_sides(4, 65_535);
-        let (mut handle, outbound_rx, _epoch_ended_tx, task) = one_session(a_side, 65_535);
+        let (handle, mut acceptor, outbound_rx, _epoch_ended_tx, task) =
+            one_session(a_side, 65_535);
         drop(outbound_rx);
 
         // Opening a stream makes yamux itself produce an outbound Mux
         // frame, which this session tries (and, with no receiver left on
         // `outbound`, fails) to send.
         let _ = handle.open_stream().await;
-        let reason = tokio::time::timeout(Duration::from_secs(5), handle.closed())
+        let reason = tokio::time::timeout(Duration::from_secs(5), acceptor.closed())
             .await
             .unwrap();
         assert!(matches!(reason.as_ref(), EndReason::OutboundGone));
@@ -1543,7 +1610,8 @@ mod tests {
     #[tokio::test]
     async fn the_epoch_ending_ends_the_session() {
         let (a_side, _b_side) = two_sides(2, 65_535);
-        let (mut handle, mut outbound_rx, epoch_ended_tx, task) = one_session(a_side, 65_535);
+        let (_handle, mut acceptor, mut outbound_rx, epoch_ended_tx, task) =
+            one_session(a_side, 65_535);
         // `yamux::Connection::new` produces an initial outbound frame of
         // its own (confirmed live, tracing which `select!` branch fired
         // on a failing run of this exact test) — this session's own
@@ -1562,7 +1630,7 @@ mod tests {
         });
 
         let _ = epoch_ended_tx.send(());
-        let reason = tokio::time::timeout(Duration::from_secs(5), handle.closed())
+        let reason = tokio::time::timeout(Duration::from_secs(5), acceptor.closed())
             .await
             .unwrap();
         assert!(matches!(reason.as_ref(), EndReason::EpochEnded));
