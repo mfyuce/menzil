@@ -102,9 +102,9 @@ pub struct E2eTransport {
     inner: snow::StatelessTransportState,
     /// The index this side must stamp as `receiver_index` on every
     /// outgoing `data` frame: the peer's own local index for this
-    /// session (protocol.md 5.1 — the initiator's `sender_index` as the
-    /// responder sees it, or the responder's `receiver_index` as the
-    /// initiator sees it).
+    /// session (protocol.md 5.1 — the initiator's `sender_index` in
+    /// `init` as the responder sees it, or the responder's `sender_index`
+    /// in `resp` as the initiator sees it).
     peer_index: u32,
     /// The largest [`E2eDataBody`] plaintext (`u8 kind | body`) this
     /// session may encrypt — `menzil_proto::max_e2e_data_plaintext`
@@ -426,6 +426,33 @@ pub(crate) mod tests {
             responder.max_plaintext,
             menzil_proto::max_e2e_data_plaintext(1024)
         );
+    }
+
+    #[test]
+    fn e2e_data_frame_len_matches_what_encrypt_data_actually_produces() {
+        // TODO.md L4h5: an L4 session reserves send-queue space from this
+        // number *before* encrypting, so it must equal the real encoded
+        // frame length for every body shape, not merely come close.
+        let (mut initiator, _responder) = run_live_handshake();
+        for body in [
+            E2eDataBody::Mux(vec![]),
+            E2eDataBody::Mux(vec![7; 1]),
+            E2eDataBody::Mux(vec![7; 12]),
+            E2eDataBody::Mux(vec![7; 16 * 1024 + 12]),
+            E2eDataBody::Keep,
+            E2eDataBody::Close {
+                code: menzil_proto::ErrorCode::NoGrant,
+                msg: "no grant".to_string(),
+            },
+        ] {
+            let plaintext_len = body.encode().unwrap().len();
+            let frame = initiator.encrypt_data(&body).unwrap();
+            assert_eq!(
+                frame.encode().len(),
+                menzil_proto::e2e_data_frame_len(plaintext_len),
+                "{body:?}"
+            );
+        }
     }
 
     #[test]

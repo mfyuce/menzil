@@ -19,19 +19,30 @@
 //! L4c) holds this node's verified Policies and answers membership/
 //! grant questions. [`admission`] (TODO.md L4h2) is the glue from those
 //! questions to protocol.md 5.1's handshake checks/grant gate and 5.3's
-//! per-OPEN grant check (a `menzil_stream::Authorizer` impl) — still,
-//! like `PolicyStore` itself, not yet wired into `run_session`/`Engine`:
-//! nothing drives an actual L4 handshake or OPEN yet to call it
-//! (`menzil-e2e`/`menzil-stream` exist, TODO.md L4d/f/g, but the runtime
-//! wiring that joins them to this, L4h, is still mostly ahead).
-//! [`l4_session`] (TODO.md L4h3) is the first piece of that wiring: one
+//! per-OPEN grant check (a `menzil_stream::Authorizer` impl), which
+//! [`Node`] plugs into every session's [`accept_loop`]; the handshake
+//! checks are called by the router below. [`l4_session`] (TODO.md L4h3)
+//! is the first piece of the L4 wiring: one
 //! actor per L4 session, given an already-finished `menzil_e2e::
 //! E2eTransport`, that pumps a `menzil_stream` yamux connection's frames
 //! into epoch-tagged SENDs and back, runs REKEY/KEEP, and ends the
 //! session on any of the reasons protocol.md 5.2 or this node's own L3
-//! layer can produce — still not driven by anything real: no table
-//! allocates `sender_index`/`receiver_index` or routes an inbound
-//! `E2eFrame::Data` to the right one yet (TODO.md L4e1/L4h6). [`l5_stream`]
+//! layer can produce. [`new_router`] (TODO.md L4h6) is what makes them:
+//! it reads [`run_session`]'s events, answers peers' `init`s and starts
+//! handshakes for callers ([`RouterHandle::ensure_session`]) over
+//! `menzil-e2e`'s session table, routes each `E2eFrame::Data` to the right
+//! actor, and ends a session's actors when its L3 attachment does.
+//! [`Node`] (TODO.md L4h7) is the running node built around it: one
+//! [`Node::start`] joins the L3 session, the router and an accept loop per
+//! session, and [`Node::open_stream`] is the entry point for everything
+//! that wants a stream to a peer. The inbound path is not paced yet
+//! (TODO.md L4h6b). Each
+//! session reserves space in this node's send queue before producing a
+//! record ([`SendBudgets`], TODO.md L4h5), so ordinary bulk transfer
+//! waits for the queue to drain instead of overflowing it and ending the
+//! session; [`Node::start`] creates the one [`SendBudgets`], and the router
+//! gives every session to the same peer `SendBudgets::for_peer(peer)`.
+//! [`l5_stream`]
 //! (TODO.md L4h4) is the L5 stream layer riding on one established
 //! session: the outbound OPEN/OPEN_ACK exchange ([`open_stream`]) and the
 //! inbound accept loop ([`accept_loop`]), both under protocol.md 5.3's
@@ -50,8 +61,10 @@
 mod admission;
 mod error;
 mod identity;
+mod l4_router;
 mod l4_session;
 mod l5_stream;
+mod node;
 mod outbound;
 mod policy_store;
 mod roster_store;
@@ -59,14 +72,24 @@ mod session;
 
 pub use admission::{
     HandshakeAdmission, InitiatorAdmission, PolicyAuthorizer, decide_initiator_admission,
-    decide_responder_admission,
+    decide_responder_admission, resolve_dial_cert,
 };
 pub use error::NodeError;
 pub use identity::LocalIdentity;
+pub use l4_router::{
+    EnsureError, HANDSHAKE_ATTEMPTS, RouterConfig, RouterHandle, RouterParts, SessionReady,
+    new_router,
+};
 pub use l4_session::new as new_l4_session;
-pub use l4_session::{CloseReason, EndReason, L4SessionAcceptor, L4SessionConfig, L4SessionHandle};
+pub use l4_session::{
+    CloseReason, EndReason, L4SessionAcceptor, L4SessionConfig, L4SessionHandle, SessionNotice,
+    SessionObserver,
+};
 pub use l5_stream::{OpenStreamError, accept_loop, open as open_stream};
-pub use outbound::{EnqueueOutcome, Epoch, OutboundQueue, OutboundSend};
+pub use node::{Node, NodeConfig, NodeOpenError, RefuseAll, StartError};
+pub use outbound::{
+    EnqueueOutcome, Epoch, OutboundQueue, OutboundSend, SendBudget, SendBudgets, SendPermit,
+};
 pub use policy_store::PolicyStore;
 pub use roster_store::RosterStore;
 pub use session::{Session, SessionConfig, SessionEvent, run_session};

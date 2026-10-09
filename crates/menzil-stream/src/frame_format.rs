@@ -77,32 +77,36 @@ pub enum FrameFormatError {
     },
 }
 
-/// How many bytes `buf`'s leading yamux frame occupies, once that many
-/// are actually present: `Ok(None)` means `buf` is a genuine prefix of a
-/// well-formed frame that simply needs more bytes before a length can be
-/// known (never returned for an actually-invalid header — version and
-/// type are both checked as soon as the first two bytes are available,
-/// before the length field or any body is consulted).
-pub(crate) fn leading_frame_len(buf: &[u8]) -> Result<Option<usize>, FrameFormatError> {
+/// The total size (header plus body) of the frame whose leading bytes are
+/// `prefix`, as soon as `prefix` holds the whole 12 byte header and not
+/// before: `Ok(None)` means `prefix` is a genuine prefix of a well-formed
+/// header that simply needs more bytes before a length can be known
+/// (never returned for an actually-invalid one — version and type are both
+/// checked as soon as their own byte is available, before the length
+/// field is consulted). Does *not* require the body to be present, unlike
+/// [`leading_frame_len`]: [`crate::record_io::RecordIo::poll_write`] needs
+/// the answer before it has accepted the body bytes, to decide whether
+/// accepting them would complete a frame it has nowhere to put yet.
+pub(crate) fn declared_frame_len(prefix: &[u8]) -> Result<Option<usize>, FrameFormatError> {
     // Version and type are each checked the moment their own one byte is
     // in, independently of the rest of the 12 byte header: both are
     // cheap, fixed-position checks, and failing fast on either avoids
     // accumulating bytes behind a header that (whatever its declared
     // length later turns out to be) can never resolve to a frame this
     // module understands.
-    let Some(&version) = buf.first() else {
+    let Some(&version) = prefix.first() else {
         return Ok(None);
     };
     if version != 0 {
         return Err(FrameFormatError::Version(version));
     }
-    let Some(&tag) = buf.get(1) else {
+    let Some(&tag) = prefix.get(1) else {
         return Ok(None);
     };
     if !matches!(tag, 0..=3) {
         return Err(FrameFormatError::Type(tag));
     }
-    if buf.len() < HEADER_LEN {
+    if prefix.len() < HEADER_LEN {
         return Ok(None);
     }
     let total = match tag {
@@ -111,7 +115,7 @@ pub(crate) fn leading_frame_len(buf: &[u8]) -> Result<Option<usize>, FrameFormat
         // `FrameFormatError::LengthOverflow`'s own doc comment for why a
         // direct `usize` addition is not safe on every platform.
         0 => {
-            let length = u32::from_be_bytes([buf[8], buf[9], buf[10], buf[11]]);
+            let length = u32::from_be_bytes([prefix[8], prefix[9], prefix[10], prefix[11]]);
             let total = HEADER_LEN as u64 + length as u64;
             usize::try_from(total).map_err(|_| FrameFormatError::LengthOverflow { length })?
         }
@@ -119,10 +123,17 @@ pub(crate) fn leading_frame_len(buf: &[u8]) -> Result<Option<usize>, FrameFormat
         // ping id, or error code respectively — never a body size.
         _ => HEADER_LEN,
     };
-    if buf.len() < total {
-        return Ok(None);
-    }
     Ok(Some(total))
+}
+
+/// How many bytes `buf`'s leading yamux frame occupies, once that many
+/// are actually present: `Ok(None)` means `buf` is a genuine prefix of a
+/// well-formed frame that simply needs more bytes before a length can be
+/// known (never returned for an actually-invalid header — version and
+/// type are both checked as soon as the first two bytes are available,
+/// before the length field or any body is consulted).
+pub(crate) fn leading_frame_len(buf: &[u8]) -> Result<Option<usize>, FrameFormatError> {
+    Ok(declared_frame_len(buf)?.filter(|&total| buf.len() >= total))
 }
 
 /// Whether `buf` is *exactly* one well-formed yamux frame — no fewer
@@ -239,5 +250,33 @@ mod tests {
     fn a_bare_control_frame_is_exactly_one_frame() {
         let buf = header(0, 2, 42); // Ping
         assert_eq!(is_exactly_one_frame(&buf), Ok(()));
+    }
+
+    #[test]
+    fn a_data_frames_total_is_known_from_its_header_alone() {
+        let buf = header(0, 0, 5);
+        for n in 0..HEADER_LEN {
+            assert_eq!(declared_frame_len(&buf[..n]), Ok(None), "n={n}");
+        }
+        // No body bytes present at all, yet the total is already known —
+        // the difference from `leading_frame_len`, which would say `None`.
+        assert_eq!(declared_frame_len(&buf), Ok(Some(HEADER_LEN + 5)));
+        assert_eq!(leading_frame_len(&buf), Ok(None));
+    }
+
+    #[test]
+    fn a_control_frames_declared_total_is_the_header_whatever_its_length_field_says() {
+        for tag in [1u8, 2, 3] {
+            let buf = header(0, tag, 0xffff_ffff);
+            assert_eq!(declared_frame_len(&buf), Ok(Some(HEADER_LEN)), "tag={tag}");
+        }
+    }
+
+    #[test]
+    fn declared_frame_len_rejects_a_bad_version_or_type_before_the_header_is_complete() {
+        assert_eq!(declared_frame_len(&[1]), Err(FrameFormatError::Version(1)));
+        assert_eq!(declared_frame_len(&[0, 9]), Err(FrameFormatError::Type(9)));
+        assert_eq!(declared_frame_len(&[]), Ok(None));
+        assert_eq!(declared_frame_len(&[0]), Ok(None));
     }
 }

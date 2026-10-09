@@ -22,13 +22,28 @@ pub async fn dial_tcp(
     target_port: u16,
 ) -> Result<TcpStream, CarrierError> {
     match proxy {
-        None => Ok(TcpStream::connect((target_host, target_port)).await?),
+        None => low_latency(TcpStream::connect((target_host, target_port)).await?),
         Some((proxy_host, proxy_port, creds)) => {
-            let mut stream = TcpStream::connect((proxy_host, proxy_port)).await?;
+            // Set on the connection to the proxy: once CONNECT succeeds
+            // that same socket carries everything after it.
+            let mut stream = low_latency(TcpStream::connect((proxy_host, proxy_port)).await?)?;
             connect_tunnel(&mut stream, target_host, target_port, creds).await?;
             Ok(stream)
         }
     }
+}
+
+/// Turns off Nagle's algorithm (TODO.md, found by two external model
+/// reviews on 2026-10-04): this protocol sends a steady stream of small
+/// records (L3 PING/PONG, L4 KEEP, `yamux` window updates, a single
+/// interactive keystroke under S2 reach), and Nagle holds a small write
+/// back until the peer's delayed ACK arrives (typically 40-200 ms),
+/// adding that to each of them on top of whatever the tunnel costs.
+/// Nothing in this protocol relies on small writes being coalesced:
+/// every record is already a whole WebSocket message.
+fn low_latency(stream: TcpStream) -> Result<TcpStream, CarrierError> {
+    stream.set_nodelay(true)?;
+    Ok(stream)
 }
 
 struct ConnectResponse {
@@ -224,6 +239,33 @@ mod tests {
             sock.write_all(response.as_bytes()).await.unwrap();
         }
         requests
+    }
+
+    #[tokio::test]
+    async fn a_direct_dial_disables_nagle() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accepted = tokio::spawn(async move { listener.accept().await.unwrap() });
+
+        let stream = dial_tcp(None, "127.0.0.1", addr.port()).await.unwrap();
+        assert!(stream.nodelay().unwrap());
+        drop(accepted.await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn a_dial_through_a_proxy_disables_nagle_on_the_proxy_connection() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(fake_proxy(
+            listener,
+            vec!["HTTP/1.1 200 Connection Established\r\n\r\n"],
+        ));
+
+        let stream = dial_tcp(Some(("127.0.0.1", addr.port(), None)), "relay.example", 443)
+            .await
+            .unwrap();
+        assert!(stream.nodelay().unwrap());
+        server.await.unwrap();
     }
 
     #[tokio::test]

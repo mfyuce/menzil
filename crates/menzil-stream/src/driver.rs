@@ -43,6 +43,20 @@ use crate::record_io::RecordIo;
 /// `Cargo.toml` pin on it ever moves.
 const YAMUX_DEFAULT_SPLIT_SEND_SIZE: usize = 16 * 1024;
 
+/// The most streams one connection may hold at once, accepted and
+/// outbound together: `yamux` 0.14.1's own default, stated here so the
+/// receive-window arithmetic in [`config_for`] does not silently change if
+/// that default ever does. Reaching it is fatal to the whole connection
+/// (`yamux` ends it, taking every healthy stream along), which is why the
+/// layers above should stay well clear of it — TODO.md L4h5.
+const MAX_STREAMS: usize = 512;
+
+/// The largest receive window one stream may auto-tune up to: protocol.md
+/// 5.3's "tuned upward to 16 MiB within a per session budget". Where that
+/// "budget" is the connection-wide growth allowance described on
+/// [`config_for`].
+const MAX_STREAM_RECEIVE_WINDOW: usize = 16 * 1024 * 1024;
+
 type OpenReply = oneshot::Sender<Result<Stream, StreamMuxError>>;
 
 /// A yamux-multiplexed L4 session's control handle: open outbound
@@ -141,9 +155,15 @@ impl Inbound {
 
 /// Produces one yamux frame's raw bytes at a time, ready to carry as
 /// [`menzil_proto::E2eDataBody::Mux`] — see [`crate::record_io`]'s doc
-/// comment for where these come from, the budget that bounds this
-/// channel, and what exceeding it does ([`Driver`] ends with
-/// [`StreamMuxError::Connection`]).
+/// comment for where these come from and the bound on this channel.
+/// **A caller that stops calling [`Self::next_frame`] pauses the
+/// connection, it does not break it**: once the channel is full `yamux`
+/// stops producing frames (every stream writer then waits in turn) and
+/// resumes when draining does. So a caller may take its time, or wait
+/// before pulling the next frame for a reason of its own (`menzil-node`
+/// waits for send-queue space), with no failure and no loss. Draining
+/// fast enough to keep a connection busy is the caller's concern, not a
+/// correctness one.
 pub struct OutboundFrames {
     rx: mpsc::Receiver<Vec<u8>>,
 }
@@ -348,24 +368,34 @@ pub fn new(mode: Mode, max_record: u32) -> (StreamMux, Inbound, OutboundFrames, 
 /// claims and nothing downstream has ever asked this function to tell
 /// them apart.
 ///
-/// **What this function deliberately does not configure, left exactly at
-/// `yamux`'s own defaults**: protocol.md 5.3's "initial receive window
-/// 256 KiB, receiver tuned upward to 16 MiB within a per session budget"
-/// is not implementable against `yamux` 0.14.1's actual `Config` API,
-/// confirmed by the same review — it exposes only a *connection-wide*
-/// `max_connection_receive_window` (1 GiB by default, used here
-/// unmodified), no per-stream ceiling at all; one stream's own window can
-/// auto-tune toward that entire connection-wide budget (confirmed live:
-/// one stream over a simulated 50&nbsp;ms RTT reached a 48&nbsp;MiB grant
-/// well before any ceiling intervened). This is the same gap protocol.md
-/// 14's own "Open items after v0.2," item 2 already names as an
-/// unresolved policy question ("yamux receive window auto tuning policy
-/// once credits exist"), confirmed here to concretely mean "today's
-/// default is unbounded in practice, not merely untuned" — picking an
-/// actual number is a policy call for whichever later item owns
-/// per-session resource accounting (most naturally TODO.md L4h, which
-/// already owns joining sessions into a running node), not a decision
-/// this function makes unasked.
+/// **The receive-window ceiling (TODO.md L4h5, closing the L4f review's
+/// finding that protocol.md 5.3's 16 MiB ceiling was "fully unenforced,
+/// not merely untuned")**: `yamux` 0.14.1 has no per-stream ceiling, only
+/// a connection-wide `max_connection_receive_window` (1 GiB by default;
+/// one stream over a simulated 50&nbsp;ms RTT was seen reaching a
+/// 48&nbsp;MiB grant with nothing intervening). Its meaning, read from
+/// `flow_control.rs`: every stream is guaranteed [`yamux::DEFAULT_CREDIT`]
+/// (256 KiB) for each of the [`MAX_STREAMS`] slots, and only what the
+/// configured total has *left over* after that — the "growth budget",
+/// shared by all streams on the connection — may be spent on auto-tuning
+/// any stream's window above its 256 KiB. One stream can claim all of it,
+/// so choosing the growth budget as `MAX_STREAM_RECEIVE_WINDOW - 256 KiB`
+/// caps **every** stream at [`MAX_STREAM_RECEIVE_WINDOW`] (protocol.md
+/// 5.3's 16 MiB), however few streams are open, and caps the *sum* of all
+/// growth at the same figure: the "per session budget". The most this
+/// session can ever be made to buffer unread is then the guaranteed share
+/// of every stream slot plus that one growth budget — about 144 MiB, down
+/// from the 1 GiB it was (128 MiB guaranteed plus 896 MiB of growth).
+/// That is the deliberate answer to protocol.md 14's open item 2 for
+/// phase 1: the *policy* of when a window grows is still `yamux`'s own
+/// (double when the sender used half of it within two round trips), only
+/// its ceiling is ours.
+///
+/// This is a receive-side figure, independent of the send-side queue
+/// budgets (`menzil-node`'s `SendBudget`): how much a peer may have in
+/// flight *toward* us is what we grant it; how much we have queued toward
+/// the peer is what the peer grants us, held to a different, lower number
+/// by `SendBudget` regardless of what any peer grants.
 fn config_for(max_record: u32) -> Config {
     let record_budget = menzil_proto::max_e2e_data_plaintext(max_record);
     let max_body_for_this_session = record_budget
@@ -374,8 +404,13 @@ fn config_for(max_record: u32) -> Config {
         .max(1);
     let split_send_size = YAMUX_DEFAULT_SPLIT_SEND_SIZE.min(max_body_for_this_session);
 
+    let guaranteed = MAX_STREAMS * yamux::DEFAULT_CREDIT as usize;
+    let growth_budget = MAX_STREAM_RECEIVE_WINDOW - yamux::DEFAULT_CREDIT as usize;
+
     let mut cfg = Config::default();
     cfg.set_split_send_size(split_send_size);
+    cfg.set_max_num_streams(MAX_STREAMS);
+    cfg.set_max_connection_receive_window(Some(guaranteed + growth_budget));
     cfg
 }
 
@@ -432,6 +467,42 @@ mod tests {
         assert_eq!(
             configured_split_send_size(&config_for(max_record)),
             expected
+        );
+    }
+
+    /// Reads one numeric `Config` field back out of its `Debug` output —
+    /// see [`configured_split_send_size`] for why that is the only way.
+    fn configured_usize(cfg: &Config, field: &str) -> usize {
+        let debug = format!("{cfg:?}");
+        let marker = format!("{field}: ");
+        let start = debug
+            .find(&marker)
+            .unwrap_or_else(|| panic!("yamux::Config's Debug format lost `{field}`"))
+            + marker.len();
+        let rest = &debug[start..];
+        // `Some(123)` for an `Option`, a bare `123` otherwise.
+        let rest = rest.strip_prefix("Some(").unwrap_or(rest);
+        let end = rest
+            .find(|c: char| !c.is_ascii_digit())
+            .unwrap_or(rest.len());
+        rest[..end].parse().expect("a plain integer")
+    }
+
+    #[test]
+    fn one_stream_can_grow_to_the_spec_ceiling_and_no_further() {
+        // protocol.md 5.3: 256 KiB initially, tuned up to 16 MiB. The
+        // growth budget (what the connection total leaves after every
+        // stream slot's guaranteed 256 KiB) is the most any single stream
+        // can add to its own window, so it must be exactly the difference.
+        let cfg = config_for(65_535);
+        let total = configured_usize(&cfg, "max_connection_receive_window");
+        let slots = configured_usize(&cfg, "max_num_streams");
+        let growth = total - slots * yamux::DEFAULT_CREDIT as usize;
+        assert_eq!(slots, MAX_STREAMS);
+        assert_eq!(
+            yamux::DEFAULT_CREDIT as usize + growth,
+            MAX_STREAM_RECEIVE_WINDOW,
+            "a lone stream's ceiling"
         );
     }
 

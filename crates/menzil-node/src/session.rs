@@ -284,18 +284,21 @@ impl Engine {
 /// which would otherwise starve the hourly REKEY.
 const TICK: Duration = Duration::from_secs(1);
 
-/// How long [`run_session`]'s drain loop waits for one queued outbound
-/// send to actually complete before giving up on this attachment and
+/// How long [`run_session`] waits for one queued outbound send to
+/// actually complete before giving up on this attachment and
 /// reconnecting (TODO.md L4b's own review, finding 7, live-reproduced
 /// against a real relay under two-way saturated traffic with a slow
-/// reader): the drain loop does not read the carrier at all while it is
-/// draining, so a write that blocks because the *relay* has stopped
-/// reading from this node — itself possible if the relay is meanwhile
-/// stuck writing to this same node, `menzil-relay`'s own pre-existing,
-/// documented no-write-timeout gap — would otherwise hang forever with
-/// nothing left to interrupt it: this loop runs outside [`Session::recv`],
-/// so the liveness clock that would normally notice a dead link never
-/// gets to run either. Ending the attachment on a stall, rather than
+/// reader): the loop does not read the carrier at all while one of its
+/// writes is in progress (a write is one arm of the loop, awaited inline;
+/// since L4h5's review the loop writes one record per iteration instead
+/// of finishing the whole queue, so the others get their turn between
+/// records, but not during one), so a write that blocks because the
+/// *relay* has stopped reading from this node — itself possible if the
+/// relay is meanwhile stuck writing to this same node, `menzil-relay`'s
+/// own pre-existing, documented no-write-timeout gap — would otherwise
+/// hang forever with nothing left to interrupt it: this loop runs
+/// outside [`Session::recv`], so the liveness clock that would normally
+/// notice a dead link never gets to run either. Ending the attachment on a stall, rather than
 /// waiting indefinitely, is a partial mitigation, not the complete fix
 /// (a true fix needs the relay side timed out too, and ideally a
 /// priority split between control and data sends on both ends — a
@@ -713,7 +716,13 @@ fn admit(req: OutboundSend, epoch: Epoch, outbound_queue: &mut OutboundQueue) {
     }
     let dst = req.dst;
     let payload_len = req.payload.len();
-    let outcome = outbound_queue.enqueue(req.dst, req.e2e_proto, req.flags, req.payload);
+    let outcome = outbound_queue.enqueue_with_permit(
+        req.dst,
+        req.e2e_proto,
+        req.flags,
+        req.payload,
+        req.permit,
+    );
     match outcome {
         EnqueueOutcome::QueueFull => {
             tracing::warn!(dst = %dst, "node outbound queue full, reliable send refused");
@@ -938,21 +947,46 @@ pub async fn run_session(
                 }
                 Some(req) = outbound.recv() => {
                     admit(req, epoch, &mut outbound_queue);
-                }
-            }
-
-            while let Some(record) = outbound_queue.next_ready_to_send() {
-                match tokio::time::timeout(SEND_TIMEOUT, session.send(record)).await {
-                    Ok(Ok(())) => {}
-                    Ok(Err(err)) => {
-                        tracing::warn!(error = %err, "node session ended while draining outbound sends, reconnecting");
-                        break 'attached None;
+                    // Take everything already waiting too, before anything
+                    // slow happens: admitting is cheap and never blocks,
+                    // and a caller is waiting on each request's outcome
+                    // (the L4 actor gives up on it after 35 s). Admitting
+                    // one request per iteration, each followed by writing
+                    // it, made a request's outcome wait for every request
+                    // ahead of it to be written at link speed: on a slow
+                    // uplink a bulk transfer ended its own session
+                    // (TODO.md, found by L4h5's red-team review).
+                    while let Ok(req) = outbound.try_recv() {
+                        admit(req, epoch, &mut outbound_queue);
                     }
-                    Err(_elapsed) => {
-                        tracing::warn!(
-                            "node session outbound send stalled past the write timeout, reconnecting"
-                        );
-                        break 'attached None;
+                }
+                // Write one record per iteration, as an arm like the
+                // others rather than a run that finishes the whole queue
+                // before the loop looks at anything else: `session.send`
+                // can take as long as the link is slow, and while it
+                // runs nothing else here does. Between two records the
+                // loop reads the carrier (a PING is answered, a CREDIT
+                // lets more records out), serves `events`, and admits
+                // whatever has arrived on `outbound`. `ready` is always
+                // ready, so this arm is chosen whenever something is
+                // writable and `select!`'s random order keeps it from
+                // starving the others.
+                () = std::future::ready(()), if outbound_queue.has_ready_to_send() => {
+                    let record = outbound_queue
+                        .next_ready_to_send()
+                        .expect("this arm only runs while has_ready_to_send is true");
+                    match tokio::time::timeout(SEND_TIMEOUT, session.send(record)).await {
+                        Ok(Ok(())) => {}
+                        Ok(Err(err)) => {
+                            tracing::warn!(error = %err, "node session ended while writing outbound sends, reconnecting");
+                            break 'attached None;
+                        }
+                        Err(_elapsed) => {
+                            tracing::warn!(
+                                "node session outbound send stalled past the write timeout, reconnecting"
+                            );
+                            break 'attached None;
+                        }
                     }
                 }
             }

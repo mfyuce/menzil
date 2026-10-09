@@ -154,9 +154,9 @@
 //! line anticipates — is enough to end an otherwise perfectly healthy
 //! session under ordinary bulk transfer: a single `Driver` poll can move
 //! up to eleven frames per actively writing stream into `menzil-stream`'s
-//! own `RecordIo`, whose outbound channel holds only 256
-//! (`OUTBOUND_FRAME_BUDGET`, enforced as a hard failure, not
-//! backpressure — see that crate's own `record_io` doc comment); pulling
+//! own `RecordIo`, whose outbound channel then held only 256
+//! (`OUTBOUND_FRAME_BUDGET`, which was then enforced as a hard failure,
+//! not backpressure; it pauses `yamux` now, see below); pulling
 //! frames out of it one at a time, each gated on a full encrypt-send-
 //! admit round trip through this node's own L3 layer, could not keep up,
 //! and the live reproduction needed as little as 9-16ms of sustained
@@ -175,31 +175,41 @@
 //! cannot change a decision already made to end the session, so it is
 //! sent fully best effort (see [`L4SessionHandle::close`]).
 //!
-//! **A real improvement, not a full fix — worth saying plainly rather
-//! than overclaiming it**: a second red-team review found live that
-//! ordinary bulk transfer can still exhaust the same 256-frame budget
-//! and end the session, just at a higher bar than before (this module's
-//! own regression test passes reliably at 16-20 concurrent streams and
-//! fails at 23 and up; chunkier reads or a multi-thread runtime lower
-//! that bar further). Two distinct mechanisms, both confirmed live: (A)
-//! backlog can still build up *across* several `select!` iterations —
-//! yamux auto-tunes a stream's own receive window upward as it reads,
-//! letting more than 256 frames be in flight at once regardless of how
-//! fast this actor drains them, and draining still costs one `select!`
-//! iteration per frame even without blocking on its outcome; (B) a
-//! *single* `Driver` poll, draining several actively writing streams'
-//! own command queues in one call, can on its own emit more than 256
-//! frames before this actor — or anything else — ever gets a chance to
-//! run in between. Mechanism (B) specifically cannot be fixed by any
-//! change inside this module: the actor has no way to interrupt a
-//! `Driver` poll partway through it. The real fix belongs where the
-//! budget and the windows actually live — TODO.md's own L4h5 line
-//! (composing L3 credit, this budget, and yamux's windows) or a
-//! `menzil-stream` budget that pauses instead of failing outright (the
-//! same shape TODO.md already names for the refused-OPEN-burst case,
-//! confirmed by this review to be the identical mechanism for plain
-//! accepted data, not something specific to refusals) — recorded as its
-//! own TODO.md line rather than attempted here.
+//! **What closed the rest of it (TODO.md L4h5)**: a second red-team
+//! review found that ordinary bulk transfer could still end a session
+//! after the change above, at a higher bar (this module's own regression
+//! test passed at 16-20 concurrent streams and failed at 23 and up), by
+//! two mechanisms: backlog building up *across* several `select!`
+//! iterations (`yamux` auto-tunes a stream's receive window upward, so
+//! more than the channel's capacity can be in flight whatever the actor's
+//! drain rate), and a *single* `Driver` poll emitting more frames than
+//! the channel holds before this actor ever runs, which nothing inside
+//! this module could fix since the actor cannot interrupt a poll. Both
+//! were one thing underneath: `menzil-stream`'s channel failing the whole
+//! connection when full. It now pauses `yamux` instead, so neither can
+//! end anything.
+//!
+//! That moved the failure one hop down, where a live test against a real
+//! relay (`tests/l4_bulk.rs`, which keeps the smallest size that still
+//! overflowed the old queue, 16 streams of 256 KiB; the first measurement
+//! was 32 of 512 KiB) found it: with the stream layer waiting
+//! properly, such transfers over a *healthy* relay still
+//! ended the sending session with [`EndReason::SendRefused`]
+//! (`QueueFull`) and the receiver with a counter-gap `Decrypt` error —
+//! the windows `yamux` grants a few busy streams add up to more than the
+//! node's own send queue holds (3 MiB per destination), and once
+//! `menzil-e2e` has given an L4 record its counter, that record being
+//! refused can only end the session. So a `Mux` frame no longer goes
+//! straight from `menzil-stream` to `outbound`: it is *staged* (pulled
+//! out, not yet encrypted) until the queue space it will occupy has been
+//! reserved through the node's shared [`SendBudget`], and the reservation
+//! travels with the record until the queue sends it. See [`Staged`] for
+//! why the wait is its own `select!` branch and why nothing else is
+//! pulled meanwhile — that chain, an unpulled frame leaving the channel
+//! full, `yamux` paused, every stream writer waiting in turn, is the
+//! backpressure. KEEP, REKEY and CLOSE (tiny, rare) do not reserve:
+//! the budget is sized below the queue's caps with room left over for
+//! them.
 //!
 //! **Why both the send itself and each individual outcome wait are
 //! bounded by [`SEND_OUTCOME_TIMEOUT`]**: `outbound` is a bounded
@@ -223,10 +233,14 @@
 //! can be stalled on any *one* record (`session::SEND_TIMEOUT`, 30s) —
 //! [`SEND_OUTCOME_TIMEOUT`] is set a little past that so a stall
 //! `run_session` is about to recover from on its own is not pre-empted by
-//! this module's own, separate timeout first; whether a *whole* drain
-//! pass, rather than one record, could still exceed this bound under a
-//! healthy but slow `run_session` is a related, open question that
-//! overlaps L4h5's own per-session budget work, not resolved here.
+//! this module's own, separate timeout first. A *whole* drain pass,
+//! rather than one record, used to be able to exceed this bound: a slow
+//! uplink delayed each request's admission behind every earlier write
+//! (found by L4h5's red-team review, reproduced at 12 KiB/s as
+//! [`EndReason::OutboundGone`] after about 35s). `run_session` now admits
+//! everything waiting before it writes, and writes one record per
+//! iteration, so an outcome waits at most for the write in progress,
+//! which `SEND_TIMEOUT` bounds below this constant.
 //! **This bites on literally every session's first poll, not just under
 //! contention**:
 //! `yamux::Connection::new` produces an outbound frame of its own before
@@ -271,23 +285,35 @@
 //! real (TODO.md L4h6 does not exist) to make the actual pacing, if any,
 //! concrete.
 use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use futures_util::stream::{FuturesUnordered, StreamExt};
 use menzil_e2e::{E2eError, E2eTransport, Liveness, RekeySchedule};
-use menzil_proto::{E2eDataBody, ErrorCode, NetworkId, NodeId};
+use menzil_proto::{
+    E2eDataBody, ErrorCode, MIN_SEND_CHARGE_BYTES, NetworkId, NodeId, e2e_data_frame_len,
+};
 use menzil_stream::{Mode, Stream, StreamMuxError};
 use tokio::sync::{mpsc, oneshot};
 
-use crate::outbound::{EnqueueOutcome, Epoch, OutboundSend};
+use crate::outbound::{EnqueueOutcome, Epoch, OutboundSend, SendBudget, SendPermit};
+
+/// The current time as a `std::time::Instant`, read through tokio's clock.
+/// Identical in production; a test that pauses and advances tokio's clock
+/// then moves this session's liveness and rekey schedules with it (the
+/// sans-IO types in `menzil-e2e` take a `std::time::Instant`, which tokio's
+/// paused clock would otherwise leave behind).
+fn clock_now() -> Instant {
+    tokio::time::Instant::now().into_std()
+}
 
 /// `e2e_proto` tag for this project's own L4 (decision 0001); every other
 /// call site in this workspace that needs it today (L3's HELLO/ATTACH
 /// catch-up, this crate's own tests) inlines the same literal rather than
 /// importing a shared constant, since none exists yet — matched here for
 /// consistency rather than introducing one unilaterally.
-const E2E_PROTO_TAG: u8 = 0x01;
+pub(crate) const E2E_PROTO_TAG: u8 = 0x01;
 
 /// protocol.md 4.2's flags bit 0; 0 means reliable. Every record this
 /// module ever sends is reliable-class (protocol.md 5.2's table: MUX,
@@ -298,9 +324,10 @@ const RELIABLE_FLAGS: u8 = 0x00;
 
 /// How long [`enqueue_send`] waits for `outbound` to accept one send, and
 /// separately how long it then waits for that send's own admission
-/// outcome, before giving up on this session entirely — see this
-/// module's own doc comment for why a bound is needed for both halves
-/// and why this particular value.
+/// outcome, and how long a [`Staged`] frame waits for send-queue space
+/// (TODO.md L4h5), before giving up on this session entirely — see this
+/// module's own doc comment for why a bound is needed for each and why
+/// this particular value.
 const SEND_OUTCOME_TIMEOUT: Duration = Duration::from_secs(35);
 
 /// How long [`L4SessionHandle::close`]'s own best-effort CLOSE send waits
@@ -425,6 +452,9 @@ pub enum EndReason {
     /// This session's own L3 epoch ended (protocol.md 5.1's path
     /// pinning) — reported by whoever constructed this session via the
     /// `epoch_ended` channel passed to [`new`], not detected internally.
+    /// If [`L4SessionHandle::close`] had already queued a close when the
+    /// epoch ended (or the channel was dropped, which counts the same),
+    /// that close is the reason instead: [`Self::ClosedLocally`].
     EpochEnded,
     /// Every live clone of [`L4SessionHandle`] was dropped without any
     /// of them calling [`L4SessionHandle::close`] first — see this
@@ -441,6 +471,61 @@ pub enum EndReason {
     /// module's own doc comment for why this is kept distinct from
     /// [`Self::OutboundGone`].
     ActorGone,
+}
+
+/// What a session actor tells whoever built it, through a
+/// [`SessionObserver`] (TODO.md L4h6: the peer/session table needs both to
+/// do its job, and neither is visible from outside the actor).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionNotice {
+    /// The first record on this session authenticated: it decrypted, so
+    /// the peer on the other end really holds the session's keys.
+    /// Sent once. protocol.md 5.1: "A responder keeps its current session
+    /// with a peer until a data record on the new session decrypts" — this
+    /// is that moment, and the table's `promote` is what it triggers.
+    FirstRecord,
+    /// The actor is done, for whatever reason (why is on
+    /// [`L4SessionAcceptor::closed`]) — including when its task is
+    /// dropped or aborted before it finished, which is why this is sent
+    /// from a drop guard and not from the end of [`run`]. Sent last.
+    Ended,
+}
+
+/// Where a session actor reports [`SessionNotice`]s: every notice goes down
+/// `tx` together with `tag`, whatever the caller needs to tell sessions
+/// apart by (the peer/session table packs a local index and a generation
+/// into it, so a late notice from a session whose index has since been
+/// reused is told from the new one's).
+#[derive(Debug, Clone)]
+pub struct SessionObserver {
+    tx: mpsc::UnboundedSender<(u64, SessionNotice)>,
+    tag: u64,
+}
+
+impl SessionObserver {
+    /// An observer sending `(tag, notice)` on `tx`. Unbounded on purpose:
+    /// a session sends at most two notices in its life.
+    pub fn new(tx: mpsc::UnboundedSender<(u64, SessionNotice)>, tag: u64) -> Self {
+        Self { tx, tag }
+    }
+
+    fn notify(&self, notice: SessionNotice) {
+        // Nobody listening any more is not the actor's problem.
+        let _ = self.tx.send((self.tag, notice));
+    }
+}
+
+/// Sends [`SessionNotice::Ended`] when dropped, which is when the session's
+/// future finishes or is dropped without ever finishing (or starting): see
+/// [`new`], which owns it for exactly that reason.
+struct EndGuard(Option<SessionObserver>);
+
+impl Drop for EndGuard {
+    fn drop(&mut self) {
+        if let Some(observer) = &self.0 {
+            observer.notify(SessionNotice::Ended);
+        }
+    }
 }
 
 /// A command sent to [`run`] through [`L4SessionHandle`].
@@ -476,6 +561,16 @@ pub struct L4SessionConfig {
     /// 5.1's path pinning) — stamped on every `OutboundSend` this session
     /// produces.
     pub epoch: Epoch,
+    /// Where this session reserves queue space in this node's L3
+    /// `OutboundQueue` before producing each `Mux` record (TODO.md L4h5;
+    /// see [`SendBudget`] for why). **Every L4 session to the same `peer`
+    /// must share one**, since they share one per-destination queue
+    /// allowance: take it from one [`crate::SendBudgets`] per node,
+    /// `for_peer(peer)`.
+    pub send_budget: SendBudget,
+    /// Told when the first record authenticates and when the actor ends
+    /// (see [`SessionNotice`]); `None` if nobody needs to know.
+    pub observer: Option<SessionObserver>,
 }
 
 /// A cloneable handle to one running [`run`] actor's send side: open
@@ -651,6 +746,12 @@ pub fn new(
         ended_cached: None,
     };
 
+    // Built here, outside `run`, and moved into the future that wraps it:
+    // a guard created inside `run`'s body would never exist if the task
+    // were dropped before its first poll (an `abort()` right after
+    // spawning, found by this module's own test), and then no `Ended`
+    // would ever be sent.
+    let end_guard = EndGuard(config.observer.clone());
     let task = run(
         config.transport,
         config.peer,
@@ -660,13 +761,70 @@ pub fn new(
         outbound_frames,
         driver,
         outbound,
+        config.send_budget,
+        config.observer,
         inbound_data_rx,
         command_rx,
         epoch_ended,
         ended_tx,
     );
+    let task = async move {
+        let _end_guard = end_guard;
+        task.await;
+    };
 
     (handle, acceptor, task)
+}
+
+/// One outbound `Mux` frame that [`run`] has pulled out of
+/// `menzil-stream` but not yet encrypted, because the space it will
+/// occupy in this node's send queue is not free yet (TODO.md L4h5).
+///
+/// **Why a frame waits here, un-encrypted, instead of being encrypted and
+/// handed to `outbound` straight away**: once `menzil-e2e` has given a
+/// record a counter it can never be dropped or retried without ending the
+/// session, and the node's `OutboundQueue` refuses a reliable record when
+/// it is full. Ordinary bulk transfer fills it (the receive windows of a
+/// few busy streams add up to more than it holds), so before this existed
+/// a perfectly healthy session ended with [`EndReason::SendRefused`]
+/// ([`EnqueueOutcome::QueueFull`]). Reserving the space first through the
+/// shared [`SendBudget`] means that never happens to a reserved record;
+/// everything beyond the budget just waits.
+///
+/// **Why the wait is a `select!` branch rather than an `.await` inside the
+/// loop body**: it can last as long as the peer takes to give credit back,
+/// and this actor must keep decrypting inbound records, answering its own
+/// clocks, and noticing a `close()` the whole time (a blocking wait here
+/// would leave it deaf, and its liveness clock would eventually declare a
+/// perfectly alive peer dead).
+///
+/// **Why nothing else is staged behind it**: while a frame is staged, the
+/// next one is not pulled from `menzil-stream` at all. Its bounded
+/// outbound channel then fills and pauses `yamux` (`menzil-stream`'s
+/// `record_io` module), and every stream writer ends up waiting in turn:
+/// that chain *is* the backpressure.
+struct Staged {
+    frame: Vec<u8>,
+    /// Resolves to the reserved space, or `Err` once
+    /// [`SEND_OUTCOME_TIMEOUT`] passes without any being freed.
+    reservation:
+        Pin<Box<dyn Future<Output = Result<SendPermit, tokio::time::error::Elapsed>> + Send>>,
+}
+
+impl Staged {
+    fn new(frame: Vec<u8>, budget: &SendBudget) -> Self {
+        // Exactly what the node's queue will charge for this record once
+        // encrypted: its encoded length, floored at the same minimum
+        // (`OutboundQueue`'s own `QueuedSend::charge`).
+        let charge = e2e_data_frame_len(1 + frame.len()).max(MIN_SEND_CHARGE_BYTES as usize);
+        let budget = budget.clone();
+        Self {
+            frame,
+            reservation: Box::pin(tokio::time::timeout(SEND_OUTCOME_TIMEOUT, async move {
+                budget.acquire(charge).await
+            })),
+        }
+    }
 }
 
 /// Encrypts `body` and hands it to `outbound` as an epoch-tagged reliable
@@ -704,6 +862,7 @@ async fn enqueue_send(
     peer: NodeId,
     epoch: Epoch,
     body: E2eDataBody,
+    permit: Option<SendPermit>,
     pending_outcomes: &mut FuturesUnordered<
         tokio::time::Timeout<oneshot::Receiver<EnqueueOutcome>>,
     >,
@@ -713,20 +872,28 @@ async fn enqueue_send(
         Ok(frame) => frame,
         Err(err) => return Some(EndReason::EncryptFailed(err)),
     };
+    let payload = frame.encode();
+    debug_assert!(
+        permit
+            .as_ref()
+            .is_none_or(|p| p.bytes() >= payload.len().max(MIN_SEND_CHARGE_BYTES as usize)),
+        "a reservation must cover what the queue will charge for this record"
+    );
     let (outcome_tx, outcome_rx) = oneshot::channel();
     let req = OutboundSend {
         dst: peer,
         e2e_proto: E2E_PROTO_TAG,
         flags: RELIABLE_FLAGS,
-        payload: frame.encode(),
+        payload,
         epoch,
         outcome: outcome_tx,
+        permit,
     };
     match tokio::time::timeout(SEND_OUTCOME_TIMEOUT, outbound.send(req)).await {
         Ok(Ok(())) => {}
         Ok(Err(_)) | Err(_) => return Some(EndReason::OutboundGone),
     }
-    let now = Instant::now();
+    let now = clock_now();
     liveness.note_sent(now);
     if is_rekey {
         rekey.note_rekeyed(now);
@@ -744,6 +911,40 @@ async fn enqueue_send(
     None
 }
 
+/// Sends the CLOSE record for a locally requested end. Best effort, fully:
+/// a short, separate timeout, and an encrypt failure or a refusal is simply
+/// not retried or reported — the session is ending either way, and nothing
+/// about that outcome could change what happens next. See this module's own
+/// doc comment for why CLOSE specifically skips `pending_outcomes` rather
+/// than only skipping the wait.
+async fn send_close(
+    transport: &mut E2eTransport,
+    outbound: &mpsc::Sender<OutboundSend>,
+    peer: NodeId,
+    epoch: Epoch,
+    max_record: u32,
+    close: &CloseReason,
+) {
+    let limit = close_msg_limit(max_record);
+    let Ok(frame) = transport.encrypt_data(&E2eDataBody::Close {
+        code: close.code,
+        msg: clamp_close_msg(&close.msg, limit),
+    }) else {
+        return;
+    };
+    let (outcome_tx, _outcome_rx) = oneshot::channel();
+    let req = OutboundSend {
+        dst: peer,
+        e2e_proto: E2E_PROTO_TAG,
+        flags: RELIABLE_FLAGS,
+        payload: frame.encode(),
+        epoch,
+        outcome: outcome_tx,
+        permit: None,
+    };
+    let _ = tokio::time::timeout(CLOSE_SEND_TIMEOUT, outbound.send(req)).await;
+}
+
 /// The actor itself — see this module's own doc comment for the overall
 /// shape and why each branch ends the session the way it does.
 #[allow(clippy::too_many_arguments)] // assembled once, entirely from `new`; see
@@ -759,14 +960,17 @@ async fn run(
     mut outbound_frames: menzil_stream::OutboundFrames,
     driver: menzil_stream::Driver,
     outbound: mpsc::Sender<OutboundSend>,
+    send_budget: SendBudget,
+    observer: Option<SessionObserver>,
     mut inbound_data_rx: mpsc::UnboundedReceiver<(u64, Vec<u8>)>,
     mut command_rx: mpsc::UnboundedReceiver<Command>,
     epoch_ended: oneshot::Receiver<()>,
     ended_tx: oneshot::Sender<EndReason>,
 ) {
+    let mut first_record_noted = false;
     tokio::pin!(driver);
     tokio::pin!(epoch_ended);
-    let now = Instant::now();
+    let now = clock_now();
     let mut liveness = Liveness::new(now);
     let mut rekey = RekeySchedule::new(now);
     let mut clock = tokio::time::interval(CLOCK_TICK);
@@ -777,6 +981,9 @@ async fn run(
     // module's own doc comment on why that alone must not end the
     // session the way `command_rx` closing does.
     let mut inbound_closed = false;
+    // The one outbound `Mux` frame pulled from `menzil-stream` that is
+    // still waiting for send-queue space — see [`Staged`].
+    let mut staged: Option<Staged> = None;
 
     let reason = loop {
         tokio::select! {
@@ -784,7 +991,11 @@ async fn run(
                 break EndReason::DriverEnded(result);
             }
 
-            frame = outbound_frames.next_frame() => {
+            // Only while nothing is staged: the next frame is not even
+            // pulled out of `menzil-stream` until the previous one has
+            // its queue space, which is what lets that crate's bounded
+            // outbound channel fill up and pause `yamux` — see [`Staged`].
+            frame = outbound_frames.next_frame(), if staged.is_none() => {
                 let Some(frame) = frame else {
                     // Every `StreamMux` clone dropped — in practice
                     // unreachable while this function still holds its
@@ -794,9 +1005,25 @@ async fn run(
                     // condition this would otherwise imply.
                     continue;
                 };
+                staged = Some(Staged::new(frame, &send_budget));
+            }
+
+            // The staged frame got its space. Encrypting only now keeps
+            // every counter this session assigns attached to a record
+            // that is certain to be handed on, in order.
+            reserved = async {
+                staged.as_mut().expect("guarded by the precondition below").reservation.as_mut().await
+            }, if staged.is_some() => {
+                let Staged { frame, .. } = staged.take().expect("guarded by the precondition");
+                let Ok(permit) = reserved else {
+                    // No space for `SEND_OUTCOME_TIMEOUT`: nothing is
+                    // draining this node's queue to the peer, the same
+                    // dead path every other bound in this module reports.
+                    break EndReason::OutboundGone;
+                };
                 if let Some(reason) = enqueue_send(
                     &mut transport, &mut liveness, &mut rekey, &outbound, peer, epoch,
-                    E2eDataBody::Mux(frame), &mut pending_outcomes,
+                    E2eDataBody::Mux(frame), Some(permit), &mut pending_outcomes,
                 ).await {
                     break reason;
                 }
@@ -830,7 +1057,13 @@ async fn run(
                         // this module's own doc comment on why liveness
                         // must not be fed by input that never
                         // authenticated at all.
-                        liveness.note_received(Instant::now());
+                        liveness.note_received(clock_now());
+                        if !first_record_noted {
+                            first_record_noted = true;
+                            if let Some(observer) = &observer {
+                                observer.notify(SessionNotice::FirstRecord);
+                            }
+                        }
                         match body {
                             E2eDataBody::Mux(bytes) => {
                                 if let Err(err) = stream_mux.feed_inbound(bytes) {
@@ -872,40 +1105,31 @@ async fn run(
                     break EndReason::HandleDropped;
                 };
                 if let Some(close) = &reason {
-                    // Best effort, fully: a short, separate timeout, and
-                    // an encrypt failure or a refusal is simply not
-                    // retried or reported — this session is ending
-                    // either way, and nothing about that outcome could
-                    // change what happens next. See this module's own
-                    // doc comment for why CLOSE specifically skips
-                    // `pending_outcomes` rather than only skipping the
-                    // wait.
-                    let limit = close_msg_limit(max_record);
-                    if let Ok(frame) = transport.encrypt_data(&E2eDataBody::Close {
-                        code: close.code,
-                        msg: clamp_close_msg(&close.msg, limit),
-                    }) {
-                        let (outcome_tx, _outcome_rx) = oneshot::channel();
-                        let req = OutboundSend {
-                            dst: peer,
-                            e2e_proto: E2E_PROTO_TAG,
-                            flags: RELIABLE_FLAGS,
-                            payload: frame.encode(),
-                            epoch,
-                            outcome: outcome_tx,
-                        };
-                        let _ = tokio::time::timeout(CLOSE_SEND_TIMEOUT, outbound.send(req)).await;
-                    }
+                    send_close(&mut transport, &outbound, peer, epoch, max_record, close).await;
                 }
                 break EndReason::ClosedLocally(reason);
             }
 
             _ = &mut epoch_ended => {
+                // A close the owner already asked for outranks the epoch
+                // ending. The router closes a session it replaced and
+                // drops its entry in one step, which makes this branch and
+                // `command` ready together, and `select!` picks among
+                // ready branches at random: without this look at the
+                // queue, the reason a replaced session reports would be a
+                // coin toss.
+                if let Ok(Command::Close(reason)) = command_rx.try_recv() {
+                    if let Some(close) = &reason {
+                        send_close(&mut transport, &outbound, peer, epoch, max_record, close)
+                            .await;
+                    }
+                    break EndReason::ClosedLocally(reason);
+                }
                 break EndReason::EpochEnded;
             }
 
             _ = clock.tick() => {
-                let now = Instant::now();
+                let now = clock_now();
                 if liveness.is_dead(now) {
                     break EndReason::PeerDead;
                 }
@@ -919,7 +1143,7 @@ async fn run(
                 if let Some(body) = due
                     && let Some(reason) = enqueue_send(
                         &mut transport, &mut liveness, &mut rekey, &outbound, peer, epoch, body,
-                        &mut pending_outcomes,
+                        None, &mut pending_outcomes,
                     ).await
                 {
                     break reason;
@@ -1022,6 +1246,40 @@ mod tests {
         oneshot::Sender<()>,
         tokio::task::JoinHandle<()>,
     ) {
+        let budget = crate::outbound::SendBudgets::new().for_peer(side.peer);
+        one_session_with_budget(side, max_record, budget)
+    }
+
+    /// [`one_session`], for a test that needs to hold the send budget
+    /// itself (to exhaust it, or to watch it being released).
+    fn one_session_with_budget(
+        side: OneSide,
+        max_record: u32,
+        send_budget: SendBudget,
+    ) -> (
+        L4SessionHandle,
+        L4SessionAcceptor,
+        mpsc::Receiver<OutboundSend>,
+        oneshot::Sender<()>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        one_session_observed(side, max_record, send_budget, None)
+    }
+
+    /// [`one_session_with_budget`], for a test that watches the actor's
+    /// [`SessionNotice`]s.
+    fn one_session_observed(
+        side: OneSide,
+        max_record: u32,
+        send_budget: SendBudget,
+        observer: Option<SessionObserver>,
+    ) -> (
+        L4SessionHandle,
+        L4SessionAcceptor,
+        mpsc::Receiver<OutboundSend>,
+        oneshot::Sender<()>,
+        tokio::task::JoinHandle<()>,
+    ) {
         let (outbound_tx, outbound_rx) = mpsc::channel(64);
         let (epoch_ended_tx, epoch_ended_rx) = oneshot::channel();
         let (handle, acceptor, task) = new(
@@ -1032,6 +1290,8 @@ mod tests {
                 mode: side.mode,
                 max_record,
                 epoch: Epoch::first(),
+                send_budget,
+                observer,
             },
             outbound_tx,
             epoch_ended_rx,
@@ -1126,6 +1386,35 @@ mod tests {
         }
     }
 
+    /// [`two_sessions_with_max_record`], with an observer on each side.
+    fn two_observed_sessions(
+        a_observer: Option<SessionObserver>,
+        b_observer: Option<SessionObserver>,
+    ) -> TwoSessions {
+        let max_record = 65_535;
+        let (a_side, b_side) = two_sides(1, max_record);
+        let budget_for = |side: &OneSide| crate::outbound::SendBudgets::new().for_peer(side.peer);
+        let (a_budget, b_budget) = (budget_for(&a_side), budget_for(&b_side));
+        let (a_handle, a_acceptor, a_outbound_rx, a_epoch_ended_tx, task_a) =
+            one_session_observed(a_side, max_record, a_budget, a_observer);
+        let (b_handle, b_acceptor, b_outbound_rx, b_epoch_ended_tx, task_b) =
+            one_session_observed(b_side, max_record, b_budget, b_observer);
+        let pump_a_to_b = pump(a_outbound_rx, b_handle.clone());
+        let pump_b_to_a = pump(b_outbound_rx, a_handle.clone());
+        TwoSessions {
+            a: a_handle,
+            a_acceptor,
+            b: b_handle,
+            b_acceptor,
+            _pump_a_to_b: pump_a_to_b,
+            _pump_b_to_a: pump_b_to_a,
+            _task_a: task_a,
+            _task_b: task_b,
+            _a_epoch_ended_tx: a_epoch_ended_tx,
+            _b_epoch_ended_tx: b_epoch_ended_tx,
+        }
+    }
+
     fn two_sessions() -> TwoSessions {
         two_sessions_with_max_record(65_535)
     }
@@ -1192,12 +1481,20 @@ mod tests {
         // frame's own admission outcome before pulling the next one from
         // `menzil_stream::OutboundFrames`, which alone — no congestion,
         // no credit starvation — was enough to exhaust that crate's own
-        // 256-frame outbound budget and end the session under perfectly
-        // ordinary bulk transfer; live-reproduced there in well under
+        // outbound budget (then 256 frames and a hard failure) and end
+        // the session under perfectly ordinary bulk transfer; live-reproduced there in well under
         // 100ms across a range of stream counts and sizes. 16 concurrent
         // streams of 1 MiB each is comfortably inside the range that
         // reproduced it every time.
         use futures_util::io::{AsyncReadExt, AsyncWriteExt};
+        // These bounds exist to catch a hang, not slowness. Moving 16 MiB
+        // through two sessions in a debug build (unoptimized crypto, two
+        // passes per byte) takes about 9.5 s on a quiet machine, with the
+        // code before and after L4h5 alike, so the 10 s each of them used
+        // to carry failed under any load at all (found when a full
+        // workspace run failed once: HEAD fails this test 3 runs in 5 with
+        // a dozen busy-loops running, and the current code 4 in 5).
+        const BULK_PATIENCE: Duration = Duration::from_secs(120);
         const STREAMS: usize = 16;
         const BYTES_PER_STREAM: usize = 1024 * 1024;
         let mut sessions = two_sessions();
@@ -1214,11 +1511,10 @@ mod tests {
 
         let mut readers = Vec::new();
         for _ in 0..STREAMS {
-            let mut stream =
-                tokio::time::timeout(Duration::from_secs(10), sessions.b_acceptor.accept())
-                    .await
-                    .unwrap()
-                    .unwrap();
+            let mut stream = tokio::time::timeout(BULK_PATIENCE, sessions.b_acceptor.accept())
+                .await
+                .unwrap()
+                .unwrap();
             readers.push(tokio::spawn(async move {
                 let mut buf = vec![0u8; BYTES_PER_STREAM];
                 stream.read_exact(&mut buf).await.unwrap();
@@ -1227,13 +1523,13 @@ mod tests {
         }
 
         for writer in writers {
-            tokio::time::timeout(Duration::from_secs(10), writer)
+            tokio::time::timeout(BULK_PATIENCE, writer)
                 .await
                 .expect("write must not stall")
                 .unwrap();
         }
         for reader in readers {
-            let buf = tokio::time::timeout(Duration::from_secs(10), reader)
+            let buf = tokio::time::timeout(BULK_PATIENCE, reader)
                 .await
                 .expect("read must not stall")
                 .unwrap();
@@ -1635,5 +1931,282 @@ mod tests {
             .unwrap();
         assert!(matches!(reason.as_ref(), EndReason::EpochEnded));
         task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_close_already_queued_when_the_epoch_ends_is_the_reason() {
+        // The router closes a session it replaced and drops its entry, the
+        // epoch sender with it, in one step, so the actor finds `command`
+        // and `epoch_ended` ready together and `select!` picks between them
+        // at random. One run proves little (the old behaviour reported
+        // `EpochEnded` about one time in eight); sixty-four make a
+        // regression a near certain failure.
+        for round in 0..64 {
+            let (a_side, _b_side) = two_sides(3, 65_535);
+            let (handle, mut acceptor, mut outbound_rx, epoch_ended_tx, task) =
+                one_session(a_side, 65_535);
+            let _drain = tokio::spawn(async move {
+                while let Some(req) = outbound_rx.recv().await {
+                    let _ = req.outcome.send(EnqueueOutcome::Accepted);
+                }
+            });
+            // No await between the two: the actor sees them together.
+            handle.close(None);
+            drop(epoch_ended_tx);
+            let reason = tokio::time::timeout(Duration::from_secs(5), acceptor.closed())
+                .await
+                .unwrap();
+            assert!(
+                matches!(reason.as_ref(), EndReason::ClosedLocally(None)),
+                "round {round}: {reason:?}"
+            );
+            task.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn a_close_with_a_reason_still_reaches_the_peer_when_the_epoch_ends_with_it() {
+        for round in 0..32 {
+            let mut sessions = two_sessions();
+            sessions.a.close(Some(CloseReason {
+                code: ErrorCode::GrantRemoved,
+                msg: "revoked".to_string(),
+            }));
+            drop(sessions._a_epoch_ended_tx);
+            let a_end = tokio::time::timeout(Duration::from_secs(5), sessions.a_acceptor.closed())
+                .await
+                .unwrap();
+            assert!(
+                matches!(a_end.as_ref(), EndReason::ClosedLocally(Some(_))),
+                "round {round}: {a_end:?}"
+            );
+            let b_end = tokio::time::timeout(Duration::from_secs(5), sessions.b_acceptor.closed())
+                .await
+                .expect("the CLOSE must still be sent");
+            match b_end.as_ref() {
+                EndReason::PeerClosed { code, msg } => {
+                    assert_eq!(*code, ErrorCode::GrantRemoved, "round {round}");
+                    assert_eq!(msg, "revoked", "round {round}");
+                }
+                other => panic!("round {round}: expected PeerClosed, got {other:?}"),
+            }
+        }
+    }
+
+    // --- TODO.md L4h5: the send budget -----------------------------------
+
+    /// A [`SendBudget`] for `peer` whose whole per-destination allowance
+    /// is held by the returned permit: until that is dropped, nothing can
+    /// reserve any queue space through (any clone of) the budget.
+    async fn exhausted_budget(peer: NodeId) -> (SendBudget, SendPermit) {
+        let budget = crate::outbound::SendBudgets::new().for_peer(peer);
+        let hog = budget
+            .acquire(crate::outbound::L4_SEND_BUDGET_PER_DST)
+            .await;
+        (budget, hog)
+    }
+
+    #[tokio::test]
+    async fn an_exhausted_send_budget_holds_frames_back_but_the_session_stays_responsive() {
+        // `yamux::Connection::new` produces a frame of its own the moment
+        // the session starts (see this module's own doc comment), so the
+        // very first frame is already waiting for queue space here — no
+        // stream needs opening.
+        let (a_side, _b_side) = two_sides(20, 65_535);
+        let (budget, hog) = exhausted_budget(a_side.peer).await;
+        let (handle, mut acceptor, mut outbound_rx, _epoch_ended_tx, task) =
+            one_session_with_budget(a_side, 65_535, budget);
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), outbound_rx.recv())
+                .await
+                .is_err(),
+            "a frame must not be encrypted and sent while it has no queue space"
+        );
+
+        // The wait must not leave the actor deaf: a `close()` issued
+        // while a frame is staged still ends the session promptly.
+        handle.close(None);
+        let reason = tokio::time::timeout(Duration::from_secs(5), acceptor.closed())
+            .await
+            .expect("a staged frame must not stop the actor noticing a close()");
+        assert!(matches!(reason.as_ref(), EndReason::ClosedLocally(None)));
+        drop(hog);
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("must not hang")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn freeing_queue_space_lets_the_held_back_frame_through_with_its_reservation() {
+        let (a_side, _b_side) = two_sides(21, 65_535);
+        let (budget, hog) = exhausted_budget(a_side.peer).await;
+        let (_handle, _acceptor, mut outbound_rx, _epoch_ended_tx, _task) =
+            one_session_with_budget(a_side, 65_535, budget);
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), outbound_rx.recv())
+                .await
+                .is_err()
+        );
+        drop(hog);
+
+        let req = tokio::time::timeout(Duration::from_secs(5), outbound_rx.recv())
+            .await
+            .expect("the frame must go out once space is free")
+            .expect("the channel is still open");
+        let permit = req
+            .permit
+            .as_ref()
+            .expect("a Mux frame must travel with the queue space it reserved");
+        assert!(
+            permit.bytes() >= req.payload.len().max(MIN_SEND_CHARGE_BYTES as usize),
+            "the reservation must cover what the queue will charge ({} < {})",
+            permit.bytes(),
+            req.payload.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_reservation_that_never_comes_ends_the_session_as_outbound_gone() {
+        // Nothing frees queue space for `SEND_OUTCOME_TIMEOUT`: the same
+        // dead path every other bound in this module reports. Virtual
+        // time, stepped the same way and for the same reason as
+        // `an_unresolved_outcome_ends_the_session_via_timeout`.
+        tokio::time::pause();
+        let (a_side, _b_side) = two_sides(22, 65_535);
+        let (budget, _hog) = exhausted_budget(a_side.peer).await;
+        let (_handle, mut acceptor, _outbound_rx, _epoch_ended_tx, task) =
+            one_session_with_budget(a_side, 65_535, budget);
+
+        let deadline = SEND_OUTCOME_TIMEOUT + Duration::from_secs(1);
+        let step = Duration::from_millis(500);
+        let mut elapsed = Duration::ZERO;
+        while elapsed < deadline && !task.is_finished() {
+            tokio::task::yield_now().await;
+            tokio::time::advance(step).await;
+            elapsed += step;
+        }
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("must not hang once virtual time has passed SEND_OUTCOME_TIMEOUT")
+            .unwrap();
+        let reason = acceptor.closed().await;
+        assert!(matches!(reason.as_ref(), EndReason::OutboundGone));
+    }
+
+    #[tokio::test]
+    async fn queue_space_is_given_back_when_the_consumer_drops_the_send() {
+        // The budget must not leak: a send that is dropped (the queue
+        // sent it, refused it, or was torn down with its L3 session) frees
+        // exactly what it reserved.
+        let (a_side, _b_side) = two_sides(23, 65_535);
+        let peer = a_side.peer;
+        let budgets = crate::outbound::SendBudgets::new();
+        let (_handle, _acceptor, mut outbound_rx, _epoch_ended_tx, _task) =
+            one_session_with_budget(a_side, 65_535, budgets.for_peer(peer));
+
+        let req = tokio::time::timeout(Duration::from_secs(5), outbound_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let held = req.permit.as_ref().unwrap().bytes();
+        assert!(held > 0);
+        // While the send is alive its reservation is taken...
+        let remaining = crate::outbound::L4_SEND_BUDGET_PER_DST - held;
+        let probe = budgets.for_peer(peer);
+        let _fits = tokio::time::timeout(Duration::from_millis(200), probe.acquire(remaining))
+            .await
+            .expect("everything but the reservation is still free");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), probe.acquire(held))
+                .await
+                .is_err(),
+            "the reservation must still be held while the send is alive"
+        );
+        // ...and gone with it.
+        drop(req);
+        drop(_fits);
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            probe.acquire(crate::outbound::L4_SEND_BUDGET_PER_DST),
+        )
+        .await
+        .expect("dropping the send must give its whole reservation back");
+    }
+    // --- TODO.md L4h6: SessionObserver notices -----------------------------
+
+    #[tokio::test]
+    async fn the_first_authenticated_record_is_reported_once() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut sessions = two_observed_sessions(None, Some(SessionObserver::new(tx, 77)));
+
+        // `yamux` sends a frame of its own the moment a session starts, so
+        // B's first record arrives without anyone opening a stream.
+        let first = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("B must see A's first record")
+            .unwrap();
+        assert_eq!(first, (77, SessionNotice::FirstRecord));
+
+        // Real traffic afterwards must not repeat it.
+        let mut stream = sessions.a.open_stream().await.unwrap();
+        futures_util::io::AsyncWriteExt::write_all(&mut stream, b"hello")
+            .await
+            .unwrap();
+        let _accepted = tokio::time::timeout(Duration::from_secs(5), sessions.b_acceptor.accept())
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        while let Ok((tag, notice)) = rx.try_recv() {
+            assert_eq!(tag, 77);
+            assert_ne!(notice, SessionNotice::FirstRecord, "reported twice");
+        }
+    }
+
+    #[tokio::test]
+    async fn the_end_of_a_session_is_reported_last() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let sessions = two_observed_sessions(Some(SessionObserver::new(tx, 5)), None);
+        sessions.a.close(None);
+        let mut notices = Vec::new();
+        loop {
+            let (tag, notice) = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .expect("a closed session must report that it ended")
+                .expect("the actor holds the sender until it is done");
+            assert_eq!(tag, 5);
+            notices.push(notice);
+            if notice == SessionNotice::Ended {
+                break;
+            }
+        }
+        // Nothing follows `Ended`: the actor's sender is gone with it.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), rx.recv())
+                .await
+                .map(|n| n.is_none())
+                .unwrap_or(false)
+        );
+        assert_eq!(notices.last(), Some(&SessionNotice::Ended));
+    }
+
+    #[tokio::test]
+    async fn the_end_is_reported_even_when_the_actor_task_is_aborted() {
+        // A task that is aborted (or panics) never reaches the end of
+        // `run`, so `Ended` has to come from a drop guard.
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let sessions = two_observed_sessions(Some(SessionObserver::new(tx, 9)), None);
+        sessions._task_a.abort();
+        loop {
+            let (_, notice) = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .expect("an aborted actor must still report that it ended")
+                .unwrap();
+            if notice == SessionNotice::Ended {
+                break;
+            }
+        }
     }
 }

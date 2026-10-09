@@ -236,6 +236,7 @@ fn with_outcome(
             payload,
             epoch,
             outcome,
+            permit: None,
         },
         rx,
     )

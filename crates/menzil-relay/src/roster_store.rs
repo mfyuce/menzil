@@ -110,6 +110,14 @@ impl RosterStore {
     /// claim: a stale, compromised NodeCert should not become usable
     /// again just by a HELLO that omits the network where it was
     /// flagged).
+    ///
+    /// Within one Roster a NodeId listed more than once counts at its
+    /// highest `min_serial`, not at whichever entry comes first: nothing
+    /// rejects duplicate `members` entries, and protocol.md 7.3's
+    /// compromise response ("`min_serial` raised") must not be silently
+    /// defeated by a stale, lower entry that happens to be listed ahead of
+    /// the raised one (TODO.md, found by L4c's red-team review; the
+    /// node-side `PolicyStore` already did this).
     pub fn min_serial_for(&self, node_id: &NodeId) -> Option<u32> {
         self.by_network
             .read()
@@ -118,8 +126,9 @@ impl RosterStore {
             .filter_map(|(_, body)| {
                 body.members
                     .iter()
-                    .find(|member| &member.node_id == node_id)
+                    .filter(|member| &member.node_id == node_id)
                     .map(|member| member.min_serial)
+                    .max()
             })
             .max()
     }
@@ -371,6 +380,47 @@ mod tests {
 
         assert_eq!(store.min_serial_for(&node_id), Some(7));
         assert_eq!(store.min_serial_for(&NodeId::from([1u8; 32])), None);
+    }
+
+    #[test]
+    fn min_serial_for_takes_the_highest_of_duplicate_entries_within_one_roster() {
+        // protocol.md 7.3's compromise response is "min_serial raised". A
+        // Roster listing the same NodeId twice (nothing in this crate or
+        // `menzil-proto` rejects that) must not let a stale, lower entry
+        // that happens to come first silently defeat the raised one: the
+        // old `find` honored whichever was first. Both orders, since the
+        // answer must not depend on it. The node-side twin
+        // (`menzil-node`'s `roster_standing`) already takes the maximum.
+        let node_id = NodeId::from([9u8; 32]);
+        let other = NodeId::from([4u8; 32]);
+        for members in [
+            vec![(node_id, 2), (node_id, 9), (other, 1)],
+            vec![(node_id, 9), (other, 1), (node_id, 2)],
+        ] {
+            let owner = SigningKey::generate(&mut rand::rng());
+            let network_id = NetworkId::from(owner.verifying_key().to_bytes());
+            let body = RosterBody {
+                v: menzil_proto::PROTOCOL_VERSION,
+                network_id,
+                seq: 1,
+                issued: 0,
+                expires: 1_000_000_000,
+                members: members
+                    .iter()
+                    .map(|&(node_id, min_serial)| RosterMember {
+                        node_id,
+                        min_serial,
+                    })
+                    .collect(),
+                revoked: vec![],
+                stewards: vec![],
+                labels: vec![],
+            };
+            let store = RosterStore::new();
+            store.set(&Roster::sign(&owner, &body).unwrap()).unwrap();
+            assert_eq!(store.min_serial_for(&node_id), Some(9), "{members:?}");
+            assert_eq!(store.min_serial_for(&other), Some(1), "{members:?}");
+        }
     }
 
     #[test]

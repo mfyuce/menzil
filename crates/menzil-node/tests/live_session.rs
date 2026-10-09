@@ -49,7 +49,9 @@ use menzil_proto::{
 };
 use menzil_relay::{Listener, Relay, RelayIdentity, server_config};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
-use tokio::sync::{mpsc, oneshot};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpSocket, TcpStream};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::timeout;
 
 /// Generous: nothing here is expected to take more than a second or two,
@@ -244,6 +246,7 @@ fn reliable(dst: NodeId, epoch: Epoch, payload: Vec<u8>) -> OutboundSend {
         payload,
         epoch,
         outcome,
+        permit: None,
     }
 }
 
@@ -263,6 +266,7 @@ fn reliable_with_outcome(
             payload,
             epoch,
             outcome,
+            permit: None,
         },
         rx,
     )
@@ -333,6 +337,8 @@ async fn run_session_over_a_live_relay() {
     reliable_sends_to_one_peer_arrive_in_the_order_they_were_queued(&trust).await;
     a_caller_that_both_reads_events_and_writes_outbound_cannot_deadlock(&trust).await;
     a_reconnect_gets_a_fresh_epoch_and_refuses_a_stale_tagged_send(&trust).await;
+    admission_is_not_held_up_by_a_stalled_write(&trust).await;
+    an_arrival_during_a_slow_write_run_waits_for_one_write_not_the_queue(&trust).await;
 }
 
 /// Regression test for TODO.md L4b's review, finding 1, at the wire: with
@@ -603,4 +609,275 @@ async fn a_reconnect_gets_a_fresh_epoch_and_refuses_a_stale_tagged_send(trust: &
 
     node_task.abort();
     peer_task.abort();
+}
+
+/// What a [`ControlledProxy`] does with the bytes the node sends.
+#[derive(Clone, Copy)]
+enum Wire {
+    /// Forward them as fast as they come.
+    Flowing,
+    /// Read nothing, so the node's writes block once the kernel's small
+    /// buffers fill.
+    Paused,
+    /// Forward them, but only this many bytes per second: a slow uplink.
+    Throttled { bytes_per_sec: usize },
+}
+
+/// A TCP proxy between a node and the relay whose node-to-relay direction
+/// can be paused or throttled (the relay-to-node direction is never
+/// touched). The receive buffer is set tiny *on the listener* (accepted
+/// sockets inherit it) so a stalled or slow proxy blocks the node's writes
+/// after a few kilobytes: the carrier also sets `TCP_NOTSENT_LOWAT` to
+/// 16 KiB (`menzil-carrier::socket_tuning`), so together with `rustls`'s
+/// 64 KiB plaintext buffer the node can get only about a hundred kilobytes
+/// ahead of the proxy, far less than the hundreds of kilobytes these
+/// scenarios queue, whatever the machine's default socket buffers are.
+struct ControlledProxy {
+    port: u16,
+    wire: watch::Sender<Wire>,
+}
+
+async fn controlled_proxy(relay: SocketAddr) -> ControlledProxy {
+    let socket = TcpSocket::new_v4().unwrap();
+    socket.set_recv_buffer_size(4 * 1024).unwrap();
+    socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    let listener = socket.listen(16).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (wire, wire_rx) = watch::channel(Wire::Flowing);
+    tokio::spawn(async move {
+        while let Ok((down, _)) = listener.accept().await {
+            let up = TcpStream::connect(relay).await.unwrap();
+            let (mut down_read, mut down_write) = down.into_split();
+            let (mut up_read, mut up_write) = up.into_split();
+            // Relay to node: never touched.
+            tokio::spawn(async move {
+                let _ = tokio::io::copy(&mut up_read, &mut down_write).await;
+            });
+            // Node to relay: according to `wire`.
+            let mut wire_rx = wire_rx.clone();
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 4096];
+                loop {
+                    let mode = *wire_rx.borrow();
+                    if matches!(mode, Wire::Paused) {
+                        if wire_rx.changed().await.is_err() {
+                            return;
+                        }
+                        continue;
+                    }
+                    let n = match down_read.read(&mut buf).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => n,
+                    };
+                    if up_write.write_all(&buf[..n]).await.is_err() {
+                        return;
+                    }
+                    if let Wire::Throttled { bytes_per_sec } = mode {
+                        tokio::time::sleep(Duration::from_secs_f64(
+                            n as f64 / bytes_per_sec as f64,
+                        ))
+                        .await;
+                    }
+                }
+            });
+        }
+    });
+    ControlledProxy { port, wire }
+}
+
+/// One sender node reaching `receiver` through a [`ControlledProxy`], both
+/// attached and routable, with the sender's `outbound`/`events` ends handed
+/// back. Shared by the two scenarios below.
+struct ThroughProxy {
+    proxy: ControlledProxy,
+    sender: Identity,
+    receiver: Identity,
+    sender_outbound: mpsc::Sender<OutboundSend>,
+    _sender_events: mpsc::Receiver<SessionEvent>,
+    receiver_events: mpsc::Receiver<SessionEvent>,
+    tasks: [tokio::task::JoinHandle<()>; 2],
+}
+
+async fn node_through_a_controlled_proxy(trust: &TestTrust) -> ThroughProxy {
+    let relay = start_relay(trust, 4 * 1024 * 1024).await;
+    let (sender, receiver) = (identity(), identity());
+    let network_id = seed_roster(&relay, &[&sender, &receiver]);
+    let proxy = controlled_proxy(relay.addr).await;
+
+    let (receiver_events_tx, mut receiver_events) = mpsc::channel(256);
+    let (_receiver_outbound, receiver_outbound_rx) = mpsc::channel(64);
+    let receiver_task = spawn_node(
+        &relay,
+        &receiver,
+        network_id,
+        receiver_events_tx,
+        receiver_outbound_rx,
+    );
+
+    let (sender_events_tx, sender_events) = mpsc::channel(256);
+    let (sender_outbound, sender_outbound_rx) = mpsc::channel(256);
+    let mut sender_config = session_config(&relay, &sender, network_id);
+    sender_config.dial.connection_info.port = proxy.port;
+    let sender_task = tokio::spawn(run_session(
+        sender_config,
+        HashMap::new(),
+        sender_events_tx,
+        sender_outbound_rx,
+        Arc::new(RosterStore::new()),
+    ));
+    wait_until_routable(
+        &sender_outbound,
+        sender.node_id,
+        &mut receiver_events,
+        receiver.node_id,
+    )
+    .await;
+    ThroughProxy {
+        proxy,
+        sender,
+        receiver,
+        sender_outbound,
+        _sender_events: sender_events,
+        receiver_events,
+        tasks: [sender_task, receiver_task],
+    }
+}
+
+/// Regression test for TODO.md's L4h5 review follow-up (its High), first
+/// half: a node whose writes are slow must still admit what its callers
+/// hand it.
+///
+/// `run_session` used to admit exactly one `OutboundSend` per `select!`
+/// iteration and then write every sendable record before it read
+/// `outbound` again, so admission queued up behind the wire: a record's
+/// admission outcome arrived only after every record ahead of it had been
+/// written at link speed. The L4 actor waits at most 35 s for that
+/// outcome, so on a slow uplink an ordinary bulk transfer ended its
+/// session as `OutboundGone` (the reviewer reproduced it at 20 KiB/s,
+/// marginal on this machine; at 12 KiB/s it was reproduced here, and a
+/// probe at that speed survives with the fix).
+///
+/// Here the node-to-relay direction is paused outright and 48 records of
+/// 16 KiB are handed over in one burst, before `run_session` gets to run
+/// (this test and the node share a single-threaded runtime and the burst
+/// never yields). Every one must be admitted at once, the wire being
+/// stalled or not, and once the wire flows again all 48 must arrive intact
+/// and in the order they were queued. One write can still block the loop
+/// while it is in progress (a `session.send` is awaited inline, bounded by
+/// `SEND_TIMEOUT`); what must not wait behind it is everything that was
+/// already handed over.
+async fn admission_is_not_held_up_by_a_stalled_write(trust: &TestTrust) {
+    const RECORDS: usize = 48;
+    const RECORD_LEN: usize = 16 * 1024;
+    let payload = |index: usize| vec![index as u8; RECORD_LEN];
+
+    let mut node = node_through_a_controlled_proxy(trust).await;
+
+    // Stall the sender's wire, and let whatever the proxy had already read
+    // go through.
+    node.proxy.wire.send(Wire::Paused).unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let mut outcomes = Vec::new();
+    for index in 0..RECORDS {
+        let (send, outcome) =
+            reliable_with_outcome(node.receiver.node_id, Epoch::first(), payload(index));
+        node.sender_outbound.send(send).await.unwrap();
+        outcomes.push(outcome);
+    }
+
+    let admitted = timeout(
+        Duration::from_secs(3),
+        futures_util::future::join_all(outcomes),
+    )
+    .await
+    .expect(
+        "every record handed over must be admitted promptly while the wire is stalled; \
+         admission is queueing up behind a blocked write",
+    );
+    for (index, outcome) in admitted.into_iter().enumerate() {
+        assert_eq!(outcome, Ok(EnqueueOutcome::Accepted), "record {index}");
+    }
+
+    node.proxy.wire.send(Wire::Flowing).unwrap();
+    for index in 0..RECORDS {
+        let received = next_recv_from(&mut node.receiver_events, node.sender.node_id)
+            .await
+            .unwrap_or_else(|| panic!("record {index} never arrived once the wire flowed again"));
+        assert_eq!(
+            received,
+            payload(index),
+            "record {index} arrived corrupted or out of order"
+        );
+    }
+    for task in node.tasks {
+        task.abort();
+    }
+}
+
+/// The same finding's second half: a request that arrives *while* a run of
+/// slow writes is under way is admitted after at most the write in
+/// progress, not after the whole queue.
+///
+/// The wire here is slow but flowing (64 KiB/s). 48 records of 16 KiB are
+/// admitted at once, as above, and then take about ten seconds to write.
+/// A request handed over one second into that must still be admitted
+/// within two. A loop that wrote the whole queue before looking at
+/// `outbound` again would keep it waiting for the rest of those ten
+/// seconds; this is the difference between writing one record per
+/// iteration and finishing the queue, which the stalled-wire scenario
+/// above cannot tell apart (everything there is handed over before the
+/// first write).
+async fn an_arrival_during_a_slow_write_run_waits_for_one_write_not_the_queue(trust: &TestTrust) {
+    const RECORDS: usize = 48;
+    const RECORD_LEN: usize = 16 * 1024;
+    let payload = |index: usize| vec![index as u8; RECORD_LEN];
+
+    let mut node = node_through_a_controlled_proxy(trust).await;
+    node.proxy
+        .wire
+        .send(Wire::Throttled {
+            bytes_per_sec: 64 * 1024,
+        })
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    for index in 0..RECORDS {
+        node.sender_outbound
+            .send(reliable(
+                node.receiver.node_id,
+                Epoch::first(),
+                payload(index),
+            ))
+            .await
+            .unwrap();
+    }
+    // Well into the run, but nowhere near its end.
+    tokio::time::sleep(Duration::from_secs(1)).await;
+
+    let (late, late_outcome) =
+        reliable_with_outcome(node.receiver.node_id, Epoch::first(), payload(RECORDS));
+    node.sender_outbound.send(late).await.unwrap();
+    let outcome = timeout(Duration::from_secs(2), late_outcome).await.expect(
+        "a request handed over during a slow write run must be admitted after at most the \
+             write in progress, not after the whole queue has been written",
+    );
+    assert_eq!(outcome, Ok(EnqueueOutcome::Accepted));
+
+    // Let the rest through quickly, and check nothing was lost or reordered
+    // on the way, the late one last.
+    node.proxy.wire.send(Wire::Flowing).unwrap();
+    for index in 0..=RECORDS {
+        let received = next_recv_from(&mut node.receiver_events, node.sender.node_id)
+            .await
+            .unwrap_or_else(|| panic!("record {index} never arrived"));
+        assert_eq!(
+            received,
+            payload(index),
+            "record {index} arrived corrupted or out of order"
+        );
+    }
+    for task in node.tasks {
+        task.abort();
+    }
 }

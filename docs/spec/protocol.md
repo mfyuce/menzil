@@ -209,6 +209,8 @@ resp  = u8 0x02 | u32 sender_index | u32 receiver_index | noise msg2
 data  = u8 0x03 | u32 receiver_index | u64 counter | ciphertext
 ```
 
+In every frame, `sender_index` is the index the sender of that frame chose for itself and `receiver_index` the index its receiver chose. So `init` carries the initiator's own index; `resp` carries the responder's own index as `sender_index` and echoes the initiator's, from `init`, as `receiver_index`; and each side stamps the other's index as `receiver_index` on every `data` frame it sends. A node never lets two of its live sessions share an index.
+
 Handshake payloads: `CBOR{ v: 1, node_cert: NodeCert, roster_seq: u64, policy_seq: u64, e2e_protos: [u8] }`. There is no application data in message 1.
 
 Checks. The initiator verifies the responder's `node_cert.node_id` equals the NodeId it dialed and `x25519_pub` equals the handshake static key. The responder verifies the initiator's `node_id` equals the RECV `src` and its static key matches, that both are unrevoked members of `network_id` in an unexpired Roster and Policy, and that the initiator's serial is not below `min_serial`. The responder then decides whether any grant exists for the initiator on this node; if none, it answers with a data record of kind CLOSE `no_grant` and the initiator learns nothing further. Handshakes are rate limited per peer (10 per minute) because each costs four Diffie Hellman operations and two signature checks.

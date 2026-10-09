@@ -59,17 +59,20 @@
 //! red-team review rather than present from the start.
 //!
 //! What protocol.md 5.1/5.2 name but leave to a *different*,
-//! cross-session sub-item (TODO.md L4e, "peer/session table"), not this
-//! one: allocating `sender_index`/`receiver_index` and avoiding
-//! collisions among concurrent sessions (this crate takes both as
-//! caller-supplied parameters); the simultaneous-open tie-break; the
-//! mandatory 24-hour full re-handshake and the old-session-stays-valid
-//! handover (TOBEDECIDED item 6 blocks that item, not this crate); and
-//! deciding what to *do* about a dead session, as opposed to detecting
-//! one (see [`liveness`]'s doc comment: this crate tracks send and
-//! receive activity separately and exposes `is_dead`, the receive side
-//! of which is a documented judgment call — protocol.md does not state
-//! a number for it at L4 the way it does for L3 in section 3.3).
+//! cross-session sub-item, not [`transport`]/[`handshake`]: allocating
+//! `sender_index`/`receiver_index` and avoiding collisions among
+//! concurrent sessions (those two modules take both as caller-supplied
+//! parameters), the simultaneous-open tie-break, replacing an established
+//! session, and per-peer handshake rate limiting all live in [`table`]
+//! and [`limiter`] (TODO.md L4e1, also sans-IO and generic over what it
+//! routes to). Still not built: the mandatory 24-hour full re-handshake
+//! and the old-session-stays-valid handover (TODO.md L4e2; TOBEDECIDED
+//! item 6 blocks it, not this crate); and deciding what to *do* about a
+//! dead session, as opposed to detecting one (see [`liveness`]'s doc
+//! comment: this crate tracks send and receive activity separately and
+//! exposes `is_dead`, the receive side of which is a documented judgment
+//! call — protocol.md does not state a number for it at L4 the way it
+//! does for L3 in section 3.3).
 //!
 //! **A red-team review round** (this crate's own, before anything else
 //! builds on it) found and fixed five further issues beyond the ones
@@ -97,12 +100,22 @@
 
 mod error;
 mod handshake;
+mod limiter;
 mod liveness;
 mod rekey;
+mod table;
 mod transport;
 
 pub use error::E2eError;
 pub use handshake::{E2eInitiatorHandshake, E2eResponderHandshake, prologue};
+pub use limiter::{
+    DEFAULT_HANDSHAKE_WINDOW, DEFAULT_HANDSHAKES_PER_WINDOW, DEFAULT_MAX_TRACKED_PEERS,
+    HandshakeLimiter,
+};
 pub use liveness::Liveness;
 pub use rekey::RekeySchedule;
+pub use table::{
+    Expired, IgnoreReason, InitDecision, Installed, Promoted, RegisterError, Removed, RespLookup,
+    Role, Route, SessionIndex, SessionStatus, SessionTable, SlotState, TableConfig, TableError,
+};
 pub use transport::E2eTransport;

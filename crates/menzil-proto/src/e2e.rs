@@ -62,11 +62,17 @@ pub enum E2eFrame {
         noise_msg1: Vec<u8>,
     },
     /// `resp`: the responder's Noise message 2, completing the
-    /// handshake and announcing its own local index.
+    /// handshake and announcing its own local index. The two indices read
+    /// the way they do in `init` and `data`: `sender_index` is the one the
+    /// sender of this frame chose, `receiver_index` the one its receiver
+    /// chose.
     Resp {
-        /// Echoed back from the `init` this answers.
+        /// The responder's own freshly chosen local index: what the
+        /// initiator must stamp as `receiver_index` on every `data` frame
+        /// it sends for this session.
         sender_index: u32,
-        /// The responder's own freshly chosen local index.
+        /// The initiator's own index, echoed back from the `init` this
+        /// answers (that `init`'s `sender_index`).
         receiver_index: u32,
         /// The raw Noise `Ik` message 2 bytes, carrying
         /// [`E2eHandshakePayload`] as its payload.
@@ -500,6 +506,19 @@ pub fn max_e2e_data_plaintext(max_record: u32) -> usize {
         .saturating_sub(E2E_DATA_FRAME_PREFIX_LEN + L4_AEAD_TAG_LEN)
 }
 
+/// The exact encoded size of an [`E2eFrame::Data`] whose plaintext (an
+/// [`E2eDataBody::encode`] result, kind byte included) is `plaintext_len`
+/// bytes: the frame's own prefix plus that plaintext plus the L4 AEAD tag.
+/// This is also the L3 SEND payload length such a frame becomes, so a
+/// caller can work out what a record will cost against the node's send
+/// queue and the relay's credit *before* encrypting it (TODO.md L4h5: an
+/// L4 session must reserve queue space before `menzil-e2e` assigns the
+/// record a counter, since a record refused after that can only end the
+/// session). Pinned against real encryption by a test in `menzil-e2e`.
+pub const fn e2e_data_frame_len(plaintext_len: usize) -> usize {
+    E2E_DATA_FRAME_PREFIX_LEN + plaintext_len + L4_AEAD_TAG_LEN
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -535,13 +554,20 @@ mod tests {
     #[test]
     fn resp_frame_round_trips() {
         let frame = E2eFrame::Resp {
-            sender_index: 7,
-            receiver_index: 9,
+            sender_index: 9,
+            receiver_index: 7,
             noise_msg2: vec![10, 11, 12],
         };
         let encoded = frame.encode();
         assert_eq!(encoded[0], 0x02);
         assert_eq!(E2eFrame::decode(&encoded).unwrap(), frame);
+        // protocol.md 5.1's layout: `sender_index` (the responder's own)
+        // first, then `receiver_index` (the initiator's, echoed).
+        assert_eq!(
+            encoded,
+            vec![0x02, 0, 0, 0, 9, 0, 0, 0, 7, 10, 11, 12],
+            "sender_index first, receiver_index second"
+        );
     }
 
     #[test]

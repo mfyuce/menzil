@@ -37,7 +37,7 @@ pub use doc::{
 };
 pub use e2e::{
     E2eDataBody, E2eDataKind, E2eFrame, E2eFrameTag, E2eHandshakePayload, RecordClass,
-    max_e2e_data_plaintext,
+    e2e_data_frame_len, max_e2e_data_plaintext,
 };
 pub use error::{ErrorCode, ProtoError};
 pub use handshake::{Capability, HelloBody, Limits, WelcomeBody};

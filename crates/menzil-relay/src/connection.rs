@@ -43,6 +43,12 @@ impl InboundConnection {
         }
     }
 
+    /// Whether the underlying TCP socket has Nagle's algorithm turned off.
+    #[cfg(test)]
+    pub(crate) fn tcp_nodelay(&self) -> std::io::Result<bool> {
+        self.ws.get_ref().get_ref().0.nodelay()
+    }
+
     /// Sends one binary L3 record (protocol.md 3.3: "one message is one
     /// L3 record"). Errors if `payload` exceeds
     /// [`menzil_carrier::MAX_MESSAGE_BYTES`] without sending anything.

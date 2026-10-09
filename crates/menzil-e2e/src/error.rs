@@ -29,15 +29,16 @@ pub enum E2eError {
     /// or malicious peer.
     #[error("message 1 carried a non-empty payload, which protocol.md 5.1 never allows")]
     UnexpectedHandshakePayload,
-    /// [`crate::handshake::E2eInitiatorHandshake::finish`]'s `resp` echoed
-    /// a `sender_index` other than the one this handshake actually sent
-    /// in `init` — either a misrouted response or a confused/malicious
-    /// peer, never a valid continuation of this handshake.
-    #[error("resp echoed sender_index {actual}, expected {expected}")]
-    SenderIndexMismatch {
-        /// The `sender_index` this handshake started with.
+    /// [`crate::handshake::E2eInitiatorHandshake::finish`]'s `resp` carried
+    /// a `receiver_index` other than the `sender_index` this handshake
+    /// actually sent in `init` — either a misrouted response or a
+    /// confused/malicious peer, never a valid continuation of this
+    /// handshake.
+    #[error("resp echoed index {actual}, expected {expected}")]
+    EchoedIndexMismatch {
+        /// The `sender_index` this handshake sent in `init`.
         expected: u32,
-        /// The `sender_index` the `resp` frame actually echoed.
+        /// The `receiver_index` the `resp` frame actually carried.
         actual: u32,
     },
     /// A caller tried to [`crate::E2eTransport::encrypt_data`] an

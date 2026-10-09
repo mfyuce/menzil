@@ -26,7 +26,7 @@
 //! nothing to preserve order *between* them, only within each.
 //!
 //! Admission (`enqueue`) bounds three things, all using the same
-//! [`QueuedSend::charge`] (not a send's raw `payload.len()` — TODO.md
+//! `QueuedSend::charge` (not a send's raw `payload.len()` — TODO.md
 //! L4b's own review, finding 9: counting the unfloored length let an
 //! unbounded number of near-empty sends occupy real memory while
 //! reporting zero budget used) — a per-record size cap
@@ -47,10 +47,11 @@
 //! difference from the precedent, not an oversight.
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::{Arc, Mutex};
 
 use menzil_proto::{MIN_SEND_CHARGE_BYTES, NodeId, Record, max_send_payload};
 use menzil_session::CreditLedger;
-use tokio::sync::oneshot;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot};
 
 /// One attachment to the relay (protocol.md 5.1's path pinning), counting
 /// from 1 and incrementing on every successful
@@ -126,6 +127,11 @@ struct QueuedSend {
     e2e_proto: u8,
     flags: u8,
     payload: Vec<u8>,
+    /// Held for exactly as long as this item occupies the queue: dropped
+    /// when [`OutboundQueue::next_ready_to_send`] removes it (it is not
+    /// moved into the returned [`Record`]), and with the whole queue on a
+    /// reconnect. See [`SendBudget`].
+    _permit: Option<SendPermit>,
 }
 
 impl QueuedSend {
@@ -190,6 +196,18 @@ pub struct OutboundSend {
     /// already assigned it a counter can only end that L4 session,
     /// never be retried in place.
     pub outcome: oneshot::Sender<EnqueueOutcome>,
+    /// Queue space this send reserved *before* it was produced (see
+    /// [`SendBudget`]), handed on to the [`OutboundQueue`] with the send
+    /// and released when the queue lets it go, or immediately if the send
+    /// is refused or never drained. `None` for a send that did not
+    /// reserve any: small control records (KEEP, REKEY, CLOSE) and every
+    /// non-L4 caller. A send that holds one is not refused for lack of
+    /// queue space ([`EnqueueOutcome::QueueFull`]) **as long as the sends
+    /// that hold none stay within what the budgets leave free** (the
+    /// queue's caps minus [`L4_SEND_BUDGET_PER_DST`] / [`L4_SEND_BUDGET_TOTAL`]):
+    /// the queue does not enforce that split, it only holds today because
+    /// the permit-less senders are tiny and rare (TODO.md, L4h5's review).
+    pub permit: Option<SendPermit>,
 }
 
 /// Outcome of [`OutboundQueue::enqueue`].
@@ -233,6 +251,168 @@ pub enum EnqueueOutcome {
     /// to, is a fresh send with a fresh outcome, not an automatic retry
     /// of this one.
     WrongEpoch,
+}
+
+/// What L4 sessions may, all together, have queued in this node's
+/// [`OutboundQueue`] for one destination at a time (TODO.md L4h5). One
+/// mebibyte is WELCOME's default per-peer credit (protocol.md 4.1): the
+/// relay will not let more than that out the door per round trip anyway,
+/// so queuing more than a credit window of bulk data ahead of it adds
+/// latency for everything sharing the session (a keystroke queued behind
+/// it waits for all of it, `yamux` being FIFO across streams) and no
+/// throughput. Well under the queue's own per-destination cap
+/// ([`MAX_QUEUED_BYTES_PER_DST`]), so that what is left over covers every
+/// send that does not reserve space first.
+pub(crate) const L4_SEND_BUDGET_PER_DST: usize = 1024 * 1024;
+
+/// What L4 sessions may have queued across *all* destinations at once.
+/// Below [`MAX_QUEUED_BYTES`] for the same reason as
+/// [`L4_SEND_BUDGET_PER_DST`]: two busy peers can each use their whole
+/// share; beyond that peers wait for each other. A peer that has stopped
+/// reading but is still attached (the relay gives up on it only after its
+/// own 50 s liveness window) keeps its share, and a third peer's staged
+/// frames then time out after 35 s instead of being refused at once as
+/// the queue's own 3/4 + 1/4 split would have.
+pub(crate) const L4_SEND_BUDGET_TOTAL: usize = 2 * 1024 * 1024;
+
+const _: () = {
+    assert!(L4_SEND_BUDGET_PER_DST < MAX_QUEUED_BYTES_PER_DST);
+    assert!(L4_SEND_BUDGET_TOTAL < MAX_QUEUED_BYTES);
+    assert!(L4_SEND_BUDGET_PER_DST <= L4_SEND_BUDGET_TOTAL);
+};
+
+/// A node's send budgets, one per destination peer plus a shared total
+/// (TODO.md L4h5). Cheap to clone; every clone is the same budgets.
+///
+/// **Why this exists**: once `menzil-e2e` has assigned an L4 record a
+/// counter, that record can never be dropped or retried without ending its
+/// session (the receiving side sees a gap). Until this existed, the
+/// [`OutboundQueue`] refusing such a record for lack of room
+/// ([`EnqueueOutcome::QueueFull`]) did exactly that, and *ordinary* bulk
+/// transfer reached it: the windows `yamux` grants a few busy streams add
+/// up to more than the queue holds (measured live over a healthy relay:
+/// 32 concurrent 512 KiB transfers, and `tests/l4_bulk.rs` keeps the
+/// smallest size that still overflowed the old queue, 16 of 256 KiB). A
+/// session now
+/// reserves the space a record will occupy, waiting if there is none,
+/// *before* encrypting it, and the reservation travels with the record
+/// ([`OutboundSend::permit`]) until the queue sends it, so reserved
+/// sends alone can never overfill the queue and none of them is refused
+/// for lack of room. That is a guarantee about reserved sends only: the
+/// queue still admits sends that reserved nothing up to its full caps, so
+/// the guarantee holds while those stay within the headroom the budgets
+/// leave (see [`OutboundSend::permit`]). Everything above the budget
+/// simply waits, which is what backpressure to the stream writers means.
+///
+/// One [`SendBudget`] per destination *peer*, not per session: several L4
+/// sessions to one `NodeId` (one per shared network, or a replacement's
+/// brief overlap) share one L3 queue allowance, so they must share one
+/// budget — hence this registry, which hands every caller asking for the
+/// same peer the same budget.
+#[derive(Clone)]
+pub struct SendBudgets {
+    inner: Arc<SendBudgetsInner>,
+}
+
+struct SendBudgetsInner {
+    total: Arc<Semaphore>,
+    per_peer: Mutex<HashMap<NodeId, Arc<Semaphore>>>,
+}
+
+impl SendBudgets {
+    /// Fresh budgets at the default sizes.
+    pub fn new() -> Self {
+        Self {
+            inner: Arc::new(SendBudgetsInner {
+                total: Arc::new(Semaphore::new(L4_SEND_BUDGET_TOTAL)),
+                per_peer: Mutex::new(HashMap::new()),
+            }),
+        }
+    }
+
+    /// The budget for sends to `peer`: the same one on every call for the
+    /// same peer. (Entries are never removed — one small allocation per
+    /// peer ever contacted, which is a handful on the networks this
+    /// project targets.)
+    pub fn for_peer(&self, peer: NodeId) -> SendBudget {
+        let mut per_peer = self
+            .inner
+            .per_peer
+            .lock()
+            .expect("no code path panics while holding this lock");
+        let dst = per_peer
+            .entry(peer)
+            .or_insert_with(|| Arc::new(Semaphore::new(L4_SEND_BUDGET_PER_DST)))
+            .clone();
+        SendBudget {
+            dst,
+            total: Arc::clone(&self.inner.total),
+        }
+    }
+}
+
+impl Default for SendBudgets {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// One destination's share of [`SendBudgets`]. See there for what it is
+/// for.
+#[derive(Clone)]
+pub struct SendBudget {
+    dst: Arc<Semaphore>,
+    total: Arc<Semaphore>,
+}
+
+impl SendBudget {
+    /// Waits until `bytes` of queue space is free, both for this
+    /// destination and overall, and reserves it until the returned
+    /// [`SendPermit`] is dropped. `bytes` should be what the record will
+    /// be charged in the queue (`QueuedSend::charge`: its payload
+    /// length, floored at [`MIN_SEND_CHARGE_BYTES`]); asking for more
+    /// than a whole budget is clamped to it, since that could otherwise
+    /// never be granted.
+    ///
+    /// Cancel-safe: dropping the future before it completes gives back
+    /// whatever it had already taken. Waiters are served in arrival
+    /// order, so a busy session cannot starve another one sharing the
+    /// budget. The destination share is taken first, then the total;
+    /// nothing ever waits on the destination share while holding total
+    /// space, and queue space is only ever released by sending, never by
+    /// another waiter, so this cannot deadlock.
+    pub async fn acquire(&self, bytes: usize) -> SendPermit {
+        let bytes = bytes.min(L4_SEND_BUDGET_PER_DST);
+        let bytes = u32::try_from(bytes).expect("L4_SEND_BUDGET_PER_DST fits in u32");
+        let dst = Arc::clone(&self.dst)
+            .acquire_many_owned(bytes)
+            .await
+            .expect("send budget semaphores are never closed");
+        let total = Arc::clone(&self.total)
+            .acquire_many_owned(bytes)
+            .await
+            .expect("send budget semaphores are never closed");
+        SendPermit {
+            bytes: bytes as usize,
+            _dst: dst,
+            _total: total,
+        }
+    }
+}
+
+/// Queue space reserved through a [`SendBudget`], released on drop.
+#[derive(Debug)]
+pub struct SendPermit {
+    bytes: usize,
+    _dst: OwnedSemaphorePermit,
+    _total: OwnedSemaphorePermit,
+}
+
+impl SendPermit {
+    /// How many bytes of queue space this reserves.
+    pub fn bytes(&self) -> usize {
+        self.bytes
+    }
 }
 
 /// Per-destination credit plus one shared pending-send FIFO, all in
@@ -310,6 +490,20 @@ impl OutboundQueue {
         flags: u8,
         payload: Vec<u8>,
     ) -> EnqueueOutcome {
+        self.enqueue_with_permit(dst, e2e_proto, flags, payload, None)
+    }
+
+    /// Like [`Self::enqueue`], for a send that reserved its space first
+    /// ([`OutboundSend::permit`]): `permit` is kept for as long as the
+    /// send stays queued, and dropped at once if it is refused instead.
+    pub fn enqueue_with_permit(
+        &mut self,
+        dst: NodeId,
+        e2e_proto: u8,
+        flags: u8,
+        payload: Vec<u8>,
+        permit: Option<SendPermit>,
+    ) -> EnqueueOutcome {
         if payload.len() > self.max_payload {
             return EnqueueOutcome::TooLarge;
         }
@@ -318,6 +512,7 @@ impl OutboundQueue {
             e2e_proto,
             flags,
             payload,
+            _permit: permit,
         };
         let reliable = send.is_reliable();
         if reliable {
@@ -348,7 +543,7 @@ impl OutboundQueue {
     /// Whether `send` could go out right now: always true for droppable
     /// (once queued at all — admission already decided whether it was
     /// worth queueing), true for reliable only if `dst`'s ledger
-    /// currently covers [`QueuedSend::charge`].
+    /// currently covers `QueuedSend::charge`.
     fn is_sendable(&self, send: &QueuedSend) -> bool {
         if !send.is_reliable() {
             return true;
@@ -356,6 +551,39 @@ impl OutboundQueue {
         self.credit
             .get(&send.dst)
             .is_some_and(|ledger| ledger.remaining() >= send.charge())
+    }
+
+    /// Whether [`Self::next_ready_to_send`] would return a record right
+    /// now. Lets a caller that writes one record at a time (see
+    /// `run_session`) make "something is ready to write" a condition of its
+    /// own `select!` arm, so the slow write is one step among the others
+    /// instead of a run that locks them all out until it finishes.
+    pub fn has_ready_to_send(&self) -> bool {
+        self.ready_index().is_some()
+    }
+
+    /// Where the item [`Self::next_ready_to_send`] would take sits in the
+    /// queue: the first one (by original order) that is sendable right
+    /// now, with every later item for a destination skipped once an
+    /// earlier reliable one for it was found not sendable (this module's
+    /// own doc comment on per-destination order). The one definition both
+    /// callers share, so they cannot disagree.
+    fn ready_index(&self) -> Option<usize> {
+        let mut blocked_reliable_dsts: HashSet<NodeId> = HashSet::new();
+        self.queue.iter().position(|send| {
+            if !send.is_reliable() {
+                return true;
+            }
+            if blocked_reliable_dsts.contains(&send.dst) {
+                return false;
+            }
+            if self.is_sendable(send) {
+                true
+            } else {
+                blocked_reliable_dsts.insert(send.dst);
+                false
+            }
+        })
     }
 
     /// The next record ready to actually go out, if any: the first
@@ -371,25 +599,11 @@ impl OutboundQueue {
     /// loss protocol.md 4.2 already accepts for a session that just
     /// ends.
     pub fn next_ready_to_send(&mut self) -> Option<Record> {
-        let mut blocked_reliable_dsts: HashSet<NodeId> = HashSet::new();
-        let index = self.queue.iter().position(|send| {
-            if !send.is_reliable() {
-                return true;
-            }
-            if blocked_reliable_dsts.contains(&send.dst) {
-                return false;
-            }
-            if self.is_sendable(send) {
-                true
-            } else {
-                blocked_reliable_dsts.insert(send.dst);
-                false
-            }
-        })?;
+        let index = self.ready_index()?;
         let send = self
             .queue
             .remove(index)
-            .expect("index was just found by position");
+            .expect("index was just found by ready_index");
 
         let charge = send.charge() as usize;
         self.queued_bytes -= charge;
@@ -714,5 +928,218 @@ mod tests {
             EnqueueOutcome::Accepted,
             "the first send's floored charge must have been fully released, not just its 1 byte"
         );
+    }
+    // --- TODO.md L4h5: send budgets ---------------------------------------
+
+    use std::time::Duration;
+    use tokio::time::timeout;
+
+    /// Whether `fut` completes within a short wait — i.e. whether the
+    /// budget it asks for is available right now.
+    async fn is_immediately_granted(budget: &SendBudget, bytes: usize) -> bool {
+        timeout(Duration::from_millis(50), budget.acquire(bytes))
+            .await
+            .is_ok()
+    }
+
+    #[tokio::test]
+    async fn a_permit_is_held_while_its_send_is_queued_and_released_when_the_send_leaves() {
+        let budget = SendBudgets::new().for_peer(peer(1));
+        let permit = budget.acquire(1000).await;
+        let mut q = q(1_000_000);
+        assert_eq!(
+            q.enqueue_with_permit(peer(1), 0x01, RELIABLE, vec![0; 1000], Some(permit)),
+            EnqueueOutcome::Accepted
+        );
+        assert!(
+            !is_immediately_granted(&budget, L4_SEND_BUDGET_PER_DST).await,
+            "the reservation must be held for as long as the send sits in the queue"
+        );
+        q.next_ready_to_send().unwrap();
+        assert!(
+            is_immediately_granted(&budget, L4_SEND_BUDGET_PER_DST).await,
+            "the reservation must be released when the send leaves the queue"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_send_waiting_for_credit_keeps_its_reservation() {
+        // Released on leaving the queue, not on being admitted to it: a
+        // send that can't go out yet (no credit) still occupies the queue.
+        let budget = SendBudgets::new().for_peer(peer(1));
+        let permit = budget.acquire(1000).await;
+        let mut q = q(100); // far less credit than the send needs
+        q.enqueue_with_permit(peer(1), 0x01, RELIABLE, vec![0; 1000], Some(permit));
+        assert!(q.next_ready_to_send().is_none());
+        assert!(!is_immediately_granted(&budget, L4_SEND_BUDGET_PER_DST).await);
+        q.note_credit(peer(1), 10_000);
+        q.next_ready_to_send().unwrap();
+        assert!(is_immediately_granted(&budget, L4_SEND_BUDGET_PER_DST).await);
+    }
+
+    #[tokio::test]
+    async fn a_refused_enqueue_releases_its_permit_at_once() {
+        let budget = SendBudgets::new().for_peer(peer(1));
+        let mut small = OutboundQueue::new(1_000_000, 200); // max_payload well under 1000
+        let permit = budget.acquire(1000).await;
+        assert_eq!(
+            small.enqueue_with_permit(peer(1), 0x01, RELIABLE, vec![0; 1000], Some(permit)),
+            EnqueueOutcome::TooLarge
+        );
+        assert!(is_immediately_granted(&budget, L4_SEND_BUDGET_PER_DST).await);
+    }
+
+    #[tokio::test]
+    async fn dropping_the_queue_releases_every_queued_permit() {
+        // A reconnect rebuilds the queue (`run_session`'s per-attach
+        // reset); whatever was still queued must not stay reserved.
+        let budget = SendBudgets::new().for_peer(peer(1));
+        let mut q = q(0); // no credit: nothing ever leaves
+        for _ in 0..4 {
+            let permit = budget.acquire(100_000).await;
+            q.enqueue_with_permit(peer(1), 0x01, RELIABLE, vec![0; 100_000], Some(permit));
+        }
+        assert!(!is_immediately_granted(&budget, L4_SEND_BUDGET_PER_DST).await);
+        drop(q);
+        assert!(is_immediately_granted(&budget, L4_SEND_BUDGET_PER_DST).await);
+    }
+
+    #[tokio::test]
+    async fn acquire_waits_for_space_and_proceeds_when_it_is_freed() {
+        let budget = SendBudgets::new().for_peer(peer(1));
+        let hog = budget.acquire(L4_SEND_BUDGET_PER_DST).await;
+        let waiter = {
+            let budget = budget.clone();
+            tokio::spawn(async move { budget.acquire(4096).await })
+        };
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !waiter.is_finished(),
+            "must wait while the budget is exhausted"
+        );
+        drop(hog);
+        timeout(Duration::from_secs(5), waiter)
+            .await
+            .expect("must be woken when space is freed")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn one_peer_has_one_budget_however_it_is_asked_for() {
+        let budgets = SendBudgets::new();
+        let first = budgets.for_peer(peer(1));
+        let _hog = first.acquire(L4_SEND_BUDGET_PER_DST).await;
+        // The same peer asked for again, or through a clone of the
+        // registry, is the same allowance: several L4 sessions to one
+        // peer share one L3 per-destination queue allowance.
+        assert!(!is_immediately_granted(&budgets.for_peer(peer(1)), 1).await);
+        assert!(!is_immediately_granted(&budgets.clone().for_peer(peer(1)), 1).await);
+        // A different peer has its own.
+        assert!(is_immediately_granted(&budgets.for_peer(peer(2)), 1).await);
+    }
+
+    #[tokio::test]
+    async fn the_total_is_shared_across_peers() {
+        let budgets = SendBudgets::new();
+        let p1 = budgets.for_peer(peer(1));
+        let p2 = budgets.for_peer(peer(2));
+        let p3 = budgets.for_peer(peer(3));
+        let a = p1.acquire(L4_SEND_BUDGET_PER_DST).await;
+        let _b = p2.acquire(L4_SEND_BUDGET_PER_DST).await;
+        assert_eq!(
+            L4_SEND_BUDGET_TOTAL,
+            2 * L4_SEND_BUDGET_PER_DST,
+            "this test's premise"
+        );
+        assert!(
+            !is_immediately_granted(&p3, 1).await,
+            "two busy peers have used the whole total; a third waits"
+        );
+        drop(a);
+        assert!(is_immediately_granted(&p3, 1).await);
+    }
+
+    #[tokio::test]
+    async fn a_request_larger_than_a_whole_budget_is_clamped_not_stuck() {
+        let budget = SendBudgets::new().for_peer(peer(1));
+        let permit = timeout(
+            Duration::from_secs(1),
+            budget.acquire(10 * L4_SEND_BUDGET_PER_DST),
+        )
+        .await
+        .expect("an impossible request must be clamped, not wait forever");
+        assert_eq!(permit.bytes(), L4_SEND_BUDGET_PER_DST);
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_acquire_gives_back_what_it_had_already_taken() {
+        // The destination share is taken before the total one; a waiter
+        // that gives up between the two must not leave the first held.
+        let budgets = SendBudgets::new();
+        let (p1, p2, p3) = (
+            budgets.for_peer(peer(1)),
+            budgets.for_peer(peer(2)),
+            budgets.for_peer(peer(3)),
+        );
+        let _a = p1.acquire(L4_SEND_BUDGET_PER_DST).await;
+        let _b = p2.acquire(L4_SEND_BUDGET_PER_DST).await; // total now exhausted
+        assert!(
+            timeout(Duration::from_millis(50), p3.acquire(4096))
+                .await
+                .is_err(),
+            "peer 3 gets its destination share, then waits on the total"
+        );
+        assert_eq!(
+            p3.dst.available_permits(),
+            L4_SEND_BUDGET_PER_DST,
+            "the cancelled waiter must give its destination share back"
+        );
+    }
+    // --- TODO.md L4h5 review follow-up: has_ready_to_send ----------------
+
+    #[test]
+    fn has_ready_to_send_is_false_for_an_empty_queue() {
+        assert!(!q(100).has_ready_to_send());
+    }
+
+    #[test]
+    fn has_ready_to_send_follows_credit() {
+        let mut q = q(100);
+        q.enqueue(peer(1), 0x01, RELIABLE, vec![0; 1000]);
+        assert!(
+            !q.has_ready_to_send(),
+            "a reliable send that credit does not cover is queued, not ready"
+        );
+        q.note_credit(peer(1), 10_000);
+        assert!(q.has_ready_to_send());
+        q.next_ready_to_send().unwrap();
+        assert!(!q.has_ready_to_send());
+    }
+
+    #[test]
+    fn has_ready_to_send_never_disagrees_with_next_ready_to_send() {
+        // A mixed queue: one peer blocked on credit (so everything behind
+        // its first item is skipped too), another peer sendable, and a
+        // droppable item. Walk it until empty, asking before each take.
+        let mut q = q(100);
+        q.enqueue(peer(1), 0x01, RELIABLE, vec![0; 500]); // blocked: 100 credit
+        q.enqueue(peer(1), 0x01, RELIABLE, vec![0; 10]); // behind a blocked item
+        q.enqueue(peer(2), 0x01, RELIABLE, vec![0; 50]); // sendable
+        q.enqueue(peer(1), 0x01, DROPPABLE, vec![0; 10]); // droppable, never blocked
+        let mut taken = 0;
+        loop {
+            let predicted = q.has_ready_to_send();
+            let actual = q.next_ready_to_send();
+            assert_eq!(predicted, actual.is_some(), "after {taken} taken");
+            if actual.is_none() {
+                break;
+            }
+            taken += 1;
+        }
+        // Peer 2's send and the droppable one go out; peer 1's two reliable
+        // sends stay queued behind the one credit does not cover.
+        assert_eq!(taken, 2);
+        q.note_credit(peer(1), 10_000);
+        assert!(q.has_ready_to_send());
     }
 }

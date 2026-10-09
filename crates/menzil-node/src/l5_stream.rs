@@ -84,21 +84,30 @@
 //! bound, real deaths at the raised one). An occasional false shed is
 //! strictly better than an occasional dead session, so this module keeps
 //! the smaller problem rather than the larger one. This is the same
-//! structural gap TODO.md's own L4h3/L4h5 lines already name — a single
-//! `Driver` poll can emit more frames than the budget allows before
-//! anything downstream, including this module's own admission control,
-//! ever gets a chance to run — and already say to escalate to L4h5's own
-//! per-session budget work (or a `menzil-stream` budget that pauses
-//! instead of failing outright) rather than retune a number here; no
-//! bound or shedding strategy chosen at this layer closes it, only
-//! trades which load pattern triggers it. This module's own, deliberately
+//! structural gap TODO.md's own L4h3/L4h5 lines named — a single
+//! `Driver` poll can emit more frames than `menzil-stream`'s outbound
+//! channel holds before anything downstream, including this module's own
+//! admission control, ever gets a chance to run — and said to escalate
+//! to `menzil-stream`'s budget pausing instead of failing outright
+//! rather than retune a number here, since no bound or shedding strategy
+//! chosen at this layer could close it, only trade which load pattern
+//! triggers it.
+//!
+//! **That escalation has since happened (TODO.md L4h5), and the gap is
+//! closed one layer down**: `menzil-stream`'s outbound channel now pauses
+//! `yamux` when full instead of ending the connection, so a burst of
+//! refusals, of any size, only queues. A second symptom that first looked
+//! like a separate, unknown `yamux` bug ("unknown frame type N") was the
+//! same exhaustion misreported by a retry bug in `RecordIo::poll_write`,
+//! which is gone with the failure path it lived in. The 32-slot bare-drop
+//! shape above is deliberately left as measured rather than re-tuned:
+//! the 128-slot variant that killed sessions then no longer would, but
+//! nothing here re-measured it, and a shed stream still reads as a dead
+//! session to its initiator either way. This module's own
 //! `#[ignore]`d `tests::a_hostile_unpaced_open_burst_does_not_end_the_session`
-//! is the live reproduction of that gap — including a second symptom
-//! that first looked like a separate, unknown `yamux` bug ("unknown frame
-//! type N") but turned out, on investigation, to be the identical budget
-//! exhaustion misreported by an already-tracked `menzil-stream` retry bug
-//! (TODO.md's own line on `RecordIo::poll_write`) — not something this
-//! bound closes either way.
+//! is the end-to-end probe of a hostile burst; the tests that fail
+//! without the pause semantics are in `menzil-stream`'s
+//! `tests/backpressure.rs`.
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -459,6 +468,8 @@ mod tests {
                 mode,
                 max_record,
                 epoch: Epoch::first(),
+                send_budget: crate::outbound::SendBudgets::new().for_peer(peer),
+                observer: None,
             },
             outbound_tx,
             epoch_ended_rx,
@@ -1004,9 +1015,9 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    #[ignore = "known-flaky stress probe for an already-tracked structural gap (TODO.md's \
-                L4h3/L4h5 lines), not a gating regression test for this module — see its own \
-                doc comment"]
+    #[ignore = "slow (about 5s of fixed waiting) end-to-end probe of a hostile OPEN burst; \
+                the tests that fail without `menzil-stream`'s pause-on-full outbound channel \
+                are in that crate's tests/backpressure.rs"]
     async fn a_hostile_unpaced_open_burst_does_not_end_the_session() {
         // A 2026-10-06 red-team review found that `open()`-paced bursts
         // (this test's own predecessor) cannot actually exercise this
@@ -1019,41 +1030,22 @@ mod tests {
         // transport and handing them straight to `b`'s inbound feed,
         // bypassing `L4SessionHandle::open_stream`.
         //
-        // **What this test is, and is not, evidence of**: a single
-        // `Driver` poll can emit more outbound frames than
-        // `menzil-stream`'s own 256-frame budget allows before anything
-        // downstream — including this module's own admission control —
-        // ever gets a chance to run; that structural gap is TODO.md's
-        // own L4h3/L4h5 lines, not something fixable in this module (see
-        // this module's own doc comment). A round-2 red-team review
-        // measured this test, exactly as written (burst=1000, multi-
-        // thread), surviving 30/30 runs at this module's original,
-        // reverted-back-to shape (32-slot admission, bare-drop
-        // shedding) — so this specific configuration is not, today, a
-        // reliable live reproduction of that gap; an earlier, since-
-        // reverted attempt to fix the false-shedding problem by raising
-        // the bound and writing an explicit refusal made it one (5/30),
-        // for reasons that attempt's own revert (see this module's doc
-        // comment) explains. Kept `#[ignore]`d rather than deleted: a
-        // real, working harness for whoever builds L4h5's own
-        // per-session budget work to re-drive at whatever burst size or
-        // concurrency their own fix needs probing against, not proof
-        // either way about this module's current, reverted shape.
-        //
-        // **A second symptom this test can also surface, now understood,
-        // not a separate bug**: an earlier run of this same test
-        // surfaced `DriverEnded(Err(Connection(Io(.. "unknown yamux
-        // frame type 54" ..))))`, briefly tracked on TODO.md as its own,
-        // unexplained line. It is the identical 256-frame budget
-        // exhaustion above, misreported: `menzil-stream`'s own
-        // `RecordIo::poll_write` (TODO.md's own line on it) retries an
-        // already-partially-consumed buffer on that exhaustion and
-        // parses the leftover body bytes of whatever frame was mid-write
-        // as a new header instead — confirmed by varying the triggering
-        // OPEN_ACK refusal's own message length and watching the
-        // reported "frame type" number move in lockstep with the first
-        // byte of whatever got retried. Whichever exact wording a given
-        // run surfaces, it is this same gap, not two.
+        // **What this test is, and is not, evidence of**: it was written
+        // as the live reproduction of TODO.md's L4h3/L4h5 structural gap
+        // (a single `Driver` poll emitting more outbound frames than
+        // `menzil-stream`'s channel held, which then ended the session).
+        // That gap is closed in `menzil-stream` (the channel now pauses
+        // `yamux` instead of failing), and this test passes reliably (10
+        // of 10 runs at the time) — but it never reliably *failed*
+        // against this module's reverted 32-slot shape either (a
+        // round-2 review measured 30/30 survivals before the fix), so it
+        // is not proof that the fix works; `menzil-stream`'s
+        // `tests/backpressure.rs` is, each of its tests having been
+        // confirmed to fail against the pre-fix code. Kept as a real,
+        // working harness for a hostile burst at the whole-session
+        // level, and `#[ignore]`d only because it spends about five
+        // seconds waiting (asserting the session is *still* alive after
+        // them cannot be made faster).
         //
         // Deliberately not `two_sessions()`: this test needs `a`'s own
         // raw `E2eTransport` left unconsumed (to encrypt hostile frames

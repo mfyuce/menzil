@@ -213,6 +213,50 @@ fn resolve_member_cert(
         .max_by_key(|body| body.serial)
 }
 
+/// Resolves the cert to *dial* `node_id` with in `network_id` (protocol.md
+/// 5.1: "A knows B's current NodeCert from the Policy `certs`"): the
+/// counterpart of `resolve_member_cert`, which starts from a Noise static
+/// key already negotiated and goes looking for the cert behind it, where
+/// this starts from nothing but the peer's identity and says which key to
+/// hand `E2eInitiatorHandshake::start` as the responder's (TODO.md L4h6,
+/// the "no pre-dial NodeCert resolution" line).
+///
+/// Only a cert for `node_id` that is self-signed, currently valid and
+/// whose serial passes [`PolicyStore::check_membership`] against the held
+/// Roster counts: a peer whose newest cert this node knows of sits below
+/// the Roster's `min_serial` floor, is revoked, or is simply not a member
+/// is not dialed at all, which saves the Diffie Hellmans and, more to the
+/// point, never trusts a key this node's own documents have moved past.
+/// The highest serial wins among several that pass, the same
+/// not-trusting-list-order discipline as `resolve_member_cert`. `None`
+/// when the network is not held or nothing qualifies; the caller decides
+/// what that means for whoever wanted the session.
+pub fn resolve_dial_cert(
+    policies: &PolicyStore,
+    rosters: &RosterStore,
+    network_id: &NetworkId,
+    node_id: &NodeId,
+    now: u64,
+) -> Option<NodeCertBody> {
+    let policy = policies.body(network_id)?;
+    policy
+        .certs
+        .iter()
+        .filter(|cert| {
+            // The cheap comparison first, for the same reason as in
+            // `resolve_member_cert`: do not pay a signature check per
+            // entry just to compare it against the one being looked up.
+            cert.decode().is_ok_and(|body| &body.node_id == node_id)
+        })
+        .filter_map(|cert| verify_cert(cert, now).ok())
+        .filter(|body| {
+            policies
+                .check_membership(rosters, network_id, node_id, body.serial, now)
+                .is_ok()
+        })
+        .max_by_key(|body| body.serial)
+}
+
 /// What protocol.md 5.1's responder-side checks, plus its handshake-time
 /// grant gate (`PolicyStore::has_grant` with `service: None`), decide
 /// about one just-read `init` — before `resp` is ever written. See this
@@ -1231,5 +1275,190 @@ mod tests {
             OpenDecision::Deny(refusal) => assert_eq!(refusal.code, ErrorCode::NoGrant),
             OpenDecision::Allow => panic!("must not evaluate grants for a different network"),
         }
+    }
+    // --- resolve_dial_cert ---------------------------------------------
+
+    fn cert_with(ids: &Ids, serial: u32, not_before: u64, not_after: u64) -> NodeCert {
+        let body = NodeCertBody {
+            v: menzil_proto::PROTOCOL_VERSION,
+            node_id: ids.initiator_node_id,
+            x25519_pub: X25519PublicKey::from([serial as u8; 32]),
+            serial,
+            not_before,
+            not_after,
+        };
+        NodeCert::sign(&ids.initiator_signing_key, &body).unwrap()
+    }
+
+    #[test]
+    fn dial_resolves_the_members_cert_and_so_the_key_to_dial_with() {
+        let f = fixture(vec![]);
+        let cert = resolve_dial_cert(
+            &f.policies,
+            &f.rosters,
+            &f.ids.network_id,
+            &f.ids.initiator_node_id,
+            1_000,
+        )
+        .expect("a member with a valid cert is dialable");
+        assert_eq!(cert.node_id, f.ids.initiator_node_id);
+        assert_eq!(cert.x25519_pub, f.ids.initiator_x25519);
+        assert_eq!(cert.serial, f.ids.initiator_cert_serial);
+    }
+
+    #[test]
+    fn dial_prefers_the_highest_serial_among_valid_certs() {
+        let ids = fresh_ids();
+        let rosters = RosterStore::new();
+        rosters.set(&signed_roster(&ids, 1)).unwrap();
+        let policies = PolicyStore::new();
+        policies
+            .set(&signed_policy(
+                &ids,
+                vec![
+                    cert_with(&ids, 2, 0, 4_000_000_000),
+                    cert_with(&ids, 9, 0, 4_000_000_000),
+                    cert_with(&ids, 4, 0, 4_000_000_000),
+                ],
+                vec![],
+            ))
+            .unwrap();
+        let cert = resolve_dial_cert(
+            &policies,
+            &rosters,
+            &ids.network_id,
+            &ids.initiator_node_id,
+            1_000,
+        )
+        .unwrap();
+        assert_eq!(cert.serial, 9);
+    }
+
+    #[test]
+    fn dial_skips_certs_below_the_rosters_floor_and_falls_back_to_one_above_it() {
+        let ids = fresh_ids();
+        let rosters = RosterStore::new();
+        rosters.set(&signed_roster(&ids, 5)).unwrap();
+        let policies = PolicyStore::new();
+        policies
+            .set(&signed_policy(
+                &ids,
+                vec![
+                    cert_with(&ids, 3, 0, 4_000_000_000),
+                    cert_with(&ids, 6, 0, 4_000_000_000),
+                ],
+                vec![],
+            ))
+            .unwrap();
+        let cert = resolve_dial_cert(
+            &policies,
+            &rosters,
+            &ids.network_id,
+            &ids.initiator_node_id,
+            1_000,
+        )
+        .expect("serial 6 clears the floor of 5");
+        assert_eq!(cert.serial, 6);
+
+        // Only a cert below the floor: nothing to dial.
+        let policies = PolicyStore::new();
+        policies
+            .set(&signed_policy(
+                &ids,
+                vec![cert_with(&ids, 3, 0, 4_000_000_000)],
+                vec![],
+            ))
+            .unwrap();
+        assert!(
+            resolve_dial_cert(
+                &policies,
+                &rosters,
+                &ids.network_id,
+                &ids.initiator_node_id,
+                1_000
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn dial_skips_an_expired_cert_for_an_older_one_that_is_still_valid() {
+        let ids = fresh_ids();
+        let rosters = RosterStore::new();
+        rosters.set(&signed_roster(&ids, 1)).unwrap();
+        let policies = PolicyStore::new();
+        policies
+            .set(&signed_policy(
+                &ids,
+                vec![
+                    cert_with(&ids, 2, 0, 4_000_000_000),
+                    cert_with(&ids, 7, 0, 500), // expired by `now` = 1_000
+                ],
+                vec![],
+            ))
+            .unwrap();
+        let cert = resolve_dial_cert(
+            &policies,
+            &rosters,
+            &ids.network_id,
+            &ids.initiator_node_id,
+            1_000,
+        )
+        .unwrap();
+        assert_eq!(cert.serial, 2);
+    }
+
+    #[test]
+    fn dial_ignores_a_cert_whose_signature_is_not_the_nodes_own() {
+        // A cert claiming the initiator's NodeId but signed by someone
+        // else's key: not self-signed, so not that node's cert.
+        let ids = fresh_ids();
+        let rosters = RosterStore::new();
+        rosters.set(&signed_roster(&ids, 1)).unwrap();
+        let forger = SigningKey::generate(&mut rand::rng());
+        let forged_body = NodeCertBody {
+            v: menzil_proto::PROTOCOL_VERSION,
+            node_id: ids.initiator_node_id,
+            x25519_pub: X25519PublicKey::from([0xEE; 32]),
+            serial: 8,
+            not_before: 0,
+            not_after: 4_000_000_000,
+        };
+        let forged = NodeCert::sign(&forger, &forged_body).unwrap();
+        let policies = PolicyStore::new();
+        policies
+            .set(&signed_policy(&ids, vec![forged], vec![]))
+            .unwrap();
+        assert!(
+            resolve_dial_cert(
+                &policies,
+                &rosters,
+                &ids.network_id,
+                &ids.initiator_node_id,
+                1_000
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn dial_finds_nothing_for_a_node_with_no_cert_or_in_a_network_not_held() {
+        let f = fixture(vec![]);
+        let stranger = NodeId::from([0x77; 32]);
+        assert!(
+            resolve_dial_cert(&f.policies, &f.rosters, &f.ids.network_id, &stranger, 1_000)
+                .is_none()
+        );
+        let other_network = NetworkId::from([0x11; 32]);
+        assert!(
+            resolve_dial_cert(
+                &f.policies,
+                &f.rosters,
+                &other_network,
+                &f.ids.initiator_node_id,
+                1_000
+            )
+            .is_none()
+        );
     }
 }

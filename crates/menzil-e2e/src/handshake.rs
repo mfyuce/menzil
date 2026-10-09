@@ -49,10 +49,15 @@
 //! (a wrong prologue breaks the Noise transcript) rather than silently
 //! completing against the wrong identity.
 //!
-//! **`sender_index`/`receiver_index` are caller-supplied, not generated
-//! here** — allocating them without colliding with other concurrent
+//! **Each side's own index is caller-supplied, not generated here**
+//! (`init`'s `sender_index` for the initiator, `resp`'s `sender_index` for
+//! the responder) — allocating one without colliding with other concurrent
 //! sessions needs a table of what's already in use, which is TODO.md
-//! L4e's job ("peer/session table"), not a single session's.
+//! L4e's job ("peer/session table"), not a single session's. A frame's
+//! `sender_index` is always the index its sender chose and its
+//! `receiver_index` the one its receiver chose, so `resp` carries the
+//! responder's own index as `sender_index` and echoes the initiator's, from
+//! `init`, as `receiver_index`.
 //!
 //! **Defense in depth: an all-zero Noise static key is rejected outright**
 //! (a red-team finding on this crate), on whichever side first learns
@@ -154,7 +159,8 @@ fn is_all_zero(key: &X25519PublicKey) -> bool {
 #[derive(Debug)]
 pub struct E2eInitiatorHandshake {
     hs: snow::HandshakeState,
-    sender_index: u32,
+    /// The index this side chose and sent in `init`; `resp` must echo it.
+    own_index: u32,
 }
 
 impl E2eInitiatorHandshake {
@@ -190,7 +196,13 @@ impl E2eInitiatorHandshake {
             network_id,
             noise_msg1,
         };
-        Ok((Self { hs, sender_index }, frame))
+        Ok((
+            Self {
+                hs,
+                own_index: sender_index,
+            },
+            frame,
+        ))
     }
 
     /// Consumes `resp`, decoding its payload as [`E2eHandshakePayload`]
@@ -201,9 +213,9 @@ impl E2eInitiatorHandshake {
     /// this crate surfaces that comparison, it does not perform it).
     ///
     /// Fails with `E2eError::UnexpectedFrame` if `resp` is not an
-    /// [`E2eFrame::Resp`], or `E2eError::SenderIndexMismatch` if it
-    /// echoes a different `sender_index` than the one this handshake
-    /// actually sent.
+    /// [`E2eFrame::Resp`], or `E2eError::EchoedIndexMismatch` if its
+    /// `receiver_index` is not the `sender_index` this handshake actually
+    /// sent in `init`.
     ///
     /// `max_record` (WELCOME's `limits.max_record`) becomes the new
     /// [`E2eTransport`]'s plaintext budget ceiling — see its own
@@ -213,18 +225,18 @@ impl E2eInitiatorHandshake {
         resp: &E2eFrame,
         max_record: u32,
     ) -> Result<(E2eTransport, E2eHandshakePayload, X25519PublicKey), E2eError> {
-        let (sender_index, receiver_index, noise_msg2) = match resp {
+        let (echoed_index, responder_index, noise_msg2) = match resp {
             E2eFrame::Resp {
                 sender_index,
                 receiver_index,
                 noise_msg2,
-            } => (*sender_index, *receiver_index, noise_msg2),
+            } => (*receiver_index, *sender_index, noise_msg2),
             _ => return Err(E2eError::UnexpectedFrame { expected: "resp" }),
         };
-        if sender_index != self.sender_index {
-            return Err(E2eError::SenderIndexMismatch {
-                expected: self.sender_index,
-                actual: sender_index,
+        if echoed_index != self.own_index {
+            return Err(E2eError::EchoedIndexMismatch {
+                expected: self.own_index,
+                actual: echoed_index,
             });
         }
         let payload_bytes = read(&mut self.hs, noise_msg2)?;
@@ -233,7 +245,7 @@ impl E2eInitiatorHandshake {
             "IK's initiator already knows the responder's static key from the start; by \
              message 2 it is necessarily still known",
         );
-        let transport = E2eTransport::from_finished(self.hs, receiver_index, max_record)?;
+        let transport = E2eTransport::from_finished(self.hs, responder_index, max_record)?;
         Ok((transport, payload, responder_static))
     }
 }
@@ -248,7 +260,9 @@ impl E2eInitiatorHandshake {
 #[derive(Debug)]
 pub struct E2eResponderHandshake {
     hs: snow::HandshakeState,
-    sender_index: u32,
+    /// The initiator's own index, from `init`'s `sender_index`: echoed in
+    /// `resp`, and stamped as `receiver_index` on this side's `data`.
+    initiator_index: u32,
     initiator_static: X25519PublicKey,
 }
 
@@ -303,7 +317,7 @@ impl E2eResponderHandshake {
         }
         Ok(Self {
             hs,
-            sender_index,
+            initiator_index: sender_index,
             initiator_static,
         })
     }
@@ -320,9 +334,9 @@ impl E2eResponderHandshake {
     /// `e2e_protos` — all caller-supplied; this module has no source for
     /// any of them), and completes the handshake.
     ///
-    /// `receiver_index` is this responder's own freshly chosen local
-    /// index for the new session (caller-allocated — see this module's
-    /// doc comment). `max_record` (WELCOME's `limits.max_record`)
+    /// `own_index` is this responder's own freshly chosen local index for
+    /// the new session (caller-allocated — see this module's doc
+    /// comment); it goes out as `resp`'s `sender_index`. `max_record` (WELCOME's `limits.max_record`)
     /// becomes the new [`E2eTransport`]'s plaintext budget ceiling —
     /// see its own `encrypt_data` docs for why this crate enforces one
     /// at all.
@@ -332,7 +346,7 @@ impl E2eResponderHandshake {
         roster_seq: u64,
         policy_seq: u64,
         e2e_protos: Vec<u8>,
-        receiver_index: u32,
+        own_index: u32,
         max_record: u32,
     ) -> Result<(E2eTransport, E2eFrame), E2eError> {
         let payload = E2eHandshakePayload {
@@ -344,11 +358,11 @@ impl E2eResponderHandshake {
         };
         let noise_msg2 = write(&mut self.hs, &payload.encode()?)?;
         let frame = E2eFrame::Resp {
-            sender_index: self.sender_index,
-            receiver_index,
+            sender_index: own_index,
+            receiver_index: self.initiator_index,
             noise_msg2,
         };
-        let transport = E2eTransport::from_finished(self.hs, self.sender_index, max_record)?;
+        let transport = E2eTransport::from_finished(self.hs, self.initiator_index, max_record)?;
         Ok((transport, frame))
     }
 }
@@ -413,8 +427,8 @@ mod tests {
     #[test]
     fn responder_start_rejects_a_non_init_frame() {
         let not_init = E2eFrame::Resp {
-            sender_index: 1,
-            receiver_index: 2,
+            sender_index: 2,
+            receiver_index: 1,
             noise_msg2: vec![],
         };
         let err = E2eResponderHandshake::start(
@@ -431,7 +445,63 @@ mod tests {
     }
 
     #[test]
-    fn initiator_finish_rejects_a_mismatched_sender_index() {
+    fn resp_carries_the_responders_own_index_and_echoes_the_initiators() {
+        // protocol.md 5.1: in every frame `sender_index` is the index the
+        // sender chose and `receiver_index` the one its receiver chose; each
+        // side then stamps the other's index on its `data` frames.
+        let (responder_priv, responder_pub) = fresh_keypair();
+        let (initiator_hs, init_frame) = E2eInitiatorHandshake::start(
+            &fresh_private_key(),
+            &responder_pub,
+            NetworkId::from([1u8; 32]),
+            NodeId::from([2u8; 32]),
+            NodeId::from([3u8; 32]),
+            42,
+        )
+        .unwrap();
+        let responder_hs = E2eResponderHandshake::start(
+            &responder_priv,
+            NodeId::from([2u8; 32]),
+            NodeId::from([3u8; 32]),
+            &init_frame,
+        )
+        .unwrap();
+        let (mut responder_transport, resp_frame) = responder_hs
+            .finish(sample_cert(), 0, 0, vec![0x01], 99, 65_535)
+            .unwrap();
+        match &resp_frame {
+            E2eFrame::Resp {
+                sender_index,
+                receiver_index,
+                ..
+            } => {
+                assert_eq!(*sender_index, 99, "the responder's own index");
+                assert_eq!(*receiver_index, 42, "the initiator's, echoed from init");
+            }
+            other => panic!("not a resp: {other:?}"),
+        }
+        let (mut initiator_transport, _payload, _static) =
+            initiator_hs.finish(&resp_frame, 65_535).unwrap();
+
+        let data_index = |frame: E2eFrame| match frame {
+            E2eFrame::Data { receiver_index, .. } => receiver_index,
+            other => panic!("not data: {other:?}"),
+        };
+        let body = menzil_proto::E2eDataBody::Keep;
+        assert_eq!(
+            data_index(initiator_transport.encrypt_data(&body).unwrap()),
+            99,
+            "the initiator addresses the responder by the responder's index"
+        );
+        assert_eq!(
+            data_index(responder_transport.encrypt_data(&body).unwrap()),
+            42,
+            "and the responder the initiator by the initiator's"
+        );
+    }
+
+    #[test]
+    fn initiator_finish_rejects_a_resp_that_echoes_another_index() {
         let (responder_priv, responder_pub) = fresh_keypair();
         let (initiator_hs, init_frame) = E2eInitiatorHandshake::start(
             &fresh_private_key(),
@@ -454,12 +524,12 @@ mod tests {
             .unwrap();
         let tampered = match resp_frame {
             E2eFrame::Resp {
-                receiver_index,
+                sender_index,
                 noise_msg2,
                 ..
             } => E2eFrame::Resp {
-                sender_index: 42 + 1, // wrong on purpose
-                receiver_index,
+                sender_index,
+                receiver_index: 42 + 1, // wrong on purpose
                 noise_msg2,
             },
             _ => unreachable!(),
@@ -467,7 +537,7 @@ mod tests {
         let err = initiator_hs.finish(&tampered, 65_535).unwrap_err();
         assert!(matches!(
             err,
-            E2eError::SenderIndexMismatch {
+            E2eError::EchoedIndexMismatch {
                 expected: 42,
                 actual: 43
             }

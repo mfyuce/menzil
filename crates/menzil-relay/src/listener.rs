@@ -62,6 +62,10 @@ impl Listener {
     /// the upgrade.
     pub async fn accept(&self) -> Result<InboundConnection, RelayError> {
         let (tcp, _peer) = self.tcp.accept().await?;
+        // Nagle off, for the same reason as on the dialing side (see
+        // `menzil_carrier::connect`'s `low_latency`): the relay's writes
+        // are the small records of every session it serves.
+        tcp.set_nodelay(true)?;
         let tls = self.acceptor.accept(tcp).await?;
         let expected_path = self.expected_path.clone();
         // `validate_upgrade` only has borrowed access to the request
@@ -179,6 +183,10 @@ mod tests {
 
         let server = tokio::spawn(async move {
             let mut conn = listener.accept().await.unwrap();
+            assert!(
+                conn.tcp_nodelay().unwrap(),
+                "an accepted socket must have Nagle's algorithm off"
+            );
             let msg = conn.recv().await.unwrap();
             assert_eq!(msg, b"hello from client");
             conn.send(b"hello from relay".to_vec()).await.unwrap();
