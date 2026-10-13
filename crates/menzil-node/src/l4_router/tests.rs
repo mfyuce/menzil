@@ -1304,10 +1304,23 @@ fn driven_with(
     capacity: usize,
     index_source: impl FnMut() -> u32 + Send + 'static,
 ) -> Driven {
+    driven_full(party, stores, relay, capacity, index_source, None)
+}
+
+/// [`driven_with`], optionally with another inbound budget per session
+/// (TODO.md L4h6b).
+fn driven_full(
+    party: &Party,
+    stores: &Stores,
+    relay: NodeId,
+    capacity: usize,
+    index_source: impl FnMut() -> u32 + Send + 'static,
+    inbound_budget: Option<usize>,
+) -> Driven {
     let (outbound_tx, outbound) = mpsc::channel(capacity);
     let (ready_tx, ready) = mpsc::unbounded_channel();
     let (notices_tx, notices) = mpsc::unbounded_channel();
-    let config = RouterConfig::new(
+    let mut config = RouterConfig::new(
         party.identity(),
         relay,
         stores.policies.clone(),
@@ -1315,6 +1328,9 @@ fn driven_with(
         SendBudgets::new(),
     )
     .unwrap();
+    if let Some(bytes) = inbound_budget {
+        config = config.with_inbound_budget(bytes);
+    }
     let (attachment_tx, _) = tokio::sync::watch::channel(None);
     let engine = Engine::new(
         config,
@@ -1883,4 +1899,227 @@ async fn a_network_we_hold_no_documents_for_is_unknown_not_a_standing_problem() 
     let outcome = ensure(&na, b.id, NetworkId::from([0xEE; 32])).await;
     assert_eq!(outcome.err(), Some(EnsureError::UnknownPeer));
     assert_eq!(net.count_from(&a.id, "init"), 0);
+}
+
+// ----------------------------------------------------------------------
+// TODO.md L4h6b: a session's unread inbound data is bounded
+// ----------------------------------------------------------------------
+
+/// An engine for `b` with two sessions up at indices 7 (peer `m`) and 8
+/// (peer `n`), each still a candidate, and an inbound budget of
+/// `budget` bytes per session. The engine is driven by hand, so the
+/// session actors it spawned do not run until the test awaits: they are
+/// the consumers that sleep.
+async fn two_sessions_at(
+    budget: usize,
+) -> (
+    World,
+    Party,
+    Party,
+    Party,
+    Driven,
+    impl Fn(NodeId, &E2eFrame) -> Record,
+) {
+    let w = world();
+    let (b, m, n) = (party(), party(), party());
+    let stores = w.stores(&[&b, &m, &n], vec![w.grant(&m, &b), w.grant(&n, &b)]);
+    let mut next = 6u32;
+    let mut d = driven_full(
+        &b,
+        &stores,
+        NodeId::from([0xAA; 32]),
+        1024,
+        move || {
+            next += 1;
+            next
+        },
+        Some(budget),
+    );
+    d.engine.on_attached(Epoch::first(), LIMITS);
+    let net = Net::new();
+    let recv = |src: NodeId, frame: &E2eFrame| Record::Recv {
+        src,
+        e2e_proto: E2E_PROTO_TAG,
+        flags: 0,
+        payload: frame.encode(),
+    };
+    for peer in [&m, &n] {
+        let manual = Manual::new(&net, peer.clone_for_test());
+        let (_hs, init) = manual.init(&b, w.network, 1);
+        assert!(
+            d.engine
+                .on_record(Epoch::first(), recv(peer.id, &init), Now::capture())
+                .is_none()
+        );
+    }
+    assert!(d.engine.table.get(7).is_some() && d.engine.table.get(8).is_some());
+    (w, b, m, n, d, recv)
+}
+
+fn junk_data(receiver_index: u32, counter: u64, len: usize) -> E2eFrame {
+    E2eFrame::Data {
+        receiver_index,
+        counter,
+        ciphertext: vec![0xAB; len],
+    }
+}
+
+#[tokio::test]
+async fn a_session_that_passes_its_inbound_budget_is_closed_and_forgotten_and_a_neighbour_is_untouched()
+ {
+    const BUDGET: usize = 1024 * 1024;
+    const RECORD: usize = 16 * 1024;
+    let (_w, _b, m, n, mut d, recv) = two_sessions_at(BUDGET).await;
+    let mut ready_m = d._ready.try_recv().expect("the session with m came up");
+    let ready_n = d._ready.try_recv().expect("the session with n came up");
+    assert_eq!((ready_m.peer, ready_n.peer), (m.id, n.id));
+
+    // A peer that keeps sending while its session's actor sleeps: every
+    // record is queued until the budget is full, and the one that does not
+    // fit ends the session, in the same call.
+    let fits = BUDGET / (RECORD + 128);
+    let mut ended_at = None;
+    for counter in 0..(fits as u64 * 2) {
+        let record = recv(m.id, &junk_data(7, counter, RECORD));
+        assert!(
+            d.engine
+                .on_record(Epoch::first(), record, Now::capture())
+                .is_none()
+        );
+        if d.engine.table.get(7).is_none() {
+            ended_at = Some(counter as usize);
+            break;
+        }
+    }
+    assert_eq!(ended_at, Some(fits), "the first record that did not fit");
+
+    // More of the same is routed nowhere: nothing piles up behind it. What
+    // the closed session holds is read off its own handle, which the test
+    // kept: it must not move however much more arrives for its index.
+    let held = ready_m.handle.inbound_in_use();
+    assert!(held > 0 && held <= BUDGET, "it still holds what was queued");
+    for counter in 0..100 {
+        let record = recv(m.id, &junk_data(7, counter, RECORD));
+        assert!(
+            d.engine
+                .on_record(Epoch::first(), record, Now::capture())
+                .is_none()
+        );
+    }
+    assert_eq!(ready_m.handle.inbound_in_use(), held);
+
+    // The other peer's session is untouched and still takes records.
+    let neighbour = d.engine.table.get(8).expect("the neighbour is still there");
+    assert_eq!(neighbour.handle.inbound_in_use(), 0);
+    let record = recv(n.id, &junk_data(8, 0, RECORD));
+    assert!(
+        d.engine
+            .on_record(Epoch::first(), record, Now::capture())
+            .is_none()
+    );
+    assert!(d.engine.table.get(8).unwrap().handle.inbound_in_use() > 0);
+
+    // The session's actor ends with the reason the router gave: closed
+    // `rate_limited`, a local decision, not a decrypt error from the junk.
+    let reason = timeout(Duration::from_secs(5), ready_m.acceptor.closed())
+        .await
+        .expect("the closed session's actor must end");
+    match reason.as_ref() {
+        EndReason::ClosedLocally(Some(close)) => {
+            assert_eq!(close.code, ErrorCode::RateLimited, "{close:?}");
+        }
+        other => panic!("ended as {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn a_peer_whose_session_overflowed_can_be_dialed_again_at_once() {
+    const BUDGET: usize = 256 * 1024;
+    let (w, _b, m, _n, mut d, recv) = two_sessions_at(BUDGET).await;
+
+    for counter in 0..64u64 {
+        let record = recv(m.id, &junk_data(7, counter, 16 * 1024));
+        d.engine.on_record(Epoch::first(), record, Now::capture());
+        if d.engine.table.get(7).is_none() {
+            break;
+        }
+    }
+    assert!(d.engine.table.get(7).is_none(), "the session overflowed");
+
+    // The table does not still hold a dead session for the slot: a request
+    // for that peer starts a handshake instead of being handed a handle
+    // that was closed.
+    let (reply, _answer) = oneshot::channel();
+    d.engine.ensure(m.id, w.network, reply, Now::capture());
+    let mut sent_init = false;
+    while let Ok(request) = d.outbound.try_recv() {
+        sent_init |= request.dst == m.id
+            && matches!(
+                E2eFrame::decode(&request.payload),
+                Ok(E2eFrame::Init { .. })
+            );
+    }
+    assert!(sent_init, "no new init went to the peer");
+}
+
+#[tokio::test]
+async fn a_caller_waiting_on_a_session_that_overflows_is_told_at_once() {
+    // The candidate the caller waits on is the slot's only hope; when it
+    // goes, the caller must hear so now, not at its 30 s deadline (the
+    // actor's own `Ended` finds the entry already gone, so nothing else
+    // would tell it).
+    let (w, _b, m, _n, mut d, recv) = two_sessions_at(256 * 1024).await;
+    let (reply, mut answer) = oneshot::channel();
+    d.engine.ensure(m.id, w.network, reply, Now::capture());
+    assert!(
+        answer.try_recv().is_err(),
+        "nothing to hand out before the candidate proves itself"
+    );
+
+    for counter in 0..64u64 {
+        let record = recv(m.id, &junk_data(7, counter, 16 * 1024));
+        d.engine.on_record(Epoch::first(), record, Now::capture());
+        if d.engine.table.get(7).is_none() {
+            break;
+        }
+    }
+    assert!(d.engine.table.get(7).is_none(), "the session overflowed");
+
+    match answer.try_recv() {
+        Ok(Err(EnsureError::SessionEnded)) => {}
+        Ok(Err(other)) => panic!("the waiter was told {other:?}, not that the session ended"),
+        Ok(Ok(_)) => panic!("the waiter was handed a session"),
+        Err(_) => panic!("the waiter was not told anything"),
+    }
+}
+
+#[tokio::test]
+async fn sessions_get_the_default_inbound_budget_unless_the_router_is_told_otherwise() {
+    // Nothing else pins that the budget the router hands every session is
+    // the documented one: a config whose default drifted would leave the
+    // bound in place on paper only.
+    let w = world();
+    let (b, m) = (party(), party());
+    let stores = w.stores(&[&b, &m], vec![w.grant(&m, &b)]);
+    let mut d = driven(&b, &stores, NodeId::from([0xAA; 32]), 7);
+    d.engine.on_attached(Epoch::first(), LIMITS);
+    let manual = Manual::new(&Net::new(), m);
+    let (_hs, init) = manual.init(&b, w.network, 1);
+    let record = Record::Recv {
+        src: manual.party.id,
+        e2e_proto: E2E_PROTO_TAG,
+        flags: 0,
+        payload: init.encode(),
+    };
+    assert!(
+        d.engine
+            .on_record(Epoch::first(), record, Now::capture())
+            .is_none()
+    );
+
+    let session = d.engine.table.get(7).expect("a session at index 7");
+    assert_eq!(
+        session.handle.inbound_budget(),
+        crate::l4_session::L4_INBOUND_BUDGET_PER_SESSION
+    );
 }

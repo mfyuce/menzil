@@ -88,36 +88,31 @@
 //! a full channel of bulk data waits for all of it, since `yamux`'s output
 //! is FIFO across streams.
 //!
-//! The *inbound* direction (fed by [`crate::StreamMux::feed_inbound`])
-//! is deliberately left unbounded still, on narrower reasoning the same
-//! review flagged as worth stating explicitly rather than assuming: each
-//! inbound record already corresponds to one L4 reliable-class counter
+//! The *inbound* direction (fed by [`crate::StreamMux::feed_inbound`]) has
+//! no bound of its own, and cannot have a useful one here: each inbound
+//! record already corresponds to one L4 reliable-class counter
 //! `menzil-e2e` only advances after a successful decrypt, so a caller
 //! cannot "re-queue" a `feed_inbound` call it already made without
-//! violating that counter's own contiguity — meaning an inbound bound
-//! cannot be a `Poll::Pending`-style retry either, only an immediate
-//! fatal rejection at the point of the call (which
-//! [`crate::StreamMux::feed_inbound`]'s malformed-frame check already
-//! gives a shape for). This crate does not add that bound yet, but
-//! **the argument it was left on is no longer true**, found by TODO.md
-//! L4h5's own review: it said no growth scenario existed and that a
-//! caller's own read loop paces `feed_inbound`, nothing a remote peer
-//! controls. That held while a stalled outbound channel failed the whole
-//! connection (the stall could not last). Now that it pauses `yamux`
-//! instead, there is a window: while a Pong (or GoAway) is pending,
-//! `yamux` stops reading its input (`Active::poll` only reads while
-//! `pending_read_frame` is empty), and a peer that stops reading from its
-//! relay connection starves this side of credit, which keeps a frame
-//! staged in `menzil-node`'s actor and the channel full for up to its 35 s
-//! reservation timeout; meanwhile the actor keeps decrypting and calling
-//! `feed_inbound`, and the peer's flood (bare Pings are enough) piles up
-//! here, limited only by link speed times that timeout. The
-//! `a_ping_flood_with_nothing_draining...` test shows the mechanism (50,000
-//! Pings fed, at most 65 Pongs out, the rest unread inbound); the
-//! end-to-end path is reasoning, not a measured run. Not fixed here: the
-//! bound belongs with the caller that can pace its source (TODO.md L4h6,
-//! which now carries this scenario), or as the immediate fatal rejection
-//! sketched above.
+//! violating that counter's own contiguity. A bound at this layer could
+//! therefore only be an immediate fatal rejection, which would end honest
+//! sessions at a burst, or a `Poll::Pending`-style wait the caller has no
+//! way to honor.
+//!
+//! What it does have is a way for the caller to bound it from outside,
+//! found necessary by TODO.md L4h5's own review and built for L4h6b: a
+//! record fed with [`crate::StreamMux::feed_inbound_guarded`] carries a
+//! guard that is dropped the moment `yamux` has read the record's last
+//! byte (or when the connection goes away with the record still queued).
+//! A caller that makes the guard a permit on a byte budget therefore
+//! counts exactly the bytes that are waiting here, and refuses to feed
+//! more at its limit. That matters because `yamux` stops reading its
+//! input while a Pong or GoAway is pending, and a peer that stops reading
+//! from its own relay connection keeps that reply pending for up to
+//! `menzil-node`'s 35 s reservation timeout while flooding us (bare Pings
+//! suffice; `a_ping_flood_with_nothing_draining...` shows the mechanism).
+//! Everything `yamux` has read is its own to account for, through its
+//! receive windows (`driver::config_for`), which count payload bytes, not
+//! the heap those bytes take (see the note there).
 
 use std::pin::Pin;
 use std::task::{Context, Poll};
@@ -147,16 +142,36 @@ use crate::frame_format::{FrameFormatError, HEADER_LEN, declared_frame_len};
 /// same count, so the memory bound only gets tighter.
 const OUTBOUND_FRAME_BUDGET: usize = 64;
 
+/// Something a caller wants kept alive exactly as long as one inbound
+/// record is still waiting to be read: dropped once `yamux` has read the
+/// record's last byte, or when the connection is torn down with the record
+/// still queued. See [`crate::StreamMux::feed_inbound_guarded`].
+pub type InboundGuard = Box<dyn Send>;
+
+/// One inbound record on its way into `yamux`, with the caller's guard.
+pub(crate) struct InboundRecord {
+    pub(crate) bytes: Vec<u8>,
+    pub(crate) guard: Option<InboundGuard>,
+}
+
+impl From<Vec<u8>> for InboundRecord {
+    fn from(bytes: Vec<u8>) -> Self {
+        Self { bytes, guard: None }
+    }
+}
+
 /// The `T` in this crate's `yamux::Connection<T>`. See this module's own
 /// doc comment.
 pub(crate) struct RecordIo {
-    inbound_rx: mpsc::UnboundedReceiver<Vec<u8>>,
+    inbound_rx: mpsc::UnboundedReceiver<InboundRecord>,
     /// The most recently received frame not yet fully consumed by
     /// `poll_read`, and how far into it we already are — avoids an O(n)
     /// shift on every partial read the way draining from the front of a
     /// `VecDeque<u8>` would.
     inbound_current: Vec<u8>,
     inbound_pos: usize,
+    /// The caller's guard for `inbound_current`; dropped with it.
+    inbound_guard: Option<InboundGuard>,
     outbound_tx: mpsc::Sender<Vec<u8>>,
     /// The leading bytes of the one frame `yamux` is currently writing,
     /// accepted by `poll_write` but not yet complete. Never holds more
@@ -172,7 +187,7 @@ impl RecordIo {
     /// is the only part `yamux::Connection::new` ever sees.
     pub(crate) fn new() -> (
         Self,
-        mpsc::UnboundedSender<Vec<u8>>,
+        mpsc::UnboundedSender<InboundRecord>,
         mpsc::Receiver<Vec<u8>>,
     ) {
         let (inbound_tx, inbound_rx) = mpsc::unbounded();
@@ -182,6 +197,7 @@ impl RecordIo {
                 inbound_rx,
                 inbound_current: Vec::new(),
                 inbound_pos: 0,
+                inbound_guard: None,
                 outbound_tx,
                 outbound_partial: Vec::new(),
             },
@@ -236,8 +252,9 @@ impl AsyncRead for RecordIo {
         let this = self.get_mut();
         if this.inbound_pos >= this.inbound_current.len() {
             match this.inbound_rx.poll_next_unpin(cx) {
-                Poll::Ready(Some(frame)) => {
-                    this.inbound_current = frame;
+                Poll::Ready(Some(record)) => {
+                    this.inbound_current = record.bytes;
+                    this.inbound_guard = record.guard;
                     this.inbound_pos = 0;
                 }
                 // Every `StreamMux` clone (the only inbound feeder) was
@@ -252,6 +269,13 @@ impl AsyncRead for RecordIo {
         let n = buf.len().min(remaining.len());
         buf[..n].copy_from_slice(&remaining[..n]);
         this.inbound_pos += n;
+        if this.inbound_pos >= this.inbound_current.len() {
+            // Read to the end: give the memory and the caller's guard back
+            // now, not when the next record happens to arrive.
+            this.inbound_current = Vec::new();
+            this.inbound_pos = 0;
+            this.inbound_guard = None;
+        }
         Poll::Ready(Ok(n))
     }
 }
@@ -408,7 +432,7 @@ mod tests {
     async fn feeding_one_frame_then_reading_in_small_pieces_reassembles_it() {
         let (mut io, inbound_tx, _outbound_rx) = RecordIo::new();
         let frame = vec![1, 2, 3, 4, 5];
-        inbound_tx.unbounded_send(frame.clone()).unwrap();
+        inbound_tx.unbounded_send(frame.clone().into()).unwrap();
 
         let mut out = Vec::new();
         let mut byte = [0u8; 1];

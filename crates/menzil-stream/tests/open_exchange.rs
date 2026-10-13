@@ -75,13 +75,14 @@ impl EchoHandler {
 }
 
 impl ServiceHandler<Stream> for EchoHandler {
+    type Opened = ();
     type Handling = Pin<Box<dyn Future<Output = ()> + Send>>;
 
-    fn accepts(&self, _request: &OpenRequest) -> Result<(), OpenRefusal> {
+    async fn open(&self, _request: &OpenRequest) -> Result<(), OpenRefusal> {
         Ok(())
     }
 
-    fn handle(&self, mut stream: Stream, request: OpenRequest) -> Self::Handling {
+    fn handle(&self, mut stream: Stream, request: OpenRequest, _opened: ()) -> Self::Handling {
         if let Some(tx) = self.seen_tx.lock().unwrap().take() {
             let _ = tx.send(request);
         }
@@ -97,13 +98,14 @@ impl ServiceHandler<Stream> for EchoHandler {
 
 struct DecliningHandler(OpenRefusal);
 impl ServiceHandler<Stream> for DecliningHandler {
+    type Opened = ();
     type Handling = std::future::Ready<()>;
 
-    fn accepts(&self, _request: &OpenRequest) -> Result<(), OpenRefusal> {
+    async fn open(&self, _request: &OpenRequest) -> Result<(), OpenRefusal> {
         Err(self.0.clone())
     }
 
-    fn handle(&self, _stream: Stream, _request: OpenRequest) -> Self::Handling {
+    fn handle(&self, _stream: Stream, _request: OpenRequest, _opened: ()) -> Self::Handling {
         panic!("accepts() refused this request; handle() must never run")
     }
 }
@@ -209,13 +211,14 @@ async fn an_authorizer_denial_is_acked_as_refused_before_the_handler_ever_sees_i
 /// only the type, not the behavior, of a `ServiceHandler` matters.
 struct NeverHandles;
 impl<S> ServiceHandler<S> for NeverHandles {
+    type Opened = ();
     type Handling = std::future::Ready<()>;
 
-    fn accepts(&self, _request: &OpenRequest) -> Result<(), OpenRefusal> {
+    async fn open(&self, _request: &OpenRequest) -> Result<(), OpenRefusal> {
         Ok(())
     }
 
-    fn handle(&self, _stream: S, _request: OpenRequest) -> Self::Handling {
+    fn handle(&self, _stream: S, _request: OpenRequest, _opened: ()) -> Self::Handling {
         panic!("every test using this handler refuses before handle() could run")
     }
 }
@@ -224,13 +227,14 @@ impl<S> ServiceHandler<S> for NeverHandles {
 /// it owns the stream, then echoes back the first 5 bytes it reads.
 struct BannerThenEcho;
 impl ServiceHandler<Stream> for BannerThenEcho {
+    type Opened = ();
     type Handling = Pin<Box<dyn Future<Output = ()> + Send>>;
 
-    fn accepts(&self, _request: &OpenRequest) -> Result<(), OpenRefusal> {
+    async fn open(&self, _request: &OpenRequest) -> Result<(), OpenRefusal> {
         Ok(())
     }
 
-    fn handle(&self, mut stream: Stream, _request: OpenRequest) -> Self::Handling {
+    fn handle(&self, mut stream: Stream, _request: OpenRequest, _opened: ()) -> Self::Handling {
         Box::pin(async move {
             let _ = stream.write_all(b"BANNER").await;
             let mut first = [0u8; 5];

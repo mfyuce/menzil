@@ -44,9 +44,9 @@ use futures_util::io::{AsyncReadExt, AsyncWriteExt};
 use menzil_carrier::{ConnectionInfo, DialConfig, ProxyOverride};
 use menzil_e2e::{E2eInitiatorHandshake, E2eResponderHandshake};
 use menzil_node::{
-    EndReason, Epoch, L4SessionAcceptor, L4SessionConfig, L4SessionHandle, LocalIdentity,
-    OutboundSend, RosterStore, SendBudgets, SessionConfig, SessionEvent, new_l4_session,
-    run_session,
+    EndReason, Epoch, L4_INBOUND_BUDGET_PER_SESSION, L4SessionAcceptor, L4SessionConfig,
+    L4SessionHandle, LocalIdentity, OutboundSend, RosterStore, SendBudgets, SessionConfig,
+    SessionEvent, new_l4_session, run_session,
 };
 use menzil_proto::{
     E2eFrame, Limits, NetworkId, NodeCert, NodeCertBody, NodeId, PROTOCOL_VERSION, Record, Roster,
@@ -295,7 +295,9 @@ fn spawn_demux(
                             ..
                         }) = E2eFrame::decode(&payload)
                     {
-                        handle.feed_inbound(counter, ciphertext);
+                        handle
+                            .feed_inbound(counter, ciphertext)
+                            .expect("a healthy transfer stays within the inbound budget");
                     }
                 }
                 SessionEvent::Detached { .. } => {
@@ -357,6 +359,7 @@ async fn live_pair(relay: &TestRelay) -> Pair {
             epoch: a_epoch,
             send_budget: SendBudgets::new().for_peer(b.id.node_id),
             observer: None,
+            inbound_budget: L4_INBOUND_BUDGET_PER_SESSION,
         },
         a.outbound.clone(),
         a_end_rx,
@@ -372,6 +375,7 @@ async fn live_pair(relay: &TestRelay) -> Pair {
             epoch: b_epoch,
             send_budget: SendBudgets::new().for_peer(a.id.node_id),
             observer: None,
+            inbound_budget: L4_INBOUND_BUDGET_PER_SESSION,
         },
         b.outbound.clone(),
         b_end_rx,

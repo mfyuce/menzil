@@ -40,9 +40,10 @@ use tokio::time::timeout;
 struct Echo;
 
 impl ServiceHandler<Stream> for Echo {
+    type Opened = ();
     type Handling = Pin<Box<dyn Future<Output = ()> + Send>>;
 
-    fn accepts(&self, request: &OpenRequest) -> Result<(), OpenRefusal> {
+    async fn open(&self, request: &OpenRequest) -> Result<(), OpenRefusal> {
         if request.service == ssh() {
             Ok(())
         } else {
@@ -53,7 +54,7 @@ impl ServiceHandler<Stream> for Echo {
         }
     }
 
-    fn handle(&self, mut stream: Stream, _request: OpenRequest) -> Self::Handling {
+    fn handle(&self, mut stream: Stream, _request: OpenRequest, _opened: ()) -> Self::Handling {
         Box::pin(async move {
             let mut buf = [0u8; 4096];
             loop {
@@ -226,7 +227,7 @@ async fn two_nodes_over_a_real_relay() {
         .expect_err("A serves nothing");
     match &refused {
         NodeOpenError::Open(OpenStreamError::Refused { code, msg }) => {
-            assert_eq!(*code, ErrorCode::NoGrant);
+            assert_eq!(*code, ErrorCode::UnknownService);
             assert!(msg.contains("serves no services"), "{msg}");
         }
         other => panic!("{other:?}"),

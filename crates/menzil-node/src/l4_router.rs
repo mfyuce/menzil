@@ -86,12 +86,24 @@
 //! one place the table takes a side on TOBEDECIDED item 6; see
 //! `menzil-e2e`'s `table` docs).
 //!
-//! **Not paced** (TODO.md L4h6b): [`L4SessionHandle::feed_inbound`] is
-//! unbounded, so a peer that floods a session while we are slow to read it
-//! makes this node buffer without limit; see that line and `menzil-stream`'s
-//! `record_io` docs for why a simple byte cap at this layer would misfire.
-//! Everything else here is bounded: the table by its entry cap, handshakes
-//! by the per-peer limit, unproven state by timeouts, waiters by their own
+//! **Inbound data is bounded, not paced** (TODO.md L4h6b). Each session holds
+//! at most [`L4_INBOUND_BUDGET_PER_SESSION`] bytes of `data` records that
+//! `yamux` has not read yet (counted from [`L4SessionHandle::feed_inbound`]
+//! to the moment `yamux` reads the record, through the actor and through
+//! `menzil-stream`'s queue). A record that does not fit ends that session
+//! at once ([`Engine::end_overflowed`]): closed with `rate_limited`,
+//! removed, nothing else touched. The router never waits for a session.
+//! Stopping it from reading `events` instead would hold every other peer's
+//! traffic behind one session, as often as a member can finish a handshake,
+//! and `run_session` reads the relay socket only while no event is waiting,
+//! so the relay's PINGs would go unanswered and the node's own liveness
+//! clock would stand still; a wait past the 50 s window tears the
+//! attachment down, and every session with it, when reading resumes. The
+//! budget is sized above the whole receive window we grant a peer, so a peer
+//! that respects the windows does not reach it (a peer cutting its data
+//! into tiny frames can: each record is charged its overhead). Everything
+//! else here is bounded too: the table by its entry cap, handshakes by the
+//! per-peer limit, unproven state by timeouts, waiters by their own
 //! deadline.
 
 use std::collections::{HashMap, VecDeque};
@@ -113,8 +125,8 @@ use crate::admission::{
 };
 use crate::identity::LocalIdentity;
 use crate::l4_session::{
-    CloseReason, E2E_PROTO_TAG, L4SessionAcceptor, L4SessionConfig, L4SessionHandle, SessionNotice,
-    SessionObserver, new as new_l4_session,
+    CloseReason, E2E_PROTO_TAG, L4_INBOUND_BUDGET_PER_SESSION, L4SessionAcceptor, L4SessionConfig,
+    L4SessionHandle, SessionNotice, SessionObserver, new as new_l4_session,
 };
 use crate::outbound::{Epoch, OutboundSend, SendBudgets};
 use crate::policy_store::PolicyStore;
@@ -272,6 +284,7 @@ pub struct RouterConfig {
     rosters: Arc<RosterStore>,
     budgets: SendBudgets,
     table: TableConfig,
+    inbound_budget: usize,
 }
 
 impl RouterConfig {
@@ -298,6 +311,7 @@ impl RouterConfig {
             rosters,
             budgets,
             table: TableConfig::default(),
+            inbound_budget: L4_INBOUND_BUDGET_PER_SESSION,
         })
     }
 
@@ -305,6 +319,14 @@ impl RouterConfig {
     /// `menzil_e2e::TableConfig::default()`).
     pub fn with_table_config(mut self, table: TableConfig) -> Self {
         self.table = table;
+        self
+    }
+
+    /// Replaces how many bytes of unread inbound records each session may
+    /// hold (the default is [`L4_INBOUND_BUDGET_PER_SESSION`]); a session
+    /// past it is ended, see [`L4SessionHandle::feed_inbound`].
+    pub fn with_inbound_budget(mut self, bytes: usize) -> Self {
+        self.inbound_budget = bytes;
         self
     }
 }
@@ -502,6 +524,7 @@ struct Engine {
     policies: Arc<PolicyStore>,
     rosters: Arc<RosterStore>,
     budgets: SendBudgets,
+    inbound_budget: usize,
     table: SessionTable<Entry, Pending>,
     waiters: HashMap<(NodeId, NetworkId), Vec<Waiting>>,
     /// How long a caller waits at most: the whole retry chain.
@@ -516,6 +539,10 @@ struct Engine {
     unsent: VecDeque<OutboundSend>,
     /// For the line about refused `init`s.
     refused_log: LogThrottle,
+    /// For the line about a session ended for passing its inbound budget:
+    /// its own, so that a peer making `init`s fail (up to a line a second)
+    /// cannot hide it.
+    overflow_log: LogThrottle,
     next_generation: u32,
 }
 
@@ -545,6 +572,7 @@ impl Engine {
             policies: config.policies,
             rosters: config.rosters,
             budgets: config.budgets,
+            inbound_budget: config.inbound_budget,
             table: SessionTable::new(config.local_node_id, config.table, index_source),
             waiters: HashMap::new(),
             waiter_timeout,
@@ -555,6 +583,7 @@ impl Engine {
             attachment,
             unsent: VecDeque::new(),
             refused_log: LogThrottle::new(),
+            overflow_log: LogThrottle::new(),
             next_generation: 1,
         }
     }
@@ -641,12 +670,50 @@ impl Engine {
                 counter,
                 ciphertext,
             } => {
-                if let Route::Session { handle, .. } = self.table.route(receiver_index, &src) {
-                    handle.handle.feed_inbound(counter, ciphertext);
+                let refused = match self.table.route(receiver_index, &src) {
+                    Route::Session { handle, .. } => {
+                        handle.handle.feed_inbound(counter, ciphertext).is_err()
+                    }
+                    Route::Unknown | Route::WrongSource => false,
+                };
+                if refused {
+                    self.end_overflowed(receiver_index, now);
                 }
             }
         }
         None
+    }
+
+    /// Ends the session at `index`, whose unread inbound data passed its
+    /// budget (TODO.md L4h6b): the frame that did not fit was dropped, so
+    /// the peer's counter has a gap and the session cannot go on. Closed
+    /// with `rate_limited` and removed from the table at once, in one step
+    /// like a session the router replaced: no further frame for it is
+    /// routed (so nothing more piles up, however long its actor takes to
+    /// notice), a request for that peer dials afresh, and the actor's own
+    /// `Ended` later finds nothing to remove.
+    fn end_overflowed(&mut self, index: SessionIndex, now: Now) {
+        let Some(Removed::Session { handle, .. }) = self.table.remove(index) else {
+            return;
+        };
+        let (peer, network) = (handle.peer, handle.network);
+        if let Some(held_back) = self.overflow_log.allow(now.instant) {
+            // The records are charged before they are decrypted, so what
+            // piled up may be junk a relay forwarded under this peer's name:
+            // the line does not say the peer did it.
+            tracing::warn!(
+                %peer,
+                budget = self.inbound_budget,
+                held_back,
+                "ended an L4 session whose unread inbound data passed its budget \
+                 (the peer, or a relay forwarding records in its name)"
+            );
+        }
+        handle.handle.close(Some(CloseReason {
+            code: ErrorCode::RateLimited,
+            msg: "unread inbound data passed the session budget".to_string(),
+        }));
+        self.fail_orphans(&(peer, network));
     }
 
     // ------------------------------------------------------------------
@@ -1157,6 +1224,7 @@ impl Engine {
                 max_record: attached.limits.max_record,
                 epoch: attached.epoch,
                 send_budget: self.budgets.for_peer(peer),
+                inbound_budget: self.inbound_budget,
                 observer: Some(SessionObserver::new(
                     self.notices.clone(),
                     tag_of(generation, index),

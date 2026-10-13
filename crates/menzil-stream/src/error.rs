@@ -44,4 +44,13 @@ pub enum StreamMuxError {
     /// [`std::future::Future`] again after it resolves already carries.
     #[error("this stream multiplexer's driver task is no longer running")]
     DriverGone,
+    /// [`crate::StreamMux::open`] found the connection holding `limit`
+    /// streams ([`crate::MAX_LIVE_STREAMS`]) and opened nothing. Not
+    /// fatal: the connection and every stream on it are untouched, and a
+    /// later attempt succeeds once streams have been dropped and `yamux`
+    /// has written their last frames. A local open at `yamux`'s own cap of
+    /// 512 would end the connection, which is why this crate stops 64
+    /// short of it.
+    #[error("{0} streams are live on this connection already")]
+    StreamLimit(usize),
 }

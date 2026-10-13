@@ -310,6 +310,32 @@ const TICK: Duration = Duration::from_secs(1);
 /// liveness mechanism would otherwise have had a chance to.
 const SEND_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// The largest L3 record there is: protocol.md 4 says one message is one
+/// record, "payload at most 65,535 bytes (the Noise message limit)". A relay
+/// that announces a bigger `max_record` in WELCOME cannot make a bigger
+/// record exist, so the figure is cut to this before anything is sized from
+/// it (the outbound queue, every L4 session, the stream layer's frame split).
+const MAX_RECORD_CEILING: u32 = 65_535;
+
+/// `announced`, the limits a relay stated in WELCOME, with the one number
+/// whose excess is harmless to cut cut to what the protocol allows. Nothing
+/// else is changed: a relay that grants no credit or a tiny `max_record`
+/// makes sends fail or sessions not complete, visibly, which is its right;
+/// raising such a figure would have this node send what the relay refuses.
+fn sane_limits(announced: Limits) -> Limits {
+    if announced.max_record > MAX_RECORD_CEILING {
+        tracing::warn!(
+            announced = announced.max_record,
+            used = MAX_RECORD_CEILING,
+            "the relay announced a max_record above the protocol's 65,535 byte ceiling"
+        );
+    }
+    Limits {
+        max_record: announced.max_record.min(MAX_RECORD_CEILING),
+        ..announced
+    }
+}
+
 /// One attached L3 relay session: dial, handshake, verify, ATTACH
 /// (protocol.md 3, 4.1, 4.2). Owns the live [`Carrier`] plus the pure
 /// [`Engine`] logic that runs on top of it.
@@ -899,7 +925,7 @@ pub async fn run_session(
         };
         tracing::info!(?epoch, "node session attached");
         let attached_at = Instant::now();
-        let limits = session.welcome().limits;
+        let limits = sane_limits(session.welcome().limits);
         let mut outbound_queue = OutboundQueue::new(limits.credit, limits.max_record);
         for req in waiting {
             admit(req, epoch, &mut outbound_queue);
@@ -1135,6 +1161,29 @@ mod tests {
             node_handshake.finish(&message2).unwrap();
         assert!(outgoing.is_none(), "Ik never has a message 3");
         (node_transport, relay_transport)
+    }
+
+    #[test]
+    fn a_max_record_above_the_protocol_ceiling_is_cut_and_nothing_else_changes() {
+        let limits = |max_record, credit| Limits {
+            max_record,
+            max_peers: 7,
+            credit,
+        };
+        // Four gigabytes, as a hostile or broken relay might announce.
+        assert_eq!(
+            sane_limits(limits(u32::MAX, 1 << 20)),
+            limits(65_535, 1 << 20)
+        );
+        assert_eq!(sane_limits(limits(65_536, 5)), limits(65_535, 5));
+        // At and below the ceiling the figure is the relay's own, however small or odd.
+        for max_record in [65_535, 65_000, 1_024, 100, 0] {
+            assert_eq!(
+                sane_limits(limits(max_record, 0)),
+                limits(max_record, 0),
+                "{max_record}"
+            );
+        }
     }
 
     fn sample_welcome(relay_cert: NodeCert) -> WelcomeBody {

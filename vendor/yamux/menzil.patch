@@ -1,0 +1,465 @@
+diff -ruN a/src/chunks.rs b/src/chunks.rs
+--- a/src/chunks.rs
++++ b/src/chunks.rs
+@@ -10,6 +10,13 @@
+ 
+ use std::{collections::VecDeque, io};
+ 
++/// menzil patch: a body shorter than this is appended to the previous chunk, see
++/// [`Chunks::push`].
++const COALESCE_BELOW: usize = 1024;
++
++/// menzil patch: a chunk grown by appending never holds more than this many bytes.
++const COALESCE_UP_TO: usize = 8 * 1024;
++
+ /// A sequence of [`Chunk`] values.
+ ///
+ /// [`Chunks::len`] considers all [`Chunk`] elements and computes the total
+@@ -36,13 +43,35 @@
+     }
+ 
+     /// Add another chunk of bytes to the end.
++    ///
++    /// menzil patch (vendor/yamux/PATCHES.md, patch 1): a body shorter than [`COALESCE_BELOW`]
++    /// is appended to the last chunk while that chunk stays within [`COALESCE_UP_TO`], instead
++    /// of becoming a chunk of its own. A chunk costs a `Vec` and a queue slot, about 65 bytes
++    /// of heap, while the receive window charges only the body's length, so without this a
++    /// peer cutting its data into one-byte frames makes every byte of window cost 65 bytes of
++    /// memory. With it, every chunk but the first and the last holds at least
++    /// [`COALESCE_BELOW`] bytes, or follows a chunk of more than `COALESCE_UP_TO -
++    /// COALESCE_BELOW` bytes, so the memory held is a small constant factor of the window
++    /// (about twice, at worst: appending to an exact-fit body doubles its capacity). The cap
++    /// compares the whole `Vec`, consumed bytes included, so a chunk a reader keeps up with
++    /// still fills and is replaced. The byte stream a reader sees is the same; only the
++    /// boundaries of the `Packet`s of the `futures::Stream` impl move.
+     pub(crate) fn push(&mut self, x: Vec<u8>) {
+         self.len += x.len();
+-        if !x.is_empty() {
+-            self.seq.push_back(Chunk {
+-                cursor: io::Cursor::new(x),
+-            })
++        if x.is_empty() {
++            return;
+         }
++        if x.len() < COALESCE_BELOW {
++            if let Some(last) = self.seq.back_mut() {
++                if last.cursor.get_ref().len() + x.len() <= COALESCE_UP_TO {
++                    last.cursor.get_mut().extend_from_slice(&x);
++                    return;
++                }
++            }
++        }
++        self.seq.push_back(Chunk {
++            cursor: io::Cursor::new(x),
++        })
+     }
+ 
+     /// Remove and return the first chunk.
+@@ -110,3 +139,191 @@
+         &self.cursor.get_ref()[self.offset()..]
+     }
+ }
++
++// menzil patch: tests for the coalescing in `Chunks::push`.
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    /// Takes every chunk out the way a reader finishing the stream would.
++    fn drain(chunks: &mut Chunks) -> Vec<u8> {
++        let mut out = Vec::new();
++        while let Some(chunk) = chunks.pop() {
++            out.extend_from_slice(chunk.as_ref());
++        }
++        out
++    }
++
++    #[test]
++    fn one_byte_bodies_share_chunks() {
++        let mut chunks = Chunks::new();
++        for i in 0..100_000u32 {
++            chunks.push(vec![(i % 251) as u8]);
++        }
++        assert_eq!(chunks.len(), 100_000);
++        // Every chunk is filled to the cap before the next one starts.
++        assert_eq!(chunks.seq.len(), 100_000usize.div_ceil(COALESCE_UP_TO));
++        let bytes = drain(&mut chunks);
++        assert_eq!(bytes.len(), 100_000);
++        assert!(bytes.iter().enumerate().all(|(i, b)| *b == (i % 251) as u8));
++        assert_eq!(chunks.len(), 0);
++    }
++
++    #[test]
++    fn a_chunk_may_be_filled_exactly_to_the_cap() {
++        let mut chunks = Chunks::new();
++        for _ in 0..COALESCE_UP_TO {
++            chunks.push(vec![7]);
++        }
++        assert_eq!(chunks.seq.len(), 1);
++        chunks.push(vec![7]);
++        assert_eq!(chunks.seq.len(), 2);
++    }
++
++    #[test]
++    fn a_body_at_the_threshold_keeps_a_chunk_of_its_own() {
++        let mut chunks = Chunks::new();
++        chunks.push(vec![1; COALESCE_BELOW]);
++        chunks.push(vec![2; COALESCE_BELOW]);
++        assert_eq!(chunks.seq.len(), 2);
++        // One byte shorter is a short body: it joins the last chunk.
++        chunks.push(vec![3; COALESCE_BELOW - 1]);
++        assert_eq!(chunks.seq.len(), 2);
++        assert_eq!(chunks.len(), 3 * COALESCE_BELOW - 1);
++    }
++
++    #[test]
++    fn a_short_body_that_would_pass_the_cap_starts_a_new_chunk() {
++        let mut chunks = Chunks::new();
++        chunks.push(vec![0; COALESCE_UP_TO]);
++        chunks.push(vec![1]);
++        assert_eq!(chunks.seq.len(), 2);
++        chunks.push(vec![2]);
++        assert_eq!(chunks.seq.len(), 2);
++        let bytes = drain(&mut chunks);
++        assert_eq!(bytes.len(), COALESCE_UP_TO + 2);
++        assert_eq!(&bytes[COALESCE_UP_TO..], &[1, 2]);
++    }
++
++    #[test]
++    fn len_stays_exact_when_a_partly_read_chunk_grows() {
++        let mut chunks = Chunks::new();
++        chunks.push(vec![1, 2, 3, 4, 5]);
++        chunks.front_mut().unwrap().advance(3);
++        assert_eq!(chunks.len(), 2);
++        // Appended to the chunk the reader is in the middle of.
++        chunks.push(vec![6, 7]);
++        assert_eq!(chunks.seq.len(), 1);
++        assert_eq!(chunks.len(), 4);
++        let chunk = chunks.pop().unwrap();
++        assert_eq!(chunk.as_ref(), &[4, 5, 6, 7]);
++        assert_eq!(chunks.len(), 0);
++    }
++
++    #[test]
++    fn a_fully_read_chunk_still_takes_an_appended_body() {
++        let mut chunks = Chunks::new();
++        chunks.push(vec![1, 2]);
++        let front = chunks.front_mut().unwrap();
++        front.advance(2);
++        assert!(front.is_empty());
++        chunks.push(vec![3]);
++        assert_eq!(chunks.len(), 1);
++        assert!(!chunks.front_mut().unwrap().is_empty());
++        assert_eq!(drain(&mut chunks), vec![3]);
++        assert_eq!(chunks.len(), 0);
++    }
++
++    #[test]
++    fn empty_bodies_are_dropped() {
++        let mut chunks = Chunks::new();
++        chunks.push(Vec::new());
++        assert_eq!(chunks.seq.len(), 0);
++        assert_eq!(chunks.len(), 0);
++        chunks.push(vec![1]);
++        chunks.push(Vec::new());
++        assert_eq!(chunks.seq.len(), 1);
++        assert_eq!(chunks.len(), 1);
++    }
++
++    /// A reader that keeps up with the writer must not make a chunk grow without bound: the
++    /// cap compares the length of the whole `Vec`, not what is left unread in it. Mirrors the
++    /// `poll_read` loop (an empty front chunk is popped when the next read finds it).
++    #[test]
++    fn a_reader_that_keeps_pace_does_not_make_a_chunk_grow_without_bound() {
++        let mut chunks = Chunks::new();
++        let mut buf = [0u8; 100];
++        for round in 0..20_000u32 {
++            for i in 0..100u32 {
++                chunks.push(vec![(round + i) as u8]);
++            }
++            // What `poll_read` does for a 100 byte buffer.
++            let mut n = 0;
++            while let Some(chunk) = chunks.front_mut() {
++                if chunk.is_empty() {
++                    chunks.pop();
++                    continue;
++                }
++                let k = std::cmp::min(chunk.len(), buf.len() - n);
++                buf[n..n + k].copy_from_slice(&chunk.as_ref()[..k]);
++                n += k;
++                chunk.advance(k);
++                if n == buf.len() {
++                    break;
++                }
++            }
++            assert_eq!(n, 100);
++            assert_eq!(chunks.len(), 0);
++            for (i, b) in buf.iter().enumerate() {
++                assert_eq!(*b, (round + i as u32) as u8);
++            }
++            assert!(chunks.seq.len() <= 2, "{} chunks", chunks.seq.len());
++            let widest = chunks
++                .seq
++                .iter()
++                .map(|c| c.cursor.get_ref().len())
++                .max()
++                .unwrap_or(0);
++            assert!(
++                widest <= COALESCE_UP_TO + COALESCE_BELOW,
++                "a chunk of {widest} bytes"
++            );
++        }
++    }
++
++    /// Whatever sizes arrive, the bytes come out unchanged and in order, and the chunk count
++    /// stays proportional to the bytes held, so memory cannot be inflated by cutting the data
++    /// into small bodies: every chunk but the first and the last holds at least
++    /// `COALESCE_BELOW` bytes, or follows one holding more than `COALESCE_UP_TO -
++    /// COALESCE_BELOW`.
++    #[test]
++    fn chunk_count_is_bounded_whatever_the_body_sizes() {
++        let mut state = 0x2545_f491_4f6c_dd1d_u64;
++        let mut next = move || {
++            state ^= state << 13;
++            state ^= state >> 7;
++            state ^= state << 17;
++            state
++        };
++        for round in 0..60usize {
++            let max = [3, 40, 700, 1100, 3000, 9000][round % 6];
++            let mut chunks = Chunks::new();
++            let mut expected = Vec::new();
++            for _ in 0..1500 {
++                let n = 1 + next() as usize % max;
++                let body: Vec<u8> = (0..n).map(|_| next() as u8).collect();
++                expected.extend_from_slice(&body);
++                chunks.push(body);
++                let total = expected.len();
++                assert!(
++                    chunks.seq.len()
++                        <= total / COALESCE_BELOW + total / (COALESCE_UP_TO - COALESCE_BELOW) + 2,
++                    "{} chunks for {total} bytes",
++                    chunks.seq.len(),
++                );
++            }
++            assert_eq!(chunks.len(), expected.len());
++            assert_eq!(drain(&mut chunks), expected);
++        }
++    }
++}
+diff -ruN a/src/connection/stream.rs b/src/connection/stream.rs
+--- a/src/connection/stream.rs
++++ b/src/connection/stream.rs
+@@ -189,6 +189,31 @@
+         matches!(self.shared().state(), State::Closed)
+     }
+ 
++    /// menzil patch (vendor/yamux/PATCHES.md, patch 2): abort the stream when it is dropped.
++    ///
++    /// Marks the stream so that dropping it makes the connection send an RST to the remote
++    /// whatever state the stream is in, so that the remote's writes fail and its reads end with
++    /// [`Stream::is_reset`] set. Plain dropping sends an RST only while the stream is still
++    /// fully open: after our own `poll_close` it sends nothing (a remote blocked on credit
++    /// hangs), and after the remote's FIN it answers with a FIN, a clean end. Frames already
++    /// handed to the stream go out before the RST. Nothing is sent for a stream that is
++    /// already closed, and the mark cannot be taken back.
++    pub fn reset_on_drop(&self) {
++        self.shared().reset_requested = true;
++    }
++
++    /// menzil patch (patch 2): whether this stream's end is not a clean one, for a reader that
++    /// has just seen end of file.
++    ///
++    /// `poll_read` returns `Ok(0)` for a FIN, for an RST and for a connection that went away
++    /// alike. This is true after the remote's RST, and when the connection was dropped or
++    /// failed while the remote had not yet closed its side with a FIN; it is false for a FIN,
++    /// including one followed by the end of the connection. It says nothing about our own
++    /// `reset_on_drop`, and a connection shut down with `Connection::poll_close` is not covered.
++    pub fn is_reset(&self) -> bool {
++        self.shared().reset_by_remote
++    }
++
+     /// Whether we are still waiting for the remote to acknowledge this stream.
+     pub fn is_pending_ack(&self) -> bool {
+         self.shared().is_pending_ack()
+@@ -450,6 +475,12 @@
+     pub(crate) buffer: Chunks,
+     pub(crate) reader: Option<Waker>,
+     pub(crate) writer: Option<Waker>,
++    /// menzil patch (patch 2): [`Stream::reset_on_drop`] was called; dropping the stream then sends an
++    /// RST in every state but `Closed`.
++    pub(crate) reset_requested: bool,
++    /// menzil patch (patch 2): the remote sent an RST, or the connection went away while the
++    /// stream could still be read. See [`Stream::is_reset`].
++    pub(crate) reset_by_remote: bool,
+ }
+ 
+ impl Shared {
+@@ -474,6 +505,8 @@
+             buffer: Chunks::new(),
+             reader: None,
+             writer: None,
++            reset_requested: false,
++            reset_by_remote: false,
+         }
+     }
+ 
+diff -ruN a/src/connection.rs b/src/connection.rs
+--- a/src/connection.rs
++++ b/src/connection.rs
+@@ -93,6 +93,17 @@
+         }
+     }
+ 
++    /// menzil patch (patch 3): how many streams the connection holds, which is what
++    /// `max_num_streams` limits. It counts every stream with a live handle and every dropped one
++    /// whose last frames have not been written yet: with the uplink stalled those stay, so this
++    /// can be far more than the handles in use. Zero once the connection is closed.
++    pub fn num_streams(&self) -> usize {
++        match &self.inner {
++            ConnectionState::Active(active) => active.streams.len(),
++            _ => 0,
++        }
++    }
++
+     /// Poll for a new outbound stream.
+     ///
+     /// This function will fail if the current state does not allow opening new outbound streams.
+@@ -328,6 +339,9 @@
+     Ping(Frame<Ping>),
+     /// The connection should be terminated.
+     Terminate(Frame<GoAway>),
++    /// menzil patch (patch 3): a stream the remote opened is refused with an RST, because the
++    /// connection holds as many streams as it may. The connection goes on.
++    Refuse(Frame<Data>),
+ }
+ 
+ impl<T> fmt::Debug for Active<T> {
+@@ -475,6 +489,10 @@
+                                 log::trace!("{}: sending term", self.id);
+                                 self.pending_read_frame.replace(f.into());
+                             }
++                            Action::Refuse(f) => {
++                                log::trace!("{}: refusing {}", self.id, f.header().stream_id());
++                                self.pending_read_frame.replace(f.into());
++                            }
+                         }
+                         continue;
+                     }
+@@ -519,7 +537,15 @@
+         log::trace!("{}: removing dropped stream {}", self.id, stream_id);
+         let frame = {
+             let mut shared = s.lock();
++            let reset_requested = shared.reset_requested;
+             let frame = match shared.update_state(self.id, stream_id, State::Closed) {
++                // menzil patch (patch 2): `Stream::reset` was called. Reset in every state,
++                // unless the stream is over already and there is nothing left to abort.
++                previous if reset_requested && previous != State::Closed => {
++                    let mut header = Header::data(stream_id, 0);
++                    header.rst();
++                    Some(Frame::new(header))
++                }
+                 // The stream was dropped without calling `poll_close`.
+                 // We reset the stream to inform the remote of the closure.
+                 State::Open { .. } => {
+@@ -601,7 +627,11 @@
+             // stream reset
+             if let Some(s) = self.streams.get_mut(&stream_id) {
+                 let mut shared = s.lock();
+-                shared.update_state(self.id, stream_id, State::Closed);
++                // menzil patch (patch 2): remember that this was not a FIN, unless the
++                // stream had ended cleanly already.
++                if shared.update_state(self.id, stream_id, State::Closed) != State::Closed {
++                    shared.reset_by_remote = true;
++                }
+                 if let Some(w) = shared.reader.take() {
+                     w.wake()
+                 }
+@@ -624,9 +654,11 @@
+                 log::error!("{}/{}: stream already exists", self.id, stream_id);
+                 return Action::Terminate(Frame::protocol_error());
+             }
+-            if self.streams.len() == self.config.max_num_streams {
+-                log::error!("{}: maximum number of streams reached", self.id);
+-                return Action::Terminate(Frame::internal_error());
++            if self.streams.len() >= self.config.max_num_streams {
++                // menzil patch (patch 3): refuse the stream, keep the connection (upstream
++                // sends a GoAway, which ends the session for the remote and every stream on it).
++                log::debug!("{}: maximum number of streams reached, refusing", self.id);
++                return Action::Refuse(refusal(stream_id));
+             }
+             if frame.body().len() > DEFAULT_CREDIT as usize {
+                 log::error!(
+@@ -704,7 +736,10 @@
+             // stream reset
+             if let Some(s) = self.streams.get_mut(&stream_id) {
+                 let mut shared = s.lock();
+-                shared.update_state(self.id, stream_id, State::Closed);
++                // menzil patch (patch 2): as in `on_data`.
++                if shared.update_state(self.id, stream_id, State::Closed) != State::Closed {
++                    shared.reset_by_remote = true;
++                }
+                 if let Some(w) = shared.reader.take() {
+                     w.wake()
+                 }
+@@ -727,9 +762,10 @@
+                 log::error!("{}/{}: stream already exists", self.id, stream_id);
+                 return Action::Terminate(Frame::protocol_error());
+             }
+-            if self.streams.len() == self.config.max_num_streams {
+-                log::error!("{}: maximum number of streams reached", self.id);
+-                return Action::Terminate(Frame::protocol_error());
++            if self.streams.len() >= self.config.max_num_streams {
++                // menzil patch (patch 3): as in `on_data`.
++                log::debug!("{}: maximum number of streams reached, refusing", self.id);
++                return Action::Refuse(refusal(stream_id));
+             }
+ 
+             let Some(credit) = frame.header().credit().checked_add(DEFAULT_CREDIT) else {
+@@ -895,12 +931,23 @@
+     }
+ }
+ 
++/// menzil patch (patch 3): the RST that refuses a stream the remote opened.
++fn refusal(stream_id: StreamId) -> Frame<Data> {
++    let mut header = Header::data(stream_id, 0);
++    header.rst();
++    Frame::new(header)
++}
++
+ impl<T> Active<T> {
+     /// Close and drop all `Stream`s and wake any pending `Waker`s.
+     fn drop_all_streams(&mut self) {
+         for (id, s) in self.streams.drain() {
+             let mut shared = s.lock();
+-            shared.update_state(self.id, id, State::Closed);
++            // menzil patch (patch 2): a stream the remote had not closed with a FIN did not end
++            // cleanly when the connection went away under it.
++            if shared.update_state(self.id, id, State::Closed).can_read() {
++                shared.reset_by_remote = true;
++            }
+             if let Some(w) = shared.reader.take() {
+                 w.wake()
+             }
+diff -ruN a/src/frame/header.rs b/src/frame/header.rs
+--- a/src/frame/header.rs
++++ b/src/frame/header.rs
+@@ -195,6 +195,7 @@
+     }
+ 
+     /// Terminate the session indicating an internal error to the remote.
++    #[allow(dead_code)] // menzil patch (patch 3): the stream cap no longer ends the connection
+     pub fn internal_error() -> Self {
+         Self::go_away(2)
+     }
+diff -ruN a/src/frame.rs b/src/frame.rs
+--- a/src/frame.rs
++++ b/src/frame.rs
+@@ -163,6 +163,7 @@
+         }
+     }
+ 
++    #[allow(dead_code)] // menzil patch (patch 3): the stream cap no longer ends the connection
+     pub fn internal_error() -> Self {
+         Frame {
+             header: Header::internal_error(),

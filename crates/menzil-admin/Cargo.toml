@@ -1,0 +1,18 @@
+[package]
+name = "menzil-admin"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+curve25519-dalek = "5.0.0"
+ed25519-dalek.workspace = true
+menzil-proto = { path = "../menzil-proto" }
+rand = "0.10.3"
+thiserror.workspace = true
+
+[dev-dependencies]
+menzil-node = { path = "../menzil-node" }
+snow = "0.10.0"

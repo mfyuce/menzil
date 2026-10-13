@@ -43,9 +43,9 @@
 //!   acted on it; whether repeating that is harmless depends on the
 //!   service, so the caller decides. The error says which stage failed
 //!   ([`NodeOpenError`]).
-//! * **The stream type is [`menzil_stream::Stream`] for now.** TODO.md's
-//!   `yamux::Stream` newtype (the force-reset line, TOBEDECIDED item 11)
-//!   will replace it, and L4i, which dispatches an accepted stream to a
+//! * **The stream type is [`menzil_stream::Stream`]**: reading one that was
+//!   reset is an error, not an end of file, and [`menzil_stream::Stream::reset`]
+//!   aborts it in any state. L4i, which dispatches an accepted stream to a
 //!   local target, defines what serving means; until then the default
 //!   handler is [`RefuseAll`].
 //!
@@ -121,27 +121,26 @@ pub enum NodeOpenError {
     Open(#[from] OpenStreamError),
 }
 
-/// The handler of a node that serves nothing, which is what a node is until
-/// TODO.md L4i exists. An OPEN that passes the grant check is refused with
-/// [`ErrorCode::NoGrant`], the nearest code the registry has: there is none
-/// for "granted, but not served here", and L4i, which defines serving, is
-/// where to add one if it is wanted. A peer without the grant is refused
-/// earlier, before this handler is asked, so it learns nothing about what
-/// is configured.
+/// The handler of a node that serves nothing: what a node is until it is
+/// given [`crate::LocalServices`] or a handler of its own. An OPEN that
+/// passes the grant check is refused with [`ErrorCode::UnknownService`]. A
+/// peer without the grant is refused earlier, before this handler is
+/// asked, so it learns nothing about what is configured.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct RefuseAll;
 
 impl ServiceHandler<Stream> for RefuseAll {
+    type Opened = ();
     type Handling = std::future::Ready<()>;
 
-    fn accepts(&self, _request: &OpenRequest) -> Result<(), OpenRefusal> {
+    async fn open(&self, _request: &OpenRequest) -> Result<(), OpenRefusal> {
         Err(OpenRefusal {
-            code: ErrorCode::NoGrant,
+            code: ErrorCode::UnknownService,
             msg: "this node serves no services".to_string(),
         })
     }
 
-    fn handle(&self, _stream: Stream, _request: OpenRequest) -> Self::Handling {
+    fn handle(&self, _stream: Stream, _request: OpenRequest, _opened: ()) -> Self::Handling {
         std::future::ready(())
     }
 }
@@ -303,15 +302,19 @@ impl Drop for Node {
 /// [`ServiceHandler`] over a handler shared by every session's accept loop.
 struct SharedHandler<H>(Arc<H>);
 
-impl<H: ServiceHandler<Stream>> ServiceHandler<Stream> for SharedHandler<H> {
+impl<H: ServiceHandler<Stream> + Sync> ServiceHandler<Stream> for SharedHandler<H> {
+    type Opened = H::Opened;
     type Handling = H::Handling;
 
-    fn accepts(&self, request: &OpenRequest) -> Result<(), OpenRefusal> {
-        self.0.accepts(request)
+    fn open(
+        &self,
+        request: &OpenRequest,
+    ) -> impl std::future::Future<Output = Result<Self::Opened, OpenRefusal>> + Send {
+        self.0.open(request)
     }
 
-    fn handle(&self, stream: Stream, request: OpenRequest) -> Self::Handling {
-        self.0.handle(stream, request)
+    fn handle(&self, stream: Stream, request: OpenRequest, opened: Self::Opened) -> Self::Handling {
+        self.0.handle(stream, request, opened)
     }
 }
 

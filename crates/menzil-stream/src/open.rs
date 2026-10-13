@@ -32,39 +32,30 @@
 //! See [`respond_to_open`]'s own doc comment for what, concretely, a
 //! caller that forgets this exposes itself to.
 //!
-//! **Why `ServiceHandler` is split into [`ServiceHandler::accepts`] and
+//! **Why `ServiceHandler` is split into [`ServiceHandler::open`] and
 //! [`ServiceHandler::handle`] rather than one fallible call**: OPEN_ACK
 //! must go out on `stream` itself regardless of the outcome, so whatever
 //! decides "would this actually work" must run *before* `stream`'s
 //! ownership ever passes to the handler — once [`ServiceHandler::handle`]
 //! takes it, this module has no way to get it back to send a refusal
-//! on. `accepts` is therefore a cheap, synchronous, pre-ack check (e.g.
-//! "is a local target even configured for this service") against
-//! `&OpenRequest` alone; `handle` only ever runs after OPEN_ACK `ok:
-//! true` has actually been written, takes `stream` by value, and is
-//! fire-and-forget from this module's perspective — a later failure
-//! inside it (a local dial refused, say) is that implementation's own
-//! problem to turn into a stream reset, not something OPEN_ACK can still
-//! speak to by then.
-//!
-//! **What that split cannot express, found by the same 2026-10-02 review
-//! building a realistic tokio-based handler against it** (a config-map
-//! lookup in `accepts`, a real `TcpStream` dial plus
-//! `copy_bidirectional` in `handle`, the whole thing spawned on a
-//! multi-thread runtime — it binds and runs without friction for phase
-//! 1's `tcp:`/`http:`/`tls:` dispatch): `ok: true` always precedes any
-//! dial, so a configured-but-dead local target reads back to the
-//! initiator as an accepted stream that immediately ends, never as a
-//! refusal (protocol.md 5.3's "on `ok` the stream is a byte pipe to the
-//! configured local target" reads at least as naturally as "the dial
-//! already succeeded"); nothing `accepts` decides can be handed to
-//! `handle` (a second lookup, racing any config reload in between, and no
-//! way to release something `accepts` reserved if the ack write then
-//! fails); and neither gate can put a `channel` into OPEN_ACK (protocol.md
-//! 5.4) or run section 8's resolve-once-then-vet egress rules, which need
-//! async DNS, before the ack. Nothing before phase 2's datagram channels
-//! and egress strictly needs more — TODO.md tracks deciding the shape
-//! before either builds on this one.
+//! on. `open` is therefore the pre-ack step, and it is async: it looks the
+//! service up, and for a service backed by a local target it connects to
+//! it, so a configured-but-dead target is refused (`target_unreachable`)
+//! instead of being accepted and then ended, which is what protocol.md 5.3
+//! means by "on `ok` the stream is a byte pipe to the configured local
+//! target". Whatever `open` prepared (the connected socket, the resolved
+//! target) is its [`ServiceHandler::Opened`] value, which travels to
+//! `handle` untouched, so nothing is looked up twice and nothing is held
+//! for a stream that never gets its ack: if the ack cannot be written the
+//! value is dropped. `handle` only ever runs after OPEN_ACK `ok: true` has
+//! been written and flushed, takes `stream` by value, and is
+//! fire-and-forget from this module's perspective; a later failure inside
+//! it is that implementation's own problem to turn into a stream reset
+//! ([`crate::Stream::reset`]), not something OPEN_ACK can still speak to.
+//! `open` runs inside the caller's OPEN timeout (see above), so a local
+//! connect must give up well inside it. Datagram channels (protocol.md
+//! 5.4) will need `open` to hand back a `channel` for the ack; nothing
+//! before phase 2 does.
 
 use std::future::Future;
 
@@ -155,8 +146,8 @@ pub struct OpenRequest {
 
 /// Why an OPEN was refused — the peer-visible reason an OPEN_ACK with
 /// `ok: false` carries, shared by both gates ([`Authorizer`] denying a
-/// grant, or [`ServiceHandler::accepts`] declining an otherwise-
-/// authorized request).
+/// grant, or [`ServiceHandler::open`] declining an otherwise-authorized
+/// request).
 ///
 /// **Both fields reach the peer** (`msg` capped at 1,024 bytes, see
 /// below), so choose them with the care `menzil_node::PolicyStore::
@@ -181,8 +172,7 @@ pub struct OpenRefusal {
 /// Whether an OPEN is authorized, from [`Authorizer::authorize`].
 #[derive(Debug, Clone)]
 pub enum OpenDecision {
-    /// The grant check passed; [`ServiceHandler::accepts`] gets the next
-    /// say.
+    /// The grant check passed; [`ServiceHandler::open`] gets the next say.
     Allow,
     /// No grant covers this request.
     Deny(OpenRefusal),
@@ -210,14 +200,21 @@ pub trait Authorizer {
     fn authorize(&self, request: &OpenRequest) -> OpenDecision;
 }
 
-/// Takes over an OPEN that both gates have already approved, and does
-/// whatever `request.service` means — dispatching to a configured local
-/// `tcp:`/`http:`/`tls:` target (TODO.md L4i) is the only implementation
-/// this project ships, but nothing here assumes that.
+/// Takes over an OPEN that the [`Authorizer`] has already approved, and
+/// does whatever `request.service` means — dispatching to a configured
+/// local `tcp:`/`http:`/`tls:` target (`menzil-node`'s `LocalServices`,
+/// TODO.md L4i) is the only implementation this project ships, but nothing
+/// here assumes that.
 ///
-/// See this module's own doc comment for why this is split from
-/// [`Self::accepts`] the way it is, and what that split cannot express.
+/// See this module's own doc comment for why this is split into
+/// [`Self::open`] and [`Self::handle`] the way it is.
 pub trait ServiceHandler<S> {
+    /// What [`Self::open`] prepared for [`Self::handle`]: a connected local
+    /// socket, a resolved target, a reserved slot. Dropped unused when the
+    /// OPEN_ACK cannot be written, so it must release whatever it holds on
+    /// drop. `()` for a handler with nothing to carry.
+    type Opened: Send + 'static;
+
     /// The future [`Self::handle`] hands back, actually running `stream`
     /// to completion. `Send + 'static` because the only realistic caller
     /// (`menzil-node`, already tokio-based) needs to spawn it; this
@@ -229,30 +226,35 @@ pub trait ServiceHandler<S> {
     /// (`Pin<Box<dyn Future<Output = ()> + Send>>`).
     type Handling: Future<Output = ()> + Send + 'static;
 
-    /// Cheap, synchronous, pre-OPEN_ACK check: would this handler even
-    /// take `request` at all (e.g. is a local target actually configured
-    /// for its service)? Only ever called once `request.target` has
-    /// already passed protocol.md 5.3's own structural rule and an
-    /// [`Authorizer`] has already allowed `request` — neither an invalid
-    /// target nor a grant denial ever reaches this method, mirroring
-    /// protocol.md 5.3's own ordering ("the target node evaluates the
-    /// grant ... On `ok` the stream is a byte pipe to ..."). That ordering
-    /// is also what keeps a peer from probing which services this node
-    /// has configured beyond the ones it is actually granted. Must not
-    /// touch the stream, and must not block (the same constraint, for the
-    /// same reason, as [`Authorizer::authorize`]): see this module's own
-    /// doc comment for why `respond_to_open` still needs the stream
-    /// available to send OPEN_ACK regardless of the answer.
-    fn accepts(&self, request: &OpenRequest) -> Result<(), OpenRefusal>;
+    /// The pre-OPEN_ACK step: would this handler take `request`, and if so
+    /// get everything ready (look the service up, connect to its local
+    /// target). Only ever called once `request.target` has already passed
+    /// protocol.md 5.3's own structural rule and an [`Authorizer`] has
+    /// already allowed `request` — neither an invalid target nor a grant
+    /// denial ever reaches this method, mirroring protocol.md 5.3's own
+    /// ordering ("the target node evaluates the grant ... On `ok` the
+    /// stream is a byte pipe to ..."). That ordering is also what keeps a
+    /// peer from probing which services this node has configured beyond
+    /// the ones it is actually granted. May await (a local connect), but
+    /// must give up well inside the caller's 10 second OPEN timeout, and
+    /// is cancelled (dropped) if that timeout fires first. Must not touch
+    /// the stream: it is not available here, [`respond_to_open`] still
+    /// needs it to send OPEN_ACK either way. An `Err` becomes an OPEN_ACK
+    /// with `ok: false`; its `code` and `msg` reach the peer (see
+    /// [`OpenRefusal`]).
+    fn open(
+        &self,
+        request: &OpenRequest,
+    ) -> impl Future<Output = Result<Self::Opened, OpenRefusal>> + Send;
 
     /// Takes ownership of `stream`, whose OPEN_ACK `ok: true` has already
     /// been written and flushed for this exact `request` (the same one
-    /// [`Self::accepts`] just approved). Any bytes the initiator sent
-    /// right behind its OPEN header are still unread on `stream`. By the
-    /// time this returns, `stream`'s fate is this handler's
-    /// responsibility alone — `respond_to_open` has nothing further to do
-    /// with it.
-    fn handle(&self, stream: S, request: OpenRequest) -> Self::Handling;
+    /// [`Self::open`] just approved, whose result is `opened`). Any bytes
+    /// the initiator sent right behind its OPEN header are still unread on
+    /// `stream`. By the time this returns, `stream`'s fate is this
+    /// handler's responsibility alone — `respond_to_open` has nothing
+    /// further to do with it.
+    fn handle(&self, stream: S, request: OpenRequest, opened: Self::Opened) -> Self::Handling;
 }
 
 /// What came of one `respond_to_open` call once its OPEN_ACK has
@@ -409,41 +411,43 @@ where
     // downstream would have caught it either.
     let target_allowed =
         request.service.kind == ServiceKind::Egress && request.service.label == "*";
-    let refusal = if request.target.is_some() && !target_allowed {
-        Some(OpenRefusal {
+    let outcome = if request.target.is_some() && !target_allowed {
+        Err(OpenRefusal {
             code: ErrorCode::InvalidTarget,
             msg: "target is only valid for the egress:* service (protocol.md 5.3)".to_string(),
         })
     } else {
         match authorizer.authorize(&request) {
-            OpenDecision::Allow => handler.accepts(&request).err(),
-            OpenDecision::Deny(refusal) => Some(refusal),
+            OpenDecision::Allow => handler.open(&request).await,
+            OpenDecision::Deny(refusal) => Err(refusal),
         }
     };
 
-    let ack = match &refusal {
-        None => OpenAckBody {
+    let ack = match &outcome {
+        Ok(_) => OpenAckBody {
             ok: true,
             code: ErrorCode::Unknown(0),
             msg: String::new(),
             channel: None,
         },
-        Some(r) => OpenAckBody {
+        Err(r) => OpenAckBody {
             ok: false,
             code: r.code,
             msg: clamp_refusal_msg(&r.msg),
             channel: None,
         },
     };
+    // If either write below fails, `outcome` (and the `Opened` value in it)
+    // is dropped with the error, releasing what `open` prepared.
     let encoded = ack.encode().map_err(OpenError::Encode)?;
     stream.write_all(&encoded).await.map_err(OpenError::Io)?;
 
-    match refusal {
-        None => {
+    match outcome {
+        Ok(opened) => {
             stream.flush().await.map_err(OpenError::Io)?;
-            Ok(Responded::Accepted(handler.handle(stream, request)))
+            Ok(Responded::Accepted(handler.handle(stream, request, opened)))
         }
-        Some(r) => {
+        Err(r) => {
             stream.close().await.map_err(OpenError::Io)?;
             Ok(Responded::Refused(r))
         }
@@ -455,6 +459,7 @@ mod tests {
     use super::*;
     use std::cell::Cell;
     use std::pin::Pin;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::task::{Context, Poll};
 
     /// A minimal `AsyncRead + AsyncWrite` test double: reads come from a
@@ -471,6 +476,10 @@ mod tests {
         written: Vec<u8>,
         delivered: usize,
         closed: bool,
+        /// How many bytes were ever written, readable while a future owns the stream.
+        written_len: std::sync::Arc<AtomicUsize>,
+        /// Every write fails, as on a stream whose peer reset it.
+        fail_writes: bool,
     }
 
     impl MockStream {
@@ -480,6 +489,8 @@ mod tests {
                 written: Vec::new(),
                 delivered: 0,
                 closed: false,
+                written_len: std::sync::Arc::new(AtomicUsize::new(0)),
+                fail_writes: false,
             }
         }
 
@@ -506,7 +517,11 @@ mod tests {
             buf: &[u8],
         ) -> Poll<std::io::Result<usize>> {
             let this = self.get_mut();
+            if this.fail_writes {
+                return Poll::Ready(Err(std::io::ErrorKind::ConnectionReset.into()));
+            }
             this.written.extend_from_slice(buf);
+            this.written_len.fetch_add(buf.len(), Ordering::SeqCst);
             Poll::Ready(Ok(buf.len()))
         }
         fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
@@ -597,12 +612,12 @@ mod tests {
         }
     }
 
-    /// Answers `accepts` with a fixed result, counting how often it was
+    /// Answers `open` with a fixed result, counting how often it was
     /// asked, and hands back a future from `handle` that just records it
     /// ran, via the oneshot it closes over.
     struct RecordingHandler {
-        accepts_result: Result<(), OpenRefusal>,
-        accepts_asked: Cell<usize>,
+        open_result: Result<(), OpenRefusal>,
+        open_asked: AtomicUsize,
         ran_tx: std::sync::Mutex<Option<futures_channel::oneshot::Sender<OpenRequest>>>,
     }
 
@@ -611,8 +626,8 @@ mod tests {
             let (tx, rx) = futures_channel::oneshot::channel();
             (
                 Self {
-                    accepts_result: Ok(()),
-                    accepts_asked: Cell::new(0),
+                    open_result: Ok(()),
+                    open_asked: AtomicUsize::new(0),
                     ran_tx: std::sync::Mutex::new(Some(tx)),
                 },
                 rx,
@@ -621,22 +636,27 @@ mod tests {
 
         fn decline(refusal: OpenRefusal) -> Self {
             Self {
-                accepts_result: Err(refusal),
-                accepts_asked: Cell::new(0),
+                open_result: Err(refusal),
+                open_asked: AtomicUsize::new(0),
                 ran_tx: std::sync::Mutex::new(None),
             }
+        }
+
+        fn asked(&self) -> usize {
+            self.open_asked.load(Ordering::SeqCst)
         }
     }
 
     impl<S> ServiceHandler<S> for RecordingHandler {
+        type Opened = ();
         type Handling = std::future::Ready<()>;
 
-        fn accepts(&self, _request: &OpenRequest) -> Result<(), OpenRefusal> {
-            self.accepts_asked.set(self.accepts_asked.get() + 1);
-            self.accepts_result.clone()
+        async fn open(&self, _request: &OpenRequest) -> Result<(), OpenRefusal> {
+            self.open_asked.fetch_add(1, Ordering::SeqCst);
+            self.open_result.clone()
         }
 
-        fn handle(&self, _stream: S, request: OpenRequest) -> Self::Handling {
+        fn handle(&self, _stream: S, request: OpenRequest, _opened: ()) -> Self::Handling {
             if let Some(tx) = self.ran_tx.lock().unwrap().take() {
                 let _ = tx.send(request);
             }
@@ -745,7 +765,7 @@ mod tests {
             Responded::Accepted(_) => panic!("a denied Authorizer must never reach the handler"),
         }
         assert_eq!(
-            handler.accepts_asked.get(),
+            handler.asked(),
             0,
             "a peer without a grant must not learn, even indirectly, what the handler would say"
         );
@@ -834,7 +854,7 @@ mod tests {
             0,
             "the Authorizer must not be asked"
         );
-        assert_eq!(handler.accepts_asked.get(), 0, "nor the handler");
+        assert_eq!(handler.asked(), 0, "nor the handler");
         assert!(
             ran_rx.try_recv().unwrap().is_none(),
             "neither gate should have run: this is rejected before either is asked"
@@ -895,7 +915,7 @@ mod tests {
 
         assert!(matches!(result, Responded::Accepted(_)));
         assert_eq!(authorizer.asked.get(), 1);
-        assert_eq!(handler.accepts_asked.get(), 1);
+        assert_eq!(handler.asked(), 1);
     }
 
     #[tokio::test]
@@ -1043,5 +1063,187 @@ mod tests {
                 "cut at {cut}: {err:?}"
             );
         }
+    }
+
+    /// Sets a flag when dropped: stands for a connected socket or a reserved
+    /// slot that `open` prepared.
+    struct DropProbe(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+    impl Drop for DropProbe {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// `open` waits for a gate the test controls, then answers with a
+    /// prepared value (or a refusal); `handle` reports the value it was
+    /// given. While `open` waits, its future holds a [`DropProbe`], so a test
+    /// can tell when it is cancelled.
+    struct GatedHandler {
+        gate: std::sync::Mutex<Option<futures_channel::oneshot::Receiver<()>>>,
+        refusal: Option<OpenRefusal>,
+        opened_value: u32,
+        open_future_dropped: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        prepared_dropped: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        handled_with: std::sync::Mutex<Option<u32>>,
+    }
+
+    struct Prepared(u32, #[allow(dead_code)] DropProbe);
+
+    impl GatedHandler {
+        fn new(refusal: Option<OpenRefusal>) -> (Self, futures_channel::oneshot::Sender<()>) {
+            let (tx, rx) = futures_channel::oneshot::channel();
+            (
+                Self {
+                    gate: std::sync::Mutex::new(Some(rx)),
+                    refusal,
+                    opened_value: 7,
+                    open_future_dropped: Default::default(),
+                    prepared_dropped: Default::default(),
+                    handled_with: std::sync::Mutex::new(None),
+                },
+                tx,
+            )
+        }
+    }
+
+    impl<S> ServiceHandler<S> for GatedHandler {
+        type Opened = Prepared;
+        type Handling = std::future::Ready<()>;
+
+        async fn open(&self, _request: &OpenRequest) -> Result<Prepared, OpenRefusal> {
+            let _cancel_probe = DropProbe(self.open_future_dropped.clone());
+            let gate = self.gate.lock().unwrap().take().expect("asked once");
+            let _ = gate.await;
+            match &self.refusal {
+                Some(refusal) => Err(refusal.clone()),
+                None => Ok(Prepared(
+                    self.opened_value,
+                    DropProbe(self.prepared_dropped.clone()),
+                )),
+            }
+        }
+
+        fn handle(&self, _stream: S, _request: OpenRequest, opened: Prepared) -> Self::Handling {
+            *self.handled_with.lock().unwrap() = Some(opened.0);
+            std::future::ready(())
+        }
+    }
+
+    fn open_stream() -> MockStream {
+        MockStream::preloaded(sample_open().encode().unwrap())
+    }
+
+    #[tokio::test]
+    async fn the_ack_waits_for_open_and_handle_gets_what_open_prepared() {
+        let (handler, gate) = GatedHandler::new(None);
+        let allow = AllowAll::default();
+        let mut stream = open_stream();
+        let written = stream.written_len.clone();
+        let mut responding = Box::pin(respond_to_open(
+            Lent(&mut stream),
+            NetworkId::from([1u8; 32]),
+            NodeId::from([2u8; 32]),
+            &allow,
+            &handler,
+        ));
+
+        // `open` is still waiting (a local connect, say): no ack may be out.
+        assert!(
+            futures_util::future::poll_immediate(&mut responding)
+                .await
+                .is_none()
+        );
+        assert_eq!(written.load(Ordering::SeqCst), 0);
+        assert!(!handler.prepared_dropped.load(Ordering::SeqCst));
+
+        gate.send(()).unwrap();
+        let responded = responding.await.unwrap();
+        assert!(matches!(responded, Responded::Accepted(_)));
+        let ack = OpenAckBody::decode(stream.delivered()).unwrap();
+        assert!(ack.ok);
+        // The value `open` made is the one `handle` got, and it was not dropped on the way.
+        assert_eq!(*handler.handled_with.lock().unwrap(), Some(7));
+    }
+
+    #[tokio::test]
+    async fn a_refusal_that_open_reaches_after_waiting_is_acked_with_its_code() {
+        let refusal = OpenRefusal {
+            code: ErrorCode::TargetUnreachable,
+            msg: "connection refused".to_string(),
+        };
+        let (handler, gate) = GatedHandler::new(Some(refusal));
+        let allow = AllowAll::default();
+        let mut stream = open_stream();
+        let responding = respond_to_open(
+            Lent(&mut stream),
+            NetworkId::from([1u8; 32]),
+            NodeId::from([2u8; 32]),
+            &allow,
+            &handler,
+        );
+        gate.send(()).unwrap();
+        let responded = responding.await.unwrap();
+        assert!(
+            matches!(responded, Responded::Refused(r) if r.code == ErrorCode::TargetUnreachable)
+        );
+        let ack = OpenAckBody::decode(stream.delivered()).unwrap();
+        assert!(!ack.ok);
+        assert_eq!(ack.code, ErrorCode::TargetUnreachable);
+        assert_eq!(ack.msg, "connection refused");
+        assert!(stream.closed, "a refused stream is closed after its ack");
+        assert_eq!(*handler.handled_with.lock().unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn what_open_prepared_is_dropped_when_the_ack_cannot_be_written() {
+        let (handler, gate) = GatedHandler::new(None);
+        let allow = AllowAll::default();
+        let mut stream = open_stream();
+        stream.fail_writes = true;
+        gate.send(()).unwrap();
+        let err = respond_to_open(
+            Lent(&mut stream),
+            NetworkId::from([1u8; 32]),
+            NodeId::from([2u8; 32]),
+            &allow,
+            &handler,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, OpenError::Io(_)));
+        assert!(
+            handler.prepared_dropped.load(Ordering::SeqCst),
+            "a connected socket must not outlive an OPEN that could not be acknowledged"
+        );
+        assert_eq!(*handler.handled_with.lock().unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn open_is_cancelled_with_the_exchange_when_the_caller_gives_up() {
+        let (handler, _gate) = GatedHandler::new(None);
+        let allow = AllowAll::default();
+        let mut stream = open_stream();
+        let mut responding = Box::pin(respond_to_open(
+            Lent(&mut stream),
+            NetworkId::from([1u8; 32]),
+            NodeId::from([2u8; 32]),
+            &allow,
+            &handler,
+        ));
+        assert!(
+            futures_util::future::poll_immediate(&mut responding)
+                .await
+                .is_none()
+        );
+        assert!(!handler.open_future_dropped.load(Ordering::SeqCst));
+
+        // What the caller's 10 second OPEN timeout does when it fires.
+        drop(responding);
+        assert!(
+            handler.open_future_dropped.load(Ordering::SeqCst),
+            "a pending local connect must be dropped with the exchange"
+        );
+        assert_eq!(stream.written.len(), 0, "and no ack was sent");
     }
 }

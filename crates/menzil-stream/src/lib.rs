@@ -82,16 +82,17 @@
 //! inbound record really is exactly one such frame before handing it to
 //! `yamux`'s own reader.
 //!
-//! **A known gap, not yet closed**: this crate re-exports `yamux::Stream`
-//! directly rather than wrapping it, which means it also inherits that
-//! type's limits — notably, no way to force-reset a stream once this side
-//! has already half-closed it (`yamux` 0.14.1 only sends `RST` on drop
-//! while a stream is still fully `Open`). TODO.md's L4k (live grant
-//! revocation) and L4i (the abnormal-end reset-not-EOF rule) will likely
-//! need that and will not get it from this crate as it stands today —
-//! found by the same 2026-10-02 review, left for whichever of those items
-//! actually needs it to decide how (a newtype wrapping [`Stream`], most
-//! likely), rather than guessed at here.
+//! **The stream type** ([`Stream`]) wraps the vendored `yamux::Stream`
+//! (`vendor/yamux/PATCHES.md`, decision 0002) to close gaps the stock type
+//! had, found by the 2026-10-02 review, the L4h6b one and the L4i one: it
+//! cannot force-reset a stream once either side has half-closed it, it
+//! reports a FIN, an RST and a lost connection alike as end of file, and
+//! dropping it after the peer's FIN answers with a FIN, a clean end. Here
+//! a stream that was not closed on purpose is aborted when it is dropped,
+//! [`Stream::reset`] aborts in every state, and reading a reset stream is
+//! an error, so the abnormal-end rule of protocol.md 5.2 and 5.3 holds
+//! even for a panic or a cancelled future. The connection also stays under
+//! `yamux`'s 512-stream cap ([`MAX_LIVE_STREAMS`]).
 
 #![forbid(unsafe_code)]
 
@@ -100,12 +101,17 @@ mod error;
 mod frame_format;
 mod open;
 mod record_io;
+mod stream;
 
-pub use driver::{Driver, Inbound, OutboundFrames, StreamMux, new};
+pub use driver::{
+    Driver, Inbound, MAX_LIVE_STREAMS, OutboundFrames, RECEIVE_WINDOW_GRANT, StreamMux, new,
+};
 pub use error::StreamMuxError;
 pub use frame_format::FrameFormatError;
 pub use open::{
     Authorizer, OpenDecision, OpenError, OpenRefusal, OpenRequest, Responded, ServiceHandler,
     initiate_open, respond_to_open,
 };
-pub use yamux::{Mode, Stream};
+pub use record_io::InboundGuard;
+pub use stream::Stream;
+pub use yamux::Mode;

@@ -6,10 +6,16 @@ members = [
     "crates/menzil-session",
     "crates/menzil-e2e",
     "crates/menzil-stream",
+    "crates/menzil-admin",
     "crates/menzil-relay",
     "crates/menzil-node",
     "crates/menzil",
 ]
+# Third-party source kept byte for byte as published apart from the listed patches; it is
+# built as a path dependency but kept out of the workspace so that `clippy` and `test
+# --workspace` stay about our own code (`cargo fmt --all` follows path dependencies and
+# formats it anyway). See vendor/yamux/PATCHES.md.
+exclude = ["vendor/yamux"]
 
 [workspace.package]
 version = "0.0.1"

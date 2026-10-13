@@ -288,15 +288,16 @@ impl<A: Authorizer> Authorizer for MemberAuthorizer<A> {
 /// [`Authorizer`].
 struct MemberServiceHandler<H>(H);
 
-impl<S, H: ServiceHandler<S>> ServiceHandler<S> for MemberServiceHandler<H> {
+impl<S, H: ServiceHandler<S> + Sync> ServiceHandler<S> for MemberServiceHandler<H> {
+    type Opened = H::Opened;
     type Handling = H::Handling;
 
-    fn accepts(&self, request: &OpenRequest) -> Result<(), OpenRefusal> {
-        self.0.accepts(&as_member_request(request))
+    async fn open(&self, request: &OpenRequest) -> Result<Self::Opened, OpenRefusal> {
+        self.0.open(&as_member_request(request)).await
     }
 
-    fn handle(&self, stream: S, request: OpenRequest) -> Self::Handling {
-        self.0.handle(stream, as_member_request(&request))
+    fn handle(&self, stream: S, request: OpenRequest, opened: Self::Opened) -> Self::Handling {
+        self.0.handle(stream, as_member_request(&request), opened)
     }
 }
 
@@ -470,6 +471,7 @@ mod tests {
                 epoch: Epoch::first(),
                 send_budget: crate::outbound::SendBudgets::new().for_peer(peer),
                 observer: None,
+                inbound_budget: crate::l4_session::L4_INBOUND_BUDGET_PER_SESSION,
             },
             outbound_tx,
             epoch_ended_rx,
@@ -504,7 +506,8 @@ mod tests {
                     ..
                 } = frame
                 {
-                    dst.feed_inbound(counter, ciphertext);
+                    dst.feed_inbound(counter, ciphertext)
+                        .expect("within the inbound budget");
                 }
                 let _ = req.outcome.send(EnqueueOutcome::Accepted);
             }
@@ -588,13 +591,14 @@ mod tests {
     }
 
     impl ServiceHandler<Stream> for CountingHandler {
+        type Opened = ();
         type Handling = std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>;
 
-        fn accepts(&self, _request: &OpenRequest) -> Result<(), OpenRefusal> {
+        async fn open(&self, _request: &OpenRequest) -> Result<(), OpenRefusal> {
             Ok(())
         }
 
-        fn handle(&self, mut stream: Stream, _request: OpenRequest) -> Self::Handling {
+        fn handle(&self, mut stream: Stream, _request: OpenRequest, _opened: ()) -> Self::Handling {
             let accepted = Arc::clone(&self.accepted);
             Box::pin(async move {
                 let mut buf = [0u8; 1];
@@ -611,16 +615,17 @@ mod tests {
     /// for real use is not this item's call to make silently.
     struct RefuseAll;
     impl ServiceHandler<Stream> for RefuseAll {
+        type Opened = ();
         type Handling = std::future::Ready<()>;
 
-        fn accepts(&self, _request: &OpenRequest) -> Result<(), OpenRefusal> {
+        async fn open(&self, _request: &OpenRequest) -> Result<(), OpenRefusal> {
             Err(OpenRefusal {
                 code: ErrorCode::Unknown(0),
                 msg: "test stub refuses everything".to_string(),
             })
         }
 
-        fn handle(&self, _stream: Stream, _request: OpenRequest) -> Self::Handling {
+        fn handle(&self, _stream: Stream, _request: OpenRequest, _opened: ()) -> Self::Handling {
             unreachable!("accepts always refuses, so handle is never called")
         }
     }
@@ -643,9 +648,10 @@ mod tests {
         }
     }
     impl ServiceHandler<Stream> for MetaAssertingGate {
+        type Opened = ();
         type Handling = std::future::Ready<()>;
 
-        fn accepts(&self, request: &OpenRequest) -> Result<(), OpenRefusal> {
+        async fn open(&self, request: &OpenRequest) -> Result<(), OpenRefusal> {
             assert_eq!(
                 request.meta,
                 OpenMeta::default(),
@@ -654,7 +660,7 @@ mod tests {
             Ok(())
         }
 
-        fn handle(&self, _stream: Stream, request: OpenRequest) -> Self::Handling {
+        fn handle(&self, _stream: Stream, request: OpenRequest, _opened: ()) -> Self::Handling {
             assert_eq!(
                 request.meta,
                 OpenMeta::default(),
@@ -775,16 +781,22 @@ mod tests {
     async fn a_refused_opens_message_is_sanitized_before_display() {
         struct ControlCharRefusal;
         impl ServiceHandler<Stream> for ControlCharRefusal {
+            type Opened = ();
             type Handling = std::future::Ready<()>;
 
-            fn accepts(&self, _request: &OpenRequest) -> Result<(), OpenRefusal> {
+            async fn open(&self, _request: &OpenRequest) -> Result<(), OpenRefusal> {
                 Err(OpenRefusal {
                     code: ErrorCode::Unknown(0),
                     msg: "line one\u{1b}[31mred\u{1b}[0m\nline two".to_string(),
                 })
             }
 
-            fn handle(&self, _stream: Stream, _request: OpenRequest) -> Self::Handling {
+            fn handle(
+                &self,
+                _stream: Stream,
+                _request: OpenRequest,
+                _opened: (),
+            ) -> Self::Handling {
                 unreachable!("accepts always refuses, so handle is never called")
             }
         }
@@ -823,9 +835,10 @@ mod tests {
     async fn a_refused_opens_message_strips_bidi_and_zero_width_characters() {
         struct BidiRefusal;
         impl ServiceHandler<Stream> for BidiRefusal {
+            type Opened = ();
             type Handling = std::future::Ready<()>;
 
-            fn accepts(&self, _request: &OpenRequest) -> Result<(), OpenRefusal> {
+            async fn open(&self, _request: &OpenRequest) -> Result<(), OpenRefusal> {
                 Err(OpenRefusal {
                     code: ErrorCode::Unknown(0),
                     // A bidi override followed by a zero-width space —
@@ -835,7 +848,12 @@ mod tests {
                 })
             }
 
-            fn handle(&self, _stream: Stream, _request: OpenRequest) -> Self::Handling {
+            fn handle(
+                &self,
+                _stream: Stream,
+                _request: OpenRequest,
+                _opened: (),
+            ) -> Self::Handling {
                 unreachable!("accepts always refuses, so handle is never called")
             }
         }
@@ -1111,7 +1129,9 @@ mod tests {
             };
             // Bypasses `L4SessionHandle::open_stream`'s own yamux
             // pacing entirely — the point of this test.
-            b_handle.feed_inbound(counter, ciphertext);
+            b_handle
+                .feed_inbound(counter, ciphertext)
+                .expect("within the inbound budget");
         }
 
         match tokio::time::timeout(Duration::from_secs(5), accept_task).await {

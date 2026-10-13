@@ -35,8 +35,9 @@
 //! [`Node`] (TODO.md L4h7) is the running node built around it: one
 //! [`Node::start`] joins the L3 session, the router and an accept loop per
 //! session, and [`Node::open_stream`] is the entry point for everything
-//! that wants a stream to a peer. The inbound path is not paced yet
-//! (TODO.md L4h6b). Each
+//! that wants a stream to a peer. Each session holds at most
+//! [`L4_INBOUND_BUDGET_PER_SESSION`] bytes of inbound records nothing has
+//! read yet and is ended past it (TODO.md L4h6b). Each
 //! session reserves space in this node's send queue before producing a
 //! record ([`SendBudgets`], TODO.md L4h5), so ordinary bulk transfer
 //! waits for the queue to drain instead of overflowing it and ending the
@@ -68,6 +69,7 @@ mod node;
 mod outbound;
 mod policy_store;
 mod roster_store;
+mod serve;
 mod session;
 
 pub use admission::{
@@ -82,8 +84,8 @@ pub use l4_router::{
 };
 pub use l4_session::new as new_l4_session;
 pub use l4_session::{
-    CloseReason, EndReason, L4SessionAcceptor, L4SessionConfig, L4SessionHandle, SessionNotice,
-    SessionObserver,
+    CloseReason, EndReason, InboundOverflow, L4_INBOUND_BUDGET_PER_SESSION, L4SessionAcceptor,
+    L4SessionConfig, L4SessionHandle, SessionNotice, SessionObserver,
 };
 pub use l5_stream::{OpenStreamError, accept_loop, open as open_stream};
 pub use node::{Node, NodeConfig, NodeOpenError, RefuseAll, StartError};
@@ -92,4 +94,5 @@ pub use outbound::{
 };
 pub use policy_store::PolicyStore;
 pub use roster_store::RosterStore;
+pub use serve::{DEFAULT_CONNECT_TIMEOUT, LocalServices, LocalTarget, ServeConfigError};
 pub use session::{Session, SessionConfig, SessionEvent, run_session};

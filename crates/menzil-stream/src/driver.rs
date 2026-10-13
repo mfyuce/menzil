@@ -26,15 +26,17 @@
 
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use futures_channel::{mpsc, oneshot};
 use futures_util::stream::StreamExt;
-use yamux::{Config, Connection, Mode, Stream};
+use yamux::{Config, Connection, Mode};
 
 use crate::error::StreamMuxError;
 use crate::frame_format::{HEADER_LEN, is_exactly_one_frame};
-use crate::record_io::RecordIo;
+use crate::record_io::{InboundGuard, InboundRecord, RecordIo};
+use crate::stream::{Stream, StreamCounters};
 
 /// `yamux` 0.14.1's own default (`DEFAULT_SPLIT_SEND_SIZE` in its
 /// `lib.rs`), duplicated here since that constant is private to that
@@ -46,16 +48,52 @@ const YAMUX_DEFAULT_SPLIT_SEND_SIZE: usize = 16 * 1024;
 /// The most streams one connection may hold at once, accepted and
 /// outbound together: `yamux` 0.14.1's own default, stated here so the
 /// receive-window arithmetic in [`config_for`] does not silently change if
-/// that default ever does. Reaching it is fatal to the whole connection
-/// (`yamux` ends it, taking every healthy stream along), which is why the
-/// layers above should stay well clear of it — TODO.md L4h5.
+/// that default ever does. A local open at this count ends the whole
+/// connection in stock `yamux`, taking every healthy stream along; the
+/// vendored one (`vendor/yamux/PATCHES.md`, patch 3) refuses a stream the
+/// peer opens at it with an RST instead of a GoAway. Either way this crate
+/// stays well clear of it, see [`MAX_LIVE_STREAMS`].
 const MAX_STREAMS: usize = 512;
+
+/// The most streams one connection holds at once, opened and accepted together, as `yamux`
+/// counts them: its table, which also keeps a stream that was dropped until its last frames are
+/// written, and with the uplink stalled that can be long. A [`StreamMux::open`] at this count
+/// fails with [`StreamMuxError::StreamLimit`] and touches nothing, and a stream the peer opens
+/// past it is reset instead of being handed up. It sits 64 below the 512 at which `yamux` stops
+/// taking streams, so that streams the peer opens while refused ones are still waiting to be
+/// reset do not reach it at once. Counting handles instead was the first version and was wrong:
+/// 300 streams dropped with data queued, the uplink stalled, and the 213th open ended the
+/// session at 212 live handles (the L4i review, `tests/stream_limit.rs`).
+///
+/// This bounds what honest traffic can do; a peer that opens streams faster than the uplink
+/// can write the resets of the ones refused still reaches 512, where the vendored `yamux`
+/// refuses the rest with an RST and the session goes on. A peer can only make *this* session
+/// refuse more streams, never another one.
+pub const MAX_LIVE_STREAMS: usize = 448;
+
+const _: () = assert!(MAX_LIVE_STREAMS < MAX_STREAMS);
 
 /// The largest receive window one stream may auto-tune up to: protocol.md
 /// 5.3's "tuned upward to 16 MiB within a per session budget". Where that
 /// "budget" is the connection-wide growth allowance described on
 /// [`config_for`].
 const MAX_STREAM_RECEIVE_WINDOW: usize = 16 * 1024 * 1024;
+
+/// The most payload one connection's peer can have in flight toward us at
+/// any moment, which is what [`config_for`] grants `yamux` as its
+/// connection-wide receive window: every one of the [`MAX_STREAMS`] slots is
+/// guaranteed `yamux`'s initial 256 KiB, and the growth budget (one stream's
+/// ceiling minus its guaranteed share) is shared by all streams on top of
+/// that. About 144 MiB.
+///
+/// Exported because a caller that bounds what it holds for a peer must not
+/// bound it below this: a peer that respects the windows we granted may
+/// have all of it in flight, and none of it is read while `yamux` is
+/// waiting to write a reply (`menzil-node`'s inbound budget is sized from
+/// it). It counts payload bytes, not memory; with the vendored `yamux` the
+/// two stay within a small constant factor, see the note on [`config_for`].
+pub const RECEIVE_WINDOW_GRANT: usize = MAX_STREAMS * yamux::DEFAULT_CREDIT as usize
+    + (MAX_STREAM_RECEIVE_WINDOW - yamux::DEFAULT_CREDIT as usize);
 
 type OpenReply = oneshot::Sender<Result<Stream, StreamMuxError>>;
 
@@ -66,14 +104,18 @@ type OpenReply = oneshot::Sender<Result<Stream, StreamMuxError>>;
 #[derive(Clone)]
 pub struct StreamMux {
     open_tx: mpsc::UnboundedSender<OpenReply>,
-    inbound_tx: mpsc::UnboundedSender<Vec<u8>>,
+    inbound_tx: mpsc::UnboundedSender<InboundRecord>,
+    streams: Arc<StreamCounters>,
 }
 
 impl StreamMux {
     /// Opens a new outbound yamux stream. Resolves once [`Driver`] has
     /// actually created it locally; this crate stops at the raw stream
     /// (no OPEN/OPEN_ACK exchange — TODO.md L4g builds that on top, not
-    /// in it). Always fails as [`StreamMuxError::DriverGone`], never as
+    /// in it). Fails as [`StreamMuxError::StreamLimit`] when the
+    /// connection holds [`MAX_LIVE_STREAMS`] streams already, which leaves
+    /// the connection and its streams alone. Otherwise it fails as
+    /// [`StreamMuxError::DriverGone`], never as
     /// [`StreamMuxError::Connection`] directly: a refusal inside `yamux`
     /// itself (stream ids exhausted, too many streams already) ends the
     /// whole connection, not just this one call (see [`Driver`]'s own doc
@@ -86,6 +128,22 @@ impl StreamMux {
             .unbounded_send(reply_tx)
             .map_err(|_| StreamMuxError::DriverGone)?;
         reply_rx.await.map_err(|_| StreamMuxError::DriverGone)?
+    }
+
+    /// How many stream handles of this connection are alive now: created or
+    /// accepted by [`Driver`] and not yet dropped, including accepted ones
+    /// still waiting in [`Inbound`]. This is not the number
+    /// [`MAX_LIVE_STREAMS`] limits, which also counts dropped streams that
+    /// have not been flushed yet.
+    pub fn live_streams(&self) -> usize {
+        self.streams.live()
+    }
+
+    /// How many streams the peer opened that [`Driver`] reset on arrival
+    /// because the connection held [`MAX_LIVE_STREAMS`] already, since the
+    /// connection began.
+    pub fn refused_inbound_streams(&self) -> usize {
+        self.streams.refused_inbound()
     }
 
     /// Hands `Driver`'s local `yamux::Connection` one inbound `Mux`-kind
@@ -122,13 +180,35 @@ impl StreamMux {
     /// without ending the session.
     ///
     /// Synchronous and never blocks: a successful call only ever queues
-    /// `record` for [`Driver`] to actually process on its next poll — see
-    /// [`crate::record_io`]'s doc comment for why this particular queue
-    /// is still unbounded even though [`OutboundFrames`]'s is not.
+    /// `record` for [`Driver`] to actually process on its next poll, and
+    /// that queue has no bound of its own (see [`crate::record_io`]'s doc
+    /// comment for why it cannot usefully have one). A caller that cannot
+    /// trust its source to be paced by something else uses
+    /// [`Self::feed_inbound_guarded`] and counts what is waiting.
     pub fn feed_inbound(&self, record: Vec<u8>) -> Result<(), StreamMuxError> {
-        is_exactly_one_frame(&record).map_err(StreamMuxError::MalformedFrame)?;
+        self.feed(record, None)
+    }
+
+    /// [`Self::feed_inbound`], with a `guard` that is dropped once `yamux`
+    /// has read the whole record, or when the connection ends with the
+    /// record still waiting (and at once if the call fails). Making the
+    /// guard a permit on a byte budget is how a caller bounds what sits in
+    /// this queue: the permit lives exactly as long as the bytes do. The
+    /// guard says nothing about what `yamux` does with the bytes after it
+    /// has read them: its receive windows bound those, in payload bytes
+    /// (see [`RECEIVE_WINDOW_GRANT`]).
+    pub fn feed_inbound_guarded(
+        &self,
+        record: Vec<u8>,
+        guard: InboundGuard,
+    ) -> Result<(), StreamMuxError> {
+        self.feed(record, Some(guard))
+    }
+
+    fn feed(&self, bytes: Vec<u8>, guard: Option<InboundGuard>) -> Result<(), StreamMuxError> {
+        is_exactly_one_frame(&bytes).map_err(StreamMuxError::MalformedFrame)?;
         self.inbound_tx
-            .unbounded_send(record)
+            .unbounded_send(InboundRecord { bytes, guard })
             .map_err(|_| StreamMuxError::DriverGone)
     }
 }
@@ -216,6 +296,7 @@ pub struct Driver {
     open_requests: mpsc::UnboundedReceiver<OpenReply>,
     pending_open_reply: Option<OpenReply>,
     inbound_tx: mpsc::UnboundedSender<Stream>,
+    streams: Arc<StreamCounters>,
 }
 
 impl Future for Driver {
@@ -230,6 +311,16 @@ impl Future for Driver {
                 this.pending_open_reply = Some(reply);
             }
             if let Some(reply) = this.pending_open_reply.take() {
+                // Refused here, before `yamux` is asked, because `yamux`
+                // ends the whole connection when a local open meets its own
+                // limit (see [`MAX_LIVE_STREAMS`]); this one caller gets the
+                // error and nothing else is touched. The table is counted,
+                // not the handles: a dropped stream stays in it until its
+                // frames are written.
+                if this.connection.num_streams() >= MAX_LIVE_STREAMS {
+                    let _ = reply.send(Err(StreamMuxError::StreamLimit(MAX_LIVE_STREAMS)));
+                    continue;
+                }
                 match this.connection.poll_new_outbound(cx) {
                     Poll::Ready(Ok(stream)) => {
                         // A dropped receiver only means `StreamMux::open`'s
@@ -237,7 +328,7 @@ impl Future for Driver {
                         // the stream `yamux` just created is then simply
                         // dropped here, closing it the same way dropping
                         // any other unused `Stream` handle would.
-                        let _ = reply.send(Ok(stream));
+                        let _ = reply.send(Ok(Stream::new(stream, this.streams.take_slot())));
                         // Without this, a *second* `open()` request already
                         // sitting in `open_requests` when this one resolved
                         // would hang until some unrelated event happens to
@@ -275,13 +366,23 @@ impl Future for Driver {
 
             match this.connection.poll_next_inbound(cx) {
                 Poll::Ready(Some(Ok(stream))) => {
-                    // A dropped `Inbound` means nobody is listening for
-                    // *new* streams anymore; streams already handed out
-                    // keep working regardless, so this is not fatal to
-                    // the connection — only to this one freshly accepted
-                    // stream, dropped (closing it) for lack of anywhere
-                    // to send it.
-                    let _ = this.inbound_tx.unbounded_send(stream);
+                    // The new stream is in `yamux`'s table already, so it is
+                    // counted: the table may hold `MAX_LIVE_STREAMS` with it.
+                    if this.connection.num_streams() <= MAX_LIVE_STREAMS {
+                        // A dropped `Inbound` means nobody is listening for
+                        // *new* streams anymore; streams already handed out
+                        // keep working regardless, so this is not fatal to
+                        // the connection — only to this one freshly accepted
+                        // stream, dropped (and so reset) for lack of anywhere
+                        // to send it.
+                        let slot = this.streams.take_slot();
+                        let _ = this.inbound_tx.unbounded_send(Stream::new(stream, slot));
+                    } else {
+                        // Over the limit: the peer is told at once, and the
+                        // stream never counts as a handle. Not fatal either.
+                        this.streams.note_refused_inbound();
+                        stream.reset_on_drop();
+                    }
                     continue;
                 }
                 Poll::Ready(Some(Err(e))) => return Poll::Ready(Err(e.into())),
@@ -324,9 +425,11 @@ pub fn new(mode: Mode, max_record: u32) -> (StreamMux, Inbound, OutboundFrames, 
 
     let connection = Connection::new(record_io, config_for(max_record), mode);
 
+    let streams = Arc::new(StreamCounters::default());
     let stream_mux = StreamMux {
         open_tx,
         inbound_tx,
+        streams: streams.clone(),
     };
     let inbound = Inbound {
         rx: stream_inbound_rx,
@@ -337,6 +440,7 @@ pub fn new(mode: Mode, max_record: u32) -> (StreamMux, Inbound, OutboundFrames, 
         open_requests,
         pending_open_reply: None,
         inbound_tx: stream_inbound_tx,
+        streams,
     };
 
     (stream_mux, inbound, outbound, driver)
@@ -396,6 +500,24 @@ pub fn new(mode: Mode, max_record: u32) -> (StreamMux, Inbound, OutboundFrames, 
 /// flight *toward* us is what we grant it; how much we have queued toward
 /// the peer is what the peer grants us, held to a different, lower number
 /// by `SendBudget` regardless of what any peer grants.
+///
+/// **The windows count payload bytes, not memory** (found by the L4h6b
+/// review). Stock `yamux` keeps each data frame's body in its own
+/// allocation, so a stream that receives one-byte frames costs one byte of
+/// window and about 65 bytes of heap per byte: measured, 249,000 one-byte
+/// frames held 16.3 MB, and six accepted streams that nothing reads,
+/// 200,000 one-byte frames each, grew a process by 88 MiB. The vendored
+/// `yamux` (`vendor/yamux/PATCHES.md`, patch 1) appends short bodies to the
+/// previous chunk, which brings the same 249,000 frames to 254 KB
+/// (`tests/small_frames.rs`), so the heap a peer can make us hold for its
+/// unread window is at most about twice "about 144 MiB" (the worst pattern
+/// measured is 2.05 bytes of heap per byte, frames alternating 1 KiB and one
+/// byte) however it cut the data into frames. Two other things a hostile
+/// peer can make a session hold are outside the windows: a fixed 917 bytes
+/// per stream, and our own outbound data per stream while the peer reads
+/// nothing, 183,028 bytes from `yamux`'s per-stream channel (about 78 MiB
+/// at 448 streams, counted by no budget). `vendor/yamux/PATCHES.md` adds it
+/// up: roughly 540 MiB for one session.
 fn config_for(max_record: u32) -> Config {
     let record_budget = menzil_proto::max_e2e_data_plaintext(max_record);
     let max_body_for_this_session = record_budget
@@ -404,13 +526,10 @@ fn config_for(max_record: u32) -> Config {
         .max(1);
     let split_send_size = YAMUX_DEFAULT_SPLIT_SEND_SIZE.min(max_body_for_this_session);
 
-    let guaranteed = MAX_STREAMS * yamux::DEFAULT_CREDIT as usize;
-    let growth_budget = MAX_STREAM_RECEIVE_WINDOW - yamux::DEFAULT_CREDIT as usize;
-
     let mut cfg = Config::default();
     cfg.set_split_send_size(split_send_size);
     cfg.set_max_num_streams(MAX_STREAMS);
-    cfg.set_max_connection_receive_window(Some(guaranteed + growth_budget));
+    cfg.set_max_connection_receive_window(Some(RECEIVE_WINDOW_GRANT));
     cfg
 }
 

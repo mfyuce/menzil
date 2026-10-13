@@ -272,21 +272,24 @@
 //! (several of its variants wrap types, like `menzil_e2e::E2eError`,
 //! that do not).
 //!
-//! **What is deliberately not fixed here, flagged by the same review for
-//! whoever builds L4h5/L4h6**: [`L4SessionHandle::feed_inbound`]'s own
-//! channel is unbounded and provides no backpressure of its own — in a
-//! live measurement, ten thousand 16 KiB calls landed in 29ms and grew
-//! this process's memory by roughly 78MB while the actor was busy
-//! elsewhere, entirely without being processed. `menzil-stream`'s own
-//! `record_io` doc comment relies on a caller's own L3 read loop to
-//! naturally pace how fast `feed_inbound`-equivalent calls can happen;
-//! that pacing does not carry through this module's own inbound channel
-//! today. Not addressed here because nothing yet calls `feed_inbound` for
-//! real (TODO.md L4h6 does not exist) to make the actual pacing, if any,
-//! concrete.
+//! **The inbound side is bounded, not paced (TODO.md L4h6b)**. An earlier
+//! version of [`L4SessionHandle::feed_inbound`] sent into an unbounded
+//! channel: in a live measurement ten thousand 16 KiB calls landed in 29 ms
+//! and grew the process by roughly 78 MB while the actor was busy
+//! elsewhere, and `menzil-stream`'s own queue below it was unbounded too (a
+//! peer that stops reading from its relay while it floods bare Pings keeps
+//! `yamux` from reading for up to 35 s; 200,000 Pings grew the process by
+//! 15 MiB with no plateau). Now every record is charged to the session's
+//! budget when it is fed and the charge is given back when `yamux` has read
+//! it, so one session never holds more than
+//! [`L4_INBOUND_BUDGET_PER_SESSION`] of unread inbound data, and a record
+//! past that is refused with [`InboundOverflow`] and ends the session. That
+//! constant's docs say what is counted and why the caller is not made to
+//! wait instead.
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use futures_util::stream::{FuturesUnordered, StreamExt};
@@ -294,7 +297,7 @@ use menzil_e2e::{E2eError, E2eTransport, Liveness, RekeySchedule};
 use menzil_proto::{
     E2eDataBody, ErrorCode, MIN_SEND_CHARGE_BYTES, NetworkId, NodeId, e2e_data_frame_len,
 };
-use menzil_stream::{Mode, Stream, StreamMuxError};
+use menzil_stream::{Mode, RECEIVE_WINDOW_GRANT, Stream, StreamMuxError};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::outbound::{EnqueueOutcome, Epoch, OutboundSend, SendBudget, SendPermit};
@@ -528,6 +531,146 @@ impl Drop for EndGuard {
     }
 }
 
+/// What one L4 session may hold of inbound `data` records that `yamux` has
+/// not read yet (TODO.md L4h6b), in bytes: the whole receive window we grant
+/// a peer ([`RECEIVE_WINDOW_GRANT`], about 144 MiB) plus an eighth and 1 MiB
+/// for what rides on top of the payload, about 163 MiB.
+///
+/// **What it counts.** Every `data` record handed to
+/// [`L4SessionHandle::feed_inbound`] is charged (ciphertext length plus a
+/// fixed allowance for the allocation and queue slot it occupies) and the
+/// charge travels with the record: through the actor's queue, through
+/// decryption, and into `menzil-stream`'s queue as the guard of
+/// `StreamMux::feed_inbound_guarded`, until `yamux` has read the record's
+/// last byte. So it counts exactly the bytes this node holds for a peer
+/// without anything having looked at them, which is the one place a peer's
+/// traffic is not already limited by something else: what `yamux` has read
+/// is held by its receive windows (in payload bytes, which the vendored
+/// `yamux` keeps within a small factor of memory: see `menzil-stream`'s
+/// `config_for`), and what we hold toward the peer is held
+/// by [`SendBudget`].
+///
+/// **Why that size.** It is a ceiling for a peer that ignores flow control,
+/// so it must sit above everything a peer that respects it can have in
+/// flight, or it ends honest sessions. That is the whole grant, and
+/// `yamux` does not read while a reply (the Pong to the peer's RTT Ping,
+/// sent every 10 s on a busy connection) waits for room in the outbound
+/// channel, which happens whenever this node's own sends back up behind a
+/// slow uplink or a peer that is slow to take them. The L4h6b review
+/// measured the failure of an earlier 32 MiB figure: with 400 streams
+/// sending at once, a 20 s stall ended the session. A record is charged
+/// its ciphertext plus 128 bytes whatever its size, so a peer that cuts
+/// its data into tiny frames reaches the ceiling with a fraction of its
+/// windows; that is intended, it is memory the peer makes us hold. An
+/// operator who prefers a lower ceiling on a small machine can set one
+/// ([`L4SessionConfig::inbound_budget`], `RouterConfig::with_inbound_budget`)
+/// and accepts that a peer filling all its windows during a stall is then
+/// ended.
+///
+/// **Why a record past the ceiling ends the session instead of waiting.**
+/// The router that calls `feed_inbound` serves every peer on one task and
+/// one L3 connection. Making it wait for one session (stop reading
+/// `events`) would hold every other peer's traffic behind that one for as
+/// long as it lasts, and one member could cause it as often as it can
+/// complete a handshake (10 a minute). `run_session` also does not read the
+/// relay socket while an event is waiting, so the relay's PINGs go
+/// unanswered and the node's own liveness clock (it runs inside the read)
+/// stands still; a wait past the 50 s window (protocol.md 3.3) makes that
+/// check fire when reading resumes, and the attachment is torn down with
+/// every session on it. A record that cannot be queued cannot be dropped
+/// either (the counter gap ends the session, protocol.md 5.2), so the
+/// session ends, now, and only that one.
+///
+/// A node-wide total across sessions is not built: the worst case is this
+/// ceiling times the sessions the table allows, and every one of them is a
+/// member of a network the owner signed.
+pub const L4_INBOUND_BUDGET_PER_SESSION: usize =
+    RECEIVE_WINDOW_GRANT + RECEIVE_WINDOW_GRANT / 8 + 1024 * 1024;
+
+// A ceiling below the grant would end peers that do what they were told.
+const _: () =
+    assert!(L4_INBOUND_BUDGET_PER_SESSION > RECEIVE_WINDOW_GRANT + RECEIVE_WINDOW_GRANT / 16);
+
+/// What a record is charged on top of its ciphertext's length: the
+/// allocation, the queue slot and the permit it occupies while it waits. A
+/// 29-byte Ping took about 96 bytes of memory in the actor's channel and
+/// about 128 in `menzil-stream`'s queue (measured by the L4h6b review); a
+/// record waits in one of the two at a time, so 128 covers either, and
+/// charging only the payload would let a flood of tiny records hold several
+/// times the budget.
+const INBOUND_RECORD_OVERHEAD: usize = 128;
+
+/// The most one Noise message can be (and so the most ciphertext one record
+/// can carry). The relay names `max_record` in WELCOME and the node does not
+/// validate it, so nothing sized from it may be trusted to be at most this.
+const NOISE_MESSAGE_LIMIT: usize = 65_535;
+
+/// The counter behind [`L4_INBOUND_BUDGET_PER_SESSION`], one per session,
+/// shared by every clone of its [`L4SessionHandle`].
+#[derive(Clone)]
+struct InboundBudget {
+    in_use: Arc<AtomicUsize>,
+    ceiling: usize,
+}
+
+impl InboundBudget {
+    fn new(ceiling: usize) -> Self {
+        Self {
+            in_use: Arc::new(AtomicUsize::new(0)),
+            ceiling,
+        }
+    }
+
+    /// Charges `charge` bytes, or `None` if that would pass the ceiling.
+    fn try_reserve(&self, charge: usize) -> Option<InboundPermit> {
+        let mut current = self.in_use.load(Ordering::Relaxed);
+        loop {
+            let next = current.checked_add(charge)?;
+            if next > self.ceiling {
+                return None;
+            }
+            match self.in_use.compare_exchange_weak(
+                current,
+                next,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => {
+                    return Some(InboundPermit {
+                        in_use: Arc::clone(&self.in_use),
+                        charge,
+                    });
+                }
+                Err(actual) => current = actual,
+            }
+        }
+    }
+}
+
+/// A charge on an [`InboundBudget`], given back on drop.
+struct InboundPermit {
+    in_use: Arc<AtomicUsize>,
+    charge: usize,
+}
+
+impl Drop for InboundPermit {
+    fn drop(&mut self) {
+        self.in_use.fetch_sub(self.charge, Ordering::AcqRel);
+    }
+}
+
+/// [`L4SessionHandle::feed_inbound`] was refused: this session already holds
+/// as much unread inbound data as its budget allows
+/// ([`L4_INBOUND_BUDGET_PER_SESSION`]). The record is dropped, which leaves
+/// a gap in the peer's counter, so the session cannot go on: the caller
+/// ends it (that constant's docs say why it is not made to wait).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("this session already holds {budget} bytes of inbound data nothing has read yet")]
+pub struct InboundOverflow {
+    /// The session's budget in bytes.
+    pub budget: usize,
+}
+
 /// A command sent to [`run`] through [`L4SessionHandle`].
 enum Command {
     Close(Option<CloseReason>),
@@ -571,6 +714,14 @@ pub struct L4SessionConfig {
     /// Told when the first record authenticates and when the actor ends
     /// (see [`SessionNotice`]); `None` if nobody needs to know.
     pub observer: Option<SessionObserver>,
+    /// How many bytes of inbound `data` records this session may hold
+    /// before `yamux` has read them; [`L4SessionHandle::feed_inbound`]
+    /// refuses past it. [`L4_INBOUND_BUDGET_PER_SESSION`] unless a test or
+    /// an operator needs another. Raised to hold at least two records of
+    /// the largest size that can exist (`max_record`, but never more than
+    /// Noise's 65,535), so that a record the wire allows can always be
+    /// queued.
+    pub inbound_budget: usize,
 }
 
 /// A cloneable handle to one running [`run`] actor's send side: open
@@ -591,9 +742,14 @@ pub struct L4SessionHandle {
     peer: NodeId,
     network_id: NetworkId,
     stream_mux: menzil_stream::StreamMux,
-    inbound_data_tx: mpsc::UnboundedSender<(u64, Vec<u8>)>,
+    inbound_data_tx: mpsc::UnboundedSender<InboundItem>,
+    inbound_budget: InboundBudget,
     command_tx: mpsc::UnboundedSender<Command>,
 }
+
+/// One routed `data` frame on its way to the actor, with the permit that
+/// counts its bytes while it waits.
+type InboundItem = (u64, Vec<u8>, InboundPermit);
 
 impl L4SessionHandle {
     /// This session's peer.
@@ -621,12 +777,40 @@ impl L4SessionHandle {
     /// trusts its caller the same way `menzil_stream::StreamMux::
     /// feed_inbound` trusts *this* module for the same property one
     /// layer up. A no-op, not an error, once this session has already
-    /// ended: nothing further this frame could still affect. **No
-    /// backpressure of its own** — see this module's own doc comment,
-    /// its final paragraph, for why that is a known, flagged gap rather
-    /// than an oversight.
-    pub fn feed_inbound(&self, counter: u64, ciphertext: Vec<u8>) {
-        let _ = self.inbound_data_tx.send((counter, ciphertext));
+    /// ended: nothing further this frame could still affect.
+    ///
+    /// Never waits, and is bounded (TODO.md L4h6b): the frame is charged to
+    /// this session's budget until `yamux` has read it
+    /// ([`L4_INBOUND_BUDGET_PER_SESSION`]), and past the budget this
+    /// returns [`InboundOverflow`] and drops the frame. The
+    /// session cannot go on after that (the peer's counter now has a gap),
+    /// so the caller must end it; the actor is told nothing and will
+    /// itself end as soon as it sees the close the caller sends, or the
+    /// session's removal.
+    pub fn feed_inbound(&self, counter: u64, ciphertext: Vec<u8>) -> Result<(), InboundOverflow> {
+        let charge = ciphertext.len().saturating_add(INBOUND_RECORD_OVERHEAD);
+        let Some(permit) = self.inbound_budget.try_reserve(charge) else {
+            return Err(InboundOverflow {
+                budget: self.inbound_budget.ceiling,
+            });
+        };
+        // A send to an actor that is gone hands the message back inside the
+        // error; dropping it gives the charge back.
+        let _ = self.inbound_data_tx.send((counter, ciphertext, permit));
+        Ok(())
+    }
+
+    /// How many bytes of inbound records this session holds right now that
+    /// `yamux` has not read yet (what [`Self::feed_inbound`] charges).
+    pub fn inbound_in_use(&self) -> usize {
+        self.inbound_budget.in_use.load(Ordering::Relaxed)
+    }
+
+    /// The most [`Self::inbound_in_use`] can reach before
+    /// [`Self::feed_inbound`] refuses: the configured budget, or the floor
+    /// described on [`L4SessionConfig::inbound_budget`] if that was lower.
+    pub fn inbound_budget(&self) -> usize {
+        self.inbound_budget.ceiling
     }
 
     /// Ends this session, optionally telling the peer why first — a
@@ -728,6 +912,15 @@ pub fn new(
     let (stream_mux, inbound, outbound_frames, driver) =
         menzil_stream::new(config.mode, config.max_record);
     let (inbound_data_tx, inbound_data_rx) = mpsc::unbounded_channel();
+    // At least two records of the largest size that can exist, so that one
+    // the wire allows can always be queued; sized from the smaller of
+    // `max_record` and what Noise allows, because the relay sets `max_record`.
+    let largest_record = (config.max_record as usize).min(NOISE_MESSAGE_LIMIT);
+    let inbound_budget = InboundBudget::new(
+        config
+            .inbound_budget
+            .max(2 * (largest_record + INBOUND_RECORD_OVERHEAD)),
+    );
     let (command_tx, command_rx) = mpsc::unbounded_channel();
     let (ended_tx, ended_rx) = oneshot::channel();
 
@@ -736,6 +929,7 @@ pub fn new(
         network_id: config.network_id,
         stream_mux: stream_mux.clone(),
         inbound_data_tx,
+        inbound_budget,
         command_tx,
     };
     let acceptor = L4SessionAcceptor {
@@ -962,7 +1156,7 @@ async fn run(
     outbound: mpsc::Sender<OutboundSend>,
     send_budget: SendBudget,
     observer: Option<SessionObserver>,
-    mut inbound_data_rx: mpsc::UnboundedReceiver<(u64, Vec<u8>)>,
+    mut inbound_data_rx: mpsc::UnboundedReceiver<InboundItem>,
     mut command_rx: mpsc::UnboundedReceiver<Command>,
     epoch_ended: oneshot::Receiver<()>,
     ended_tx: oneshot::Sender<EndReason>,
@@ -1040,7 +1234,7 @@ async fn run(
             }
 
             inbound = inbound_data_rx.recv(), if !inbound_closed => {
-                let Some((counter, ciphertext)) = inbound else {
+                let Some((counter, ciphertext, permit)) = inbound else {
                     // Unlike `command_rx` below, this alone does not
                     // mean the handle is gone for good — see this
                     // module's own doc comment on why only disabling
@@ -1066,7 +1260,14 @@ async fn run(
                         }
                         match body {
                             E2eDataBody::Mux(bytes) => {
-                                if let Err(err) = stream_mux.feed_inbound(bytes) {
+                                // The record's charge goes on with its
+                                // bytes and is given back when `yamux`
+                                // has read them. Every other arm, and a
+                                // frame that did not decrypt, lets
+                                // `permit` go at the end of this one.
+                                if let Err(err) =
+                                    stream_mux.feed_inbound_guarded(bytes, Box::new(permit))
+                                {
                                     break EndReason::StreamMuxFeedFailed(err);
                                 }
                             }
@@ -1292,6 +1493,7 @@ mod tests {
                 epoch: Epoch::first(),
                 send_budget,
                 observer,
+                inbound_budget: L4_INBOUND_BUDGET_PER_SESSION,
             },
             outbound_tx,
             epoch_ended_rx,
@@ -1355,7 +1557,8 @@ mod tests {
                     ..
                 } = frame
                 {
-                    dst.feed_inbound(counter, ciphertext);
+                    dst.feed_inbound(counter, ciphertext)
+                        .expect("within the inbound budget");
                 }
                 let _ = req.outcome.send(EnqueueOutcome::Accepted);
             }
@@ -1660,7 +1863,10 @@ mod tests {
         // independently confirmed live by this item's own red-team
         // review (two separate runs, ~40.0s each).
         let mut sessions = two_sessions();
-        sessions.a.feed_inbound(999, vec![0xffu8; 32]);
+        sessions
+            .a
+            .feed_inbound(999, vec![0xffu8; 32])
+            .expect("within the inbound budget");
         // If that frame had wrongly been treated as authenticated (or
         // worse, actually ended the session), the next real traffic
         // would fail; it does not.
@@ -1838,7 +2044,9 @@ mod tests {
         else {
             unreachable!()
         };
-        handle.feed_inbound(c1, ct1);
+        handle
+            .feed_inbound(c1, ct1)
+            .expect("within the inbound budget");
 
         tokio::time::timeout(Duration::from_secs(5), task)
             .await
@@ -2190,6 +2398,369 @@ mod tests {
                 .unwrap_or(false)
         );
         assert_eq!(notices.last(), Some(&SessionNotice::Ended));
+    }
+
+    // --- TODO.md L4h6b: the inbound budget -------------------------------
+
+    fn yamux_ping(nonce: u32) -> Vec<u8> {
+        // A SYN-flagged Ping on stream id 0: `yamux` answers with an ACK.
+        let mut frame = vec![0u8, 2, 0, 1, 0, 0, 0, 0];
+        frame.extend_from_slice(&nonce.to_be_bytes());
+        frame
+    }
+
+    /// A session built by [`new`] directly, whose actor is never polled:
+    /// the consumer that sleeps. Everything fed to its handle just queues.
+    fn sleeping_session(
+        seed: u8,
+        inbound_budget: usize,
+    ) -> (
+        L4SessionHandle,
+        impl Future<Output = ()> + Send + 'static,
+        mpsc::Receiver<OutboundSend>,
+        oneshot::Sender<()>,
+    ) {
+        let (_a_side, b_side) = two_sides(seed, 65_535);
+        let (outbound_tx, outbound_rx) = mpsc::channel(64);
+        let (epoch_tx, epoch_rx) = oneshot::channel();
+        let (handle, _acceptor, task) = new(
+            L4SessionConfig {
+                transport: b_side.transport,
+                peer: b_side.peer,
+                network_id: b_side.network_id,
+                mode: b_side.mode,
+                max_record: 65_535,
+                epoch: Epoch::first(),
+                send_budget: crate::outbound::SendBudgets::new().for_peer(b_side.peer),
+                observer: None,
+                inbound_budget,
+            },
+            outbound_tx,
+            epoch_rx,
+        );
+        (handle, task, outbound_rx, epoch_tx)
+    }
+
+    #[tokio::test]
+    async fn a_sleeping_consumer_cannot_make_the_handle_hold_more_than_the_budget() {
+        // Before TODO.md L4h6b, 10,000 records of 16 KiB fed to a session
+        // whose actor was not running grew the process by 156 MiB (measured
+        // in this module's debug build): the channel was unbounded. Now the
+        // handle stops taking records at the budget, whatever the consumer
+        // does.
+        const BUDGET: usize = 1024 * 1024;
+        const RECORD: usize = 16 * 1024;
+        let (handle, task, _outbound_rx, _epoch_tx) = sleeping_session(30, BUDGET);
+
+        let charge = RECORD + INBOUND_RECORD_OVERHEAD;
+        let fits = BUDGET / charge;
+        let mut accepted = 0usize;
+        let mut refused = None;
+        for counter in 0..10_000u64 {
+            match handle.feed_inbound(counter, vec![0xAB; RECORD]) {
+                Ok(()) => accepted += 1,
+                Err(error) => {
+                    refused = Some(error);
+                    break;
+                }
+            }
+        }
+
+        assert_eq!(accepted, fits, "exactly what fits in {BUDGET} bytes");
+        assert_eq!(refused, Some(InboundOverflow { budget: BUDGET }));
+        assert_eq!(handle.inbound_in_use(), fits * charge);
+        // Still refused while nothing is consumed, and nothing is added.
+        assert!(handle.feed_inbound(fits as u64, vec![0u8; RECORD]).is_err());
+        assert_eq!(handle.inbound_in_use(), fits * charge);
+
+        // The charge is given back when the records are: dropping the
+        // actor drops the queue they wait in.
+        drop(task);
+        assert_eq!(handle.inbound_in_use(), 0);
+        // And the handle works again as far as the budget goes (the actor
+        // is gone, so the record is simply dropped).
+        assert!(handle.feed_inbound(0, vec![0u8; RECORD]).is_ok());
+        assert_eq!(handle.inbound_in_use(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_record_is_charged_for_its_overhead_not_only_its_payload() {
+        // A flood of tiny records must hit the budget in proportion to the
+        // memory they take, not to their payload: a Ping is 29 bytes.
+        const BUDGET: usize = 1024 * 1024;
+        let (handle, _task, _outbound_rx, _epoch_tx) = sleeping_session(32, BUDGET);
+
+        let mut accepted = 0usize;
+        while handle.feed_inbound(accepted as u64, vec![0u8; 29]).is_ok() {
+            accepted += 1;
+            assert!(accepted < 100_000, "never refused");
+        }
+
+        assert_eq!(accepted, BUDGET / (29 + INBOUND_RECORD_OVERHEAD));
+        assert!(accepted < BUDGET / 29 / 2, "charged by payload alone");
+    }
+
+    #[tokio::test]
+    async fn the_budget_is_never_smaller_than_two_records() {
+        // A budget asked for below what two maximum-size records need would
+        // refuse a record the wire allows: it is raised.
+        let (handle, _task, _outbound_rx, _epoch_tx) = sleeping_session(33, 1);
+
+        assert!(handle.feed_inbound(0, vec![0u8; 65_000]).is_ok());
+        assert!(handle.feed_inbound(1, vec![0u8; 65_000]).is_ok());
+    }
+
+    #[tokio::test]
+    async fn what_yamux_has_read_is_given_back_and_a_working_session_stays_at_zero() {
+        use futures_util::io::{AsyncReadExt, AsyncWriteExt};
+        let mut sessions = two_sessions();
+        let mut opened = sessions.a.open_stream().await.unwrap();
+        let payload = vec![7u8; 600 * 1024];
+        let writer = tokio::spawn(async move {
+            opened.write_all(&payload).await.unwrap();
+            opened.flush().await.unwrap();
+            opened
+        });
+        let mut accepted =
+            tokio::time::timeout(Duration::from_secs(10), sessions.b_acceptor.accept())
+                .await
+                .unwrap()
+                .unwrap();
+        let mut received = vec![0u8; 600 * 1024];
+        tokio::time::timeout(Duration::from_secs(10), accepted.read_exact(&mut received))
+            .await
+            .unwrap()
+            .unwrap();
+        let _opened = writer.await.unwrap();
+
+        // Everything delivered, nothing left charged on either side.
+        for _ in 0..500 {
+            if sessions.a.inbound_in_use() == 0 && sessions.b.inbound_in_use() == 0 {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!(
+            "still charged after the transfer: a {} b {}",
+            sessions.a.inbound_in_use(),
+            sessions.b.inbound_in_use()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_record_that_fills_the_budget_exactly_is_accepted() {
+        // The boundary: a ceiling is a number of bytes that may be held, so
+        // the record that brings the total to it fits and the next does not.
+        const BUDGET: usize = 1024 * 1024;
+        const CHARGE: usize = 16 * 1024;
+        let (handle, _task, _outbound_rx, _epoch_tx) = sleeping_session(35, BUDGET);
+
+        let record = vec![0u8; CHARGE - INBOUND_RECORD_OVERHEAD];
+        for counter in 0..(BUDGET / CHARGE) as u64 {
+            assert!(
+                handle.feed_inbound(counter, record.clone()).is_ok(),
+                "record {counter} must fit"
+            );
+        }
+        assert_eq!(handle.inbound_in_use(), BUDGET);
+        assert!(handle.feed_inbound(9999, vec![]).is_err());
+    }
+
+    #[tokio::test]
+    async fn the_budget_covers_the_whole_window_grant_in_full_size_frames() {
+        // The reason the ceiling is where it is (L4h6b review, finding 1): a
+        // peer that respects the receive windows may have all of them in
+        // flight while our `yamux` is not reading. Full-size frames are
+        // charged their payload plus a yamux header, the kind byte, the
+        // Noise tag and the allowance; down to 4 KiB frames the whole grant
+        // still fits.
+        for frame_payload in [16 * 1024usize, 8 * 1024, 4 * 1024] {
+            let frames = RECEIVE_WINDOW_GRANT.div_ceil(frame_payload);
+            let charged = frames * (frame_payload + 12 + 1 + 16 + INBOUND_RECORD_OVERHEAD);
+            assert!(
+                charged <= L4_INBOUND_BUDGET_PER_SESSION,
+                "{frame_payload}-byte frames: the grant charges {charged}, the budget is {L4_INBOUND_BUDGET_PER_SESSION}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn the_relay_cannot_raise_the_budget_through_max_record() {
+        // WELCOME's `max_record` comes from the relay and nothing validates
+        // it. The floor of two records is sized from at most Noise's limit,
+        // so a huge value neither lifts the ceiling nor overflows the sum.
+        for max_record in [u32::MAX, 1 << 30] {
+            let (_a_side, b_side) = two_sides(36, 65_535);
+            let (outbound_tx, _outbound_rx) = mpsc::channel(64);
+            let (_epoch_tx, epoch_rx) = oneshot::channel();
+            let (small, _acceptor, _task) = new(
+                L4SessionConfig {
+                    transport: b_side.transport,
+                    peer: b_side.peer,
+                    network_id: b_side.network_id,
+                    mode: b_side.mode,
+                    max_record,
+                    epoch: Epoch::first(),
+                    send_budget: crate::outbound::SendBudgets::new().for_peer(b_side.peer),
+                    observer: None,
+                    inbound_budget: 1,
+                },
+                outbound_tx,
+                epoch_rx,
+            );
+            assert_eq!(
+                small.inbound_budget(),
+                2 * (65_535 + INBOUND_RECORD_OVERHEAD),
+                "max_record {max_record}"
+            );
+        }
+    }
+
+    /// Settles (briefly, in real time) until the session holds nothing.
+    async fn drains_to_zero(handle: &L4SessionHandle) -> bool {
+        for _ in 0..500 {
+            if handle.inbound_in_use() == 0 {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        handle.inbound_in_use() == 0
+    }
+
+    #[tokio::test]
+    async fn every_kind_of_record_gives_its_charge_back() {
+        // A charge that is not given back is a budget that fills for good: a
+        // relay could do that with junk. Each way a record can end must
+        // release it: KEEP, REKEY and a Mux frame yamux reads, a frame that
+        // does not decrypt, and a datagram-class counter.
+        let (a_side, b_side) = two_sides(37, 65_535);
+        let mut peer = a_side.transport;
+        let (handle, _acceptor, mut outbound_rx, _epoch_tx, _task) = one_session(b_side, 65_535);
+        // Something must take what the session sends, or it stalls.
+        tokio::spawn(async move {
+            while let Some(request) = outbound_rx.recv().await {
+                let _ = request.outcome.send(EnqueueOutcome::Accepted);
+            }
+        });
+        let feed = |body: E2eDataBody, peer: &mut E2eTransport| {
+            let E2eFrame::Data {
+                counter,
+                ciphertext,
+                ..
+            } = peer.encrypt_data(&body).unwrap()
+            else {
+                unreachable!()
+            };
+            handle.feed_inbound(counter, ciphertext).unwrap();
+        };
+
+        feed(E2eDataBody::Keep, &mut peer);
+        assert!(drains_to_zero(&handle).await, "KEEP kept its charge");
+
+        // Not the next counter, and not authentic: dropped with its charge,
+        // and the session goes on.
+        handle.feed_inbound(1, vec![0xAB; 64]).unwrap();
+        assert!(
+            drains_to_zero(&handle).await,
+            "a junk frame kept its charge"
+        );
+        handle.feed_inbound(1 << 63, vec![0xAB; 64]).unwrap();
+        assert!(
+            drains_to_zero(&handle).await,
+            "a datagram-class frame kept its charge"
+        );
+
+        feed(E2eDataBody::Rekey, &mut peer);
+        assert!(drains_to_zero(&handle).await, "REKEY kept its charge");
+
+        feed(E2eDataBody::Mux(yamux_ping(7)), &mut peer);
+        assert!(drains_to_zero(&handle).await, "a Mux frame kept its charge");
+    }
+
+    #[tokio::test]
+    async fn a_ping_flood_at_a_paused_yamux_is_cut_off_at_the_budget() {
+        // The L4h5 review's scenario, end to end through the actor: the
+        // peer authenticates fine and sends bare yamux Pings, and nothing
+        // we send can leave (the send budget is held), so `yamux` stops
+        // reading after a few dozen Pings and the rest wait unread. Before
+        // TODO.md L4h6b nothing bounded that: 200,000 Pings grew the
+        // process by 15 MiB with no plateau, until the 35 s reservation
+        // timeout ended the session.
+        const BUDGET: usize = 512 * 1024;
+        let (a_side, b_side) = two_sides(31, 65_535);
+        let mut attacker = a_side.transport;
+        let (send_budget, _hog) = exhausted_budget(b_side.peer).await;
+        let (outbound_tx, _outbound_rx) = mpsc::channel(64);
+        let (_epoch_tx, epoch_rx) = oneshot::channel();
+        let (handle, mut acceptor, task) = new(
+            L4SessionConfig {
+                transport: b_side.transport,
+                peer: b_side.peer,
+                network_id: b_side.network_id,
+                mode: b_side.mode,
+                max_record: 65_535,
+                epoch: Epoch::first(),
+                send_budget,
+                observer: None,
+                inbound_budget: BUDGET,
+            },
+            outbound_tx,
+            epoch_rx,
+        );
+        let task = tokio::spawn(task);
+
+        let charge = 29 + INBOUND_RECORD_OVERHEAD;
+        let mut fed = 0u32;
+        let overflow = loop {
+            let E2eFrame::Data {
+                counter,
+                mut ciphertext,
+                ..
+            } = attacker
+                .encrypt_data(&E2eDataBody::Mux(yamux_ping(fed)))
+                .unwrap()
+            else {
+                unreachable!()
+            };
+            // The router gets an exact-size Vec out of `E2eFrame::decode`.
+            ciphertext.shrink_to_fit();
+            if let Err(error) = handle.feed_inbound(counter, ciphertext) {
+                break error;
+            }
+            fed += 1;
+            if fed.is_multiple_of(256) {
+                tokio::task::yield_now().await;
+            }
+            assert!(fed < 50_000, "the flood was never cut off");
+        };
+
+        assert_eq!(overflow, InboundOverflow { budget: BUDGET });
+        // What was accepted is what fits plus what `yamux` read before it
+        // paused (a few dozen: the channel of replies it writes into holds
+        // 64 frames plus the one the actor staged).
+        let fits = (BUDGET / charge) as u32;
+        assert!(
+            fed >= fits,
+            "{fed} accepted, fewer than the {fits} that fit"
+        );
+        assert!(
+            fed < fits + 400,
+            "{fed} accepted: the budget did not bound what yamux left unread"
+        );
+        assert!(handle.inbound_in_use() <= BUDGET);
+
+        // The caller ends the session, as the router does; the charge goes
+        // when the actor does.
+        handle.close(None);
+        let reason = tokio::time::timeout(Duration::from_secs(5), acceptor.closed())
+            .await
+            .expect("a close must end a session with a staged frame and a full queue");
+        assert!(matches!(reason.as_ref(), EndReason::ClosedLocally(None)));
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(handle.inbound_in_use(), 0);
     }
 
     #[tokio::test]

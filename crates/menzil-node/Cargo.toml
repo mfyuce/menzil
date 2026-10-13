@@ -15,8 +15,9 @@ menzil-e2e = { path = "../menzil-e2e" }
 menzil-proto = { path = "../menzil-proto" }
 menzil-session = { path = "../menzil-session" }
 menzil-stream = { path = "../menzil-stream" }
+socket2.workspace = true
 thiserror.workspace = true
-tokio = { workspace = true, features = ["sync", "time"] }
+tokio = { workspace = true, features = ["sync", "time", "net", "io-util"] }
 tracing.workspace = true
 
 [dev-dependencies]

@@ -225,13 +225,14 @@ impl Authorizer for DenyAll {
 
 struct NeverHandles;
 impl<S> ServiceHandler<S> for NeverHandles {
+    type Opened = ();
     type Handling = std::future::Ready<()>;
 
-    fn accepts(&self, _request: &OpenRequest) -> Result<(), OpenRefusal> {
+    async fn open(&self, _request: &OpenRequest) -> Result<(), OpenRefusal> {
         Ok(())
     }
 
-    fn handle(&self, _stream: S, _request: OpenRequest) -> Self::Handling {
+    fn handle(&self, _stream: S, _request: OpenRequest, _opened: ()) -> Self::Handling {
         panic!("every OPEN in this test is denied before handle() could run")
     }
 }
@@ -372,4 +373,131 @@ async fn bulk_transfer_over_many_streams_behind_a_paced_consumer_completes_intac
     assert!(seen.iter().all(|&s| s));
     assert!(!driver_a.is_finished());
     assert!(!driver_b.is_finished());
+}
+
+// ----------------------------------------------------------------------
+// The inbound guard (TODO.md L4h6b)
+// ----------------------------------------------------------------------
+
+/// Counts how many guards are alive: `+1` when made, `-1` when dropped.
+#[derive(Clone, Default)]
+struct Live(std::sync::Arc<std::sync::atomic::AtomicIsize>);
+
+impl Live {
+    fn guard(&self) -> Box<dyn Send> {
+        struct Guard(Live);
+        impl Drop for Guard {
+            fn drop(&mut self) {
+                self.0.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Box::new(Guard(self.clone()))
+    }
+
+    fn count(&self) -> isize {
+        self.0.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Waits (briefly, in real time) until the count is `want`.
+    async fn settles_at(&self, want: isize) -> bool {
+        for _ in 0..500 {
+            if self.count() == want {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        self.count() == want
+    }
+}
+
+#[tokio::test]
+async fn a_guard_is_dropped_once_yamux_has_read_the_record() {
+    let (mux, _inbound, mut outbound, driver) = menzil_stream::new(Mode::Server, 65_535);
+    let _driver: DriverHandle = tokio::spawn(driver);
+    let live = Live::default();
+
+    mux.feed_inbound_guarded(ping(7), live.guard()).unwrap();
+
+    assert!(
+        live.settles_at(0).await,
+        "yamux read the Ping, so its guard must be gone"
+    );
+    // And it really was read: the Pong is on its way out.
+    let mut answered = false;
+    while let Ok(Some(frame)) =
+        tokio::time::timeout(Duration::from_millis(200), outbound.next_frame()).await
+    {
+        answered |= frame[1] == 2 && frame[8..12] == 7u32.to_be_bytes();
+    }
+    assert!(answered, "the Ping was never answered");
+}
+
+#[tokio::test]
+async fn guards_count_exactly_the_records_yamux_has_not_read_yet() {
+    // The flood that motivated the guard: with nothing draining the
+    // outbound channel `yamux` stops reading after a few dozen Pings (its
+    // single pending reply cannot be written), and everything fed after
+    // that waits unread. Each unread record's guard must still be alive,
+    // and each one `yamux` got to must be gone.
+    let (mux, _inbound, mut outbound, driver) = menzil_stream::new(Mode::Server, 65_535);
+    let driver: DriverHandle = tokio::spawn(driver);
+    let live = Live::default();
+
+    const PINGS: u32 = 5_000;
+    for nonce in 0..PINGS {
+        mux.feed_inbound_guarded(ping(nonce), live.guard()).unwrap();
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(!driver.is_finished());
+    let unread = live.count();
+    assert!(
+        unread >= PINGS as isize - 300,
+        "only {unread} of {PINGS} guards are alive, but yamux is paused and cannot have read more than a few dozen records"
+    );
+    assert!(unread < PINGS as isize, "yamux read nothing at all?");
+
+    // Draining lets it catch up, and each record it reads gives its guard
+    // back; at the end nothing is held.
+    let drain = tokio::spawn(async move { while outbound.next_frame().await.is_some() {} });
+    assert!(
+        live.settles_at(0).await,
+        "{} guards still alive after yamux caught up",
+        live.count()
+    );
+    drop(mux);
+    let _ = tokio::time::timeout(Duration::from_secs(5), drain).await;
+}
+
+#[tokio::test]
+async fn a_malformed_record_gives_its_guard_back_at_once() {
+    let (mux, _inbound, _outbound, _driver) = menzil_stream::new(Mode::Server, 65_535);
+    let live = Live::default();
+
+    let outcome = mux.feed_inbound_guarded(vec![0u8; 5], live.guard());
+
+    assert!(matches!(outcome, Err(StreamMuxError::MalformedFrame(_))));
+    assert_eq!(live.count(), 0);
+}
+
+#[tokio::test]
+async fn records_still_queued_when_the_connection_is_dropped_give_their_guards_back() {
+    let (mux, inbound, outbound, driver) = menzil_stream::new(Mode::Server, 65_535);
+    let live = Live::default();
+    for nonce in 0..100 {
+        mux.feed_inbound_guarded(ping(nonce), live.guard()).unwrap();
+    }
+    assert_eq!(live.count(), 100, "the driver never ran, nothing was read");
+
+    drop(driver);
+    drop(inbound);
+    drop(outbound);
+
+    assert_eq!(live.count(), 0, "a dead connection must not hold a budget");
+    // Feeding a dead connection fails, and does not keep the guard either.
+    assert!(matches!(
+        mux.feed_inbound_guarded(ping(0), live.guard()),
+        Err(StreamMuxError::DriverGone)
+    ));
+    assert_eq!(live.count(), 0);
 }

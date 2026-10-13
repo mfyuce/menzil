@@ -123,7 +123,7 @@ menzil://relay.example:443/_menzil/v1?id=<relay NodeId hex>[&key=<relay x25519 h
 
 ### 3.3 WebSocket usage
 
-- Binary messages only; one message is one L3 record; payload at most 65,535 bytes (the Noise message limit). No compression extensions.
+- Binary messages only; one message is one L3 record; payload at most 65,535 bytes (the Noise message limit); a node treats a WELCOME `limits.max_record` above that as 65,535. No compression extensions.
 - Liveness is measured at L3 (PING and PONG records, section 4.2), not with WebSocket control frames, because proxies may answer or swallow those. A link is dead when no authenticated record has arrived for two ping intervals (interval 25 s, so 50 s). Control records take priority over SEND on the sender's queue; implementations set `TCP_NOTSENT_LOWAT` or equivalent where available.
 - Reconnection: exponential backoff 1 s to 60 s with full jitter, reset after a connection older than 60 s; `retry_after_ms` from GOAWAY is honored and spread.
 
@@ -245,7 +245,7 @@ OPEN     = u16 len | CBOR{ v: 1, service: ServiceId, target: { host: str, port: 
 OPEN_ACK = u16 len | CBOR{ ok: bool, code: u16, msg: str, channel: u16 | null }
 ```
 
-`target` must be null unless `service` is `egress:*`. `meta` is honored only from the relay principal (section 6). The target node evaluates the grant for `(network, initiator)` on `(this node, service)` and, for egress, the rules of section 8. On `ok` the stream is a byte pipe to the configured local target or the vetted egress address. OPEN times out after 10 seconds. Grants are re evaluated whenever a Policy changes or a grant's `expires` passes; streams and channels whose grant disappeared are closed with CLOSE `grant_removed`.
+`target` must be null unless `service` is `egress:*`. `meta` is honored only from the relay principal (section 6). The target node evaluates the grant for `(network, initiator)` on `(this node, service)` and, for egress, the rules of section 8. On `ok` the stream is a byte pipe to the configured local target or the vetted egress address; the node makes the local connection before it answers, so `ok` means the pipe exists. A service the node does not serve is refused with `unknown_service`, and a local target that cannot be reached, or does not answer within a few seconds, with `target_unreachable`; both are answered only after the grant check, so a peer learns nothing about services it holds no grant for. A stream ends cleanly when each side has sent a FIN. Anything else ends it with an RST: the local target failed or reset the connection, the grant was removed, or the node is shutting down. A node that receives an RST, or loses the L4 session under a stream, closes that stream's local socket with a reset where the platform allows, as in section 5.2, so that truncation is visible to applications. OPEN times out after 10 seconds. Grants are re evaluated whenever a Policy changes or a grant's `expires` passes; streams and channels whose grant disappeared are closed with CLOSE `grant_removed`.
 
 ### 5.4 Datagram channels
 

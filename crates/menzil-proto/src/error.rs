@@ -105,6 +105,17 @@ pub enum ErrorCode {
     /// and so its refusal code, to TODO.md L4g); this crate assigns it a
     /// number the same way it does for every other code in this registry.
     InvalidTarget,
+    /// `unknown_service` (protocol.md 5.3): an OPEN named a service this
+    /// node does not serve. Answered only to a peer whose grant covers the
+    /// service, so it tells a member nothing about services it could not
+    /// have asked for; a service that is configured but whose local target
+    /// cannot be reached is [`Self::TargetUnreachable`] instead.
+    UnknownService,
+    /// `target_unreachable` (protocol.md 5.3): the node serves the service
+    /// but could not connect to its configured local target (refused,
+    /// unreachable, or no answer within the node's connect timeout). May be
+    /// transient: retrying later can succeed.
+    TargetUnreachable,
     /// A code this build does not recognize, preserved verbatim.
     Unknown(u16),
 }
@@ -131,6 +142,8 @@ impl ErrorCode {
     const NO_GRANT: u16 = 19;
     const GRANT_REMOVED: u16 = 20;
     const INVALID_TARGET: u16 = 21;
+    const UNKNOWN_SERVICE: u16 = 22;
+    const TARGET_UNREACHABLE: u16 = 23;
 
     /// The symbolic name from protocol.md, e.g. `"bad_cert"`.
     pub fn name(self) -> &'static str {
@@ -156,6 +169,8 @@ impl ErrorCode {
             Self::NoGrant => "no_grant",
             Self::GrantRemoved => "grant_removed",
             Self::InvalidTarget => "invalid_target",
+            Self::UnknownService => "unknown_service",
+            Self::TargetUnreachable => "target_unreachable",
             Self::Unknown(_) => "unknown",
         }
     }
@@ -185,6 +200,8 @@ impl From<ErrorCode> for u16 {
             ErrorCode::NoGrant => ErrorCode::NO_GRANT,
             ErrorCode::GrantRemoved => ErrorCode::GRANT_REMOVED,
             ErrorCode::InvalidTarget => ErrorCode::INVALID_TARGET,
+            ErrorCode::UnknownService => ErrorCode::UNKNOWN_SERVICE,
+            ErrorCode::TargetUnreachable => ErrorCode::TARGET_UNREACHABLE,
             ErrorCode::Unknown(code) => code,
         }
     }
@@ -214,6 +231,8 @@ impl From<u16> for ErrorCode {
             Self::NO_GRANT => Self::NoGrant,
             Self::GRANT_REMOVED => Self::GrantRemoved,
             Self::INVALID_TARGET => Self::InvalidTarget,
+            Self::UNKNOWN_SERVICE => Self::UnknownService,
+            Self::TARGET_UNREACHABLE => Self::TargetUnreachable,
             other => Self::Unknown(other),
         }
     }
@@ -259,11 +278,22 @@ mod tests {
             ErrorCode::NoGrant,
             ErrorCode::GrantRemoved,
             ErrorCode::InvalidTarget,
+            ErrorCode::UnknownService,
+            ErrorCode::TargetUnreachable,
         ];
         for code in codes {
             let wire: u16 = code.into();
             assert_eq!(ErrorCode::from(wire), code);
         }
+    }
+
+    #[test]
+    fn the_serving_codes_keep_their_numbers_and_names() {
+        // Wire values: a peer built from another checkout must read these the same.
+        assert_eq!(u16::from(ErrorCode::UnknownService), 22);
+        assert_eq!(u16::from(ErrorCode::TargetUnreachable), 23);
+        assert_eq!(ErrorCode::UnknownService.name(), "unknown_service");
+        assert_eq!(ErrorCode::TargetUnreachable.name(), "target_unreachable");
     }
 
     #[test]
