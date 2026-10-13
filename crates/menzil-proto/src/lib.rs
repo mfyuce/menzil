@@ -36,8 +36,8 @@ pub use doc::{
     DocReassembler, DocReassemblyError, MAX_DOC_BYTES, MAX_DOC_CHUNK_BYTES, split_into_doc_records,
 };
 pub use e2e::{
-    E2eDataBody, E2eDataKind, E2eFrame, E2eFrameTag, E2eHandshakePayload, RecordClass,
-    e2e_data_frame_len, max_e2e_data_plaintext,
+    E2eDataBody, E2eDataKind, E2eFrame, E2eFrameTag, E2eHandshakePayload, L4_AEAD_TAG_LEN,
+    RecordClass, e2e_data_frame_len, max_e2e_data_plaintext,
 };
 pub use error::{ErrorCode, ProtoError};
 pub use handshake::{Capability, HelloBody, Limits, WelcomeBody};

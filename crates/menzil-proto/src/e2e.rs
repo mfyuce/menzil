@@ -490,7 +490,7 @@ const E2E_DATA_FRAME_PREFIX_LEN: usize = 1 + 4 + 8;
 /// missed the L3 one entirely, overstating the true budget by exactly 16
 /// bytes (TODO.md L4b's own review, which found it while live-verifying
 /// [`crate::record::max_send_payload`] against a real relay).
-const L4_AEAD_TAG_LEN: usize = 16;
+pub const L4_AEAD_TAG_LEN: usize = 16;
 
 /// The largest [`E2eDataBody`] plaintext that fits in one L4 `data`
 /// frame once wrapped in an L3 SEND/RECV record bound by `max_record`

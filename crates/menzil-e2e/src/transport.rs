@@ -72,7 +72,7 @@
 //! counter) cannot happen, since every datagram-class counter is
 //! already refused before decryption.
 
-use menzil_proto::{E2eDataBody, E2eFrame, RecordClass};
+use menzil_proto::{E2eDataBody, E2eFrame, L4_AEAD_TAG_LEN, RecordClass};
 
 use crate::error::E2eError;
 
@@ -81,9 +81,10 @@ use crate::error::E2eError;
 /// identical constant and doc comment for the same reasoning. Distinct
 /// from [`E2eTransport::max_plaintext`] (this session's own, usually
 /// much smaller, L4 budget derived from WELCOME's `limits.max_record` —
-/// see [`Self::encrypt_data`]'s docs): this constant is only ever used to
-/// size a scratch buffer large enough for whatever Noise itself allows,
-/// never as a size check in its own right.
+/// see [`Self::encrypt_data`]'s docs): this constant is only ever used as
+/// the ceiling checked before a buffer sized from the input is allocated,
+/// so that an input Noise cannot carry fails as `snow` fails it (`Input`)
+/// without allocating for it, never as the size of the buffer itself.
 const MAX_NOISE_MESSAGE: usize = 65_535;
 
 /// protocol.md 5.2's top bit, past which a reliable-class counter would
@@ -183,7 +184,16 @@ impl E2eTransport {
             });
         }
         let counter = self.send_reliable_next;
-        let mut out = vec![0u8; MAX_NOISE_MESSAGE];
+        // Sized from the input: the ciphertext is the plaintext and the tag,
+        // exactly. (A buffer for the largest Noise message, truncated, kept
+        // 64 KiB of capacity on every frame for as long as it lived and cost
+        // a 64 KiB memset per record.) A plaintext Noise cannot carry fails
+        // as `snow` fails it, without allocating for it first.
+        let needed = plaintext.len() + L4_AEAD_TAG_LEN;
+        if needed > MAX_NOISE_MESSAGE {
+            return Err(snow::Error::Input.into());
+        }
+        let mut out = vec![0u8; needed];
         let n = self.inner.write_message(counter, &plaintext, &mut out)?;
         out.truncate(n);
         self.send_reliable_next = self.send_reliable_next.saturating_add(1);
@@ -235,7 +245,13 @@ impl E2eTransport {
         if RecordClass::of_counter(counter) == RecordClass::Datagram {
             return Err(E2eError::UnauthenticatedDatagramCounter);
         }
-        let mut out = vec![0u8; MAX_NOISE_MESSAGE];
+        // The plaintext is the ciphertext less its tag, so a buffer the size
+        // of the ciphertext always holds it. A ciphertext longer than any
+        // Noise message fails as `snow` fails it, without allocating for it.
+        if ciphertext.len() > MAX_NOISE_MESSAGE {
+            return Err(snow::Error::Input.into());
+        }
+        let mut out = vec![0u8; ciphertext.len()];
         let n = self.inner.read_message(counter, ciphertext, &mut out)?;
         out.truncate(n);
 
@@ -767,5 +783,70 @@ pub(crate) mod tests {
         };
         assert!(responder.decrypt_data(counter, &ciphertext).is_err());
         assert_eq!(responder.recv_reliable_next, 0);
+    }
+
+    // --- the per-record buffer (found while measuring TODO.md L4h6b) -----
+
+    #[test]
+    fn an_encrypted_record_holds_no_spare_capacity() {
+        // The ciphertext was built in a buffer sized for the largest Noise
+        // message and then truncated, which keeps the capacity: every frame
+        // carried 64 KiB it never used for as long as it lived, and each
+        // record cost a 64 KiB memset.
+        let (mut initiator, _responder) = run_live_handshake();
+        let E2eFrame::Data { ciphertext, .. } = initiator.encrypt_data(&E2eDataBody::Keep).unwrap()
+        else {
+            unreachable!()
+        };
+        assert_eq!(ciphertext.len(), 1 + 16, "kind byte plus the tag");
+        assert!(
+            ciphertext.capacity() < 1024,
+            "{} bytes of capacity for {} bytes of ciphertext",
+            ciphertext.capacity(),
+            ciphertext.len()
+        );
+    }
+
+    #[test]
+    fn a_ciphertext_that_cannot_be_one_is_refused_the_way_noise_refuses_it() {
+        let (_initiator, mut responder) = run_live_handshake();
+        assert!(matches!(
+            responder.decrypt_data(0, &[0u8; 5]),
+            Err(E2eError::Noise(snow::Error::Decrypt))
+        ));
+        assert!(matches!(
+            responder.decrypt_data(0, &vec![0u8; 65_536]),
+            Err(E2eError::Noise(snow::Error::Input))
+        ));
+        assert_eq!(
+            responder.recv_reliable_next, 0,
+            "neither advanced the counter"
+        );
+    }
+
+    #[test]
+    fn bodies_of_every_size_up_to_the_limit_round_trip_and_the_next_size_is_refused() {
+        // The buffers are sized from their input now, so the edges are
+        // where a mistake would show: empty, around the tag, and the
+        // largest body the session allows.
+        let (mut initiator, mut responder) = run_live_handshake();
+        let largest_mux = initiator.max_plaintext - 1;
+        for len in [0usize, 1, 15, 16, 17, 1000, 16 * 1024, largest_mux] {
+            let body = E2eDataBody::Mux(vec![0x5A; len]);
+            let E2eFrame::Data {
+                counter,
+                ciphertext,
+                ..
+            } = initiator.encrypt_data(&body).unwrap()
+            else {
+                unreachable!()
+            };
+            assert_eq!(ciphertext.len(), 1 + len + 16, "len {len}");
+            assert_eq!(responder.decrypt_data(counter, &ciphertext).unwrap(), body);
+        }
+        assert!(matches!(
+            initiator.encrypt_data(&E2eDataBody::Mux(vec![0; largest_mux + 1])),
+            Err(E2eError::BodyTooLarge { .. })
+        ));
     }
 }

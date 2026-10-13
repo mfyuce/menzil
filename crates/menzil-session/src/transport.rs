@@ -2,7 +2,7 @@
 //! and decrypts whole [`menzil_proto::Record`]s, and applies the hourly
 //! REKEY this side owns for each direction independently.
 
-use menzil_proto::Record;
+use menzil_proto::{L3_AEAD_TAG_LEN, Record};
 
 use crate::error::SessionError;
 
@@ -16,9 +16,9 @@ use crate::error::SessionError;
 /// for one record is nearer 65,519 bytes, not 65,535. This crate does
 /// not paper over that: it does not enforce a separate, smaller
 /// plaintext limit of its own, so a record that is too large to fit
-/// surfaces naturally as `SessionError::Noise(snow::Error::Input)` from
-/// [`Transport::encrypt_record`], rather than from an earlier check
-/// here.
+/// surfaces as `SessionError::Noise(snow::Error::Input)` from
+/// [`Transport::encrypt_record`], the error `snow` itself gives; the check
+/// there only avoids allocating a buffer for it.
 const MAX_NOISE_MESSAGE: usize = 65_535;
 
 /// A Noise transport-mode session: one side of an established L3
@@ -39,7 +39,16 @@ impl Transport {
     /// (protocol.md 3.3: "one message is one L3 record").
     pub fn encrypt_record(&mut self, record: &Record) -> Result<Vec<u8>, SessionError> {
         let plaintext = record.encode();
-        let mut out = vec![0u8; MAX_NOISE_MESSAGE];
+        // Sized from the input, not for the largest Noise message: the
+        // ciphertext is the plaintext and the tag, exactly (a bigger buffer,
+        // truncated, kept 64 KiB of capacity on every record and cost a
+        // 64 KiB memset). A record Noise cannot carry fails as `snow` fails
+        // it, without allocating for it first.
+        let needed = plaintext.len() + L3_AEAD_TAG_LEN;
+        if needed > MAX_NOISE_MESSAGE {
+            return Err(snow::Error::Input.into());
+        }
+        let mut out = vec![0u8; needed];
         let n = self.inner.write_message(&plaintext, &mut out)?;
         out.truncate(n);
         Ok(out)
@@ -48,7 +57,13 @@ impl Transport {
     /// Noise-decrypts `ciphertext` and decodes the result as a
     /// [`Record`].
     pub fn decrypt_record(&mut self, ciphertext: &[u8]) -> Result<Record, SessionError> {
-        let mut out = vec![0u8; MAX_NOISE_MESSAGE];
+        // The plaintext is the ciphertext less its tag, so a buffer the size
+        // of the ciphertext always holds it; one longer than any Noise
+        // message fails as `snow` fails it, without allocating for it.
+        if ciphertext.len() > MAX_NOISE_MESSAGE {
+            return Err(snow::Error::Input.into());
+        }
+        let mut out = vec![0u8; ciphertext.len()];
         let n = self.inner.read_message(ciphertext, &mut out)?;
         out.truncate(n);
         Ok(Record::decode(&out)?)
@@ -246,5 +261,61 @@ pub(crate) mod tests {
         // the message above: the stale key must not still work.
         relay.rekey_incoming();
         assert!(relay.decrypt_record(&ciphertext).is_err());
+    }
+
+    // --- the per-record buffer (found while measuring TODO.md L4h6b) -----
+
+    #[test]
+    fn an_encrypted_record_holds_no_spare_capacity() {
+        let (mut node, _relay) = run_live_handshake(HandshakePattern::Ik);
+        let ciphertext = node
+            .encrypt_record(&Record::Ping { nonce: [1; 8] })
+            .unwrap();
+        assert!(
+            ciphertext.capacity() < 1024,
+            "{} bytes of capacity for {} bytes of ciphertext",
+            ciphertext.capacity(),
+            ciphertext.len()
+        );
+    }
+
+    #[test]
+    fn a_message_that_cannot_be_one_is_refused_the_way_noise_refuses_it() {
+        let (_node, mut relay) = run_live_handshake(HandshakePattern::Ik);
+        assert!(matches!(
+            relay.decrypt_record(&[0u8; 5]),
+            Err(SessionError::Noise(snow::Error::Decrypt))
+        ));
+        assert!(matches!(
+            relay.decrypt_record(&vec![0u8; 65_536]),
+            Err(SessionError::Noise(snow::Error::Input))
+        ));
+    }
+
+    #[test]
+    fn records_up_to_the_noise_limit_round_trip_and_one_byte_more_is_refused() {
+        let (mut node, mut relay) = run_live_handshake(HandshakePattern::Ik);
+        let send = |payload_len: usize| Record::Send {
+            dst: NodeId::from([3; 32]),
+            e2e_proto: 1,
+            flags: 0,
+            payload: vec![0x5A; payload_len],
+        };
+        // The largest payload whose encoding plus the tag is one Noise message.
+        let overhead = send(0).encode().len() + menzil_proto::L3_AEAD_TAG_LEN;
+        let largest = MAX_NOISE_MESSAGE - overhead;
+        for len in [0usize, 1, 100, 16 * 1024, largest] {
+            let record = send(len);
+            let ciphertext = node.encrypt_record(&record).unwrap();
+            assert_eq!(
+                relay.decrypt_record(&ciphertext).unwrap(),
+                record,
+                "len {len}"
+            );
+        }
+        assert!(matches!(
+            node.encrypt_record(&send(largest + 1)),
+            Err(SessionError::Noise(snow::Error::Input))
+        ));
     }
 }
