@@ -1,11 +1,15 @@
 //! The strings people paste between machines (TOBEDECIDED 14: phase 1 has no invites, a new
-//! member is admitted by hand). Two kinds, told apart by their prefix so that pasting the wrong
+//! member is admitted by hand). Three kinds, told apart by their prefix so that pasting the wrong
 //! one fails with a clear message instead of a decode error:
 //!
 //! * `menzil1-join:` + base64url of a NodeCert: what `menzil init` prints, what the owner pastes
 //!   into `menzil admit`.
 //! * `menzil1-docs:` + base64url of a Roster and a Policy ([`documents_to_bytes`]): what `menzil
 //!   admit` prints, what the new member pastes into `menzil join`.
+//! * `menzil1-roster:` + base64url of a Roster alone: what `menzil token --for-relay` prints,
+//!   what a relay's operator pastes into `menzil relay add-network`. The Policy (who may use
+//!   what, and the members' device names) is hidden from relays (threat-model.md), so a relay
+//!   is never handed it: not on its command line, not in its shell history.
 //!
 //! A token carries only public, signed material. Nothing here verifies a signature; the caller
 //! does, against the key the document names (an unsigned or forged token must not be trusted
@@ -20,6 +24,8 @@ use thiserror::Error;
 pub const JOIN_PREFIX: &str = "menzil1-join:";
 /// Prefix of a membership token.
 pub const DOCS_PREFIX: &str = "menzil1-docs:";
+/// Prefix of a token that carries a Roster alone, for a relay.
+pub const ROSTER_PREFIX: &str = "menzil1-roster:";
 
 /// The longest token text accepted: two documents at the size verifiers allow, base64 encoded,
 /// with room for the framing. Checked before any decoding.
@@ -50,19 +56,20 @@ pub enum TokenError {
 fn strip<'a>(
     token: &'a str,
     expected: &'static str,
-    other: &'static str,
+    others: &[(&'static str, &'static str)],
 ) -> Result<&'a str, TokenError> {
     let token = token.trim();
     if let Some(rest) = token.strip_prefix(expected) {
         return Ok(rest);
     }
-    let hint = if token.starts_with(other) {
-        " (this is the other kind of token)"
-    } else {
-        ""
-    };
+    let hint = others
+        .iter()
+        .find(|(prefix, _)| token.starts_with(prefix))
+        .map_or("", |(_, hint)| hint);
     Err(TokenError::WrongKind { expected, hint })
 }
+
+const OTHER_KIND: &str = " (this is another kind of token)";
 
 fn decode_base64(text: &str) -> Result<Vec<u8>, TokenError> {
     if text.len() > MAX_TOKEN_CHARS {
@@ -80,7 +87,11 @@ pub fn encode_join_request(cert: &NodeCert) -> String {
 
 /// The certificate in a join request. Its signature is not checked here.
 pub fn decode_join_request(token: &str) -> Result<NodeCert, TokenError> {
-    let bytes = decode_base64(strip(token, JOIN_PREFIX, DOCS_PREFIX)?)?;
+    let bytes = decode_base64(strip(
+        token,
+        JOIN_PREFIX,
+        &[(DOCS_PREFIX, OTHER_KIND), (ROSTER_PREFIX, OTHER_KIND)],
+    )?)?;
     NodeCert::decode_strict(&bytes).map_err(|_| TokenError::Malformed("node certificate"))
 }
 
@@ -127,7 +138,28 @@ pub fn encode_documents(roster: &Roster, policy: &Policy) -> String {
 
 /// The Roster and the Policy in a membership token. Signatures are not checked here.
 pub fn decode_documents(token: &str) -> Result<(Roster, Policy), TokenError> {
-    documents_from_bytes(&decode_base64(strip(token, DOCS_PREFIX, JOIN_PREFIX)?)?)
+    documents_from_bytes(&decode_base64(strip(
+        token,
+        DOCS_PREFIX,
+        &[(JOIN_PREFIX, OTHER_KIND), (ROSTER_PREFIX, OTHER_KIND)],
+    )?)?)
+}
+
+/// A token for a Roster alone: what a relay is given. It carries none of the Policy.
+pub fn encode_roster(roster: &Roster) -> String {
+    format!("{ROSTER_PREFIX}{}", URL_SAFE_NO_PAD.encode(roster.encode()))
+}
+
+/// The Roster in a relay token. Its signature is not checked here. A full membership token is
+/// refused with a pointer to the right command: pasting it would hand the relay the Policy.
+pub fn decode_roster(token: &str) -> Result<Roster, TokenError> {
+    const FULL_TOKEN: &str = " (this is a full membership token, which carries the Policy; a relay is given the Roster alone: make its token with `menzil token --for-relay`)";
+    let bytes = decode_base64(strip(
+        token,
+        ROSTER_PREFIX,
+        &[(DOCS_PREFIX, FULL_TOKEN), (JOIN_PREFIX, OTHER_KIND)],
+    )?)?;
+    Roster::decode_strict(&bytes).map_err(|_| TokenError::Malformed("Roster"))
 }
 
 #[cfg(test)]

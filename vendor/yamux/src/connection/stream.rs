@@ -29,7 +29,9 @@ use futures::{
 };
 use parking_lot::{Mutex, MutexGuard};
 use std::{
-    fmt, io,
+    fmt,
+    future::Future,
+    io,
     pin::Pin,
     sync::Arc,
     task::{Context, Poll, Waker},
@@ -214,6 +216,23 @@ impl Stream {
         self.shared().reset_by_remote
     }
 
+    /// menzil patch (vendor/yamux/PATCHES.md, patch 4): a future that completes when this stream
+    /// is torn down, that is when the remote's RST arrives or the connection goes away while the
+    /// stream is not yet closed in both directions, whether or not the remote had sent its FIN.
+    ///
+    /// `poll_read` and `poll_write` register a waker only while they are pending, so an owner
+    /// that is not polling the stream (it has read the remote's FIN and waits for something
+    /// else, or its write is blocked on another resource) is never told. The watcher is a
+    /// separate handle with a waker of its own, so it can be awaited next to a task that holds
+    /// the stream mutably. It completes at once if the stream was torn down already; a stream
+    /// that ended cleanly (a FIN each way, or an RST after that) never completes it. Only the
+    /// watcher polled last is woken, so use one at a time.
+    pub fn torn_down(&self) -> TornDown {
+        TornDown {
+            shared: self.clone_shared(),
+        }
+    }
+
     /// Whether we are still waiting for the remote to acknowledge this stream.
     pub fn is_pending_ack(&self) -> bool {
         self.shared().is_pending_ack()
@@ -281,6 +300,26 @@ pub struct Packet(Vec<u8>);
 impl AsRef<[u8]> for Packet {
     fn as_ref(&self) -> &[u8] {
         self.0.as_ref()
+    }
+}
+
+/// menzil patch (patch 4): see [`Stream::torn_down`]. It keeps the stream's shared state (and
+/// with it the data not read yet) alive while it exists, so drop it together with the stream.
+#[derive(Debug)]
+pub struct TornDown {
+    shared: Arc<Mutex<Shared>>,
+}
+
+impl Future for TornDown {
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        let mut shared = self.shared.lock();
+        if shared.torn_down {
+            return Poll::Ready(());
+        }
+        shared.torn_down_waker = Some(cx.waker().clone());
+        Poll::Pending
     }
 }
 
@@ -481,6 +520,11 @@ pub(crate) struct Shared {
     /// menzil patch (patch 2): the remote sent an RST, or the connection went away while the
     /// stream could still be read. See [`Stream::is_reset`].
     pub(crate) reset_by_remote: bool,
+    /// menzil patch (patch 4): the remote's RST arrived, or the connection went away, while the
+    /// stream was not closed in both directions yet. See [`Stream::torn_down`].
+    torn_down: bool,
+    /// menzil patch (patch 4): the waker of the [`TornDown`] polled last.
+    torn_down_waker: Option<Waker>,
 }
 
 impl Shared {
@@ -507,6 +551,16 @@ impl Shared {
             writer: None,
             reset_requested: false,
             reset_by_remote: false,
+            torn_down: false,
+            torn_down_waker: None,
+        }
+    }
+
+    /// menzil patch (patch 4): records the teardown and wakes the [`TornDown`] watching it.
+    pub(crate) fn mark_torn_down(&mut self) {
+        self.torn_down = true;
+        if let Some(w) = self.torn_down_waker.take() {
+            w.wake()
         }
     }
 

@@ -1,7 +1,7 @@
 use ed25519_dalek::SigningKey;
 use menzil_node::{PolicyStore, RosterStore};
 use menzil_proto::{
-    ErrorCode, NodeCertBody, NodeOrWildcard, Principal, ServiceId, X25519PublicKey,
+    ErrorCode, NodeCertBody, NodeOrWildcard, Principal, RevokedMember, ServiceId, X25519PublicKey,
 };
 
 use super::*;
@@ -12,7 +12,9 @@ const DAY: u64 = 24 * 60 * 60;
 
 fn node() -> (NodeKeys, NodeCert) {
     let keys = NodeKeys::generate();
-    let cert = keys.issue_cert(1, NOW - 100, NOW + 400 * DAY).unwrap();
+    let cert = keys
+        .issue_cert(1, NOW - 100, NOW - 100 + 400 * DAY)
+        .unwrap();
     (keys, cert)
 }
 
@@ -201,6 +203,7 @@ fn renewing_keeps_the_content_and_moves_the_lifetime() {
     let renewed = renew(&owner, &docs, later).unwrap();
     assert_eq!(renewed.seq(), docs.seq() + 1);
     assert_eq!(renewed.roster_body().issued, later);
+    assert_eq!(renewed.policy_body().issued, later);
     assert_eq!(renewed.roster_body().expires, later + 14 * DAY);
     assert_eq!(renewed.policy_body().expires, later + 14 * DAY);
     assert_eq!(renewed.roster_body().members, docs.roster_body().members);
@@ -292,6 +295,12 @@ fn names_that_cannot_head_an_address_are_refused() {
         "right\u{202e}left",
         "zero\u{200b}width",
         "emoji\u{1f600}",
+        // Not names a person could type into an address: dots only, or a leading mark.
+        ".",
+        "..",
+        ".hidden",
+        "-flag",
+        "_private",
         long.as_str(),
     ] {
         let (_, cert) = node();
@@ -309,7 +318,7 @@ fn names_that_cannot_head_an_address_are_refused() {
         "Phone_2",
         "ünlü",
         "host.lan",
-        &"a".repeat(63),
+        &"z".repeat(63),
     ] {
         let (_, cert) = node();
         admit(&owner, &docs, &cert, good, &[], NOW).unwrap_or_else(|e| panic!("{good:?}: {e}"));
@@ -465,4 +474,242 @@ fn a_sequence_number_at_its_maximum_cannot_be_extended() {
         renew(&owner, &top, NOW),
         Err(AdminError::SeqOverflow)
     ));
+}
+
+/// The issuer owes protocol.md 2.2's 400 days: no verifier checks it.
+#[test]
+fn a_certificate_valid_for_longer_than_400_days_is_not_accepted_to_join() {
+    let (owner, _laptop, _, docs) = founded();
+    let keys = NodeKeys::generate();
+    // `issue_cert` refuses such a window, so the certificate is built by hand.
+    let cert_with = |extra: u64| {
+        let body = NodeCertBody {
+            v: PROTOCOL_VERSION,
+            node_id: keys.node_id(),
+            x25519_pub: keys.x25519_public(),
+            serial: 1,
+            not_before: NOW - 100,
+            not_after: NOW - 100 + 400 * DAY + extra,
+        };
+        NodeCert::sign(keys.signing_key(), &body).unwrap()
+    };
+    admit(&owner, &docs, &cert_with(0), "exactly", &[], NOW).unwrap();
+    for extra in [1, 100 * DAY, u64::MAX / 2] {
+        assert!(
+            matches!(
+                admit(&owner, &docs, &cert_with(extra), "long", &[], NOW),
+                Err(AdminError::CertLifetimeTooLong)
+            ),
+            "{extra}"
+        );
+    }
+    assert!(matches!(
+        create_network(&OwnerKey::generate(), &cert_with(1), "net", NOW),
+        Err(AdminError::CertLifetimeTooLong)
+    ));
+}
+
+#[test]
+fn a_revoked_node_is_not_admitted_again() {
+    let (owner, _laptop, _, docs) = founded();
+    let (keys, cert) = node();
+    let mut roster = docs.roster_body().clone();
+    roster.revoked.push(RevokedMember {
+        node_id: keys.node_id(),
+        since: NOW - DAY,
+    });
+    let revoked = Documents::signed(&owner, roster, docs.policy_body().clone()).unwrap();
+    assert!(matches!(
+        admit(&owner, &revoked, &cert, "back", &[], NOW),
+        Err(AdminError::Revoked(id)) if id == keys.node_id()
+    ));
+    // Someone else is still welcome.
+    let (_, other) = node();
+    admit(&owner, &revoked, &other, "other", &[], NOW).unwrap();
+}
+
+#[test]
+fn names_that_differ_in_letter_case_only_are_the_same_name() {
+    let (owner, _laptop, _, docs) = founded();
+    for same in ["Laptop", "LAPTOP", "lAPtop"] {
+        let (_, cert) = node();
+        assert!(
+            matches!(
+                admit(&owner, &docs, &cert, same, &[], NOW),
+                Err(AdminError::NameTaken(name)) if name == same
+            ),
+            "{same}"
+        );
+    }
+    // Beyond ASCII too.
+    let (_, cert) = node();
+    let docs = admit(&owner, &docs, &cert, "ünlü", &[], NOW).unwrap();
+    let (_, cert) = node();
+    assert!(matches!(
+        admit(&owner, &docs, &cert, "ÜNLÜ", &[], NOW),
+        Err(AdminError::NameTaken(_))
+    ));
+}
+
+/// What a verifier will hold the member to is the serial of the certificate it was admitted
+/// with: older ones of the same node are dead from the start.
+#[test]
+fn a_member_s_minimum_serial_is_the_serial_of_its_certificate() {
+    let owner = OwnerKey::generate();
+    let founder = NodeKeys::generate();
+    let founder_cert = founder.issue_cert(3, NOW - 100, NOW + DAY).unwrap();
+    let docs = create_network(&owner, &founder_cert, "laptop", NOW).unwrap();
+    let phone = NodeKeys::generate();
+    let phone_cert = phone.issue_cert(7, NOW - 100, NOW + DAY).unwrap();
+    let docs = admit(&owner, &docs, &phone_cert, "phone", &[], NOW).unwrap();
+
+    let min_serial = |id: NodeId| {
+        docs.roster_body()
+            .members
+            .iter()
+            .find(|member| member.node_id == id)
+            .unwrap()
+            .min_serial
+    };
+    assert_eq!(min_serial(founder.node_id()), 3);
+    assert_eq!(min_serial(phone.node_id()), 7);
+
+    let (rosters, policies) = load(&docs);
+    let standing = |id: NodeId, serial| {
+        policies.check_membership(&rosters, &docs.network_id(), &id, serial, NOW)
+    };
+    assert_eq!(standing(phone.node_id(), 7), Ok(()));
+    assert_eq!(standing(phone.node_id(), 6), Err(ErrorCode::StaleSerial));
+    assert_eq!(standing(founder.node_id(), 2), Err(ErrorCode::StaleSerial));
+}
+
+/// The owner signs a successor of what it is given, so it must have checked both signatures:
+/// a Policy someone else signed next to a genuine Roster would otherwise be extended with the
+/// owner's signature on the forger's grants. (The test above covers a pair forged as a whole,
+/// where the Roster check fails first.)
+#[test]
+fn a_genuine_roster_next_to_a_forged_policy_is_not_extended_and_the_other_way_round() {
+    let (owner, laptop, _, docs) = founded();
+    let thief = SigningKey::generate(&mut rand::rng());
+    let (_, cert) = node();
+    let extra = || {
+        node_grant(
+            docs.network_id(),
+            laptop.node_id(),
+            laptop.node_id(),
+            &["tcp:everything"],
+        )
+    };
+
+    let mut evil_policy = docs.policy_body().clone();
+    evil_policy.grants.push(extra());
+    let forged_policy = Policy::sign(&thief, &evil_policy).unwrap();
+    let forged_roster = Roster::sign(&thief, docs.roster_body()).unwrap();
+    for (what, mixed) in [
+        (
+            "forged policy",
+            Documents::from_signed(docs.roster().clone(), forged_policy).unwrap(),
+        ),
+        (
+            "forged roster",
+            Documents::from_signed(forged_roster, docs.policy().clone()).unwrap(),
+        ),
+    ] {
+        assert!(
+            matches!(renew(&owner, &mixed, NOW + DAY), Err(AdminError::Proto(_))),
+            "renew, {what}"
+        );
+        assert!(
+            matches!(
+                admit(&owner, &mixed, &cert, "x", &[], NOW),
+                Err(AdminError::Proto(_))
+            ),
+            "admit, {what}"
+        );
+        assert!(
+            matches!(
+                grant(&owner, &mixed, extra(), NOW),
+                Err(AdminError::Proto(_))
+            ),
+            "grant, {what}"
+        );
+    }
+}
+
+#[test]
+fn the_size_limit_is_inclusive() {
+    check_size("Roster", MAX_DOC_BYTES).unwrap();
+    check_size("Policy", 0).unwrap();
+    assert!(matches!(
+        check_size("Policy", MAX_DOC_BYTES + 1),
+        Err(AdminError::TooLarge { what: "Policy", len, max })
+            if len == MAX_DOC_BYTES + 1 && max == MAX_DOC_BYTES
+    ));
+}
+
+/// The third red-team round, M1: a name that is eight or more hex digits can be taken for the
+/// start of a node id, and an address cannot tell which it is.
+#[test]
+fn a_name_that_reads_as_the_start_of_a_node_id_is_refused() {
+    let (owner, _laptop, _, docs) = founded();
+    for bad in ["1a2b3c4d", "DEADBEEF", "0123456789abcdef", &"a".repeat(63)] {
+        let (_, cert) = node();
+        assert!(
+            matches!(
+                admit(&owner, &docs, &cert, bad, &[], NOW),
+                Err(AdminError::NameLooksLikeNodeId(_))
+            ),
+            "{bad}"
+        );
+        assert!(matches!(
+            check_name(bad),
+            Err(AdminError::NameLooksLikeNodeId(_))
+        ));
+    }
+    // Short hex-looking words and longer words with a non-hex letter are names.
+    for good in ["abc", "1234567", "face", "1a2b3c4g", "deadbeef-2", "phone1"] {
+        check_name(good).unwrap_or_else(|e| panic!("{good}: {e}"));
+    }
+}
+
+#[test]
+fn roles_are_held_to_the_same_characters_as_names() {
+    let (owner, _laptop, _, docs) = founded();
+    for good in ["admin", "ops-team", "dev_2", "a.b", "1a2b3c4d", "ünlü"] {
+        check_role(good).unwrap_or_else(|e| panic!("{good}: {e}"));
+    }
+    for bad in [
+        "",
+        "-x",
+        ".",
+        "a b",
+        "a:b",
+        "a/b",
+        "esc\u{1b}[2J",
+        "right\u{202e}left",
+        &"r".repeat(64),
+    ] {
+        assert!(
+            matches!(check_role(bad), Err(AdminError::BadRole(_))),
+            "{bad:?}"
+        );
+        let (_, cert) = node();
+        assert!(
+            matches!(
+                admit(&owner, &docs, &cert, "someone", &[bad.to_string()], NOW),
+                Err(AdminError::BadRole(_))
+            ),
+            "{bad:?}"
+        );
+    }
+    let (_, cert) = node();
+    admit(
+        &owner,
+        &docs,
+        &cert,
+        "someone",
+        &["admin".to_string(), "dev".to_string()],
+        NOW,
+    )
+    .unwrap();
 }

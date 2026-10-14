@@ -369,12 +369,12 @@ pub async fn initiate_open<S: AsyncRead + AsyncWrite + Unpin>(
 /// timeout, and in practice must: nothing else bounds that wait except
 /// the end of the whole connection. Confirmed live by a 2026-10-02 red
 /// team review: a peer can park one of these calls per stream, forever,
-/// up to yamux's own 512-streams-per-connection cap (yamux answers a
-/// 513th with a GoAway but keeps this side's connection, and every parked
-/// call, running) — and a stream table that full also makes this side's
-/// own next [`crate::StreamMux::open`] on that connection end the whole
-/// [`crate::Driver`] (`TooManyStreams`, see [`crate::Driver`]'s own doc
-/// comment), taking every stream on it down.
+/// up to the connection's live stream limit ([`crate::MAX_LIVE_STREAMS`]).
+/// A stream the peer opens past it is reset, and this side's own
+/// [`crate::StreamMux::open`] then fails with `StreamLimit` until some
+/// stream ends, leaving the connection and every parked call running (the
+/// first version of that limit let such a table end the whole
+/// [`crate::Driver`], taking every stream on the connection down).
 pub async fn respond_to_open<S, A, H>(
     mut stream: S,
     network_id: NetworkId,

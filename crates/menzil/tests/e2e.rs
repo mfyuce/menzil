@@ -68,16 +68,20 @@ async fn failing_server(listener: TcpListener) {
 }
 
 async fn run_through(socket: &Path, target: &str, input: &[u8]) -> anyhow::Result<(Vec<u8>, End)> {
-    let (mut feed, stdin) = duplex(64 * 1024);
-    let (stdout, mut collect) = duplex(1 << 20);
+    let (mut feed, mut stdin) = duplex(64 * 1024);
+    let (mut stdout, mut collect) = duplex(1 << 20);
     let input = input.to_vec();
     tokio::spawn(async move {
         let _ = feed.write_all(&input).await;
         let _ = feed.shutdown().await;
     });
-    let end = timeout(WAIT, connect_and_bridge(socket, target, stdin, stdout))
-        .await
-        .expect("the client must finish")?;
+    let end = timeout(
+        WAIT,
+        connect_and_bridge(socket, target, &mut stdin, &mut stdout),
+    )
+    .await
+    .expect("the client must finish")?;
+    drop(stdout);
     let mut output = Vec::new();
     collect.read_to_end(&mut output).await.unwrap();
     Ok((output, end))
@@ -133,7 +137,12 @@ async fn a_phone_reaches_a_service_on_a_laptop_through_a_relay() {
     ];
     let granted = grant(&laptop_home, None, "phone", "laptop", &services, None, now).unwrap();
     join(&phone_home, &granted.token, now).unwrap();
-    relay_cmd::add_network(&relay_home, &granted.token, now).unwrap();
+    relay_cmd::add_network(
+        &relay_home,
+        &menzil_cli::local::token_for_relay(&laptop_home, None).unwrap(),
+        now,
+    )
+    .unwrap();
 
     // The relay.
     let relay = relay_cmd::start(

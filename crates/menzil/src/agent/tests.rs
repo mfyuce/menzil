@@ -27,7 +27,9 @@ type Seen = Result<usize, io::ErrorKind>;
 /// * `e` echoes until the end of file and closes;
 /// * `r` reads one byte, writes `partial` and resets the stream;
 /// * `h` reads to the end of file, writes `got N` and closes;
-/// * `w` reads to the end and reports how that ended, so a test can see a reset.
+/// * `w` reads to the end and reports how that ended, so a test can see a reset;
+/// * `f` finishes first: writes `greet`, closes, then reads to the end and reports how many
+///   bytes it got (a peer that half-closes and still listens).
 async fn remote(mut inbound: Inbound, seen: mpsc::UnboundedSender<Seen>) {
     while let Some(mut stream) = inbound.accept().await {
         let seen = seen.clone();
@@ -87,6 +89,13 @@ async fn remote(mut inbound: Inbound, seen: mpsc::UnboundedSender<Seen>) {
                     let _ = seen.send(outcome.map(|()| 0));
                 }
                 b'w' => {
+                    let mut all = Vec::new();
+                    let ended = stream.read_to_end(&mut all).await;
+                    let _ = seen.send(ended.map_err(|e| e.kind()));
+                }
+                b'f' => {
+                    let _ = stream.write_all(b"greet").await;
+                    let _ = stream.close().await;
                     let mut all = Vec::new();
                     let ended = stream.read_to_end(&mut all).await;
                     let _ = seen.send(ended.map_err(|e| e.kind()));
@@ -158,16 +167,20 @@ fn rig() -> Rig {
 
 /// Runs the client with `input` as stdin and returns what came out and how it ended.
 async fn run_client(rig: &Rig, target: &str, input: &[u8]) -> Result<(Vec<u8>, End)> {
-    let (mut feed, stdin) = duplex(64 * 1024);
-    let (stdout, mut collect) = duplex(1 << 20);
+    let (mut feed, mut stdin) = duplex(64 * 1024);
+    let (mut stdout, mut collect) = duplex(1 << 20);
     let input = input.to_vec();
     tokio::spawn(async move {
         let _ = feed.write_all(&input).await;
         let _ = feed.shutdown().await;
     });
-    let end = timeout(WAIT, connect_and_bridge(&rig.socket, target, stdin, stdout))
-        .await
-        .expect("the client must finish")?;
+    let end = timeout(
+        WAIT,
+        connect_and_bridge(&rig.socket, target, &mut stdin, &mut stdout),
+    )
+    .await
+    .expect("the client must finish")?;
+    drop(stdout);
     let mut output = Vec::new();
     collect.read_to_end(&mut output).await.unwrap();
     Ok((output, end))
@@ -386,9 +399,9 @@ async fn many_clients_at_once_do_not_disturb_each_other() {
 async fn without_an_agent_the_client_says_how_to_start_one() {
     let dir = tempfile::tempdir().unwrap();
     let missing = dir.path().join("none.sock");
-    let (_feed, stdin) = duplex(16);
-    let (stdout, _collect) = duplex(16);
-    let error = connect_and_bridge(&missing, "a/b", stdin, stdout)
+    let (_feed, mut stdin) = duplex(16);
+    let (mut stdout, _collect) = duplex(16);
+    let error = connect_and_bridge(&missing, "a/b", &mut stdin, &mut stdout)
         .await
         .unwrap_err();
     let text = format!("{error:#}");
@@ -398,25 +411,94 @@ async fn without_an_agent_the_client_says_how_to_start_one() {
     );
 }
 
+/// A reset is the end of everything: the client does not wait for a program that keeps its
+/// input open.
 #[tokio::test]
-async fn the_client_returns_when_the_stream_ends_even_if_its_input_stays_open() {
+async fn a_reset_ends_the_client_at_once_even_if_its_input_stays_open() {
     let rig = rig();
     // `r` ends the stream by itself; the input is never closed.
-    let (_keep_open, stdin) = duplex(64);
-    let (stdout, mut collect) = duplex(1024);
-    let mut input = _keep_open;
-    input.write_all(b"x").await.unwrap();
+    let (mut keep_open, mut stdin) = duplex(64);
+    let (mut stdout, mut collect) = duplex(1024);
+    keep_open.write_all(b"x").await.unwrap();
     let end = timeout(
         WAIT,
-        connect_and_bridge(&rig.socket, "peer/r", stdin, stdout),
+        connect_and_bridge(&rig.socket, "peer/r", &mut stdin, &mut stdout),
     )
     .await
     .expect("must not wait for the input")
     .unwrap();
     assert!(matches!(end, End::Reset(_)));
+    drop(stdout);
     let mut got = Vec::new();
     collect.read_to_end(&mut got).await.unwrap();
     assert_eq!(got, b"partial");
+}
+
+/// The third red-team round, M7: the peer finished first and still reads. Its end closes the
+/// client's output at once (the program reading it sees end of file), and the client goes on
+/// carrying the input to the end; it used to stop the input, the agent reset the stream, and the
+/// peer got a reset where it expected the rest of the upload.
+#[tokio::test]
+async fn after_the_peers_end_the_client_carries_its_input_on_until_it_ends() {
+    let mut rig = rig();
+    let (mut feed, mut stdin) = duplex(64 * 1024);
+    let (mut stdout, mut collect) = duplex(1 << 20);
+    let socket = rig.socket.clone();
+    let client = tokio::spawn(async move {
+        connect_and_bridge(&socket, "peer/f", &mut stdin, &mut stdout).await
+    });
+    feed.write_all(b"a").await.unwrap();
+
+    // The peer's end reaches the program while the input is still open.
+    let mut output = Vec::new();
+    timeout(WAIT, collect.read_to_end(&mut output))
+        .await
+        .expect("the output must be closed when the peer ends")
+        .unwrap();
+    assert_eq!(output, b"greet");
+    assert!(!client.is_finished(), "the input is not finished yet");
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    feed.write_all(&[b'b'; 1000]).await.unwrap();
+    feed.shutdown().await.unwrap();
+    let end = timeout(WAIT, client).await.unwrap().unwrap().unwrap();
+    assert_eq!(end, End::Clean);
+    let remote = timeout(WAIT, rig.seen.recv()).await.unwrap().unwrap();
+    assert_eq!(
+        remote,
+        Ok(1001),
+        "the whole upload reaches a peer that ended first"
+    );
+}
+
+/// A client whose own input fails resets the stream, and says so.
+#[tokio::test]
+async fn an_input_that_fails_resets_the_stream_and_ends_the_client() {
+    struct FailingInput;
+    impl AsyncRead for FailingInput {
+        fn poll_read(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            _buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<io::Result<()>> {
+            std::task::Poll::Ready(Err(io::Error::other("the disk went away")))
+        }
+    }
+    let mut rig = rig();
+    let (mut stdout, _collect) = duplex(1024);
+    let end = timeout(
+        WAIT,
+        connect_and_bridge(&rig.socket, "peer/w", &mut FailingInput, &mut stdout),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    match end {
+        End::Reset(why) => assert!(why.contains("disk went away"), "{why}"),
+        End::Clean => panic!("a failing input is not a clean end"),
+    }
+    let remote = timeout(WAIT, rig.seen.recv()).await.unwrap().unwrap();
+    assert_eq!(remote, Err(io::ErrorKind::ConnectionReset));
 }
 
 #[tokio::test]
@@ -446,13 +528,201 @@ async fn frames_that_lie_are_a_reset_not_a_crash() {
         }
     });
     for _ in 0..4 {
-        let (_feed, stdin) = duplex(16);
-        let (stdout, _collect) = duplex(1024);
-        let end = timeout(WAIT, connect_and_bridge(&socket, "a/b", stdin, stdout))
-            .await
-            .unwrap()
-            .unwrap();
+        let (_feed, mut stdin) = duplex(16);
+        let (mut stdout, _collect) = duplex(1024);
+        let end = timeout(
+            WAIT,
+            connect_and_bridge(&socket, "a/b", &mut stdin, &mut stdout),
+        )
+        .await
+        .unwrap()
+        .unwrap();
         assert!(matches!(end, End::Reset(_)), "{end:?}");
+    }
+    server.abort();
+}
+
+#[tokio::test]
+async fn current_uid_is_the_user_of_this_process() {
+    use std::os::unix::fs::MetadataExt;
+    let dir = tempfile::tempdir().unwrap();
+    let owner = std::fs::metadata(dir.path()).unwrap().uid();
+    assert_eq!(current_uid().await.unwrap(), owner);
+}
+
+/// The third red-team round, M2: a socket that another user serves gets nothing from this
+/// client, not even the name of the service asked for.
+#[tokio::test]
+async fn a_socket_another_user_serves_gets_nothing_from_the_client() {
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("agent.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let received = tokio::spawn(async move {
+        let (mut connection, _) = listener.accept().await.unwrap();
+        let mut got = Vec::new();
+        let _ = timeout(Duration::from_millis(500), connection.read_to_end(&mut got)).await;
+        got
+    });
+    let uid = current_uid().await.unwrap();
+    let (_feed, mut stdin) = duplex(16);
+    let (mut stdout, _collect) = duplex(16);
+    // The server is this user; the client was told to expect somebody else.
+    let error = bridge_as(&socket, "peer/e", &mut stdin, &mut stdout, uid + 1)
+        .await
+        .unwrap_err();
+    let text = format!("{error:#}");
+    assert!(text.contains("another user"), "{text}");
+    assert_eq!(received.await.unwrap(), b"", "nothing was sent to it");
+}
+
+/// And the agent does not serve a connection from another user: nothing reaches the opener. (The
+/// opener records the call instead of panicking: a panic in the connection's task would be
+/// swallowed there, and the client would see a closed connection all the same.)
+#[tokio::test]
+async fn the_agent_closes_a_connection_from_another_user_unanswered() {
+    struct Records(Arc<std::sync::atomic::AtomicUsize>);
+    impl Opener for Records {
+        async fn open(&self, _target: &str) -> Result<Stream, String> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err("a connection from another user reached the opener".to_string())
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("agent.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let uid = current_uid().await.unwrap();
+    let opened = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    // The agent expects somebody else; this process connects.
+    let agent = tokio::spawn(serve_user(
+        listener,
+        Arc::new(Records(opened.clone())),
+        uid + 1,
+    ));
+    let (_feed, mut stdin) = duplex(16);
+    let (mut stdout, _collect) = duplex(16);
+    let error = timeout(
+        WAIT,
+        connect_and_bridge(&socket, "peer/e", &mut stdin, &mut stdout),
+    )
+    .await
+    .unwrap()
+    .unwrap_err();
+    // Closed unanswered, with the request still unread: the client sees either the end of the
+    // connection or the reset the kernel sends for unread data. Not an answer of the opener's.
+    let text = format!("{error:#}");
+    assert!(
+        text.contains("without answering") || text.contains("reset by peer"),
+        "{text}"
+    );
+    assert_eq!(
+        opened.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "the opener was reached"
+    );
+    assert!(!agent.is_finished(), "the agent goes on serving");
+
+    // The same agent for this user does serve the connection (it reaches the opener).
+    let own = dir.path().join("own.sock");
+    let listener = UnixListener::bind(&own).unwrap();
+    let served = tokio::spawn(serve_user(listener, Arc::new(Records(opened.clone())), uid));
+    let (_feed, mut stdin) = duplex(16);
+    let (mut stdout, _collect) = duplex(16);
+    let error = connect_and_bridge(&own, "peer/e", &mut stdin, &mut stdout)
+        .await
+        .unwrap_err();
+    assert!(
+        format!("{error:#}").contains("reached the opener"),
+        "{error:#}"
+    );
+    assert_eq!(opened.load(std::sync::atomic::Ordering::SeqCst), 1);
+    served.abort();
+    agent.abort();
+}
+
+/// An agent that cannot take what the client sends is a broken stream, not a finished one: the
+/// client's data went nowhere, and the answer it may still get must not read as a clean end.
+#[tokio::test]
+async fn an_agent_that_stops_reading_ends_the_client_as_a_reset_not_a_clean_end() {
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("fake.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let server = tokio::spawn(async move {
+        let (connection, _) = listener.accept().await.unwrap();
+        let (read, write) = connection.into_split();
+        let mut read = BufReader::new(read);
+        let mut request = String::new();
+        read.read_line(&mut request).await.unwrap();
+        let mut connection = read.into_inner().reunite(write).unwrap();
+        // Stops taking input (the client's writes fail from now on) before it says ok, but then
+        // answers as if all were well.
+        socket2::SockRef::from(&connection)
+            .shutdown(std::net::Shutdown::Read)
+            .unwrap();
+        connection.write_all(b"ok\n").await.unwrap();
+        write_frame(&mut connection, FRAME_DATA, b"an answer")
+            .await
+            .unwrap();
+        write_frame(&mut connection, FRAME_END, &[]).await.unwrap();
+        tokio::time::sleep(Duration::from_secs(3)).await;
+    });
+    let (mut feed, mut stdin) = duplex(64 * 1024);
+    let (mut stdout, _collect) = duplex(1024);
+    feed.write_all(&[1u8; 4096]).await.unwrap();
+    let end = timeout(
+        WAIT,
+        connect_and_bridge(&socket, "peer/e", &mut stdin, &mut stdout),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    match end {
+        End::Reset(why) => assert!(why.contains("agent went away"), "{why}"),
+        End::Clean => panic!("the agent took none of the input, and the end was reported clean"),
+    }
+    server.abort();
+}
+
+/// The third red-team round, M2: whoever answers on the socket can write what it likes, and the
+/// client must not pass terminal escapes on to the user's terminal.
+#[tokio::test]
+async fn what_an_agent_sends_never_reaches_the_terminal_unescaped() {
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("fake.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let evil = "\u{1b}]0;PWNED\u{7}\u{1b}[2Jboom \u{202e}gpj";
+    let replies: Vec<Vec<u8>> = vec![format!("error {evil}\n").into_bytes(), {
+        let mut r = b"ok\n".to_vec();
+        r.push(FRAME_RESET);
+        r.extend_from_slice(&(evil.len() as u32).to_be_bytes());
+        r.extend_from_slice(evil.as_bytes());
+        r
+    }];
+    let served = Mutex::new(replies.into_iter());
+    let server = tokio::spawn(async move {
+        loop {
+            let (mut connection, _) = listener.accept().await.unwrap();
+            let reply = served.lock().unwrap().next();
+            let mut request = [0u8; 64];
+            let _ = connection.read(&mut request).await;
+            if let Some(reply) = reply {
+                connection.write_all(&reply).await.unwrap();
+            }
+            drop(connection);
+        }
+    });
+    for round in 0..2 {
+        let (_feed, mut stdin) = duplex(16);
+        let (mut stdout, _collect) = duplex(1024);
+        let shown = match connect_and_bridge(&socket, "a/b", &mut stdin, &mut stdout).await {
+            Err(error) => format!("{error:#}"),
+            Ok(End::Reset(why)) => why,
+            Ok(End::Clean) => panic!("round {round}: not a clean end"),
+        };
+        assert!(shown.contains("PWNED"), "the words stay: {shown}");
+        assert!(
+            !shown.chars().any(text::is_unsafe),
+            "round {round}: an escape reached the terminal text: {shown:?}"
+        );
     }
     server.abort();
 }

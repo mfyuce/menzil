@@ -8,8 +8,10 @@
 //! place. Bytes flow both ways through a real session; a dead target is a
 //! refusal in the OPEN_ACK, not an accepted stream that ends; a granted but
 //! unconfigured service is `unknown_service` while an ungranted one is still
-//! refused by the grant check first; and the abnormal ends are visible at
-//! the far end as resets, not as clean ends of file, in both directions.
+//! refused by the grant check first; the abnormal ends are visible at
+//! the far end as resets, not as clean ends of file, in both directions;
+//! and a node going down resets the local target of a stream the client had
+//! half-closed, even when that target is silent.
 //!
 //! One `#[tokio::test]` for the same reason `live_session.rs` has exactly
 //! one: `SSL_CERT_FILE` is process-global (see that file's own doc
@@ -100,6 +102,32 @@ async fn resetting_server(listener: TcpListener) {
     }
 }
 
+/// Reads the request to its end of file and then stays silent, watching only its own
+/// socket's error (an RST sets it; a read would see a clean end of file whatever follows).
+/// Reports `()` on `request_ended` when it saw the end of file, and the error it found on
+/// `outcome`.
+async fn silent_server(
+    listener: TcpListener,
+    request_ended: mpsc::UnboundedSender<()>,
+    outcome: mpsc::UnboundedSender<Option<io::ErrorKind>>,
+) {
+    let (mut socket, _) = listener.accept().await.unwrap();
+    let mut request = Vec::new();
+    socket.read_to_end(&mut request).await.unwrap();
+    let _ = request_ended.send(());
+    let started = std::time::Instant::now();
+    let error = loop {
+        if let Some(error) = socket.take_error().unwrap() {
+            break Some(error.kind());
+        }
+        if started.elapsed() > PATIENCE {
+            break None;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    let _ = outcome.send(error);
+}
+
 async fn echo_round_trip(stream: &mut Stream, data: &[u8]) {
     let mut back = vec![0u8; data.len()];
     let (mut reader, mut writer) = stream.split();
@@ -137,7 +165,13 @@ async fn a_node_serves_local_targets_to_a_granted_peer() {
             network_id,
             a.node_id,
             b.node_id,
-            &["tcp:app", "tcp:resetter", "tcp:dead", "tcp:ghost"],
+            &[
+                "tcp:app",
+                "tcp:resetter",
+                "tcp:dead",
+                "tcp:ghost",
+                "tcp:silent",
+            ],
         )],
     );
     let stores = || {
@@ -161,6 +195,11 @@ async fn a_node_serves_local_targets_to_a_granted_peer() {
     let dead = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let dead_port = dead.local_addr().unwrap().port();
     drop(dead); // nothing listens there
+    let silent = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let silent_port = silent.local_addr().unwrap().port();
+    let (request_ended_tx, mut request_ended_rx) = mpsc::unbounded_channel();
+    let (silent_outcome_tx, mut silent_outcome_rx) = mpsc::unbounded_channel();
+    tokio::spawn(silent_server(silent, request_ended_tx, silent_outcome_tx));
 
     let services = LocalServices::new()
         .serve(service("tcp:app"), LocalTarget::new("127.0.0.1", app_port))
@@ -173,6 +212,11 @@ async fn a_node_serves_local_targets_to_a_granted_peer() {
         .serve(
             service("tcp:dead"),
             LocalTarget::new("127.0.0.1", dead_port),
+        )
+        .unwrap()
+        .serve(
+            service("tcp:silent"),
+            LocalTarget::new("127.0.0.1", silent_port),
         )
         .unwrap();
     let nb = Node::start(
@@ -274,6 +318,29 @@ async fn a_node_serves_local_targets_to_a_granted_peer() {
     let mut stream = open("tcp:app").await.expect("still serving");
     echo_round_trip(&mut stream, b"still here").await;
 
-    na.shutdown().await;
+    // --- the serving node going down resets a target that is silent ---------
+    // The client half-closes, so the pipe has nothing left to read from the stream and waits
+    // on the silent target; only the end of the session can tell it anything (the second
+    // L4i review, M1: it did not, and the target's connection stayed open).
+    let mut silent_stream = open("tcp:silent").await.expect("the silent target accepts");
+    silent_stream.write_all(b"request").await.unwrap();
+    silent_stream.close().await.unwrap();
+    timeout(PATIENCE, request_ended_rx.recv())
+        .await
+        .expect("the target must see the request end")
+        .unwrap();
     nb.shutdown().await;
+    let outcome = timeout(PATIENCE * 2, silent_outcome_rx.recv())
+        .await
+        .expect("the silent target must report")
+        .unwrap();
+    assert!(
+        matches!(
+            outcome,
+            Some(io::ErrorKind::ConnectionReset | io::ErrorKind::BrokenPipe)
+        ),
+        "a node going down must reset the target of a half-closed stream, got {outcome:?}"
+    );
+
+    na.shutdown().await;
 }

@@ -2,9 +2,10 @@
 //!
 //! A relay machine is initialised like any device (`menzil init`: its identity is the anchor
 //! nodes pin) but it is never a member of a network (protocol.md 6.1). It learns the networks it
-//! serves from their owners: `menzil relay add-network <token>` takes the membership token the
-//! owner printed and keeps the Roster alone, as `<home>/relay/<network>.roster`; the Policy
-//! travels only between members (protocol.md 2.3) and is dropped here. Members push newer
+//! serves from their owners: `menzil relay add-network <token>` takes the Roster token the
+//! owner printed with `menzil token --for-relay` and keeps it as `<home>/relay/<network>.roster`.
+//! The Policy travels only between members (protocol.md 2.3), so the token a relay is given does
+//! not carry it, and a full membership token is refused. Members push newer
 //! Rosters to the relay when they attach (protocol.md 4.3), so the file only has to be good
 //! enough to start from.
 
@@ -23,7 +24,7 @@ use tokio::task::JoinHandle;
 
 use crate::home::{Home, parse_hex32};
 use crate::local::load_identity;
-use crate::token::decode_documents;
+use crate::token::decode_roster;
 
 /// The WebSocket path nodes ask for unless the operator picks another (protocol.md 3.1).
 pub const DEFAULT_PATH: &str = "/_menzil/v1";
@@ -44,11 +45,11 @@ fn roster_path(home: &Home, network_id: &NetworkId) -> PathBuf {
     relay_dir(home).join(format!("{}.roster", network_id.to_hex()))
 }
 
-/// Keeps the Roster in a membership token as a network this relay serves. The signature is
-/// checked against the network's own key, an expired Roster is refused, and a Roster no newer
-/// than the one kept is left alone. Returns the network and the sequence number now kept.
+/// Keeps the Roster in a relay token as a network this relay serves. The signature is checked
+/// against the network's own key, an expired Roster is refused, and a Roster no newer than the
+/// one kept is left alone. Returns the network and the sequence number now kept.
 pub fn add_network(home: &Home, token: &str, now: u64) -> Result<(NetworkId, u64)> {
-    let (roster, _policy) = decode_documents(token)?;
+    let roster = decode_roster(token)?;
     let body = roster.decode()?;
     let key = VerifyingKey::from_bytes(&<[u8; 32]>::from(body.network_id))
         .map_err(|_| anyhow!("{} is not a valid network id", body.network_id))?;

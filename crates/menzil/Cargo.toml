@@ -27,6 +27,7 @@ menzil-stream = { path = "../menzil-stream" }
 futures-util = { version = "0.3.34", default-features = false, features = ["std", "io"] }
 menzil-proto = { path = "../menzil-proto" }
 rustls = { workspace = true }
+rustix = { version = "1", default-features = false, features = ["std", "stdio"] }
 serde = { workspace = true }
 socket2 = { workspace = true }
 thiserror = { workspace = true }
@@ -34,6 +35,7 @@ toml = "1"
 tokio = { workspace = true, features = ["net", "io-util", "io-std", "signal", "time", "sync"] }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+zeroize = "1"
 
 [dev-dependencies]
 rand = "0.10.3"

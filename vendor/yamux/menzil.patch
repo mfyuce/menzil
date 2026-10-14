@@ -250,7 +250,18 @@ diff -ruN a/src/chunks.rs b/src/chunks.rs
 diff -ruN a/src/connection/stream.rs b/src/connection/stream.rs
 --- a/src/connection/stream.rs
 +++ b/src/connection/stream.rs
-@@ -189,6 +189,31 @@
+@@ -29,7 +29,9 @@
+ };
+ use parking_lot::{Mutex, MutexGuard};
+ use std::{
+-    fmt, io,
++    fmt,
++    future::Future,
++    io,
+     pin::Pin,
+     sync::Arc,
+     task::{Context, Poll, Waker},
+@@ -189,6 +191,48 @@
          matches!(self.shared().state(), State::Closed)
      }
  
@@ -279,10 +290,54 @@ diff -ruN a/src/connection/stream.rs b/src/connection/stream.rs
 +        self.shared().reset_by_remote
 +    }
 +
++    /// menzil patch (vendor/yamux/PATCHES.md, patch 4): a future that completes when this stream
++    /// is torn down, that is when the remote's RST arrives or the connection goes away while the
++    /// stream is not yet closed in both directions, whether or not the remote had sent its FIN.
++    ///
++    /// `poll_read` and `poll_write` register a waker only while they are pending, so an owner
++    /// that is not polling the stream (it has read the remote's FIN and waits for something
++    /// else, or its write is blocked on another resource) is never told. The watcher is a
++    /// separate handle with a waker of its own, so it can be awaited next to a task that holds
++    /// the stream mutably. It completes at once if the stream was torn down already; a stream
++    /// that ended cleanly (a FIN each way, or an RST after that) never completes it. Only the
++    /// watcher polled last is woken, so use one at a time.
++    pub fn torn_down(&self) -> TornDown {
++        TornDown {
++            shared: self.clone_shared(),
++        }
++    }
++
      /// Whether we are still waiting for the remote to acknowledge this stream.
      pub fn is_pending_ack(&self) -> bool {
          self.shared().is_pending_ack()
-@@ -450,6 +475,12 @@
+@@ -259,6 +303,26 @@
+     }
+ }
+ 
++/// menzil patch (patch 4): see [`Stream::torn_down`]. It keeps the stream's shared state (and
++/// with it the data not read yet) alive while it exists, so drop it together with the stream.
++#[derive(Debug)]
++pub struct TornDown {
++    shared: Arc<Mutex<Shared>>,
++}
++
++impl Future for TornDown {
++    type Output = ();
++
++    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
++        let mut shared = self.shared.lock();
++        if shared.torn_down {
++            return Poll::Ready(());
++        }
++        shared.torn_down_waker = Some(cx.waker().clone());
++        Poll::Pending
++    }
++}
++
+ impl futures::stream::Stream for Stream {
+     type Item = io::Result<Packet>;
+ 
+@@ -450,6 +514,17 @@
      pub(crate) buffer: Chunks,
      pub(crate) reader: Option<Waker>,
      pub(crate) writer: Option<Waker>,
@@ -292,21 +347,45 @@ diff -ruN a/src/connection/stream.rs b/src/connection/stream.rs
 +    /// menzil patch (patch 2): the remote sent an RST, or the connection went away while the
 +    /// stream could still be read. See [`Stream::is_reset`].
 +    pub(crate) reset_by_remote: bool,
++    /// menzil patch (patch 4): the remote's RST arrived, or the connection went away, while the
++    /// stream was not closed in both directions yet. See [`Stream::torn_down`].
++    torn_down: bool,
++    /// menzil patch (patch 4): the waker of the [`TornDown`] polled last.
++    torn_down_waker: Option<Waker>,
  }
  
  impl Shared {
-@@ -474,6 +505,8 @@
+@@ -474,6 +549,18 @@
              buffer: Chunks::new(),
              reader: None,
              writer: None,
 +            reset_requested: false,
 +            reset_by_remote: false,
++            torn_down: false,
++            torn_down_waker: None,
++        }
++    }
++
++    /// menzil patch (patch 4): records the teardown and wakes the [`TornDown`] watching it.
++    pub(crate) fn mark_torn_down(&mut self) {
++        self.torn_down = true;
++        if let Some(w) = self.torn_down_waker.take() {
++            w.wake()
          }
      }
  
 diff -ruN a/src/connection.rs b/src/connection.rs
 --- a/src/connection.rs
 +++ b/src/connection.rs
+@@ -37,7 +37,7 @@
+ use std::task::{Context, Waker};
+ use std::{fmt, sync::Arc, task::Poll};
+ 
+-pub use stream::{Packet, State, Stream};
++pub use stream::{Packet, State, Stream, TornDown};
+ 
+ /// Next connection identifier, used for debug logging.
+ static NEXT_ID: AtomicU32 = AtomicU32::new(1);
 @@ -93,6 +93,17 @@
          }
      }
@@ -362,7 +441,7 @@ diff -ruN a/src/connection.rs b/src/connection.rs
                  // The stream was dropped without calling `poll_close`.
                  // We reset the stream to inform the remote of the closure.
                  State::Open { .. } => {
-@@ -601,7 +627,11 @@
+@@ -601,7 +627,12 @@
              // stream reset
              if let Some(s) = self.streams.get_mut(&stream_id) {
                  let mut shared = s.lock();
@@ -371,11 +450,12 @@ diff -ruN a/src/connection.rs b/src/connection.rs
 +                // stream had ended cleanly already.
 +                if shared.update_state(self.id, stream_id, State::Closed) != State::Closed {
 +                    shared.reset_by_remote = true;
++                    shared.mark_torn_down();
 +                }
                  if let Some(w) = shared.reader.take() {
                      w.wake()
                  }
-@@ -624,9 +654,11 @@
+@@ -624,9 +655,11 @@
                  log::error!("{}/{}: stream already exists", self.id, stream_id);
                  return Action::Terminate(Frame::protocol_error());
              }
@@ -390,7 +470,7 @@ diff -ruN a/src/connection.rs b/src/connection.rs
              }
              if frame.body().len() > DEFAULT_CREDIT as usize {
                  log::error!(
-@@ -704,7 +736,10 @@
+@@ -704,7 +737,11 @@
              // stream reset
              if let Some(s) = self.streams.get_mut(&stream_id) {
                  let mut shared = s.lock();
@@ -398,11 +478,12 @@ diff -ruN a/src/connection.rs b/src/connection.rs
 +                // menzil patch (patch 2): as in `on_data`.
 +                if shared.update_state(self.id, stream_id, State::Closed) != State::Closed {
 +                    shared.reset_by_remote = true;
++                    shared.mark_torn_down();
 +                }
                  if let Some(w) = shared.reader.take() {
                      w.wake()
                  }
-@@ -727,9 +762,10 @@
+@@ -727,9 +764,10 @@
                  log::error!("{}/{}: stream already exists", self.id, stream_id);
                  return Action::Terminate(Frame::protocol_error());
              }
@@ -416,7 +497,7 @@ diff -ruN a/src/connection.rs b/src/connection.rs
              }
  
              let Some(credit) = frame.header().credit().checked_add(DEFAULT_CREDIT) else {
-@@ -895,12 +931,23 @@
+@@ -895,12 +933,29 @@
      }
  }
  
@@ -435,8 +516,14 @@ diff -ruN a/src/connection.rs b/src/connection.rs
 -            shared.update_state(self.id, id, State::Closed);
 +            // menzil patch (patch 2): a stream the remote had not closed with a FIN did not end
 +            // cleanly when the connection went away under it.
-+            if shared.update_state(self.id, id, State::Closed).can_read() {
++            let previous = shared.update_state(self.id, id, State::Closed);
++            if previous.can_read() {
 +                shared.reset_by_remote = true;
++            }
++            // menzil patch (patch 4): also a stream the remote had half-closed was torn down,
++            // its owner can no longer finish it.
++            if previous != State::Closed {
++                shared.mark_torn_down();
 +            }
              if let Some(w) = shared.reader.take() {
                  w.wake()
@@ -463,3 +550,15 @@ diff -ruN a/src/frame.rs b/src/frame.rs
      pub fn internal_error() -> Self {
          Frame {
              header: Header::internal_error(),
+diff -ruN a/src/lib.rs b/src/lib.rs
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -31,7 +31,7 @@
+ pub(crate) mod connection;
+ mod tagged_stream;
+ 
+-pub use crate::connection::{Connection, Mode, Packet, Stream};
++pub use crate::connection::{Connection, Mode, Packet, Stream, TornDown};
+ pub use crate::error::ConnectionError;
+ pub use crate::frame::{
+     header::{HeaderDecodeError, StreamId},

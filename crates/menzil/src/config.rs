@@ -56,7 +56,19 @@ impl Config {
 
     /// Parses the text of a configuration file.
     pub fn parse(text: &str) -> Result<Self> {
-        toml::from_str(text).map_err(|e| anyhow!("{}", e.message()))
+        toml::from_str(text).map_err(|e| {
+            // The message and where it is, without the quoted line the full report adds (a
+            // proxy URL in it can hold a password).
+            match e.span() {
+                Some(span) => {
+                    let before = &text[..span.start.min(text.len())];
+                    let line = before.matches('\n').count() + 1;
+                    let column = before.rsplit('\n').next().map_or(0, |l| l.chars().count()) + 1;
+                    anyhow!("line {line}, column {column}: {}", e.message())
+                }
+                None => anyhow!("{}", e.message()),
+            }
+        })
     }
 
     /// The relay to attach to; an error saying how to configure one if there is none.
@@ -193,6 +205,18 @@ mod tests {
         }
         let config = Config::parse("relay = \"menzil://h?id=zz\"").unwrap();
         assert!(config.connection_info().is_err());
+    }
+
+    #[test]
+    fn a_syntax_error_says_where_it_is_and_does_not_quote_the_line() {
+        let error =
+            Config::parse("relay = \"x\"\n\nproxy = \"http://user:hunter2@p:3128\"\n[services\n")
+                .unwrap_err()
+                .to_string();
+        assert!(error.starts_with("line 4, column"), "{error}");
+        assert!(!error.contains("hunter2"), "{error}");
+        let error = Config::parse("raley = 1").unwrap_err().to_string();
+        assert!(error.starts_with("line 1, column 1"), "{error}");
     }
 
     #[test]

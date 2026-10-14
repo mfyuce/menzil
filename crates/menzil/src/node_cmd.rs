@@ -27,8 +27,9 @@ use tokio::task::JoinHandle;
 
 use crate::agent::{self, Opener};
 use crate::config::Config;
-use crate::home::Home;
+use crate::home::{FileLock, Home};
 use crate::local::{load_documents, load_identity};
+use crate::text;
 
 /// How often a running node looks for newer documents on disk.
 const RELOAD_EVERY: Duration = Duration::from_secs(15);
@@ -67,44 +68,71 @@ impl Directory {
         Ok(Self { entries })
     }
 
+    /// From the documents in `home` that can be read: a network whose documents cannot is left
+    /// out (and the reload reports it) instead of taking every other network's names with it.
+    pub fn load_readable(home: &Home) -> Result<Self> {
+        let mut entries = Vec::new();
+        for network_id in home.networks()? {
+            let Ok(docs) = load_documents(home, &network_id) else {
+                continue;
+            };
+            for member in &docs.policy_body().members {
+                entries.push(Entry {
+                    network_id,
+                    name: member.name.clone(),
+                    node_id: member.node_id,
+                });
+            }
+        }
+        Ok(Self { entries })
+    }
+
     /// From entries already at hand.
     pub fn from_entries(entries: Vec<Entry>) -> Self {
         Self { entries }
     }
 
     /// The member `who` names: by name, or by the start of its NodeId in hex (8 digits or more).
-    /// A name used in several networks, or a prefix several nodes share, is refused with a list
-    /// rather than guessed.
+    /// A name used in several networks, a prefix several nodes share, or a name that is the
+    /// start of another member's node id, is refused with a list rather than guessed: names win
+    /// over nothing (the third red-team round, M1: a member named like the start of this
+    /// device's own node id, in another network, used to take the address of that node).
     pub fn resolve(&self, who: &str) -> Result<&Entry, String> {
-        let by_name: Vec<&Entry> = self.entries.iter().filter(|e| e.name == who).collect();
-        let hits =
-            if by_name.is_empty() && who.len() >= 8 && who.bytes().all(|b| b.is_ascii_hexdigit()) {
-                let prefix = who.to_ascii_lowercase();
-                self.entries
-                    .iter()
-                    .filter(|e| e.node_id.to_hex().starts_with(&prefix))
-                    .collect()
-            } else {
-                by_name
-            };
+        let wants_prefix = who.len() >= 8 && who.bytes().all(|b| b.is_ascii_hexdigit());
+        let prefix = who.to_ascii_lowercase();
+        let hits: Vec<&Entry> = self
+            .entries
+            .iter()
+            .filter(|e| e.name == who || (wants_prefix && e.node_id.to_hex().starts_with(&prefix)))
+            .collect();
         match hits.as_slice() {
             [one] => Ok(one),
             [] => {
-                let mut names: Vec<&str> = self.entries.iter().map(|e| e.name.as_str()).collect();
+                let mut names: Vec<String> = self
+                    .entries
+                    .iter()
+                    .map(|e| text::escaped(&e.name))
+                    .collect();
                 names.sort();
                 names.dedup();
                 Err(if names.is_empty() {
                     "this node holds no network documents".to_string()
                 } else {
-                    format!("no member called {who:?} (members: {})", names.join(", "))
+                    format!(
+                        "no member called {:?} (members: {})",
+                        text::escaped(who),
+                        names.join(", ")
+                    )
                 })
             }
             several => Err(format!(
-                "{who:?} is ambiguous: {}",
+                "{:?} is ambiguous: {}",
+                text::escaped(who),
                 several
                     .iter()
                     .map(|e| format!(
-                        "{} in network {}",
+                        "{} ({} in network {})",
+                        text::escaped(&e.name),
                         &e.node_id.to_hex()[..8],
                         &e.network_id.to_hex()[..8]
                     ))
@@ -155,19 +183,39 @@ pub fn check_socket_path_length(path: &Path) -> Result<()> {
     let length = path.as_os_str().len();
     if length > MAX_SOCKET_PATH_BYTES {
         bail!(
-            "the agent socket path is {length} bytes, more than a Unix socket path can be (about {MAX_SOCKET_PATH_BYTES}): set `agent_socket = \"/tmp/menzil.sock\"` (or another short path) in config.toml: {}",
+            "the agent socket path is {length} bytes, more than a Unix socket path can be (about {MAX_SOCKET_PATH_BYTES}): set `agent_socket` in config.toml to a shorter path in a directory that only you can use, such as one under $XDG_RUNTIME_DIR: {}",
             path.display()
         );
     }
     Ok(())
 }
 
+/// The directory a socket path is in: a bare file name has no directory part, and means the
+/// current directory.
+fn socket_directory(path: &Path) -> &Path {
+    path.parent()
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .unwrap_or(Path::new("."))
+}
+
+/// The environment as the node's settings see it: variables that are text. `env::vars` panics
+/// on one that is not, and one that is not cannot name a proxy or a certificate file.
+pub fn text_environment(
+    vars: impl Iterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
+) -> HashMap<String, String> {
+    vars.filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?)))
+        .collect()
+}
+
 /// Binds the agent socket. A socket file left by a node that died is removed; one with a node
-/// behind it is an error. The directory is made private (0700) when this creates it, and the
-/// socket readable by its owner only.
+/// behind it is an error; anything that is not a socket (a file the configuration pointed at by
+/// mistake, a link) is an error and is left alone. The directory is made private (0700) when
+/// this creates it, and the socket readable by its owner only. Whoever connects is checked
+/// against this user's uid when the agent accepts (see [`crate::agent`]).
 pub async fn bind_agent_socket(path: &Path) -> Result<UnixListener> {
     check_socket_path_length(path)?;
-    if let Some(dir) = path.parent().filter(|dir| !dir.exists()) {
+    let dir = socket_directory(path);
+    if !dir.exists() {
         fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
         #[cfg(unix)]
         {
@@ -175,14 +223,33 @@ pub async fn bind_agent_socket(path: &Path) -> Result<UnixListener> {
             fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
         }
     }
-    if path.exists() {
-        match UnixStream::connect(path).await {
-            Ok(_) => bail!(
-                "another menzil node is already listening on {}",
-                path.display()
-            ),
-            Err(_) => fs::remove_file(path)
-                .with_context(|| format!("removing the stale socket {}", path.display()))?,
+    match fs::symlink_metadata(path) {
+        Ok(found) => {
+            #[cfg(unix)]
+            let is_socket = {
+                use std::os::unix::fs::FileTypeExt;
+                found.file_type().is_socket()
+            };
+            #[cfg(not(unix))]
+            let is_socket = true;
+            if !is_socket {
+                bail!(
+                    "{} exists and is not a socket: not touching it (is `agent_socket` in config.toml pointing at the wrong file?)",
+                    path.display()
+                );
+            }
+            match UnixStream::connect(path).await {
+                Ok(_) => bail!(
+                    "another menzil node is already listening on {}",
+                    path.display()
+                ),
+                Err(_) => fs::remove_file(path)
+                    .with_context(|| format!("removing the stale socket {}", path.display()))?,
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error).with_context(|| format!("looking at {}", path.display()));
         }
     }
     let listener =
@@ -277,6 +344,8 @@ pub struct RunningNode {
     /// The names this node can resolve.
     pub directory: Arc<RwLock<Directory>>,
     tasks: Vec<JoinHandle<()>>,
+    /// Held while this node runs: one node per identity.
+    _instance: FileLock,
 }
 
 impl Drop for RunningNode {
@@ -289,6 +358,9 @@ impl Drop for RunningNode {
 
 /// Starts the node and the agent socket.
 pub async fn start(home: &Home, config: &Config, socket: &Path) -> Result<RunningNode> {
+    // First: two nodes with one identity would displace each other at the relay, and the socket
+    // path alone does not stop that (it depends on the environment).
+    let instance = home.lock_node()?;
     let (keys, cert) = load_identity(home)?;
     let (policies, rosters, networks) = load_stores(home)?;
     let session = SessionConfig {
@@ -310,7 +382,7 @@ pub async fn start(home: &Home, config: &Config, socket: &Path) -> Result<Runnin
         Node::start(
             NodeConfig {
                 session,
-                env: std::env::vars().collect::<HashMap<_, _>>(),
+                env: text_environment(std::env::vars_os()),
                 policies: policies.clone(),
                 rosters: rosters.clone(),
             },
@@ -344,6 +416,7 @@ pub async fn start(home: &Home, config: &Config, socket: &Path) -> Result<Runnin
         socket: socket.to_path_buf(),
         directory,
         tasks: vec![agent_task, reload_task],
+        _instance: instance,
     })
 }
 
@@ -356,19 +429,42 @@ pub fn reload(
     directory: &RwLock<Directory>,
     last: &mut HashMap<NetworkId, u64>,
 ) -> Result<()> {
+    // One network that cannot be read (a write that failed, a damaged file) must not keep the
+    // others from being reloaded: a revocation installed with `menzil join` would otherwise
+    // never be applied. Each failure is reported, and the first is returned at the end.
+    let mut first_failure = None;
     for network_id in home.networks()? {
-        let docs = load_documents(home, &network_id)?;
-        let seq = docs.seq();
-        rosters.set(docs.roster())?;
-        policies.set(docs.policy())?;
-        if last.insert(network_id, seq) != Some(seq) {
-            tracing::info!(network = %network_id, seq, "holding newer documents");
+        let loaded = load_documents(home, &network_id).and_then(|docs| {
+            rosters.set(docs.roster())?;
+            policies.set(docs.policy())?;
+            Ok(docs.seq())
+        });
+        match loaded {
+            Ok(seq) => {
+                if last.insert(network_id, seq) != Some(seq) {
+                    tracing::info!(network = %network_id, seq, "holding newer documents");
+                }
+            }
+            Err(error) => {
+                tracing::warn!(network = %network_id, error = %format!("{error:#}"), "cannot reload this network's documents");
+                first_failure.get_or_insert(error);
+            }
         }
     }
-    *directory
-        .write()
-        .map_err(|_| anyhow!("the directory is unavailable"))? = Directory::load(home)?;
-    Ok(())
+    match Directory::load_readable(home) {
+        Ok(fresh) => {
+            *directory
+                .write()
+                .map_err(|_| anyhow!("the directory is unavailable"))? = fresh;
+        }
+        Err(error) => {
+            first_failure.get_or_insert(error);
+        }
+    }
+    match first_failure {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
 }
 
 /// `menzil node`: starts everything and runs until interrupted.
@@ -386,11 +482,15 @@ pub async fn run(home: &Home) -> Result<()> {
             "not connected to the relay after 60 s; still trying (RUST_LOG=menzil=debug shows why)"
         ),
     }
-    tokio::signal::ctrl_c()
+    // Every signal that stops a process takes this path: dropping the node resets what it
+    // carries (a target connection closed by the kernel after a SIGTERM would end with a FIN,
+    // as if the peer had finished).
+    let why = crate::signals::shutdown()
         .await
-        .context("waiting for ctrl-c")?;
-    eprintln!("stopping");
+        .context("waiting for a signal")?;
+    eprintln!("stopping ({why})");
     let _ = fs::remove_file(&running.socket);
+    drop(running);
     Ok(())
 }
 

@@ -1,7 +1,7 @@
 //! The stream type this crate hands out.
 //!
 //! A [`Stream`] is a `yamux::Stream` of the vendored `yamux` (`vendor/yamux/PATCHES.md`) with
-//! three things added, each one something the stock type cannot express (TODO.md, TOBEDECIDED
+//! four things added, each one something the stock type cannot express (TODO.md, TOBEDECIDED
 //! item 11):
 //!
 //! * **A stream that is not closed on purpose is aborted.** [`Stream::reset`] aborts it in every
@@ -17,12 +17,19 @@
 //!   connection reads as [`io::ErrorKind::ConnectionReset`] once the data that arrived before
 //!   it is consumed. Writing to, flushing and closing a reset stream fail the same way, and so
 //!   does a write after the connection was lost.
+//! * **A stream can be watched for its teardown** without polling it:
+//!   [`Stream::torn_down`] completes when the peer's RST arrives or the connection goes away
+//!   under a stream that is not over, also one the peer had half-closed. Reading and writing
+//!   register a waker only while they are pending, so an owner that has read the peer's FIN
+//!   and waits for its local target, or whose write to that target is blocked, would never
+//!   learn that the stream is gone (the second L4i review).
 //! * **Every live stream holds a slot of its connection's count**, released when the stream is
 //!   dropped, so [`StreamMux::live_streams`](crate::StreamMux::live_streams) can say how many
 //!   handles are in use. (What bounds the streams a connection holds is `yamux`'s own table
 //!   size, which also counts dropped streams that have not been flushed yet: see
 //!   [`MAX_LIVE_STREAMS`](crate::MAX_LIVE_STREAMS).)
 
+use std::future::Future;
 use std::io;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -107,6 +114,16 @@ impl Stream {
         self.inner.is_reset()
     }
 
+    /// A future that completes when the stream is torn down: the peer reset it, or the
+    /// connection went away while the stream was not yet closed in both directions (a peer's FIN
+    /// does not count as closed in both). It does not complete for a stream that ended cleanly,
+    /// and it completes at once for one that was torn down already. It is a handle of its own,
+    /// so it can be awaited next to a task that holds the stream mutably; use one watcher per
+    /// stream at a time, and drop it with the stream (it keeps the stream's shared state alive).
+    pub fn torn_down(&self) -> TornDown {
+        TornDown(self.inner.torn_down())
+    }
+
     /// The stream's identifier on its connection, for logs.
     pub fn id(&self) -> u32 {
         self.inner.id().val()
@@ -122,6 +139,18 @@ impl Stream {
         } else {
             error
         }
+    }
+}
+
+/// See [`Stream::torn_down`].
+#[derive(Debug)]
+pub struct TornDown(yamux::TornDown);
+
+impl Future for TornDown {
+    type Output = ();
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        Pin::new(&mut self.0).poll(cx)
     }
 }
 

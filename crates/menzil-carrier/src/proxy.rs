@@ -20,12 +20,22 @@ pub struct ProxyTarget {
 }
 
 /// Basic auth credentials for a proxy.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct ProxyCredentials {
     /// The username.
     pub username: String,
     /// The password.
     pub password: String,
+}
+
+impl std::fmt::Debug for ProxyCredentials {
+    /// The password never goes into a log line or a panic message.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProxyCredentials")
+            .field("username", &self.username)
+            .field("password", &"<redacted>")
+            .finish()
+    }
 }
 
 /// An explicit caller decision that skips environment discovery: either a
@@ -282,5 +292,19 @@ mod tests {
         let creds = target.credentials.unwrap();
         assert_eq!(creds.username, "user");
         assert_eq!(creds.password, "p@ss");
+    }
+
+    #[test]
+    fn debug_output_never_shows_the_password() {
+        let credentials = ProxyCredentials {
+            username: "alice".to_string(),
+            password: "hunter2".to_string(),
+        };
+        let shown = format!("{credentials:?} {:?}", Some(&credentials));
+        assert!(
+            shown.contains("alice") && shown.contains("redacted"),
+            "{shown}"
+        );
+        assert!(!shown.contains("hunter2"), "{shown}");
     }
 }

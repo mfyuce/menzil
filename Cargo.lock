@@ -1127,6 +1127,7 @@ dependencies = [
  "menzil-stream",
  "rand",
  "rcgen",
+ "rustix",
  "rustls",
  "serde",
  "socket2",
@@ -1136,6 +1137,7 @@ dependencies = [
  "toml",
  "tracing",
  "tracing-subscriber",
+ "zeroize",
 ]
 
 [[package]]
@@ -1149,6 +1151,7 @@ dependencies = [
  "rand",
  "snow",
  "thiserror",
+ "zeroize",
 ]
 
 [[package]]

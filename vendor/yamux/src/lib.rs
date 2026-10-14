@@ -31,7 +31,7 @@ mod frame;
 pub(crate) mod connection;
 mod tagged_stream;
 
-pub use crate::connection::{Connection, Mode, Packet, Stream};
+pub use crate::connection::{Connection, Mode, Packet, Stream, TornDown};
 pub use crate::error::ConnectionError;
 pub use crate::frame::{
     header::{HeaderDecodeError, StreamId},

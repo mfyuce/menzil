@@ -4,8 +4,13 @@ use curve25519_dalek::montgomery::MontgomeryPoint;
 use ed25519_dalek::SigningKey;
 use menzil_proto::{NetworkId, NodeCert, NodeCertBody, NodeId, PROTOCOL_VERSION, X25519PublicKey};
 use rand::Rng;
+use zeroize::Zeroize;
 
 use crate::AdminError;
+
+/// How long a node certificate may be valid: protocol.md 2.2 says at most 400 days, and no
+/// verifier enforces it, so the issuers do.
+pub const MAX_CERT_LIFETIME_SECS: u64 = 400 * 24 * 60 * 60;
 
 /// A node's secret material: the Ed25519 key its [`NodeId`] is the public
 /// half of, and the X25519 key the Noise handshakes use (protocol.md 2.2).
@@ -15,6 +20,13 @@ use crate::AdminError;
 pub struct NodeKeys {
     signing: SigningKey,
     x25519_private: [u8; 32],
+}
+
+impl Drop for NodeKeys {
+    /// The Ed25519 half wipes itself (`ed25519-dalek`); this wipes the X25519 half.
+    fn drop(&mut self) {
+        self.x25519_private.zeroize();
+    }
 }
 
 impl std::fmt::Debug for NodeKeys {
@@ -46,9 +58,11 @@ impl NodeKeys {
     /// X25519 private key and any 32 bytes a valid Ed25519 seed, so the only
     /// thing to check is the length.
     pub fn from_secret_bytes(bytes: &[u8]) -> Result<Self, AdminError> {
-        let bytes: &[u8; Self::SECRET_LEN] = bytes
-            .try_into()
-            .map_err(|_| AdminError::BadKeyLength(bytes.len()))?;
+        let bytes: &[u8; Self::SECRET_LEN] =
+            bytes.try_into().map_err(|_| AdminError::BadKeyLength {
+                expected: Self::SECRET_LEN,
+                found: bytes.len(),
+            })?;
         let (seed, x25519) = bytes.split_at(32);
         Ok(Self {
             signing: SigningKey::from_bytes(seed.try_into().expect("32 bytes")),
@@ -85,15 +99,18 @@ impl NodeKeys {
     }
 
     /// A self-signed certificate (protocol.md 2.2) binding the NodeId to the
-    /// X25519 key. `serial` goes up by one with every rotation and
-    /// `not_after` is at most 400 days after `not_before`; the validity
-    /// window is the caller's choice, not checked here.
+    /// X25519 key. `serial` goes up by one with every rotation; the window from `not_before` to
+    /// `not_after` may not be longer than [`MAX_CERT_LIFETIME_SECS`] (400 days), which nothing
+    /// else enforces.
     pub fn issue_cert(
         &self,
         serial: u32,
         not_before: u64,
         not_after: u64,
     ) -> Result<NodeCert, AdminError> {
+        if not_after.saturating_sub(not_before) > MAX_CERT_LIFETIME_SECS {
+            return Err(AdminError::CertLifetimeTooLong);
+        }
         let body = NodeCertBody {
             v: PROTOCOL_VERSION,
             node_id: self.node_id(),
@@ -137,9 +154,11 @@ impl OwnerKey {
 
     /// The key back from [`Self::secret_bytes`].
     pub fn from_secret_bytes(bytes: &[u8]) -> Result<Self, AdminError> {
-        let seed: &[u8; Self::SECRET_LEN] = bytes
-            .try_into()
-            .map_err(|_| AdminError::BadKeyLength(bytes.len()))?;
+        let seed: &[u8; Self::SECRET_LEN] =
+            bytes.try_into().map_err(|_| AdminError::BadKeyLength {
+                expected: Self::SECRET_LEN,
+                found: bytes.len(),
+            })?;
         Ok(Self {
             signing: SigningKey::from_bytes(seed),
         })
@@ -245,20 +264,50 @@ mod tests {
         );
     }
 
+    /// protocol.md 2.2: a certificate is valid for at most 400 days, and no verifier checks.
+    #[test]
+    fn a_certificate_valid_for_longer_than_400_days_is_not_issued() {
+        let keys = NodeKeys::generate();
+        let day = 24 * 60 * 60;
+        keys.issue_cert(1, 1000, 1000 + 400 * day).unwrap();
+        assert_eq!(MAX_CERT_LIFETIME_SECS, 400 * day);
+        for not_after in [1000 + 400 * day + 1, u64::MAX] {
+            assert!(matches!(
+                keys.issue_cert(1, 1000, not_after),
+                Err(AdminError::CertLifetimeTooLong)
+            ));
+        }
+        assert!(matches!(
+            keys.issue_cert(7, 0, u64::MAX),
+            Err(AdminError::CertLifetimeTooLong)
+        ));
+    }
+
     #[test]
     fn secret_bytes_of_the_wrong_length_are_refused() {
         for len in [0, 31, 33, 63, 65] {
             assert!(matches!(
                 NodeKeys::from_secret_bytes(&vec![0u8; len]),
-                Err(AdminError::BadKeyLength(l)) if l == len
+                Err(AdminError::BadKeyLength { expected: 64, found }) if found == len
             ));
         }
         for len in [0, 31, 33, 64] {
             assert!(matches!(
                 OwnerKey::from_secret_bytes(&vec![0u8; len]),
-                Err(AdminError::BadKeyLength(l)) if l == len
+                Err(AdminError::BadKeyLength { expected: 32, found }) if found == len
             ));
         }
+        // And the message names the right length for each kind of key.
+        let node = NodeKeys::from_secret_bytes(&[0u8; 5])
+            .unwrap_err()
+            .to_string();
+        let owner = OwnerKey::from_secret_bytes(&[0u8; 5])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            node.contains("64") && owner.contains("32"),
+            "{node} / {owner}"
+        );
     }
 
     #[test]

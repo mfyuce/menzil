@@ -13,7 +13,8 @@ use menzil_cli::agent::{self, End};
 use menzil_cli::config::Config;
 use menzil_cli::home::Home;
 use menzil_cli::local::{self, Joined};
-use menzil_cli::{node_cmd, relay_cmd};
+use menzil_cli::stdio::ClosingStdout;
+use menzil_cli::{node_cmd, reach, relay_cmd, signals, text};
 use menzil_proto::ServiceId;
 use tracing_subscriber::EnvFilter;
 
@@ -42,7 +43,8 @@ enum Command {
     },
     /// Admit the device a join request names to a network this device owns.
     Admit {
-        /// The join request (`menzil1-join:...`) the new member's `menzil init` printed.
+        /// The join request (`menzil1-join:...`) the new member's `menzil init` printed; `-`
+        /// reads it from standard input.
         join_request: String,
         /// The name the member is addressed by (letters, digits, '-', '_' and '.').
         #[arg(long)]
@@ -78,7 +80,8 @@ enum Command {
     },
     /// Install the documents in a membership token an owner gave this device.
     Join {
-        /// The token (`menzil1-docs:...`).
+        /// The token (`menzil1-docs:...`); `-` reads it from standard input, which keeps it out
+        /// of `ps` output and shell history.
         token: String,
     },
     /// Print the membership token for the documents this device holds.
@@ -86,6 +89,10 @@ enum Command {
         /// The network, when this device is in more than one.
         #[arg(long, value_name = "ID")]
         network: Option<String>,
+        /// Print the token for a relay instead: the Roster alone, without the Policy (who may
+        /// use what, and the members' device names), which is hidden from relays.
+        #[arg(long)]
+        for_relay: bool,
     },
     /// Show this device's identity, networks and members.
     Status,
@@ -102,7 +109,9 @@ enum Command {
         /// Local port to expose.
         port: u16,
     },
-    /// Listen on a local port and carry each connection to a service of another member.
+    /// Listen on a local port and carry each connection to a service of another member. A
+    /// connection that does not end cleanly (the service failed, the agent refused, this
+    /// command is stopped) is reset, never closed as if it had finished.
     Reach {
         /// The service, as `<member>/<service>`, for example `laptop/ssh`.
         target: String,
@@ -116,7 +125,9 @@ enum Command {
         exit: String,
     },
     /// Carry standard input and output to a service of another member: what an SSH
-    /// `ProxyCommand` runs (`ssh -o ProxyCommand="menzil stdio %h/ssh" laptop`).
+    /// `ProxyCommand` runs (`ssh -o ProxyCommand="menzil stdio %h/ssh" laptop`). Both directions
+    /// run to their end: when the service finishes, standard output is closed and standard
+    /// input is carried on until it ends too; a reset ends it at once with status 1.
     Stdio {
         /// The service, as `<member>/<service>`, for example `laptop/ssh`.
         target: String,
@@ -127,9 +138,11 @@ enum Command {
 
 #[derive(Subcommand)]
 enum RelayCommand {
-    /// Serve a network: keep the Roster in a membership token the network's owner gave you.
+    /// Serve a network: keep the Roster in a relay token the network's owner gave you.
     AddNetwork {
-        /// The token (`menzil1-docs:...`) from `menzil token` on the owner's device.
+        /// The token (`menzil1-roster:...`) from `menzil token --for-relay` on the owner's
+        /// device; `-` reads it from standard input. A full membership token is refused: it
+        /// carries the Policy, which a relay must not get.
         token: String,
     },
     /// Run the relay until interrupted and print the connection information for nodes.
@@ -160,6 +173,17 @@ enum NetworkCommand {
         #[arg(long, default_value = "owner")]
         name: String,
     },
+}
+
+/// A token given on the command line, or `-` for one read from standard input.
+fn token_argument(value: String) -> Result<String> {
+    if value != "-" {
+        return Ok(value);
+    }
+    let mut text = String::new();
+    std::io::Read::read_to_string(&mut std::io::stdin(), &mut text)
+        .context("reading the token from standard input")?;
+    Ok(text.trim().to_string())
 }
 
 fn now() -> u64 {
@@ -225,6 +249,7 @@ async fn run(cli: Cli) -> Result<()> {
             roles,
             network,
         } => {
+            let join_request = token_argument(join_request)?;
             let issued = local::admit(
                 &home()?,
                 network.as_deref(),
@@ -267,7 +292,7 @@ async fn run(cli: Cli) -> Result<()> {
             println!("every member needs the new documents (`menzil join <token>`):");
             println!("{}", issued.token);
         }
-        Command::Join { token } => match local::join(&home()?, &token, now())? {
+        Command::Join { token } => match local::join(&home()?, &token_argument(token)?, now())? {
             Joined::New { network_id, seq } => {
                 println!("joined network {network_id} (documents #{seq})")
             }
@@ -283,12 +308,23 @@ async fn run(cli: Cli) -> Result<()> {
                 "nothing to do: this device holds documents #{held_seq} of network {network_id} already"
             ),
         },
-        Command::Token { network } => println!("{}", local::token(&home()?, network.as_deref())?),
+        Command::Token { network, for_relay } => {
+            let home = home()?;
+            println!(
+                "{}",
+                if for_relay {
+                    local::token_for_relay(&home, network.as_deref())?
+                } else {
+                    local::token(&home, network.as_deref())?
+                }
+            );
+        }
         Command::Status => print!("{}", local::status(&home()?)?.render(now())),
         Command::Relay {
             command: RelayCommand::AddNetwork { token },
         } => {
-            let (network_id, seq) = relay_cmd::add_network(&home()?, &token, now())?;
+            let (network_id, seq) =
+                relay_cmd::add_network(&home()?, &token_argument(token)?, now())?;
             println!("this relay serves network {network_id} (Roster #{seq})");
         }
         Command::Relay {
@@ -319,82 +355,52 @@ async fn run(cli: Cli) -> Result<()> {
             println!("{}", relay.connection_info);
             tokio::select! {
                 _ = relay.wait() => {}
-                _ = tokio::signal::ctrl_c() => eprintln!("stopping"),
+                why = signals::shutdown() => eprintln!("stopping ({})", why?),
             }
         }
         Command::Node => node_cmd::run(&home()?).await?,
         Command::Stdio { target } => {
             let home = home()?;
             let socket = node_cmd::agent_socket_path(&home, &Config::load(&home)?);
-            let end = agent::connect_and_bridge(
-                &socket,
-                &target,
-                tokio::io::stdin(),
-                tokio::io::stdout(),
-            )
-            .await?;
-            if let End::Reset(why) = end {
-                eprintln!("menzil: the connection was reset: {why}");
-                std::process::exit(1);
+            let mut input = tokio::io::stdin();
+            let mut output = ClosingStdout::new();
+            let end = agent::connect_and_bridge(&socket, &target, &mut input, &mut output).await?;
+            // Out at once, whatever standard input is doing: tokio reads it on a thread that a
+            // finished program would otherwise wait for.
+            match end {
+                End::Clean => std::process::exit(0),
+                End::Reset(why) => {
+                    eprintln!(
+                        "menzil: the connection was reset: {}",
+                        text::one_line(&why, 300)
+                    );
+                    std::process::exit(1);
+                }
             }
         }
         Command::Reach { target, listen } => {
             let home = home()?;
             let socket = node_cmd::agent_socket_path(&home, &Config::load(&home)?);
-            reach(&socket, &target, listen).await?;
+            let listener = tokio::net::TcpListener::bind(listen)
+                .await
+                .with_context(|| format!("listening on {listen}"))?;
+            eprintln!(
+                "carrying connections to {} to {target}; ctrl-c stops and resets what is open",
+                listener.local_addr()?
+            );
+            reach::run(&socket, &target, listener, async {
+                match signals::shutdown().await {
+                    Ok(why) => eprintln!("stopping ({why})"),
+                    Err(error) => eprintln!("menzil: cannot wait for a signal: {error}"),
+                }
+            })
+            .await?;
         }
         Command::Expose { .. } => not_implemented("expose"),
         Command::Proxy { .. } => not_implemented("proxy"),
         Command::Version => println!("menzil {}", env!("CARGO_PKG_VERSION")),
     }
     Ok(())
-}
-
-/// `menzil reach`: a local listener whose every connection is carried to `target` through the
-/// agent. A stream that ends in a reset resets the local connection (a TCP RST), so that a
-/// program reading it cannot take a truncated answer for a whole one.
-async fn reach(socket: &std::path::Path, target: &str, listen: SocketAddr) -> Result<()> {
-    use std::os::fd::AsFd;
-    use tokio::net::TcpListener;
-
-    let listener = TcpListener::bind(listen)
-        .await
-        .with_context(|| format!("listening on {listen}"))?;
-    eprintln!(
-        "carrying connections to {} to {target}; ctrl-c stops",
-        listener.local_addr()?
-    );
-    let slots = std::sync::Arc::new(tokio::sync::Semaphore::new(128));
-    loop {
-        let (connection, peer) = tokio::select! {
-            accepted = listener.accept() => accepted?,
-            _ = tokio::signal::ctrl_c() => return Ok(()),
-        };
-        let Ok(permit) = slots.clone().try_acquire_owned() else {
-            eprintln!("menzil: too many connections, refusing one from {peer}");
-            continue;
-        };
-        let (socket, target) = (socket.to_path_buf(), target.to_string());
-        tokio::spawn(async move {
-            // Kept to be able to make the connection end in a reset after the halves are gone.
-            let keep = connection.as_fd().try_clone_to_owned().ok();
-            let _ = connection.set_nodelay(true);
-            let (read, write) = connection.into_split();
-            match agent::connect_and_bridge(&socket, &target, read, write).await {
-                Ok(End::Clean) => {}
-                Ok(End::Reset(why)) => {
-                    eprintln!("menzil: a connection from {peer} was reset: {why}");
-                    if let Some(fd) = &keep {
-                        let _ =
-                            socket2::SockRef::from(fd).set_linger(Some(std::time::Duration::ZERO));
-                    }
-                }
-                Err(error) => eprintln!("menzil: {error:#}"),
-            }
-            drop(keep);
-            drop(permit);
-        });
-    }
 }
 
 /// Prints a one line "not implemented" message for `subcommand` to stderr,

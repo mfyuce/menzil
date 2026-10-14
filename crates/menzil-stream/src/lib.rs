@@ -84,7 +84,7 @@
 //!
 //! **The stream type** ([`Stream`]) wraps the vendored `yamux::Stream`
 //! (`vendor/yamux/PATCHES.md`, decision 0002) to close gaps the stock type
-//! had, found by the 2026-10-02 review, the L4h6b one and the L4i one: it
+//! had, found by two reviews (the L4h6b one of 2026-10-02 and the first one of the vendored `yamux`): it
 //! cannot force-reset a stream once either side has half-closed it, it
 //! reports a FIN, an RST and a lost connection alike as end of file, and
 //! dropping it after the peer's FIN answers with a FIN, a clean end. Here
@@ -113,5 +113,5 @@ pub use open::{
     initiate_open, respond_to_open,
 };
 pub use record_io::InboundGuard;
-pub use stream::Stream;
+pub use stream::{Stream, TornDown};
 pub use yamux::Mode;

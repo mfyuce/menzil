@@ -276,7 +276,7 @@ async fn a_connection_that_ends_after_the_peer_closed_is_still_a_clean_end() {
     assert_eq!(b.read(&mut [0u8; 4]).await.unwrap(), 0);
 }
 
-/// The L4i review's M2: dropping is an abort unless the stream was closed. The server here
+/// The first yamux review's M2: dropping is an abort unless the stream was closed. The server here
 /// reads a whole request (the client half-closed), writes half of its answer and goes away
 /// without calling anything: a panic, an early return, a cancelled future. Stock `yamux`
 /// answers the half close with a FIN, and the client reads 500 bytes as a whole reply.
@@ -334,7 +334,7 @@ async fn aborting_a_task_that_owns_a_stream_resets_it() {
     assert_eq!(read_reset(&mut a).await, b"");
 }
 
-/// The L4i review's L1: after a reset, flushing and closing fail like reading and writing do.
+/// The first yamux review's L1: after a reset, flushing and closing fail like reading and writing do.
 #[tokio::test]
 async fn flushing_and_closing_a_reset_stream_fail_as_a_reset() {
     let mut p = pair();

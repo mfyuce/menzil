@@ -63,7 +63,7 @@ const MAX_STREAMS: usize = 512;
 /// taking streams, so that streams the peer opens while refused ones are still waiting to be
 /// reset do not reach it at once. Counting handles instead was the first version and was wrong:
 /// 300 streams dropped with data queued, the uplink stalled, and the 213th open ended the
-/// session at 212 live handles (the L4i review, `tests/stream_limit.rs`).
+/// session at 212 live handles (the first yamux review, `tests/stream_limit.rs`).
 ///
 /// This bounds what honest traffic can do; a peer that opens streams faster than the uplink
 /// can write the resets of the ones refused still reaches 512, where the vendored `yamux`

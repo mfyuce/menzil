@@ -94,5 +94,9 @@ pub use outbound::{
 };
 pub use policy_store::PolicyStore;
 pub use roster_store::RosterStore;
-pub use serve::{DEFAULT_CONNECT_TIMEOUT, LocalServices, LocalTarget, ServeConfigError};
+pub use serve::{
+    DEFAULT_CONNECT_TIMEOUT, DEFAULT_MAX_CONNECTIONS, DEFAULT_MAX_CONNECTIONS_PER_PEER,
+    DEFAULT_SOCKET_BUFFER, LocalServices, LocalTarget, MAX_CONNECT_TIMEOUT, OpenedTarget,
+    ServeConfigError, ServeLimits,
+};
 pub use session::{Session, SessionConfig, SessionEvent, run_session};

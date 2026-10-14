@@ -106,7 +106,7 @@ impl ServiceHandler<Stream> for DecliningHandler {
     }
 
     fn handle(&self, _stream: Stream, _request: OpenRequest, _opened: ()) -> Self::Handling {
-        panic!("accepts() refused this request; handle() must never run")
+        panic!("open() refused this request; handle() must never run")
     }
 }
 
@@ -148,7 +148,7 @@ async fn an_allowed_open_is_acked_and_the_accepted_stream_still_works_as_a_byte_
 
     let responded = responder.await.unwrap().unwrap();
     let Responded::Accepted(handling) = responded else {
-        panic!("Allow + EchoHandler::accepts == Ok must be Accepted");
+        panic!("Allow + EchoHandler::open == Ok must be Accepted");
     };
     tokio::spawn(handling);
 

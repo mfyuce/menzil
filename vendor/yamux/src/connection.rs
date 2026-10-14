@@ -37,7 +37,7 @@ use std::collections::VecDeque;
 use std::task::{Context, Waker};
 use std::{fmt, sync::Arc, task::Poll};
 
-pub use stream::{Packet, State, Stream};
+pub use stream::{Packet, State, Stream, TornDown};
 
 /// Next connection identifier, used for debug logging.
 static NEXT_ID: AtomicU32 = AtomicU32::new(1);
@@ -631,6 +631,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Active<T> {
                 // stream had ended cleanly already.
                 if shared.update_state(self.id, stream_id, State::Closed) != State::Closed {
                     shared.reset_by_remote = true;
+                    shared.mark_torn_down();
                 }
                 if let Some(w) = shared.reader.take() {
                     w.wake()
@@ -739,6 +740,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Active<T> {
                 // menzil patch (patch 2): as in `on_data`.
                 if shared.update_state(self.id, stream_id, State::Closed) != State::Closed {
                     shared.reset_by_remote = true;
+                    shared.mark_torn_down();
                 }
                 if let Some(w) = shared.reader.take() {
                     w.wake()
@@ -945,8 +947,14 @@ impl<T> Active<T> {
             let mut shared = s.lock();
             // menzil patch (patch 2): a stream the remote had not closed with a FIN did not end
             // cleanly when the connection went away under it.
-            if shared.update_state(self.id, id, State::Closed).can_read() {
+            let previous = shared.update_state(self.id, id, State::Closed);
+            if previous.can_read() {
                 shared.reset_by_remote = true;
+            }
+            // menzil patch (patch 4): also a stream the remote had half-closed was torn down,
+            // its owner can no longer finish it.
+            if previous != State::Closed {
+                shared.mark_torn_down();
             }
             if let Some(w) = shared.reader.take() {
                 w.wake()

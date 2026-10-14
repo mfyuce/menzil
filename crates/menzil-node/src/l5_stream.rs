@@ -56,9 +56,9 @@
 //! arrives with no slot free is shed outright — a bare drop, denied even
 //! the chance to be read — rather than parked the way a bare
 //! `respond_to_open` loop with no bound at all would park every one of
-//! them (`menzil_stream::respond_to_open`'s own doc comment: up to
-//! yamux's 512-stream cap, after which this side's own next
-//! `StreamMux::open` ends the whole `Driver`). The initiator sees a shed
+//! them (`menzil_stream::respond_to_open`'s own doc comment: up to the
+//! connection's live stream limit, `MAX_LIVE_STREAMS`, after which this
+//! side's own next `StreamMux::open` fails with `StreamLimit`). The initiator sees a shed
 //! stream as a plain I/O error on its own exchange, indistinguishable
 //! from a session that simply died — a real, known limitation, not
 //! solved here (see the next paragraph for why).
@@ -313,11 +313,11 @@ impl<S, H: ServiceHandler<S> + Sync> ServiceHandler<S> for MemberServiceHandler<
 /// its OPEN_ACK has gone out — this function's own admission slot is
 /// released as soon as the exchange itself ends (accepted, refused,
 /// timed out, or errored), not held for that future's own lifetime,
-/// since an accepted stream's own resource pressure (yamux's stream cap,
-/// `menzil-stream`'s outbound budget) is a separate, not-yet-built
-/// concern (TODO.md's L4h5 line, amended 2026-10-06: nothing today
-/// bounds how many already-accepted streams stay alive at once) rather
-/// than something this function's own admission slot could cover.
+/// since an accepted stream's own resource pressure is a separate matter
+/// that this function's own admission slot could not cover: how many
+/// streams a session may hold is bounded by `menzil-stream`'s live stream
+/// limit (`MAX_LIVE_STREAMS`), and what each one holds on the node by its
+/// handler (for `LocalServices`, its connection limits).
 ///
 /// Takes the unique [`L4SessionAcceptor`] half of a session, not the
 /// cloneable [`L4SessionHandle`] — see this module's own doc comment.
@@ -626,46 +626,48 @@ mod tests {
         }
 
         fn handle(&self, _stream: Stream, _request: OpenRequest, _opened: ()) -> Self::Handling {
-            unreachable!("accepts always refuses, so handle is never called")
+            unreachable!("open always refuses, so handle is never called")
         }
     }
 
-    /// An [`Authorizer`] *and* [`ServiceHandler`] that both assert `meta`
-    /// has already been scrubbed to its default before they see a
-    /// request — combined into one type so one test exercises both
-    /// gates, after a 2026-10-06 red-team review found the previous
-    /// version of this test asserted only the `Authorizer` side, leaving
-    /// the identical scrub on the `ServiceHandler` side unverified.
-    struct MetaAssertingGate;
-    impl Authorizer for MetaAssertingGate {
+    /// An [`Authorizer`] *and* [`ServiceHandler`] that record the `meta` each of the three calls
+    /// (`authorize`, `open`, `handle`) saw, combined into one type so one test exercises every
+    /// gate. They record instead of asserting: `handle` runs on a task the exchange spawned,
+    /// where a panic goes unseen once the ack is out (a 2026-10-13 review found that an
+    /// unscrubbed `handle` survived the assertion version of this test).
+    #[derive(Clone, Default)]
+    struct MetaRecordingGate {
+        seen: Arc<std::sync::Mutex<Vec<(&'static str, OpenMeta)>>>,
+    }
+    impl MetaRecordingGate {
+        fn record(&self, stage: &'static str, request: &OpenRequest) {
+            self.seen
+                .lock()
+                .unwrap()
+                .push((stage, request.meta.clone()));
+        }
+
+        fn seen(&self) -> Vec<(&'static str, OpenMeta)> {
+            self.seen.lock().unwrap().clone()
+        }
+    }
+    impl Authorizer for MetaRecordingGate {
         fn authorize(&self, request: &OpenRequest) -> OpenDecision {
-            assert_eq!(
-                request.meta,
-                OpenMeta::default(),
-                "accept_loop must scrub a member-sent meta before the Authorizer sees it"
-            );
+            self.record("authorize", request);
             OpenDecision::Allow
         }
     }
-    impl ServiceHandler<Stream> for MetaAssertingGate {
+    impl ServiceHandler<Stream> for MetaRecordingGate {
         type Opened = ();
         type Handling = std::future::Ready<()>;
 
         async fn open(&self, request: &OpenRequest) -> Result<(), OpenRefusal> {
-            assert_eq!(
-                request.meta,
-                OpenMeta::default(),
-                "accept_loop must scrub a member-sent meta before ServiceHandler::accepts sees it"
-            );
+            self.record("open", request);
             Ok(())
         }
 
         fn handle(&self, _stream: Stream, request: OpenRequest, _opened: ()) -> Self::Handling {
-            assert_eq!(
-                request.meta,
-                OpenMeta::default(),
-                "accept_loop must scrub a member-sent meta before ServiceHandler::handle sees it"
-            );
+            self.record("handle", &request);
             std::future::ready(())
         }
     }
@@ -797,7 +799,7 @@ mod tests {
                 _request: OpenRequest,
                 _opened: (),
             ) -> Self::Handling {
-                unreachable!("accepts always refuses, so handle is never called")
+                unreachable!("open always refuses, so handle is never called")
             }
         }
 
@@ -854,7 +856,7 @@ mod tests {
                 _request: OpenRequest,
                 _opened: (),
             ) -> Self::Handling {
-                unreachable!("accepts always refuses, so handle is never called")
+                unreachable!("open always refuses, so handle is never called")
             }
         }
 
@@ -949,9 +951,13 @@ mod tests {
             _a_epoch_ended_tx,
             _b_epoch_ended_tx,
         } = two_sessions();
-        let accept_task = tokio::spawn(async move {
-            accept_loop(&mut b, MetaAssertingGate, MetaAssertingGate).await;
-        });
+        let gate = MetaRecordingGate::default();
+        let accept_task = {
+            let gate = gate.clone();
+            tokio::spawn(async move {
+                accept_loop(&mut b, gate.clone(), gate).await;
+            })
+        };
 
         let mut stream = a.open_stream().await.unwrap();
         let crafted = OpenBody {
@@ -969,11 +975,26 @@ mod tests {
         let ack = tokio::time::timeout(Duration::from_secs(5), read_ack(&mut stream))
             .await
             .expect("no OPEN_ACK arrived");
-        // If `MetaAssertingGate::authorize`/`accepts`/`handle` had seen
-        // the crafted, non-default `meta` above, it would have panicked
-        // inside the spawned `accept_task` instead of ever reaching this
-        // ack.
         assert!(ack.ok);
+        // `handle` is called on a task of the exchange, around the time the ack goes out.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while gate.seen().len() < 3 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the three gates must all have run");
+        let mut seen = gate.seen();
+        seen.sort_by_key(|(stage, _)| *stage);
+        assert_eq!(
+            seen,
+            vec![
+                ("authorize", OpenMeta::default()),
+                ("handle", OpenMeta::default()),
+                ("open", OpenMeta::default()),
+            ],
+            "a member-sent meta must be scrubbed before every one of them sees it"
+        );
         accept_task.abort();
     }
 

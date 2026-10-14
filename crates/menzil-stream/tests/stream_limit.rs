@@ -1,5 +1,5 @@
 //! A connection stays clear of `yamux`'s 512-stream cap (TODO.md L4h5's stream-count note, the
-//! L4i review's finding M1).
+//! first yamux review's finding M1).
 //!
 //! Stock `yamux` ends a session when a local open meets its cap, and answers a peer's stream
 //! past the cap with a GoAway, which ends the session for the peer. This crate stops at
@@ -159,7 +159,7 @@ async fn an_open_at_the_limit_fails_alone_and_works_again_after_a_drop() {
     assert!(!a.driver.is_finished() && !b.driver.is_finished());
 }
 
-/// The L4i review's M1, local half. B's uplink stalls, B writes a response on 300 streams and
+/// The first yamux review's M1, local half. B's uplink stalls, B writes a response on 300 streams and
 /// drops them: no handle is alive, but `yamux` keeps all 300 until it can write their frames.
 /// Opening more must hit the limit, not `yamux`'s cap.
 #[tokio::test]
@@ -219,7 +219,7 @@ async fn lingering_streams_count_against_the_limit() {
     assert!(!a.driver.is_finished() && !b.driver.is_finished());
 }
 
-/// The L4i review's M1, peer half: A (an honest peer) has 300 streams to B, B answers on each
+/// The first yamux review's M1, peer half: A (an honest peer) has 300 streams to B, B answers on each
 /// while its uplink is stalled and drops them, A gives up and opens 250 more. B's table cannot
 /// take them all; what it cannot take is refused with an RST and the session survives, where
 /// stock `yamux` answered with a GoAway that ended it.

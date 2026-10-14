@@ -16,11 +16,13 @@ use menzil_admin::{Documents, NodeKeys, OwnerKey};
 use menzil_proto::{
     Grant, NetworkId, NodeCert, NodeId, NodeOrWildcard, Principal, PrincipalTarget, ServiceId,
 };
+use zeroize::Zeroizing;
 
 use crate::home::{Home, parse_hex32};
+use crate::text;
 use crate::token::{
     decode_documents, decode_join_request, documents_from_bytes, documents_to_bytes,
-    encode_documents, encode_join_request,
+    encode_documents, encode_join_request, encode_roster,
 };
 
 /// Seconds in a day.
@@ -55,13 +57,12 @@ pub fn init(home: &Home, now: u64) -> Result<InitOutcome> {
         );
     }
     let keys = NodeKeys::generate();
-    let cert = keys.issue_cert(
-        1,
-        now.saturating_sub(CERT_BACKDATE_SECS),
-        now.saturating_add(CERT_LIFETIME_SECS),
-    )?;
+    // The window is counted from its start: 400 days from `not_before`, the most protocol.md 2.2
+    // allows, which is a few minutes short of 400 days from now.
+    let not_before = now.saturating_sub(CERT_BACKDATE_SECS);
+    let cert = keys.issue_cert(1, not_before, not_before.saturating_add(CERT_LIFETIME_SECS))?;
     home.write_public(&home.identity_cert_path(), &cert.encode())?;
-    home.write_secret(&key_path, &keys.secret_bytes())?;
+    home.write_secret(&key_path, &Zeroizing::new(keys.secret_bytes())[..])?;
     Ok(InitOutcome {
         node_id: keys.node_id(),
         join_request: encode_join_request(&cert),
@@ -72,12 +73,12 @@ pub fn init(home: &Home, now: u64) -> Result<InitOutcome> {
 pub fn load_identity(home: &Home) -> Result<(NodeKeys, NodeCert)> {
     let key_path = home.identity_key_path();
     let cert_path = home.identity_cert_path();
-    let secret = fs::read(&key_path).with_context(|| {
+    let secret = Zeroizing::new(fs::read(&key_path).with_context(|| {
         format!(
             "reading {}: this device has no identity yet, run `menzil init`",
             key_path.display()
         )
-    })?;
+    })?);
     let keys = NodeKeys::from_secret_bytes(&secret)
         .with_context(|| format!("{} is damaged", key_path.display()))?;
     let cert_bytes =
@@ -113,7 +114,10 @@ pub fn network_create(home: &Home, device_name: &str, now: u64) -> Result<Networ
     let owner = OwnerKey::generate();
     let docs = menzil_admin::create_network(&owner, &cert, device_name, now)?;
     let network_id = owner.network_id();
-    home.write_secret(&home.owner_key_path(&network_id), &owner.secret_bytes())?;
+    home.write_secret(
+        &home.owner_key_path(&network_id),
+        &Zeroizing::new(owner.secret_bytes())[..],
+    )?;
     save_documents(home, &docs)?;
     Ok(network_id)
 }
@@ -166,9 +170,10 @@ pub fn load_documents(home: &Home, network_id: &NetworkId) -> Result<Documents> 
     Ok(docs)
 }
 
-/// Keeps `docs` as this device's current documents for their network.
+/// Keeps `docs` as this device's current documents for their network, readable by this user
+/// only: the Policy says who may use what and names every device.
 pub fn save_documents(home: &Home, docs: &Documents) -> Result<()> {
-    home.write_public(
+    home.write_secret(
         &home.documents_path(&docs.network_id()),
         &documents_to_bytes(docs.roster(), docs.policy()),
     )
@@ -177,12 +182,12 @@ pub fn save_documents(home: &Home, docs: &Documents) -> Result<()> {
 /// The owner key of a network, if this device owns it.
 pub fn load_owner(home: &Home, network_id: &NetworkId) -> Result<OwnerKey> {
     let path = home.owner_key_path(network_id);
-    let secret = fs::read(&path).with_context(|| {
+    let secret = Zeroizing::new(fs::read(&path).with_context(|| {
         format!(
             "this device does not own network {network_id} ({} is missing)",
             path.display()
         )
-    })?;
+    })?);
     let owner = OwnerKey::from_secret_bytes(&secret)
         .with_context(|| format!("{} is damaged", path.display()))?;
     if owner.network_id() != *network_id {
@@ -225,6 +230,8 @@ pub fn admit(
     now: u64,
 ) -> Result<Issued> {
     let network_id = resolve_network(home, network)?;
+    // Held from reading the documents to writing the next ones.
+    let _lock = home.lock_network(&network_id)?;
     let owner = load_owner(home, &network_id)?;
     let current = load_documents(home, &network_id)?;
     let cert = decode_join_request(join_request)?;
@@ -273,6 +280,7 @@ pub fn grant(
     now: u64,
 ) -> Result<Issued> {
     let network_id = resolve_network(home, network)?;
+    let _lock = home.lock_network(&network_id)?;
     let owner = load_owner(home, &network_id)?;
     let current = load_documents(home, &network_id)?;
     let from = match from.strip_prefix("role:") {
@@ -302,6 +310,7 @@ pub fn grant(
 /// needs at least every 14 days (protocol.md 7.3).
 pub fn renew(home: &Home, network: Option<&str>, now: u64) -> Result<Issued> {
     let network_id = resolve_network(home, network)?;
+    let _lock = home.lock_network(&network_id)?;
     let owner = load_owner(home, &network_id)?;
     let next = menzil_admin::renew(&owner, &load_documents(home, &network_id)?, now)?;
     save_documents(home, &next)?;
@@ -312,6 +321,13 @@ pub fn renew(home: &Home, network: Option<&str>, now: u64) -> Result<Issued> {
 pub fn token(home: &Home, network: Option<&str>) -> Result<String> {
     let docs = load_documents(home, &resolve_network(home, network)?)?;
     Ok(encode_documents(docs.roster(), docs.policy()))
+}
+
+/// The token for a relay: the Roster of the documents this device holds now, without the Policy
+/// (threat-model.md: hidden from relays).
+pub fn token_for_relay(home: &Home, network: Option<&str>) -> Result<String> {
+    let docs = load_documents(home, &resolve_network(home, network)?)?;
+    Ok(encode_roster(docs.roster()))
 }
 
 /// What [`join`] did.
@@ -366,6 +382,27 @@ pub fn join(home: &Home, token: &str, now: u64) -> Result<Joined> {
     if !docs.is_member(&me) || !policy.members.iter().any(|m| m.node_id == me) {
         bail!("node {me} is not a member in these documents: they were made for another device");
     }
+    // Whoever signed them, a name is typed in an address and printed on a terminal, and a role
+    // in a grant: hold them to the rules an owner using `menzil admit` is held to. A name that
+    // reads as the start of a node id would also take the address of the node it imitates.
+    for member in &policy.members {
+        menzil_admin::check_name(&member.name).with_context(|| {
+            format!(
+                "these documents name a member {:?} that this tool would not have issued",
+                text::escaped(&member.name)
+            )
+        })?;
+        for role in &member.roles {
+            menzil_admin::check_role(role).with_context(|| {
+                format!(
+                    "these documents give {:?} a role {:?} that this tool would not have issued",
+                    text::escaped(&member.name),
+                    text::escaped(role)
+                )
+            })?;
+        }
+    }
+    let _lock = home.lock_network(&network_id)?;
     match load_documents(home, &network_id) {
         Ok(held) if held.seq() >= docs.seq() => Ok(Joined::AlreadyCurrent {
             network_id,
@@ -514,7 +551,8 @@ impl Status {
         let mut out = String::new();
         match (&self.node_id, self.cert_expires) {
             (Some(id), Some(expires)) => out.push_str(&format!(
-                "this device: {id}\n  certificate expires {}\n",
+                "this device: {id}\n  certificate {} {}\n",
+                if expires <= now { "EXPIRED" } else { "expires" },
                 relative(expires, now)
             )),
             (Some(id), None) => out.push_str(&format!("this device: {id}\n")),
@@ -534,7 +572,7 @@ impl Status {
                 }
             ));
             if let Some(problem) = &network.problem {
-                out.push_str(&format!("  cannot be read: {problem}\n"));
+                out.push_str(&format!("  cannot be read: {}\n", text::escaped(problem)));
                 continue;
             }
             let state = if network.expires <= now {
@@ -550,15 +588,25 @@ impl Status {
                 if network.grants == 1 { "" } else { "s" }
             ));
             for member in &network.members {
+                // Names and roles were signed by the owner, whose tool would not have issued
+                // anything but plain words; a hand made Policy could carry a terminal escape.
                 out.push_str(&format!(
                     "  {}{}  {}{}\n",
-                    member.name,
+                    text::escaped(&member.name),
                     if member.is_self { " (this device)" } else { "" },
                     member.node_id,
                     if member.roles.is_empty() {
                         String::new()
                     } else {
-                        format!("  roles: {}", member.roles.join(", "))
+                        format!(
+                            "  roles: {}",
+                            member
+                                .roles
+                                .iter()
+                                .map(|role| text::escaped(role))
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        )
                     }
                 ));
             }

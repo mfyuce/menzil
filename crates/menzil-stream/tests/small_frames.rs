@@ -9,7 +9,7 @@
 //! vendored `yamux` appends short bodies to the previous chunk instead.
 //!
 //! Three more cases run in the same test: a reader that keeps pace must not make a chunk grow
-//! without bound (the L4i review found that a comparison of the unread length with the cap
+//! without bound (the first yamux review found that a comparison of the unread length with the cap
 //! survived every test, because nothing read while frames arrived), and frames alternating a
 //! 1 KiB body with a one byte body, the pattern that costs most (about twice the payload: the
 //! one byte append doubles the capacity of the exact-fit 1 KiB body), must stay within 2.5

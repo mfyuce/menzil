@@ -6,7 +6,7 @@ use menzil_proto::{
     PolicyBody, PolicyMember, PrincipalTarget, Roster, RosterBody, RosterMember,
 };
 
-use crate::{AdminError, OwnerKey};
+use crate::{AdminError, MAX_CERT_LIFETIME_SECS, OwnerKey};
 
 /// How long a Roster or Policy lives: protocol.md 2.3 allows at most 14 days
 /// after `issued`, and a network whose documents are not re-issued before
@@ -98,18 +98,8 @@ impl Documents {
     ) -> Result<Self, AdminError> {
         let roster = Roster::sign(owner.signing_key(), &roster_body)?;
         let policy = Policy::sign(owner.signing_key(), &policy_body)?;
-        for (what, len) in [
-            ("Roster", roster.encode().len()),
-            ("Policy", policy.encode().len()),
-        ] {
-            if len > MAX_DOC_BYTES {
-                return Err(AdminError::TooLarge {
-                    what,
-                    len,
-                    max: MAX_DOC_BYTES,
-                });
-            }
-        }
+        check_size("Roster", roster.encode().len())?;
+        check_size("Policy", policy.encode().len())?;
         Ok(Self {
             roster,
             policy,
@@ -146,8 +136,21 @@ impl Documents {
     }
 }
 
+/// A document of `len` encoded bytes must not be larger than every verifier accepts.
+fn check_size(what: &'static str, len: usize) -> Result<(), AdminError> {
+    if len > MAX_DOC_BYTES {
+        return Err(AdminError::TooLarge {
+            what,
+            len,
+            max: MAX_DOC_BYTES,
+        });
+    }
+    Ok(())
+}
+
 /// A joining certificate checked the way an issuer must: it verifies against
-/// the NodeId it names and is valid at `now`.
+/// the NodeId it names, is valid at `now`, and is not valid for longer than 400 days
+/// (protocol.md 2.2; no verifier enforces that).
 fn checked_cert(cert: &NodeCert, now: u64) -> Result<menzil_proto::NodeCertBody, AdminError> {
     let body = cert.decode()?;
     let key = VerifyingKey::from_bytes(&<[u8; 32]>::from(body.node_id))
@@ -157,24 +160,48 @@ fn checked_cert(cert: &NodeCert, now: u64) -> Result<menzil_proto::NodeCertBody,
     if !body.is_valid_at(now) {
         return Err(AdminError::CertNotValidNow);
     }
+    if body.not_after.saturating_sub(body.not_before) > MAX_CERT_LIFETIME_SECS {
+        return Err(AdminError::CertLifetimeTooLong);
+    }
     Ok(body)
 }
 
 /// A member name heads an address (`name/service`) and shows up in logs and on a terminal, so it
-/// is letters, digits, `-`, `_` and `.` only: no `/`, no whitespace, nothing a terminal treats
-/// as a control, and none of the invisible format characters (a right to left override, a zero
-/// width space) that make two names look alike. Letters are not limited to ASCII.
-fn checked_name(name: &str) -> Result<(), AdminError> {
-    let usable = !name.is_empty()
-        && name.len() <= MAX_NAME_BYTES
-        && name
-            .chars()
-            .all(|c| c.is_alphanumeric() || matches!(c, '-' | '_' | '.'));
-    if usable {
+/// is letters, digits, `-`, `_` and `.` only, and starts with a letter or a digit (so it is
+/// never `.` or `..`): no `/`, no whitespace, nothing a terminal treats as a control, and none
+/// of the invisible format characters (a right to left override, a zero width space) that make
+/// two names look alike. Letters are not limited to ASCII.
+///
+/// Public because a device that is handed documents it did not issue has to hold them to the
+/// same rule (`menzil join`): names reach terminals and addresses whoever chose them.
+pub fn check_name(name: &str) -> Result<(), AdminError> {
+    if !usable_word(name) {
+        return Err(AdminError::BadName(name.to_string()));
+    }
+    // `1a2b3c4d` is a name or the start of a node id, and an address cannot tell which.
+    if name.len() >= 8 && name.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(AdminError::NameLooksLikeNodeId(name.to_string()));
+    }
+    Ok(())
+}
+
+/// A role is held to the same characters as a name (it is typed in `role:<role>` and printed),
+/// without the rule about node ids.
+pub fn check_role(role: &str) -> Result<(), AdminError> {
+    if usable_word(role) {
         Ok(())
     } else {
-        Err(AdminError::BadName(name.to_string()))
+        Err(AdminError::BadRole(role.to_string()))
     }
+}
+
+fn usable_word(word: &str) -> bool {
+    !word.is_empty()
+        && word.len() <= MAX_NAME_BYTES
+        && word.chars().next().is_some_and(char::is_alphanumeric)
+        && word
+            .chars()
+            .all(|c| c.is_alphanumeric() || matches!(c, '-' | '_' | '.'))
 }
 
 /// Starts a network: seq 1, with `founder` (the owner's own device, in
@@ -187,7 +214,7 @@ pub fn create_network(
     now: u64,
 ) -> Result<Documents, AdminError> {
     let cert = checked_cert(founder, now)?;
-    checked_name(name)?;
+    check_name(name)?;
     let network_id = owner.network_id();
     let expires = now.saturating_add(DOCUMENT_LIFETIME_SECS);
     let roster = RosterBody {
@@ -237,15 +264,28 @@ pub fn admit(
     now: u64,
 ) -> Result<Documents, AdminError> {
     let cert = checked_cert(member, now)?;
-    checked_name(name)?;
+    check_name(name)?;
+    for role in roles {
+        check_role(role)?;
+    }
     if current.is_member(&cert.node_id) {
         return Err(AdminError::AlreadyMember(cert.node_id));
     }
     if current
+        .roster_body()
+        .revoked
+        .iter()
+        .any(|revoked| revoked.node_id == cert.node_id)
+    {
+        return Err(AdminError::Revoked(cert.node_id));
+    }
+    // "Laptop" and "laptop" are two names to a computer and one to a person typing an address.
+    let wanted = name.to_lowercase();
+    if current
         .policy_body()
         .members
         .iter()
-        .any(|existing| existing.name == name)
+        .any(|existing| existing.name.to_lowercase() == wanted)
     {
         return Err(AdminError::NameTaken(name.to_string()));
     }

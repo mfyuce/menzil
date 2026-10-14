@@ -16,8 +16,9 @@
 //!   the clock is a parameter.
 //!
 //! What is checked here is what the issuer is responsible for and the types
-//! do not enforce: a joining certificate must verify against its own NodeId
-//! and be valid now, names must be unique and usable as the first part of a
+//! do not enforce: a joining certificate must verify against its own NodeId,
+//! be valid now and not for longer than 400 days, a revoked node is not admitted again,
+//! names must be unique (letter case aside) and usable as the first part of a
 //! `name/service` address, a grant must name members, a document must fit
 //! the size every verifier accepts, and its lifetime is at most 14 days.
 
@@ -28,5 +29,7 @@ mod issue;
 mod keys;
 
 pub use error::AdminError;
-pub use issue::{DOCUMENT_LIFETIME_SECS, Documents, admit, create_network, grant, renew};
-pub use keys::{NodeKeys, OwnerKey};
+pub use issue::{
+    DOCUMENT_LIFETIME_SECS, Documents, admit, check_name, check_role, create_network, grant, renew,
+};
+pub use keys::{MAX_CERT_LIFETIME_SECS, NodeKeys, OwnerKey};

@@ -1,6 +1,8 @@
 //! The agent's local socket: how `menzil stdio` and `menzil reach` get a stream through the node
-//! that holds the sessions (protocol.md 12). One Unix domain socket, mode 0600 in a directory
-//! only the user can enter, so any process of the same user may use it and nobody else.
+//! that holds the sessions (protocol.md 12). One Unix domain socket, mode 0600, and each side
+//! checks who is on the other end (the peer's uid must be its own: [`current_uid`]), so any
+//! process of the same user may use it and nobody else, also where the socket sits in a
+//! directory other users can enter.
 //!
 //! The protocol is one request and then frames:
 //!
@@ -19,6 +21,11 @@
 //! finished or died. A direction that ends without an end or reset frame is a program that
 //! died, and the agent resets the stream. What the stream's peer sends is delivered to the
 //! client in order, and its FIN becomes an end frame, its RST a reset frame.
+//!
+//! The client carries both directions to their ends, as TCP does: the peer's end frame closes
+//! the client's `output` (so the program reading it sees end of file) and the client goes on
+//! forwarding `input` until that ends too; only a reset, or the agent going away, stops it at
+//! once. A peer that finished first and still reads is not cut off.
 
 use std::future::Future;
 use std::io;
@@ -33,6 +40,8 @@ use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWrite
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::Semaphore;
 use tokio::time::timeout;
+
+use crate::text;
 
 /// The longest request line, newline included.
 pub const MAX_REQUEST_BYTES: usize = 512;
@@ -87,13 +96,18 @@ pub fn parse_request(line: &str) -> Result<&str, String> {
     Ok(target)
 }
 
-/// Single line, printable: what goes back to a client after `error `.
+/// Single line, printable: what goes back to a client after `error `, and what a client shows
+/// of what the agent sent (see [`text::one_line`]).
 fn one_line(message: &str) -> String {
-    message
-        .chars()
-        .map(|c| if c.is_control() { ' ' } else { c })
-        .take(300)
-        .collect()
+    text::one_line(message, 300)
+}
+
+/// The uid this process runs as, found without unsafe code: the peer of a connected socket pair
+/// is this process. Each side of the agent socket compares it with the uid of whoever is on the
+/// other end.
+pub async fn current_uid() -> io::Result<u32> {
+    let (here, _there) = UnixStream::pair()?;
+    Ok(here.peer_cred()?.uid())
 }
 
 async fn write_frame<W: AsyncWrite + Unpin>(
@@ -158,8 +172,18 @@ async fn read_line<R: AsyncBufReadExt + Unpin>(
     }
 }
 
-/// Serves the agent socket until the task is dropped.
+/// Serves the agent socket until the task is dropped, to processes of this user only.
 pub async fn serve<O: Opener>(listener: UnixListener, opener: Arc<O>) {
+    match current_uid().await {
+        Ok(uid) => serve_user(listener, opener, uid).await,
+        Err(error) => {
+            tracing::error!(%error, "the agent cannot tell which user it runs as, so it serves nobody");
+        }
+    }
+}
+
+/// [`serve`] for the processes of `uid`: a connection from another user is closed unanswered.
+async fn serve_user<O: Opener>(listener: UnixListener, opener: Arc<O>, uid: u32) {
     let slots = Arc::new(Semaphore::new(MAX_CONNECTIONS));
     loop {
         let (connection, _) = match listener.accept().await {
@@ -170,6 +194,20 @@ pub async fn serve<O: Opener>(listener: UnixListener, opener: Arc<O>) {
                 continue;
             }
         };
+        match connection.peer_cred() {
+            Ok(peer) if peer.uid() == uid => {}
+            Ok(peer) => {
+                tracing::warn!(
+                    peer_uid = peer.uid(),
+                    "a process of another user connected to the agent socket, closing it"
+                );
+                continue;
+            }
+            Err(error) => {
+                tracing::warn!(%error, "could not tell who connected to the agent socket, closing it");
+                continue;
+            }
+        }
         let Ok(permit) = slots.clone().try_acquire_owned() else {
             tracing::warn!("the agent has {MAX_CONNECTIONS} connections already, refusing one");
             drop(connection);
@@ -293,16 +331,39 @@ fn request_line(target: &str) -> String {
 }
 
 /// The client side: asks the agent at `socket` for a stream to `target`, then carries `input`
-/// to it and its bytes to `output` until it ends. `input` reaching end of file half-closes the
-/// stream; the call returns when the stream ends, whether or not `input` is still open.
+/// to it and its bytes to `output`, both directions to their end (see the module documentation):
+/// the stream's end closes `output`, `input` reaching end of file half-closes the stream, and the
+/// call returns when both have happened. A reset, or an agent that goes away, ends it at once as
+/// [`End::Reset`]. The caller keeps `input` and `output`, so that it can end them the way the
+/// outcome calls for (a TCP connection reset on [`End::Reset`], not closed).
+///
+/// Refuses a socket that another user serves, and shows nothing the agent sends unescaped.
 pub async fn connect_and_bridge<R, W>(
     socket: &Path,
     target: &str,
-    mut input: R,
-    mut output: W,
+    input: &mut R,
+    output: &mut W,
 ) -> Result<End>
 where
-    R: AsyncRead + Unpin + Send + 'static,
+    R: AsyncRead + Unpin + Send,
+    W: AsyncWrite + Unpin + Send,
+{
+    let uid = current_uid()
+        .await
+        .context("finding out which user this is")?;
+    bridge_as(socket, target, input, output, uid).await
+}
+
+/// [`connect_and_bridge`] for a client that expects the agent to run as `uid`.
+async fn bridge_as<R, W>(
+    socket: &Path,
+    target: &str,
+    input: &mut R,
+    output: &mut W,
+    uid: u32,
+) -> Result<End>
+where
+    R: AsyncRead + Unpin + Send,
     W: AsyncWrite + Unpin + Send,
 {
     crate::node_cmd::check_socket_path_length(socket)?;
@@ -312,6 +373,16 @@ where
             socket.display()
         )
     })?;
+    let served_by = connection
+        .peer_cred()
+        .context("asking who runs the agent")?
+        .uid();
+    if served_by != uid {
+        bail!(
+            "the socket {} is served by another user (uid {served_by}, this is uid {uid}); nothing was sent to it",
+            socket.display()
+        );
+    }
     let (read, mut write) = connection.into_split();
     let mut read = BufReader::new(read);
     write.write_all(request_line(target).as_bytes()).await?;
@@ -325,42 +396,74 @@ where
     match reply.trim_end() {
         "ok" => {}
         other => match other.strip_prefix("error ") {
-            Some(message) => bail!("{message}"),
+            Some(message) => bail!("{}", one_line(message)),
             None => bail!("the agent answered something this client does not understand"),
         },
     }
 
-    // The input runs on its own task: when the stream ends the call returns at once, even if
-    // the program feeding `input` has not closed it.
-    let up = tokio::spawn(async move {
+    // Both directions run as futures of this call, each from where it is: neither is ever
+    // dropped half way through a frame, which would leave the other end out of step.
+    let up = async {
         let mut buffer = vec![0u8; COPY_BUFFER];
         loop {
             match input.read(&mut buffer).await {
                 Ok(0) => {
-                    let _ = write_frame(&mut write, FRAME_END, &[]).await;
-                    return;
+                    return match write_frame(&mut write, FRAME_END, &[]).await {
+                        Ok(()) => Up::Finished,
+                        Err(_) => Up::AgentGone,
+                    };
                 }
                 Ok(n) => {
                     if write_frame(&mut write, FRAME_DATA, &buffer[..n])
                         .await
                         .is_err()
                     {
-                        return;
+                        return Up::AgentGone;
                     }
                 }
                 Err(error) => {
                     let message = one_line(&error.to_string());
                     let _ = write_frame(&mut write, FRAME_RESET, message.as_bytes()).await;
-                    return;
+                    return Up::InputFailed(message);
                 }
             }
         }
-    });
-    let end = read_frames(&mut read, &mut output).await;
-    up.abort();
-    end
+    };
+    let down = read_frames(&mut read, output);
+    tokio::pin!(up, down);
+    let (mut up_done, mut down_done) = (false, false);
+    loop {
+        tokio::select! {
+            outcome = &mut up, if !up_done => match outcome {
+                Up::Finished => up_done = true,
+                Up::AgentGone => return Ok(End::Reset("the agent went away".to_string())),
+                Up::InputFailed(why) => {
+                    return Ok(End::Reset(format!("reading the input failed: {why}")));
+                }
+            },
+            end = &mut down, if !down_done => match end? {
+                End::Clean => down_done = true,
+                reset => return Ok(reset),
+            },
+        }
+        if up_done && down_done {
+            return Ok(End::Clean);
+        }
+    }
 }
 
+/// How the input side of [`connect_and_bridge`] ended.
+enum Up {
+    /// The input reached end of file and the end frame went out.
+    Finished,
+    /// The agent's connection could not be written to.
+    AgentGone,
+    /// Reading the input failed; the agent was told to reset the stream.
+    InputFailed(String),
+}
+
+/// The agent's frames to `output` until the stream's end: a clean one shuts `output` down (the
+/// program reading it sees end of file), a reset or a broken connection is [`End::Reset`].
 async fn read_frames<R, W>(read: &mut R, output: &mut W) -> Result<End>
 where
     R: AsyncRead + Unpin,
@@ -370,7 +473,12 @@ where
     loop {
         let kind = match read_frame(read, &mut payload).await {
             Ok(kind) => kind,
-            Err(error) => return Ok(End::Reset(format!("the agent went away: {error}"))),
+            Err(error) => {
+                return Ok(End::Reset(format!(
+                    "the agent went away: {}",
+                    one_line(&error.to_string())
+                )));
+            }
         };
         match kind {
             FRAME_DATA => {
@@ -379,11 +487,13 @@ where
             }
             FRAME_END => {
                 output.flush().await?;
+                // Best effort: a program that has gone away cannot be told anything.
+                let _ = output.shutdown().await;
                 return Ok(End::Clean);
             }
             FRAME_RESET => {
                 output.flush().await?;
-                return Ok(End::Reset(String::from_utf8_lossy(&payload).into_owned()));
+                return Ok(End::Reset(one_line(&String::from_utf8_lossy(&payload))));
             }
             _ => {
                 return Ok(End::Reset(

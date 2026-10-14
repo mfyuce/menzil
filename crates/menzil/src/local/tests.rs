@@ -63,17 +63,36 @@ fn init_makes_an_identity_once() {
     assert_eq!(load_identity(&home).unwrap().0.node_id(), first.node_id);
 }
 
+/// The third red-team round, L4: the home and its directories were created with the umask's
+/// 0775 or 0755 and `documents.bin` was 0644, so any other user of the machine could read the
+/// Policy (who may use what, every device's name).
 #[cfg(unix)]
 #[test]
-fn secrets_are_private_and_documents_are_not() {
+fn keys_and_documents_are_private_and_so_are_the_directories_they_are_in() {
     use std::os::unix::fs::PermissionsExt;
     let two = two_devices();
+    // The member joins, so that it holds documents too.
+    let issued = admit(&two.owner, None, &two.join_request, "phone", &[], NOW).unwrap();
+    join(&two.member, &issued.token, NOW).unwrap();
     let mode = |p: &std::path::Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
-    assert_eq!(mode(&two.owner.identity_key_path()), 0o600);
+    for home in [&two.owner, &two.member] {
+        assert_eq!(mode(&home.identity_key_path()), 0o600);
+        assert_eq!(mode(&home.documents_path(&two.network_id)), 0o600);
+        // The certificate is the one public file (what the umask leaves of 0644).
+        assert_eq!(mode(&home.identity_cert_path()) & 0o022, 0);
+        for dir in [
+            home.root().to_path_buf(),
+            home.root().join("networks"),
+            home.network_dir(&two.network_id),
+        ] {
+            assert_eq!(mode(&dir) & 0o077, 0, "{} is open to others", dir.display());
+        }
+    }
     assert_eq!(mode(&two.owner.owner_key_path(&two.network_id)), 0o600);
     assert_eq!(
-        mode(&two.owner.documents_path(&two.network_id)) & 0o077,
-        0o044 & 0o077
+        mode(&two.owner.root().join("owner")) & 0o077,
+        0,
+        "the owner key's directory is open to others"
     );
 }
 
@@ -476,4 +495,209 @@ fn an_owner_key_file_of_another_network_is_not_used() {
     assert_eq!(load_documents(&home, &first).unwrap().seq(), 1);
     // The other one is untouched.
     assert_eq!(renew(&home, Some(&second.to_hex()), NOW).unwrap().seq, 2);
+}
+
+/// The third red-team round, M5: two owner commands at the same moment each read the same
+/// documents, issued the same `seq` with different contents and reported success; one change was
+/// lost and the documents forked. Under the lock every command gets its own number and none is
+/// lost.
+#[test]
+fn owner_commands_at_the_same_moment_each_get_their_own_number_and_none_is_lost() {
+    const COMMANDS: usize = 8;
+    const ROUNDS: usize = 5;
+    let two = two_devices();
+    let issued = admit(&two.owner, None, &two.join_request, "phone", &[], NOW).unwrap();
+    join(&two.member, &issued.token, NOW).unwrap();
+    let mut expected_grants = 0;
+    let mut seq = issued.seq;
+    for round in 0..ROUNDS {
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(COMMANDS));
+        let threads: Vec<_> = (0..COMMANDS)
+            .map(|command| {
+                let (home, barrier) = (two.owner.clone(), barrier.clone());
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    let service = format!("tcp:r{round}c{command}").parse().unwrap();
+                    grant(&home, None, "phone", "laptop", &[service], None, NOW)
+                })
+            })
+            .collect();
+        let mut numbers: Vec<u64> = threads
+            .into_iter()
+            .map(|t| {
+                t.join()
+                    .unwrap()
+                    .expect("a command waits its turn, it does not fail")
+                    .seq
+            })
+            .collect();
+        numbers.sort_unstable();
+        assert_eq!(
+            numbers,
+            (seq + 1..=seq + COMMANDS as u64).collect::<Vec<_>>(),
+            "round {round}: every command got its own number"
+        );
+        seq += COMMANDS as u64;
+        expected_grants += COMMANDS;
+    }
+    let docs = load_documents(&two.owner, &two.network_id).unwrap();
+    assert_eq!(docs.seq(), seq);
+    assert_eq!(
+        docs.policy_body().grants.len(),
+        expected_grants,
+        "no change was lost"
+    );
+}
+
+/// A Policy signed by the owner's key but made by hand: the way a name or a role nobody's tool
+/// would issue gets into a token.
+fn hand_made_token(two: &Two, change: impl FnOnce(&mut menzil_proto::PolicyBody)) -> String {
+    let owner = load_owner(&two.owner, &two.network_id).unwrap();
+    let current = load_documents(&two.owner, &two.network_id).unwrap();
+    let mut roster = current.roster_body().clone();
+    let mut policy = current.policy_body().clone();
+    roster.seq += 1;
+    policy.seq += 1;
+    change(&mut policy);
+    encode_documents(
+        &Roster::sign(owner.signing_key(), &roster).unwrap(),
+        &Policy::sign(owner.signing_key(), &policy).unwrap(),
+    )
+}
+
+/// The third red-team round, L3 and M1: `join` accepted whatever the owner's key had signed, so
+/// a hand made Policy could put a terminal escape in a name, or name a member like the start
+/// of another node's id.
+#[test]
+fn join_refuses_names_and_roles_the_issuing_tool_would_not_have_issued() {
+    let two = two_devices();
+    let issued = admit(&two.owner, None, &two.join_request, "phone", &[], NOW).unwrap();
+    join(&two.member, &issued.token, NOW).unwrap();
+    // Members: [laptop (owner), phone (this device)].
+    let bad_names = [
+        "laptop\u{1b}]52;c;cm0gLXJmIH4K\u{7}",
+        "x\u{202e}gpj.exe",
+        "new\nline",
+        "with space",
+        ".",
+        "..",
+        "1a2b3c4d",
+    ];
+    for name in bad_names {
+        let token = hand_made_token(&two, |policy| policy.members[0].name = name.to_string());
+        let error = format!("{:#}", join(&two.member, &token, NOW).unwrap_err());
+        assert!(error.contains("would not have issued"), "{name:?}: {error}");
+        assert!(
+            !error.chars().any(crate::text::is_unsafe),
+            "the refusal itself must not carry the escape: {error:?}"
+        );
+    }
+    for role in ["\u{1b}[31mADMIN\u{1b}[0m", "a b", "x:y", ""] {
+        let token = hand_made_token(&two, |policy| {
+            policy.members[1].roles = vec![role.to_string()]
+        });
+        let error = format!("{:#}", join(&two.member, &token, NOW).unwrap_err());
+        assert!(error.contains("role"), "{role:?}: {error}");
+        assert!(!error.chars().any(crate::text::is_unsafe), "{error:?}");
+    }
+    // Nothing was installed by any of them, and a sound pair still joins.
+    assert_eq!(
+        load_documents(&two.member, &two.network_id).unwrap().seq(),
+        2
+    );
+    let sound = hand_made_token(&two, |policy| {
+        policy.members[0].name = "workstation".to_string();
+        policy.members[1].roles = vec!["admin".to_string()];
+    });
+    assert!(matches!(
+        join(&two.member, &sound, NOW).unwrap(),
+        Joined::Updated { seq: 3, .. }
+    ));
+}
+
+/// Documents that are already on disk (an older version of this tool, or an edit) are shown
+/// escaped, not raw.
+#[test]
+fn status_shows_what_a_hand_made_policy_holds_without_letting_it_act() {
+    let two = two_devices();
+    let issued = admit(&two.owner, None, &two.join_request, "phone", &[], NOW).unwrap();
+    join(&two.member, &issued.token, NOW).unwrap();
+    let token = hand_made_token(&two, |policy| {
+        policy.members[0].name =
+            "laptop\u{1b}]52;c;cm0gLXJmIH4K\u{7}\u{1b}[2J\u{202e}gpj".to_string();
+        policy.members[1].roles = vec!["\u{1b}[31mADMIN\u{1b}[0m".to_string()];
+    });
+    // Put it on disk the way an older tool, or an editor, could have.
+    let (roster, policy) = decode_documents(&token).unwrap();
+    save_documents(
+        &two.member,
+        &Documents::from_signed(roster, policy).unwrap(),
+    )
+    .unwrap();
+    let text = status(&two.member).unwrap().render(NOW);
+    // (The report itself is lines.)
+    assert!(
+        !text.chars().any(|c| c != '\n' && crate::text::is_unsafe(c)),
+        "{text:?}"
+    );
+    assert!(
+        text.contains("\\u{1b}]52"),
+        "the words stay, escaped: {text}"
+    );
+}
+
+#[test]
+fn an_expired_certificate_is_marked_in_the_status() {
+    let two = two_devices();
+    let text = status(&two.owner).unwrap().render(NOW + 500 * DAY);
+    assert!(text.contains("certificate EXPIRED"), "{text}");
+    let text = status(&two.owner).unwrap().render(NOW + DAY);
+    assert!(text.contains("certificate expires in"), "{text}");
+}
+
+/// An owner command, run on a thread against the owner's home.
+type OwnerCommand = Box<dyn FnOnce(&Home) -> Result<Issued> + Send>;
+
+/// `admit` and `renew` are owner commands too: two admissions at the same moment must both
+/// take effect (each under its own number), and so must a renewal beside a grant.
+#[test]
+fn admissions_and_renewals_at_the_same_moment_are_not_lost_either() {
+    let two = two_devices();
+    let phone_request = two.join_request.clone();
+    let tablet = device();
+    let tablet_request = init(&tablet.1, NOW).unwrap().join_request;
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+    let spawn = |work: OwnerCommand| {
+        let (home, barrier) = (two.owner.clone(), barrier.clone());
+        std::thread::spawn(move || {
+            barrier.wait();
+            work(&home)
+        })
+    };
+    let threads = [
+        spawn(Box::new(move |home| {
+            admit(home, None, &phone_request, "phone", &[], NOW)
+        })),
+        spawn(Box::new(move |home| {
+            admit(home, None, &tablet_request, "tablet", &[], NOW)
+        })),
+        spawn(Box::new(|home| renew(home, None, NOW + DAY))),
+    ];
+    let mut numbers: Vec<u64> = threads
+        .into_iter()
+        .map(|t| t.join().unwrap().expect("each waits its turn").seq)
+        .collect();
+    numbers.sort_unstable();
+    assert_eq!(numbers, vec![2, 3, 4], "three commands, three numbers");
+    let docs = load_documents(&two.owner, &two.network_id).unwrap();
+    let names: Vec<&str> = docs
+        .policy_body()
+        .members
+        .iter()
+        .map(|m| m.name.as_str())
+        .collect();
+    assert!(
+        names.contains(&"phone") && names.contains(&"tablet"),
+        "{names:?}"
+    );
 }
