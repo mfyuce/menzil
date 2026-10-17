@@ -148,6 +148,34 @@ impl Home {
         })
     }
 
+    /// Takes the lock that serializes `menzil init`: two at once would each find no identity,
+    /// each make one, and write the certificate of one next to the key of the other, both
+    /// reporting success (the fourth red-team round, L2). Waits for the other, up to ten
+    /// seconds; the one that waited then finds the identity and stops.
+    pub fn lock_init(&self) -> Result<FileLock> {
+        create_private_dirs(&self.root)?;
+        lock_file(&self.root.join("init.lock"), LOCK_WAIT).with_context(|| {
+            format!(
+                "another `menzil init` is running with {}; try again in a moment",
+                self.root.display()
+            )
+        })
+    }
+
+    /// Takes the lock that serializes changes to the Rosters a relay keeps (`relay add-network`
+    /// reads what is held, compares and writes: two at once could leave the older Roster on disk;
+    /// the fourth red-team round, N5). Waits for the other, up to ten seconds.
+    pub fn lock_relay(&self) -> Result<FileLock> {
+        let dir = self.root.join("relay");
+        create_private_dirs(&dir)?;
+        lock_file(&dir.join(".lock"), LOCK_WAIT).with_context(|| {
+            format!(
+                "another `menzil relay add-network` is changing {}; try again in a moment",
+                dir.display()
+            )
+        })
+    }
+
     /// Takes the lock a running `menzil node` holds: two nodes with one identity would displace
     /// each other at the relay. Fails at once if another node holds it.
     pub fn lock_node(&self) -> Result<FileLock> {

@@ -14,7 +14,7 @@ use menzil_cli::config::Config;
 use menzil_cli::home::Home;
 use menzil_cli::local::{self, Joined};
 use menzil_cli::stdio::ClosingStdout;
-use menzil_cli::{node_cmd, reach, relay_cmd, signals, text};
+use menzil_cli::{node_cmd, reach, relay_cmd, signals, text, token};
 use menzil_proto::ServiceId;
 use tracing_subscriber::EnvFilter;
 
@@ -180,10 +180,7 @@ fn token_argument(value: String) -> Result<String> {
     if value != "-" {
         return Ok(value);
     }
-    let mut text = String::new();
-    std::io::Read::read_to_string(&mut std::io::stdin(), &mut text)
-        .context("reading the token from standard input")?;
-    Ok(text.trim().to_string())
+    token::read_token(std::io::stdin())
 }
 
 fn now() -> u64 {

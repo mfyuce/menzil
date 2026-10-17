@@ -8,6 +8,7 @@
 //! it belongs to as one file, updated by [`join`] when an owner hands over a newer pair. Until
 //! `menzil:docs` exists (TODO.md L4j) that hand over is a pasted token.
 
+use std::collections::HashMap;
 use std::fs;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -49,6 +50,9 @@ pub struct InitOutcome {
 /// certificate is written first and the key last: the key's existence is what says "initialised",
 /// so a failure in between can be retried.
 pub fn init(home: &Home, now: u64) -> Result<InitOutcome> {
+    // From the check to the last write: two `init`s at once would otherwise both pass the check
+    // and leave a key and a certificate that do not belong together.
+    let _lock = home.lock_init()?;
     let key_path = home.identity_key_path();
     if key_path.exists() {
         bail!(
@@ -385,6 +389,7 @@ pub fn join(home: &Home, token: &str, now: u64) -> Result<Joined> {
     // Whoever signed them, a name is typed in an address and printed on a terminal, and a role
     // in a grant: hold them to the rules an owner using `menzil admit` is held to. A name that
     // reads as the start of a node id would also take the address of the node it imitates.
+    let mut lowercased: HashMap<String, &str> = HashMap::new();
     for member in &policy.members {
         menzil_admin::check_name(&member.name).with_context(|| {
             format!(
@@ -392,6 +397,15 @@ pub fn join(home: &Home, token: &str, now: u64) -> Result<Joined> {
                 text::escaped(&member.name)
             )
         })?;
+        // `admit` treats "Laptop" and "laptop" as one name (a person typing an address, and
+        // `ssh`, which lowercases it, cannot tell them apart): so does `join`.
+        if let Some(other) = lowercased.insert(member.name.to_lowercase(), &member.name) {
+            bail!(
+                "these documents name two members {:?} and {:?} that differ only in letter case, which this tool would not have issued",
+                text::escaped(other),
+                text::escaped(&member.name)
+            );
+        }
         for role in &member.roles {
             menzil_admin::check_role(role).with_context(|| {
                 format!(

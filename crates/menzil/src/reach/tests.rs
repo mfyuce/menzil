@@ -4,6 +4,7 @@
 
 use std::io;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
@@ -41,6 +42,8 @@ enum Script {
     EndThenRead,
     /// `ok`, then nothing: the stream stays open.
     Hold,
+    /// `ok`, the bytes, then nothing: the stream stays open.
+    DataThenHold(&'static [u8]),
 }
 
 struct Fake {
@@ -107,6 +110,14 @@ async fn fake_agent(script: Script) -> Fake {
                     }
                     Script::Hold => {
                         let _ = write.write_all(b"ok\n").await;
+                        let mut sink = Vec::new();
+                        let _ = read.read_to_end(&mut sink).await;
+                        return;
+                    }
+                    Script::DataThenHold(bytes) => {
+                        let _ = write.write_all(b"ok\n").await;
+                        let _ = write.write_all(&frame(DATA, bytes)).await;
+                        let _ = write.flush().await;
                         let mut sink = Vec::new();
                         let _ = read.read_to_end(&mut sink).await;
                         return;
@@ -275,4 +286,96 @@ async fn a_clean_end_does_not_discard_what_the_client_has_not_read_yet() {
     ended.expect("a clean end reads as end of file, after all the data");
     assert_eq!(got.len(), SIZE);
     assert!(got.iter().all(|&b| b == 5));
+}
+
+/// A listener whose `accept` fails on chosen calls, as the real one does when the process is out
+/// of descriptors.
+struct Flaky {
+    inner: TcpListener,
+    calls: AtomicUsize,
+    /// The calls, counted from 1, that fail.
+    failing: &'static [usize],
+}
+
+impl Accept for Flaky {
+    async fn accept(&self) -> io::Result<(TcpStream, SocketAddr)> {
+        let call = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+        if self.failing.contains(&call) {
+            // EMFILE on Linux and macOS alike.
+            return Err(io::Error::from_raw_os_error(24));
+        }
+        TcpListener::accept(&self.inner).await
+    }
+}
+
+/// The fourth red-team round, M1: an `accept` that failed ended `run`, and the connections in
+/// flight were dropped without their reset, so each read a clean end of file after a truncated
+/// answer. A failed `accept` is now reported and tried again; what is open is not touched.
+#[tokio::test]
+async fn a_failed_accept_neither_ends_reach_nor_cuts_the_connections_in_flight() {
+    let fake = fake_agent(Script::DataThenHold(b"partial-answer")).await;
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    // The second call to accept fails, right after the first connection was taken.
+    let flaky = Flaky {
+        inner: listener,
+        calls: AtomicUsize::new(0),
+        failing: &[2],
+    };
+    let (stop_tx, stop_rx) = oneshot::channel();
+    let socket = fake.socket.clone();
+    let task = tokio::spawn(async move {
+        run_on(&socket, "peer/x", flaky, async {
+            let _ = stop_rx.await;
+        })
+        .await
+    });
+    let mut first = TcpStream::connect(addr).await.unwrap();
+    let mut got = [0u8; 14];
+    timeout(WAIT, first.read_exact(&mut got))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(&got, b"partial-answer");
+    // The connection stays open while accept recovers: not a byte, and not an end of file.
+    let mut byte = [0u8; 1];
+    assert!(
+        timeout(Duration::from_millis(600), first.read(&mut byte))
+            .await
+            .is_err(),
+        "the connection in flight was ended by the failed accept"
+    );
+    assert!(!task.is_finished(), "a failed accept ended run");
+    // A connection made after the failure is served.
+    let mut second = TcpStream::connect(addr).await.unwrap();
+    timeout(WAIT, second.read_exact(&mut got))
+        .await
+        .expect("the second connection must be carried")
+        .unwrap();
+    assert_eq!(&got, b"partial-answer");
+    // A stop still resets what is open.
+    stop_tx.send(()).unwrap();
+    let (_, ended) = read_to_the_end(&mut first).await;
+    let error = ended.expect_err("a stopped connection is not a finished one");
+    assert_eq!(error.kind(), io::ErrorKind::ConnectionReset);
+    timeout(WAIT, task).await.unwrap().unwrap().unwrap();
+}
+
+/// Whatever ends `run` without going through its stop (here a task aborted; a panic or the
+/// process being killed close the sockets the same way), a connection in flight is reset, never
+/// closed as if it had finished: the reset is the state it is accepted in.
+#[tokio::test]
+async fn an_aborted_reach_resets_the_connections_that_are_open() {
+    let fake = fake_agent(Script::DataThenHold(b"partial-answer")).await;
+    let (addr, _stop, task) = start(&fake.socket).await;
+    let mut client = TcpStream::connect(addr).await.unwrap();
+    let mut got = [0u8; 14];
+    timeout(WAIT, client.read_exact(&mut got))
+        .await
+        .unwrap()
+        .unwrap();
+    task.abort();
+    let (_, ended) = read_to_the_end(&mut client).await;
+    let error = ended.expect_err("an aborted reach must not leave a clean end of file");
+    assert_eq!(error.kind(), io::ErrorKind::ConnectionReset);
 }

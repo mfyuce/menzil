@@ -8,24 +8,59 @@
 
 use std::io;
 
-/// Completes when the process is asked to stop; says which signal it was.
-#[cfg(unix)]
-pub async fn shutdown() -> io::Result<&'static str> {
-    use tokio::signal::unix::{SignalKind, signal};
-
-    let mut interrupt = signal(SignalKind::interrupt())?;
-    let mut terminate = signal(SignalKind::terminate())?;
-    let mut hangup = signal(SignalKind::hangup())?;
-    Ok(tokio::select! {
-        _ = interrupt.recv() => "interrupt",
-        _ = terminate.recv() => "terminate",
-        _ = hangup.recv() => "hangup",
-    })
+/// The signals that ask a process to stop, caught from the moment this is made. Until one is
+/// made a signal has its default action, which ends the process on the spot: a process that has
+/// slow work before it waits for a signal (the node attaching to its relay) makes it first
+/// (the fourth red-team round, N3: the handlers were installed only after the attach wait of up
+/// to 60 s, and a signal in that time left the agent socket behind).
+pub struct Shutdown {
+    #[cfg(unix)]
+    interrupt: tokio::signal::unix::Signal,
+    #[cfg(unix)]
+    terminate: tokio::signal::unix::Signal,
+    #[cfg(unix)]
+    hangup: tokio::signal::unix::Signal,
 }
 
-/// Completes when the process is asked to stop; says which signal it was.
-#[cfg(not(unix))]
+impl Shutdown {
+    /// Starts catching the signals. Must be called inside the runtime. A signal that arrives
+    /// before [`wait`](Self::wait) is called is kept for it.
+    #[cfg(unix)]
+    pub fn catch() -> io::Result<Self> {
+        use tokio::signal::unix::{SignalKind, signal};
+        Ok(Self {
+            interrupt: signal(SignalKind::interrupt())?,
+            terminate: signal(SignalKind::terminate())?,
+            hangup: signal(SignalKind::hangup())?,
+        })
+    }
+
+    /// Starts catching the signals.
+    #[cfg(not(unix))]
+    pub fn catch() -> io::Result<Self> {
+        Ok(Self {})
+    }
+
+    /// Completes when the process is asked to stop; says which signal it was.
+    #[cfg(unix)]
+    pub async fn wait(&mut self) -> io::Result<&'static str> {
+        Ok(tokio::select! {
+            _ = self.interrupt.recv() => "interrupt",
+            _ = self.terminate.recv() => "terminate",
+            _ = self.hangup.recv() => "hangup",
+        })
+    }
+
+    /// Completes when the process is asked to stop; says which signal it was.
+    #[cfg(not(unix))]
+    pub async fn wait(&mut self) -> io::Result<&'static str> {
+        tokio::signal::ctrl_c().await?;
+        Ok("interrupt")
+    }
+}
+
+/// Completes when the process is asked to stop; says which signal it was. The signals are
+/// caught from the first poll, so use [`Shutdown::catch`] when work comes before the wait.
 pub async fn shutdown() -> io::Result<&'static str> {
-    tokio::signal::ctrl_c().await?;
-    Ok("interrupt")
+    Shutdown::catch()?.wait().await
 }

@@ -197,3 +197,67 @@ fn a_reset_ends_the_process_at_once_with_status_1_whatever_standard_input_is_doi
         "what the agent sent must not reach the terminal as an escape: {message:?}"
     );
 }
+
+/// The fourth red-team round, L4: with one socket for standard input and output (inetd,
+/// systemd's `Accept=yes`, socat's EXEC), pointing descriptor 1 at `/dev/null` releases nothing
+/// while descriptor 0 holds the socket, so the program on the other end never saw the service's
+/// end (and a program that reads to end of file before it closes waits for ever). Pipes, which
+/// ssh's ProxyCommand uses, were never affected.
+#[test]
+fn with_one_socket_for_input_and_output_the_services_end_reaches_the_program_on_it() {
+    use std::os::fd::OwnedFd;
+    use std::os::unix::net::UnixStream;
+
+    let dir = short_dir();
+    let socket = dir.path().join("c.sock");
+    let from_client = fake_agent(&socket, Script::DataThenEnd(b"answer"));
+    std::fs::write(
+        dir.path().join("config.toml"),
+        format!("agent_socket = \"{}\"\n", socket.display()),
+    )
+    .unwrap();
+    // Both descriptors are the same socket; the test keeps the other end.
+    let (mine, theirs) = UnixStream::pair().unwrap();
+    let for_stdin: OwnedFd = theirs.try_clone().unwrap().into();
+    let for_stdout: OwnedFd = theirs.into();
+    let mut child = Guard(
+        Command::new(env!("CARGO_BIN_EXE_menzil"))
+            .arg("stdio")
+            .arg("peer/x")
+            .env("MENZIL_HOME", dir.path())
+            .env("RUST_LOG", "error")
+            .stdin(Stdio::from(for_stdin))
+            .stdout(Stdio::from(for_stdout))
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    let mut writer = mine.try_clone().unwrap();
+    let output = read_to_end_on_a_thread(mine);
+
+    let got = output
+        .recv_timeout(WAIT)
+        .expect("the service's end must reach the program that holds the other end of the socket");
+    assert_eq!(got, b"answer");
+    assert!(
+        child.0.try_wait().unwrap().is_none(),
+        "the process carries standard input on until it ends"
+    );
+
+    // The program finishes sending; the process ends cleanly.
+    writer.write_all(b"upload").unwrap();
+    writer.shutdown(std::net::Shutdown::Write).unwrap();
+    let sent = from_client
+        .recv_timeout(WAIT)
+        .expect("the agent gets the upload and its end");
+    assert_eq!(sent, b"upload");
+    let started = std::time::Instant::now();
+    let status = loop {
+        if let Some(status) = child.0.try_wait().unwrap() {
+            break status;
+        }
+        assert!(started.elapsed() < WAIT, "the process did not exit");
+        thread::sleep(Duration::from_millis(20));
+    };
+    assert!(status.success(), "{status:?}");
+}

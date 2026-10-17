@@ -41,12 +41,37 @@ impl std::fmt::Debug for ProxyCredentials {
 /// An explicit caller decision that skips environment discovery: either a
 /// specific proxy to use, or a forced direct connection (equivalent to
 /// `--no-proxy`).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum ProxyOverride {
     /// Use exactly this proxy URL, ignoring the environment.
     Use(String),
     /// Skip discovery and connect directly.
     Direct,
+}
+
+impl std::fmt::Debug for ProxyOverride {
+    /// The URL's user name and password never go into a log line or a panic message (the fourth
+    /// red-team round, N2: the derived `Debug` printed `Use("http://alice:hunter2@proxy:3128")`,
+    /// and so did the `Debug` of everything that holds one).
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Use(url) => f.debug_tuple("Use").field(&redact_userinfo(url)).finish(),
+            Self::Direct => f.write_str("Direct"),
+        }
+    }
+}
+
+/// `url` with everything before its last `@` (the user name and password of a URL, or what was
+/// meant to be one) replaced by `<redacted>`, the scheme kept: `http://<redacted>@proxy:3128`.
+/// A value without an `@` comes back as it was. It works on the text, not on a parsed URL, so
+/// that a value that does not parse (a missing scheme, a typo) is hidden too. It errs on the side
+/// of hiding: an `@` in a path hides what precedes it.
+pub fn redact_userinfo(url: &str) -> String {
+    let Some(at) = url.rfind('@') else {
+        return url.to_string();
+    };
+    let keep = url[..at].find("://").map_or(0, |i| i + "://".len());
+    format!("{}<redacted>{}", &url[..keep], &url[at..])
 }
 
 /// The result of resolving how to reach a target host.
@@ -292,6 +317,43 @@ mod tests {
         let creds = target.credentials.unwrap();
         assert_eq!(creds.username, "user");
         assert_eq!(creds.password, "p@ss");
+    }
+
+    #[test]
+    fn the_debug_output_of_an_override_never_shows_the_userinfo() {
+        for url in [
+            "http://alice:hunter2@proxy.corp:3128",
+            "http://alice:hunter2@proxy.corp:3128/path",
+            "alice:hunter2@proxy.corp:3128",
+            "http://alice:h%40nter2@proxy.corp:3128",
+            // Not a URL at all, but with a secret in it: hidden as well.
+            "http://alice:hunter2@@proxy.corp",
+        ] {
+            let shown = format!("{:?}", ProxyOverride::Use(url.to_string()));
+            assert!(
+                !shown.contains("hunter2") && !shown.contains("h%40nter2"),
+                "{shown}"
+            );
+            assert!(!shown.contains("alice"), "{shown}");
+            assert!(
+                shown.contains("redacted") && shown.contains("proxy.corp"),
+                "{shown}"
+            );
+        }
+        // Nothing to hide, nothing hidden.
+        assert_eq!(
+            format!(
+                "{:?}",
+                ProxyOverride::Use("http://proxy.corp:3128".to_string())
+            ),
+            "Use(\"http://proxy.corp:3128\")"
+        );
+        assert_eq!(format!("{:?}", ProxyOverride::Direct), "Direct");
+        // And what is held inside something else.
+        let held = Some(ProxyOverride::Use(
+            "http://alice:hunter2@proxy:1".to_string(),
+        ));
+        assert!(!format!("{held:?}").contains("hunter2"));
     }
 
     #[test]

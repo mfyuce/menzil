@@ -28,6 +28,6 @@ pub use backoff::Backoff;
 pub use carrier::{Carrier, DialConfig, MAX_MESSAGE_BYTES, dial_with_backoff};
 pub use connection_info::{ConnectionInfo, DEFAULT_PATH};
 pub use error::CarrierError;
-pub use proxy::{ProxyCredentials, ProxyOverride, ProxyResolution, ProxyTarget};
+pub use proxy::{ProxyCredentials, ProxyOverride, ProxyResolution, ProxyTarget, redact_userinfo};
 pub use tls::client_config;
 pub use websocket::{HandshakeOutcome, SUBPROTOCOL};

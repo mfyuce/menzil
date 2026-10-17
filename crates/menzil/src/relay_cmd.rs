@@ -59,6 +59,9 @@ pub fn add_network(home: &Home, token: &str, now: u64) -> Result<(NetworkId, u64
     if body.expires <= now {
         bail!("this Roster has expired: ask the owner for a current token");
     }
+    // From the look at what is held to the write: two runs at once could each see the older
+    // Roster and the slower write would put it over the newer.
+    let _lock = home.lock_relay()?;
     let path = roster_path(home, &body.network_id);
     if let Ok(held) = fs::read(&path)
         && let Ok(held) = Roster::decode_strict(&held)
@@ -74,13 +77,26 @@ pub fn add_network(home: &Home, token: &str, now: u64) -> Result<(NetworkId, u64
 /// The Rosters this relay serves. A file that cannot be read is an error, not a network that
 /// quietly goes unserved.
 pub fn load_rosters(home: &Home) -> Result<Vec<Roster>> {
+    let (rosters, mut failures) = load_rosters_each(home)?;
+    if failures.is_empty() {
+        Ok(rosters)
+    } else {
+        Err(failures.swap_remove(0))
+    }
+}
+
+/// Every Roster in the relay's directory that can be read, and an error for each file that
+/// cannot: one damaged file is not allowed to hide the others (the fourth red-team round, L3: a
+/// running relay that read them as a whole picked up no newer Roster, a revocation among them,
+/// for any network while one file was damaged).
+pub fn load_rosters_each(home: &Home) -> Result<(Vec<Roster>, Vec<anyhow::Error>)> {
     let dir = relay_dir(home);
     let entries = match fs::read_dir(&dir) {
         Ok(entries) => entries,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(vec![]),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((vec![], vec![])),
         Err(e) => return Err(e).with_context(|| format!("reading {}", dir.display())),
     };
-    let mut rosters = Vec::new();
+    let (mut rosters, mut failures) = (Vec::new(), Vec::new());
     for entry in entries {
         let path = entry?.path();
         if path.extension().and_then(|e| e.to_str()) != Some("roster") {
@@ -93,12 +109,18 @@ pub fn load_rosters(home: &Home) -> Result<Vec<Roster>> {
         if !name_ok {
             continue;
         }
-        let bytes = fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
-        let roster = Roster::decode_strict(&bytes)
-            .with_context(|| format!("{} is damaged", path.display()))?;
-        rosters.push(roster);
+        let read = fs::read(&path)
+            .with_context(|| format!("reading {}", path.display()))
+            .and_then(|bytes| {
+                Roster::decode_strict(&bytes)
+                    .with_context(|| format!("{} is damaged", path.display()))
+            });
+        match read {
+            Ok(roster) => rosters.push(roster),
+            Err(error) => failures.push(error),
+        }
     }
-    Ok(rosters)
+    Ok((rosters, failures))
 }
 
 /// This machine's identity as a relay's: the certificate nodes verify and the key behind it.
@@ -232,8 +254,11 @@ pub async fn start(home: &Home, options: &RunOptions) -> Result<RunningRelay> {
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(every).await;
-                match load_rosters(&home) {
-                    Ok(rosters) => {
+                match load_rosters_each(&home) {
+                    Ok((rosters, failures)) => {
+                        for failure in &failures {
+                            tracing::warn!(error = %format!("{failure:#}"), "a Roster file cannot be read");
+                        }
                         for roster in &rosters {
                             if let Err(error) = relay.rosters().set(roster) {
                                 tracing::warn!(%error, "a Roster on disk was refused");

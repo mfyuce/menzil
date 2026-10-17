@@ -61,6 +61,46 @@ fn a_relay_keeps_the_roster_of_a_network_and_not_its_policy() {
     assert!(!relay.documents_path(&id).exists());
 }
 
+/// The fourth red-team round, N5: two `add-network` runs at the same moment each looked at what
+/// was held, then wrote; the slower write could put the older Roster over the newer one.
+#[test]
+fn add_network_runs_at_the_same_moment_leave_the_newest_roster() {
+    const TOKENS: usize = 6;
+    const ROUNDS: usize = 10;
+    let (_o, owner, id, _docs_token) = token_of_a_network();
+    let mut tokens = vec![relay_token(&owner)];
+    for step in 1..TOKENS as u64 {
+        crate::local::renew(&owner, None, NOW + step * DAY).unwrap();
+        tokens.push(relay_token(&owner));
+    }
+    for round in 0..ROUNDS {
+        let (_d, relay) = home();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(TOKENS));
+        // Every Roster is still valid on the day all of them are added.
+        let now = NOW + TOKENS as u64 * DAY;
+        let threads: Vec<_> = tokens
+            .iter()
+            .map(|token| {
+                let (token, relay, barrier) = (token.clone(), relay.clone(), barrier.clone());
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    add_network(&relay, &token, now)
+                })
+            })
+            .collect();
+        for thread in threads {
+            thread.join().unwrap().unwrap();
+        }
+        let kept = load_rosters(&relay).unwrap();
+        assert_eq!(kept.len(), 1, "round {round}");
+        assert_eq!(
+            kept[0].decode().unwrap().seq,
+            TOKENS as u64,
+            "round {round}: the relay must end up with the newest Roster of {id}"
+        );
+    }
+}
+
 #[test]
 fn an_older_or_equal_roster_does_not_replace_a_newer_one() {
     let (_o, owner, id, _docs_token) = token_of_a_network();
@@ -239,6 +279,57 @@ fn a_member_device_is_not_a_relay_and_cannot_join_as_one() {
 
 /// `menzil renew` on the owner and `add-network` with the new token on the relay's machine, while
 /// the relay runs: the relay holds the newer Roster a moment later, without a restart.
+/// The fourth red-team round, L3: one unreadable Roster file stopped every update, so a newer
+/// Roster (a revocation, say) added for another network was not picked up while the file stayed
+/// damaged. Each file is read on its own.
+#[tokio::test]
+async fn one_damaged_roster_file_does_not_stop_the_reload_of_the_others() {
+    let (_oa, owner_a, id_a, _) = token_of_a_network();
+    let (_ob, owner_b, id_b, _) = token_of_a_network();
+    let (dir, relay_home) = home();
+    init(&relay_home, NOW).unwrap();
+    add_network(&relay_home, &relay_token(&owner_a), NOW).unwrap();
+    add_network(&relay_home, &relay_token(&owner_b), NOW).unwrap();
+    let (cert, key) = pem_files(dir.path());
+    let running = start(
+        &relay_home,
+        &RunOptions {
+            listen: "127.0.0.1:0".parse().unwrap(),
+            tls_cert: cert,
+            tls_key: key,
+            path: DEFAULT_PATH.to_string(),
+            host: None,
+            reload_every: Duration::from_millis(50),
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(running.roster_seq(&id_a), Some(1));
+    assert_eq!(running.roster_seq(&id_b), Some(1));
+
+    // Network A's file is damaged; network B gets a newer Roster.
+    fs::write(roster_path(&relay_home, &id_a), b"junk").unwrap();
+    crate::local::renew(&owner_b, None, NOW + DAY).unwrap();
+    add_network(&relay_home, &relay_token(&owner_b), NOW + DAY).unwrap();
+    let mut seq = 0;
+    for _ in 0..100 {
+        seq = running.roster_seq(&id_b).unwrap();
+        if seq == 2 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(
+        seq, 2,
+        "the damaged file of another network kept the relay from taking the newer Roster"
+    );
+    assert_eq!(
+        running.roster_seq(&id_a),
+        Some(1),
+        "the damaged network keeps what the relay held"
+    );
+}
+
 #[tokio::test]
 async fn a_running_relay_picks_up_a_newer_roster_added_to_its_directory() {
     let (_o, owner, id, _docs_token) = token_of_a_network();

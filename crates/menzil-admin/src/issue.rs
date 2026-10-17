@@ -169,18 +169,19 @@ fn checked_cert(cert: &NodeCert, now: u64) -> Result<menzil_proto::NodeCertBody,
 /// A member name heads an address (`name/service`) and shows up in logs and on a terminal, so it
 /// is letters, digits, `-`, `_` and `.` only, and starts with a letter or a digit (so it is
 /// never `.` or `..`): no `/`, no whitespace, nothing a terminal treats as a control, and none
-/// of the invisible format characters (a right to left override, a zero width space) that make
-/// two names look alike. Letters are not limited to ASCII.
+/// of the invisible characters (a right to left override, a zero width space, the Hangul fillers
+/// that are letters printing as nothing: see [`is_invisible`]) that make two names look alike.
+/// Letters are not limited to ASCII.
 ///
 /// Public because a device that is handed documents it did not issue has to hold them to the
 /// same rule (`menzil join`): names reach terminals and addresses whoever chose them.
 pub fn check_name(name: &str) -> Result<(), AdminError> {
     if !usable_word(name) {
-        return Err(AdminError::BadName(name.to_string()));
+        return Err(AdminError::BadName(shown(name)));
     }
     // `1a2b3c4d` is a name or the start of a node id, and an address cannot tell which.
     if name.len() >= 8 && name.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return Err(AdminError::NameLooksLikeNodeId(name.to_string()));
+        return Err(AdminError::NameLooksLikeNodeId(shown(name)));
     }
     Ok(())
 }
@@ -191,17 +192,78 @@ pub fn check_role(role: &str) -> Result<(), AdminError> {
     if usable_word(role) {
         Ok(())
     } else {
-        Err(AdminError::BadRole(role.to_string()))
+        Err(AdminError::BadRole(shown(role)))
     }
 }
 
 fn usable_word(word: &str) -> bool {
+    let letter = |c: char| c.is_alphanumeric() && !is_invisible(c);
     !word.is_empty()
         && word.len() <= MAX_NAME_BYTES
-        && word.chars().next().is_some_and(char::is_alphanumeric)
+        && word.chars().next().is_some_and(letter)
         && word
             .chars()
-            .all(|c| c.is_alphanumeric() || matches!(c, '-' | '_' | '.'))
+            .all(|c| letter(c) || matches!(c, '-' | '_' | '.'))
+}
+
+/// Whether `c` is invisible, or acts on the text around it without being a letter: the Unicode
+/// format characters (the bidirectional controls, the zero width characters, the soft hyphen,
+/// the tag characters) and the other default-ignorable code points (the Hangul fillers, which
+/// are letters that print as nothing, the variation selectors, the combining grapheme joiner,
+/// the Khmer inherent vowels, the Mongolian selectors). A name made of them can look like
+/// another name, and text that holds them prints as less than it says. One table for names and
+/// for the text that reaches a terminal, so that the two cannot drift apart (the fourth
+/// red-team round, N1: the Hangul fillers passed both).
+pub fn is_invisible(c: char) -> bool {
+    matches!(
+        c,
+        '\u{ad}'
+            | '\u{34f}'
+            | '\u{600}'..='\u{605}'
+            | '\u{61c}'
+            | '\u{6dd}'
+            | '\u{70f}'
+            | '\u{890}'..='\u{891}'
+            | '\u{8e2}'
+            | '\u{115f}'..='\u{1160}'
+            | '\u{17b4}'..='\u{17b5}'
+            | '\u{180b}'..='\u{180f}'
+            | '\u{200b}'..='\u{200f}'
+            | '\u{202a}'..='\u{202e}'
+            | '\u{2060}'..='\u{206f}'
+            | '\u{3164}'
+            | '\u{fe00}'..='\u{fe0f}'
+            | '\u{feff}'
+            | '\u{ffa0}'
+            | '\u{fff0}'..='\u{fffb}'
+            | '\u{110bd}'
+            | '\u{110cd}'
+            | '\u{13430}'..='\u{1343f}'
+            | '\u{1bca0}'..='\u{1bca3}'
+            | '\u{1d173}'..='\u{1d17a}'
+            | '\u{e0000}'..='\u{e0fff}'
+    )
+}
+
+/// Whether `c` must not reach a terminal or a log as it is: a control character (C0, DEL, C1), a
+/// line or paragraph separator, or an invisible one ([`is_invisible`]).
+pub fn is_unsafe(c: char) -> bool {
+    c.is_control() || matches!(c, '\u{2028}' | '\u{2029}') || is_invisible(c)
+}
+
+/// `text` with every unsafe character written out as an escape such as `\u{3164}`: what an error
+/// quotes of a name or a role it refused, so that it does not carry the very characters the
+/// name was refused for (`{:?}` leaves the Hangul fillers alone: they are letters).
+fn shown(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        if is_unsafe(c) {
+            out.extend(c.escape_unicode());
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 /// Starts a network: seq 1, with `founder` (the owner's own device, in
@@ -287,7 +349,7 @@ pub fn admit(
         .iter()
         .any(|existing| existing.name.to_lowercase() == wanted)
     {
-        return Err(AdminError::NameTaken(name.to_string()));
+        return Err(AdminError::NameTaken(shown(name)));
     }
     let (mut roster, mut policy) = current.successor(owner, now)?;
     roster.members.push(RosterMember {

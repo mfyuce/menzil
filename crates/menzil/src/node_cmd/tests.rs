@@ -260,6 +260,43 @@ fn a_name_never_takes_the_address_of_a_node_id_prefix() {
     assert_eq!(directory.resolve("laptop").unwrap(), &mine);
 }
 
+/// The fourth red-team round, M2: OpenSSH lowercases the host name before it expands `%h`, so
+/// `ssh Laptop` asks for `laptop`. A member `Laptop` has to be found that way, and a member of
+/// another network that merely differs in letter case must not take the connection.
+#[test]
+fn names_compare_without_regard_to_letter_case_and_every_hit_counts() {
+    // What ssh sends for `ssh Laptop` finds the member with the capital.
+    let directory =
+        Directory::from_entries(vec![entry(1, "Laptop", 0xaa), entry(1, "phone", 0xbb)]);
+    for who in ["laptop", "Laptop", "LAPTOP"] {
+        assert_eq!(
+            directory.resolve(who).unwrap().node_id,
+            NodeId::from([0xaa; 32]),
+            "{who}"
+        );
+    }
+    // The owner of another network names a member "laptop": that is no silent winner.
+    let directory =
+        Directory::from_entries(vec![entry(1, "Laptop", 0xaa), entry(2, "laptop", 0xcc)]);
+    for who in ["laptop", "Laptop", "LAPTOP"] {
+        let error = directory.resolve(who).unwrap_err();
+        assert!(
+            error.contains("ambiguous") && error.contains("aaaaaaaa") && error.contains("cccccccc"),
+            "{who}: {error}"
+        );
+    }
+    // A node id prefix still says which.
+    assert_eq!(
+        directory.resolve("cccccccc").unwrap().network_id,
+        NetworkId::from([2; 32])
+    );
+    // Letters beyond ASCII fold the way the issuing tool folds them.
+    let directory = Directory::from_entries(vec![entry(1, "Ünlü", 0xaa)]);
+    assert!(directory.resolve("ünlü").is_ok());
+    // Different names stay different.
+    assert!(directory.resolve("unlu").is_err());
+}
+
 #[test]
 fn names_in_an_error_message_are_escaped() {
     let directory = Directory::from_entries(vec![entry(1, "laptop", 0xaa)]);
@@ -301,6 +338,52 @@ async fn a_file_that_is_not_a_socket_is_never_removed() {
     fs::create_dir(&directory).unwrap();
     assert!(bind_agent_socket(&directory).await.is_err());
     assert!(directory.is_dir());
+}
+
+/// The fourth red-team round, N4: the socket's directory was used whoever could write to it,
+/// and the chmods that follow the bind follow links. A directory others can write to is refused
+/// (the sticky bit, as on /tmp, is the exception), and so is one that belongs to somebody else.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_socket_directory_that_others_can_write_to_is_refused() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let set =
+        |mode: u32| fs::set_permissions(dir.path(), fs::Permissions::from_mode(mode)).unwrap();
+    let socket = dir.path().join("a.sock");
+    for mode in [0o777, 0o707, 0o702, 0o772, 0o757] {
+        set(mode);
+        let error = format!("{:#}", bind_agent_socket(&socket).await.err().unwrap());
+        assert!(
+            error.contains("can be written by other users"),
+            "{mode:o}: {error}"
+        );
+        assert!(!socket.exists(), "{mode:o}: nothing was bound");
+    }
+    // Private, group writable (the usual private group: every directory is 0775 under umask
+    // 0002), or world writable with the sticky bit (as /tmp is), is fine.
+    for mode in [0o700, 0o755, 0o750, 0o770, 0o775, 0o1777] {
+        set(mode);
+        let listener = bind_agent_socket(&socket)
+            .await
+            .unwrap_or_else(|e| panic!("{mode:o}: {e:#}"));
+        drop(listener);
+        let _ = fs::remove_file(&socket);
+    }
+    // A directory of somebody else (not root) is refused whatever its mode; checked with a
+    // user id that is not the owner's.
+    set(0o700);
+    let me = agent::current_uid().await.unwrap();
+    assert!(check_private_directory(dir.path(), me).is_ok());
+    let error = format!(
+        "{:#}",
+        check_private_directory(dir.path(), me + 1).unwrap_err()
+    );
+    assert!(error.contains("belongs to another user"), "{error}");
+    // A file is not a directory.
+    let file = dir.path().join("f");
+    fs::write(&file, b"x").unwrap();
+    assert!(check_private_directory(&file, me).is_err());
 }
 
 #[test]
@@ -399,6 +482,45 @@ fn one_unreadable_network_does_not_stop_the_reload_of_the_others() {
     assert_eq!(policies.seq(&id), Some(3));
     assert_eq!(last.get(&id), Some(&3));
     assert!(directory.read().unwrap().resolve("laptop").is_ok());
+}
+
+/// The fourth red-team round, L1: a network whose documents become unreadable between two
+/// reloads keeps its names in the directory. Left out, a name that two networks share (refused
+/// as ambiguous until then) would silently mean the other network's member, while the stores
+/// went on holding the damaged network's documents.
+#[test]
+fn a_network_that_becomes_unreadable_keeps_its_names() {
+    // One device in two networks, each owned by a device that calls itself "laptop".
+    let member_dir = tempfile::tempdir().unwrap();
+    let member = Home::new(member_dir.path());
+    let request = init(&member, NOW).unwrap().join_request;
+    let (mut ids, mut keep_alive) = (Vec::new(), Vec::new());
+    for _ in 0..2 {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = Home::new(dir.path());
+        init(&owner, NOW).unwrap();
+        ids.push(network_create(&owner, "laptop", NOW).unwrap());
+        let admitted = admit(&owner, None, &request, "phone", &[], NOW).unwrap();
+        join(&member, &admitted.token, NOW).unwrap();
+        keep_alive.push(dir);
+    }
+    let (policies, rosters, _) = load_stores(&member).unwrap();
+    let directory = RwLock::new(Directory::load(&member).unwrap());
+    let mut last = HashMap::new();
+    reload(&member, &policies, &rosters, &directory, &mut last).unwrap();
+    let error = directory.read().unwrap().resolve("laptop").unwrap_err();
+    assert!(error.contains("ambiguous"), "{error}");
+
+    // The first network's documents are damaged between two reloads.
+    fs::write(member.documents_path(&ids[0]), b"junk").unwrap();
+    let result = reload(&member, &policies, &rosters, &directory, &mut last);
+    assert!(result.is_err(), "the damage is reported");
+    let error = directory
+        .read()
+        .unwrap()
+        .resolve("laptop")
+        .expect_err("the damaged network's names are kept, so the name is still ambiguous");
+    assert!(error.contains("ambiguous"), "{error}");
 }
 
 /// A directory that holds no documents (a failed write, a lock taken before the first save) is

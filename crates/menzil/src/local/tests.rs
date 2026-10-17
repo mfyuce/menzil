@@ -549,6 +549,47 @@ fn owner_commands_at_the_same_moment_each_get_their_own_number_and_none_is_lost(
     );
 }
 
+/// The fourth red-team round, L2: two `init`s at the same moment both found no identity, both
+/// made one and both reported success; the certificate of one was left next to the key of the
+/// other in 6 of 20 rounds. Under the lock exactly one makes the identity, the others find it and
+/// change nothing, and what is on disk belongs together.
+#[test]
+fn two_inits_at_the_same_moment_make_one_identity_and_it_is_whole() {
+    const COMMANDS: usize = 4;
+    const ROUNDS: usize = 25;
+    for round in 0..ROUNDS {
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home::new(dir.path().join("home"));
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(COMMANDS));
+        let threads: Vec<_> = (0..COMMANDS)
+            .map(|_| {
+                let (home, barrier) = (home.clone(), barrier.clone());
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    init(&home, NOW)
+                })
+            })
+            .collect();
+        let outcomes: Vec<_> = threads.into_iter().map(|t| t.join().unwrap()).collect();
+        let made: Vec<_> = outcomes.iter().filter_map(|o| o.as_ref().ok()).collect();
+        assert_eq!(
+            made.len(),
+            1,
+            "round {round}: exactly one init makes the identity"
+        );
+        for refused in outcomes.iter().filter_map(|o| o.as_ref().err()) {
+            let message = format!("{refused:#}");
+            assert!(
+                message.contains("already has an identity"),
+                "round {round}: {message}"
+            );
+        }
+        // The key and the certificate on disk belong together, and are the ones that were printed.
+        let (keys, _) = load_identity(&home).unwrap_or_else(|e| panic!("round {round}: {e:#}"));
+        assert_eq!(keys.node_id(), made[0].node_id, "round {round}");
+    }
+}
+
 /// A Policy signed by the owner's key but made by hand: the way a name or a role nobody's tool
 /// would issue gets into a token.
 fn hand_made_token(two: &Two, change: impl FnOnce(&mut menzil_proto::PolicyBody)) -> String {
@@ -582,6 +623,13 @@ fn join_refuses_names_and_roles_the_issuing_tool_would_not_have_issued() {
         ".",
         "..",
         "1a2b3c4d",
+        // The fourth round, N1: letters that print as nothing, a variation selector, a tag.
+        "laptop\u{3164}",
+        "\u{3164}",
+        "lap\u{115f}top",
+        "\u{ffa0}x",
+        "vs\u{fe0f}x",
+        "tag\u{e0041}",
     ];
     for name in bad_names {
         let token = hand_made_token(&two, |policy| policy.members[0].name = name.to_string());
@@ -608,6 +656,33 @@ fn join_refuses_names_and_roles_the_issuing_tool_would_not_have_issued() {
     let sound = hand_made_token(&two, |policy| {
         policy.members[0].name = "workstation".to_string();
         policy.members[1].roles = vec!["admin".to_string()];
+    });
+    assert!(matches!(
+        join(&two.member, &sound, NOW).unwrap(),
+        Joined::Updated { seq: 3, .. }
+    ));
+}
+
+/// The fourth red-team round, M2: `admit` treats "Laptop" and "laptop" as one name; a device
+/// handed documents by another route holds them to the same rule, or two members could answer
+/// to what `ssh` sends for either.
+#[test]
+fn join_refuses_two_members_whose_names_differ_only_in_letter_case() {
+    let two = two_devices();
+    let issued = admit(&two.owner, None, &two.join_request, "phone", &[], NOW).unwrap();
+    join(&two.member, &issued.token, NOW).unwrap();
+    // Members: [laptop (owner), phone (this device)].
+    let token = hand_made_token(&two, |policy| policy.members[1].name = "Laptop".to_string());
+    let error = format!("{:#}", join(&two.member, &token, NOW).unwrap_err());
+    assert!(error.contains("differ only in letter case"), "{error}");
+    assert!(!error.chars().any(crate::text::is_unsafe), "{error:?}");
+    // Nothing was installed, and names that really differ still join.
+    assert_eq!(
+        load_documents(&two.member, &two.network_id).unwrap().seq(),
+        2
+    );
+    let sound = hand_made_token(&two, |policy| {
+        policy.members[1].name = "Laptop2".to_string()
     });
     assert!(matches!(
         join(&two.member, &sound, NOW).unwrap(),

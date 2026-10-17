@@ -52,39 +52,34 @@ pub struct Directory {
 }
 
 impl Directory {
-    /// From the documents in `home`.
+    /// From the documents in `home`; every network's documents must be readable.
     pub fn load(home: &Home) -> Result<Self> {
         let mut entries = Vec::new();
         for network_id in home.networks()? {
             let docs = load_documents(home, &network_id)?;
-            for member in &docs.policy_body().members {
-                entries.push(Entry {
-                    network_id,
-                    name: member.name.clone(),
-                    node_id: member.node_id,
-                });
-            }
+            entries.extend(Self::members_of(&network_id, &docs));
         }
         Ok(Self { entries })
     }
 
-    /// From the documents in `home` that can be read: a network whose documents cannot is left
-    /// out (and the reload reports it) instead of taking every other network's names with it.
-    pub fn load_readable(home: &Home) -> Result<Self> {
-        let mut entries = Vec::new();
-        for network_id in home.networks()? {
-            let Ok(docs) = load_documents(home, &network_id) else {
-                continue;
-            };
-            for member in &docs.policy_body().members {
-                entries.push(Entry {
-                    network_id,
-                    name: member.name.clone(),
-                    node_id: member.node_id,
-                });
-            }
-        }
-        Ok(Self { entries })
+    /// The members one network's documents name.
+    fn members_of(
+        network_id: &NetworkId,
+        docs: &menzil_admin::Documents,
+    ) -> impl Iterator<Item = Entry> {
+        let network_id = *network_id;
+        docs.policy_body().members.iter().map(move |member| Entry {
+            network_id,
+            name: member.name.clone(),
+            node_id: member.node_id,
+        })
+    }
+
+    /// What this directory holds for one network.
+    fn entries_in<'a>(&'a self, network_id: &'a NetworkId) -> impl Iterator<Item = &'a Entry> {
+        self.entries
+            .iter()
+            .filter(move |entry| &entry.network_id == network_id)
     }
 
     /// From entries already at hand.
@@ -97,13 +92,24 @@ impl Directory {
     /// start of another member's node id, is refused with a list rather than guessed: names win
     /// over nothing (the third red-team round, M1: a member named like the start of this
     /// device's own node id, in another network, used to take the address of that node).
+    ///
+    /// Names compare without regard to letter case, as the issuing tool's own rule for a name
+    /// being taken does, and as `ssh` needs: OpenSSH lowercases the host name before it expands
+    /// `%h`, so `ssh Laptop` runs `menzil stdio laptop/ssh` (the fourth red-team round, M2: with
+    /// an exact comparison a member `Laptop` could not be reached that way, and the owner of any
+    /// other network this device is in could name a member `laptop` and take the connection).
+    /// Every hit counts toward ambiguity.
     pub fn resolve(&self, who: &str) -> Result<&Entry, String> {
         let wants_prefix = who.len() >= 8 && who.bytes().all(|b| b.is_ascii_hexdigit());
         let prefix = who.to_ascii_lowercase();
+        let wanted = who.to_lowercase();
         let hits: Vec<&Entry> = self
             .entries
             .iter()
-            .filter(|e| e.name == who || (wants_prefix && e.node_id.to_hex().starts_with(&prefix)))
+            .filter(|e| {
+                e.name.to_lowercase() == wanted
+                    || (wants_prefix && e.node_id.to_hex().starts_with(&prefix))
+            })
             .collect();
         match hits.as_slice() {
             [one] => Ok(one),
@@ -207,22 +213,65 @@ pub fn text_environment(
         .collect()
 }
 
+/// The directory of the agent socket must belong to this user (or to root) and must not be
+/// writable by other users, unless it has the sticky bit (as `/tmp` does: others cannot remove
+/// or rename what is not theirs). In a directory others can write to, a user could swap the
+/// socket, or the directory, for a link between the bind and the chmod that follows, and have
+/// this process change the mode of a file of its own that the link points at (the fourth
+/// red-team round, N4). Write permission for the group is accepted: with the usual private
+/// group (a user's own, as on Ubuntu, where the umask makes every new directory 0775) it means
+/// the owner alone, and a shared group is a choice the user made.
+#[cfg(unix)]
+pub fn check_private_directory(dir: &Path, uid: u32) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let found = fs::metadata(dir).with_context(|| format!("looking at {}", dir.display()))?;
+    if !found.is_dir() {
+        bail!("{} is not a directory", dir.display());
+    }
+    if found.uid() != uid && found.uid() != 0 {
+        bail!(
+            "{} belongs to another user (uid {}): put `agent_socket` in a directory of your own",
+            dir.display(),
+            found.uid()
+        );
+    }
+    let mode = found.mode();
+    if mode & 0o002 != 0 && mode & 0o1000 == 0 {
+        bail!(
+            "{} can be written by other users (mode {:o}): a socket there could be swapped for a link; use a directory only you can write to, such as the default under $XDG_RUNTIME_DIR",
+            dir.display(),
+            mode & 0o7777
+        );
+    }
+    Ok(())
+}
+
 /// Binds the agent socket. A socket file left by a node that died is removed; one with a node
 /// behind it is an error; anything that is not a socket (a file the configuration pointed at by
 /// mistake, a link) is an error and is left alone. The directory is made private (0700) when
-/// this creates it, and the socket readable by its owner only. Whoever connects is checked
+/// this creates it, and the socket readable by its owner only. A directory that another user
+/// can write to is refused (see [`check_private_directory`]). Whoever connects is checked
 /// against this user's uid when the agent accepts (see [`crate::agent`]).
 pub async fn bind_agent_socket(path: &Path) -> Result<UnixListener> {
     check_socket_path_length(path)?;
     let dir = socket_directory(path);
-    if !dir.exists() {
-        fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
-        }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        // Created private in one step: a directory that appears with the default mode and is
+        // chmodded afterwards can be swapped for a link in between.
+        fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(dir)
+            .with_context(|| format!("creating {}", dir.display()))?;
+        let uid = agent::current_uid()
+            .await
+            .context("finding out which user this is")?;
+        check_private_directory(dir, uid)?;
     }
+    #[cfg(not(unix))]
+    fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     match fs::symlink_metadata(path) {
         Ok(found) => {
             #[cfg(unix)]
@@ -433,34 +482,39 @@ pub fn reload(
     // others from being reloaded: a revocation installed with `menzil join` would otherwise
     // never be applied. Each failure is reported, and the first is returned at the end.
     let mut first_failure = None;
+    let before = directory
+        .read()
+        .map_err(|_| anyhow!("the directory is unavailable"))?
+        .clone();
+    let mut entries = Vec::new();
     for network_id in home.networks()? {
         let loaded = load_documents(home, &network_id).and_then(|docs| {
             rosters.set(docs.roster())?;
             policies.set(docs.policy())?;
-            Ok(docs.seq())
+            Ok(docs)
         });
         match loaded {
-            Ok(seq) => {
+            Ok(docs) => {
+                let seq = docs.seq();
+                entries.extend(Directory::members_of(&network_id, &docs));
                 if last.insert(network_id, seq) != Some(seq) {
                     tracing::info!(network = %network_id, seq, "holding newer documents");
                 }
             }
             Err(error) => {
                 tracing::warn!(network = %network_id, error = %format!("{error:#}"), "cannot reload this network's documents");
+                // The stores keep this network's documents as they were, and so does the
+                // directory keep its names. Leaving them out would let a name that two networks
+                // share (and that is refused as ambiguous) mean the other network's member
+                // (the fourth red-team round, L1).
+                entries.extend(before.entries_in(&network_id).cloned());
                 first_failure.get_or_insert(error);
             }
         }
     }
-    match Directory::load_readable(home) {
-        Ok(fresh) => {
-            *directory
-                .write()
-                .map_err(|_| anyhow!("the directory is unavailable"))? = fresh;
-        }
-        Err(error) => {
-            first_failure.get_or_insert(error);
-        }
-    }
+    *directory
+        .write()
+        .map_err(|_| anyhow!("the directory is unavailable"))? = Directory::from_entries(entries);
     match first_failure {
         Some(error) => Err(error),
         None => Ok(()),
@@ -469,6 +523,10 @@ pub fn reload(
 
 /// `menzil node`: starts everything and runs until interrupted.
 pub async fn run(home: &Home) -> Result<()> {
+    // Before anything that takes time (starting, then up to 60 s of waiting to attach): a signal
+    // from here on takes the path below, not the default action, which would leave the agent
+    // socket behind and close what the node carries with a FIN (the fourth red-team round, N3).
+    let mut signals = crate::signals::Shutdown::catch().context("catching signals")?;
     let config = Config::load(home)?;
     let socket = agent_socket_path(home, &config);
     let running = start(home, &config, &socket).await?;
@@ -476,18 +534,29 @@ pub async fn run(home: &Home) -> Result<()> {
         "menzil node running; agent socket {}",
         running.socket.display()
     );
-    match running.node.wait_attached(Duration::from_secs(60)).await {
-        Some(_) => eprintln!("connected to the relay"),
-        None => eprintln!(
-            "not connected to the relay after 60 s; still trying (RUST_LOG=menzil=debug shows why)"
-        ),
-    }
+    let early = {
+        let attach = async {
+            match running.node.wait_attached(Duration::from_secs(60)).await {
+                Some(_) => eprintln!("connected to the relay"),
+                None => eprintln!(
+                    "not connected to the relay after 60 s; still trying (RUST_LOG=menzil=debug shows why)"
+                ),
+            }
+        };
+        tokio::pin!(attach);
+        tokio::select! {
+            () = &mut attach => None,
+            why = signals.wait() => Some(why),
+        }
+    };
     // Every signal that stops a process takes this path: dropping the node resets what it
     // carries (a target connection closed by the kernel after a SIGTERM would end with a FIN,
     // as if the peer had finished).
-    let why = crate::signals::shutdown()
-        .await
-        .context("waiting for a signal")?;
+    let why = match early {
+        Some(why) => why,
+        None => signals.wait().await,
+    }
+    .context("waiting for a signal")?;
     eprintln!("stopping ({why})");
     let _ = fs::remove_file(&running.socket);
     drop(running);

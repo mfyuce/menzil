@@ -29,7 +29,29 @@ pub const ROSTER_PREFIX: &str = "menzil1-roster:";
 
 /// The longest token text accepted: two documents at the size verifiers allow, base64 encoded,
 /// with room for the framing. Checked before any decoding.
-const MAX_TOKEN_CHARS: usize = (2 * MAX_DOC_BYTES + 16).div_ceil(3) * 4;
+pub const MAX_TOKEN_CHARS: usize = (2 * MAX_DOC_BYTES + 16).div_ceil(3) * 4;
+
+/// Reads a token from `source` (standard input, when a command is given `-`): the whole text,
+/// trimmed. At most a token's length plus a little room for a newline and spaces is read; more
+/// than that is not a token and is refused without reading on (the fourth red-team round, N5: a
+/// file piped by mistake, or a stream that never ends, was read into memory whole before any
+/// length check).
+pub fn read_token(source: impl std::io::Read) -> anyhow::Result<String> {
+    use anyhow::Context;
+    use std::io::Read;
+    let limit = MAX_TOKEN_CHARS as u64 + 64;
+    let mut text = String::new();
+    source
+        .take(limit + 1)
+        .read_to_string(&mut text)
+        .context("reading the token from standard input")?;
+    if text.len() as u64 > limit {
+        anyhow::bail!(
+            "standard input holds more than any token can be ({limit} bytes at most): nothing more was read"
+        );
+    }
+    Ok(text.trim().to_string())
+}
 
 /// Why a pasted token was not accepted.
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -273,6 +295,46 @@ mod tests {
             decode_documents(&token),
             Err(TokenError::Malformed(_))
         ));
+    }
+
+    /// The fourth red-team round, N5: `-` read all of standard input before any length check.
+    #[test]
+    fn a_token_is_read_from_a_stream_up_to_its_length_and_no_further() {
+        use std::io::Read;
+        // A counting reader over far more than any token: the reading stops near the limit.
+        struct Counting<R>(R, std::sync::Arc<std::sync::atomic::AtomicUsize>);
+        impl<R: Read> Read for Counting<R> {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                let n = self.0.read(buf)?;
+                self.1.fetch_add(n, std::sync::atomic::Ordering::SeqCst);
+                Ok(n)
+            }
+        }
+        let count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let enormous = Counting(
+            std::io::repeat(b'A').take(4 * MAX_TOKEN_CHARS as u64),
+            count.clone(),
+        );
+        let error = format!("{:#}", read_token(enormous).unwrap_err());
+        assert!(error.contains("more than any token"), "{error}");
+        let read = count.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            read <= MAX_TOKEN_CHARS + 64 + 1 + 64 * 1024,
+            "read {read} bytes of {}",
+            4 * MAX_TOKEN_CHARS
+        );
+
+        // A token with its newline, and spaces around it, is read and trimmed.
+        assert_eq!(
+            read_token(&b"  menzil1-join:abc \r\n"[..]).unwrap(),
+            "menzil1-join:abc"
+        );
+        // The longest token is not refused.
+        let longest = vec![b'A'; MAX_TOKEN_CHARS];
+        assert_eq!(read_token(&longest[..]).unwrap().len(), MAX_TOKEN_CHARS);
+        // Nothing, and what is not text, are errors of their own.
+        assert_eq!(read_token(&b""[..]).unwrap(), "");
+        assert!(read_token(&[0xff, 0xfe][..]).is_err());
     }
 
     #[test]

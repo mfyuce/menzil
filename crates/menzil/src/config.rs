@@ -21,7 +21,7 @@ use std::fs;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, anyhow, bail};
-use menzil_carrier::{ConnectionInfo, ProxyOverride};
+use menzil_carrier::{ConnectionInfo, ProxyOverride, redact_userinfo};
 use menzil_node::{LocalServices, LocalTarget};
 use menzil_proto::ServiceId;
 use serde::Deserialize;
@@ -29,7 +29,7 @@ use serde::Deserialize;
 use crate::home::Home;
 
 /// The settings file.
-#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Default, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
     /// Connection information of the relay.
@@ -41,6 +41,20 @@ pub struct Config {
     pub services: BTreeMap<String, String>,
     /// Where the agent listens; by default under the runtime directory or the home.
     pub agent_socket: Option<PathBuf>,
+}
+
+impl std::fmt::Debug for Config {
+    /// The proxy URL without its user name and password: a `Debug` print of the settings (or of
+    /// anything that holds them) must not carry them into a log or a panic message (the fourth
+    /// red-team round, N2).
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Config")
+            .field("relay", &self.relay)
+            .field("proxy", &self.proxy.as_deref().map(redact_userinfo))
+            .field("services", &self.services)
+            .field("agent_socket", &self.agent_socket)
+            .finish()
+    }
 }
 
 impl Config {
@@ -136,6 +150,31 @@ mod tests {
             "menzil://relay.example.org:443/_menzil/v1?id={}",
             "ab".repeat(32)
         )
+    }
+
+    /// The fourth red-team round, N2: the derived `Debug` of the settings printed the proxy URL
+    /// with its password, and so did the `Debug` of everything that holds them.
+    #[test]
+    fn the_debug_output_of_the_settings_never_shows_the_proxy_password() {
+        let config = Config::parse(
+            "proxy = \"http://alice:hunter2@proxy.corp:3128\"\n[services]\n\"tcp:ssh\" = \"127.0.0.1:22\"\n",
+        )
+        .unwrap();
+        let shown = format!("{config:?}");
+        assert!(
+            !shown.contains("hunter2") && !shown.contains("alice"),
+            "{shown}"
+        );
+        assert!(
+            shown.contains("proxy.corp:3128") && shown.contains("127.0.0.1:22"),
+            "{shown}"
+        );
+        // What is built from them is held to the same rule.
+        let over = config.proxy_override();
+        assert!(!format!("{over:?}").contains("hunter2"));
+        // A setting with nothing secret in it prints as it is.
+        let plain = Config::parse("proxy = \"direct\"\n").unwrap();
+        assert!(format!("{plain:?}").contains("direct"));
     }
 
     #[test]

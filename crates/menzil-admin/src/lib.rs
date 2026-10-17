@@ -30,6 +30,7 @@ mod keys;
 
 pub use error::AdminError;
 pub use issue::{
-    DOCUMENT_LIFETIME_SECS, Documents, admit, check_name, check_role, create_network, grant, renew,
+    DOCUMENT_LIFETIME_SECS, Documents, admit, check_name, check_role, create_network, grant,
+    is_invisible, is_unsafe, renew,
 };
 pub use keys::{MAX_CERT_LIFETIME_SECS, NodeKeys, OwnerKey};

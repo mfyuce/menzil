@@ -279,6 +279,66 @@ fn a_member_cannot_be_admitted_twice_and_names_are_unique() {
     ));
 }
 
+/// The one table of invisible characters, for names and for the text that reaches a terminal.
+#[test]
+fn invisible_characters_are_told_from_visible_ones() {
+    for c in [
+        '\u{ad}',
+        '\u{34f}',
+        '\u{600}',
+        '\u{61c}',
+        '\u{115f}',
+        '\u{1160}',
+        '\u{17b4}',
+        '\u{180b}',
+        '\u{180e}',
+        '\u{200b}',
+        '\u{200d}',
+        '\u{200f}',
+        '\u{202a}',
+        '\u{202e}',
+        '\u{2060}',
+        '\u{2065}',
+        '\u{2069}',
+        '\u{206f}',
+        '\u{3164}',
+        '\u{fe00}',
+        '\u{fe0f}',
+        '\u{feff}',
+        '\u{ffa0}',
+        '\u{fff0}',
+        '\u{fffb}',
+        '\u{e0001}',
+        '\u{e0041}',
+        '\u{e007f}',
+        '\u{e0100}',
+    ] {
+        assert!(crate::is_invisible(c), "{c:?}");
+    }
+    for c in [
+        'a',
+        'Z',
+        '0',
+        '-',
+        '_',
+        '.',
+        ' ',
+        'ü',
+        'ğ',
+        'ı',
+        'あ',
+        '字',
+        '\u{200a}',
+        '\u{2028}',
+        '\u{fffc}',
+        '\u{fffd}',
+        '\u{1f600}',
+        '\u{5b0}',
+    ] {
+        assert!(!crate::is_invisible(c), "{c:?}");
+    }
+}
+
 #[test]
 fn names_that_cannot_head_an_address_are_refused() {
     let (owner, _laptop, _, docs) = founded();
@@ -295,6 +355,14 @@ fn names_that_cannot_head_an_address_are_refused() {
         "right\u{202e}left",
         "zero\u{200b}width",
         "emoji\u{1f600}",
+        // The fourth round, N1: letters and marks that print as nothing.
+        "hangul\u{3164}filler",
+        "\u{3164}",
+        "x\u{115f}y",
+        "\u{ffa0}x",
+        "selector\u{fe0f}",
+        "joiner\u{34f}x",
+        "tag\u{e0041}",
         // Not names a person could type into an address: dots only, or a leading mark.
         ".",
         "..",
