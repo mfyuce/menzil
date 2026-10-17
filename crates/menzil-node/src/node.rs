@@ -50,8 +50,13 @@
 //!   handler is [`RefuseAll`].
 //!
 //! Dropping a [`Node`] aborts its tasks: the relay connection closes and
-//! every session and stream of it ends. [`Node::shutdown`] does the same
-//! and waits for the tasks to finish.
+//! every session and stream of it ends, but nothing tells the peers, who
+//! learn it from the dead peer timeout (about 40 s). [`Node::shutdown`] does
+//! the same and waits for the tasks to finish. A node that stops on purpose
+//! calls [`Node::close_gracefully`] first: every session ends with a CLOSE
+//! `shutting_down`, the relay session writes them out and closes its
+//! connection politely, and the peers reset the streams at once (protocol.md
+//! 5.2).
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -66,12 +71,12 @@ use crate::admission::PolicyAuthorizer;
 use crate::l4_router::{
     EnsureError, RouterConfig, RouterHandle, RouterParts, SessionReady, new_router,
 };
-use crate::l4_session::E2E_PROTO_TAG;
+use crate::l4_session::{CloseReason, E2E_PROTO_TAG};
 use crate::l5_stream::{OpenStreamError, accept_loop, open};
 use crate::outbound::{Epoch, SendBudgets};
 use crate::policy_store::PolicyStore;
 use crate::roster_store::RosterStore;
-use crate::session::{SessionConfig, SessionEvent, run_session};
+use crate::session::{SessionConfig, SessionEvent, run_session_until};
 
 /// Capacity of each of the two channels between [`run_session`] and the
 /// router. Any size works (`run_session` is written not to deadlock on a
@@ -153,6 +158,10 @@ pub struct Node {
     events: Option<mpsc::Receiver<SessionEvent>>,
     policies: Arc<PolicyStore>,
     rosters: Arc<RosterStore>,
+    /// Tells the relay session to write what it holds and close.
+    stop_session: watch::Sender<bool>,
+    /// Turns `true` when the relay session task has returned.
+    session_ended: watch::Receiver<bool>,
     tasks: Vec<JoinHandle<()>>,
 }
 
@@ -195,14 +204,16 @@ impl Node {
             task: router,
         } = new_router(router_config, outbound_tx, events_rx);
 
+        let (stop_session, stop_rx) = watch::channel(false);
+        let (ended_tx, session_ended) = watch::channel(false);
         let tasks = vec![
-            tokio::spawn(run_session(
-                session,
-                env,
-                events_tx,
-                outbound_rx,
-                rosters.clone(),
-            )),
+            tokio::spawn({
+                let rosters = rosters.clone();
+                async move {
+                    run_session_until(session, env, events_tx, outbound_rx, rosters, stop_rx).await;
+                    let _ = ended_tx.send(true);
+                }
+            }),
             tokio::spawn(router),
             tokio::spawn(serve_sessions(
                 ready,
@@ -219,6 +230,8 @@ impl Node {
             events: Some(passthrough),
             policies,
             rosters,
+            stop_session,
+            session_ended,
             tasks,
         })
     }
@@ -273,6 +286,37 @@ impl Node {
     /// read.
     pub fn take_events(&mut self) -> Option<mpsc::Receiver<SessionEvent>> {
         self.events.take()
+    }
+
+    /// Ends the node the polite way, within `grace`: every L4 session is
+    /// closed with a CLOSE `shutting_down` (so its peer ends it and resets its
+    /// streams at once), the relay session writes those out and closes its
+    /// connection with a WebSocket Close, and no session is opened from now
+    /// on ([`Node::open_stream`] fails with [`EnsureError::ShuttingDown`]).
+    /// Returns whether all of it finished in time; either way the node is
+    /// done afterwards: drop it, or call [`Node::shutdown`], to end the tasks
+    /// (and with them the streams being served). A node that is only dropped
+    /// leaves its peers to find out by the dead peer timeout.
+    pub async fn close_gracefully(&self, grace: Duration) -> bool {
+        let deadline = tokio::time::Instant::now() + grace;
+        let closed = self
+            .router
+            .stop(
+                CloseReason {
+                    code: ErrorCode::ShuttingDown,
+                    msg: "this node is shutting down".to_string(),
+                },
+                grace,
+            )
+            .await;
+        // The CLOSE records are in the relay session's queue now (or the time
+        // for them is up): have it write them and leave.
+        let _ = self.stop_session.send(true);
+        let mut ended = self.session_ended.clone();
+        let written = tokio::time::timeout_at(deadline, ended.wait_for(|ended| *ended))
+            .await
+            .is_ok_and(|result| result.is_ok());
+        closed && written
     }
 
     /// Stops the node and waits for its three tasks (the relay session, the

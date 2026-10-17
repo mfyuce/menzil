@@ -253,11 +253,13 @@ impl LocalServices {
         self
     }
 
-    /// Replaces the default [`ServeLimits`]. Values of zero count as 1. Starts the counts
-    /// afresh, so call it while configuring, before the node runs.
+    /// Replaces the default [`ServeLimits`]. Values of zero count as 1, and a total past
+    /// what a semaphore can hold (about 2^61, far more than any process has descriptors for)
+    /// is cut to that: it used to panic. Starts the counts afresh, so call it while
+    /// configuring, before the node runs.
     pub fn with_limits(mut self, limits: ServeLimits) -> Self {
         let limits = ServeLimits {
-            max_connections: limits.max_connections.max(1),
+            max_connections: limits.max_connections.clamp(1, Semaphore::MAX_PERMITS),
             max_connections_per_peer: limits.max_connections_per_peer.max(1),
             socket_buffer: limits.socket_buffer,
         };
@@ -1839,6 +1841,14 @@ mod tests {
         assert_eq!(services.limits().max_connections, 1);
         assert_eq!(services.limits().max_connections_per_peer, 1);
         assert_eq!(services.limits().socket_buffer, 4096);
+        // The fifth red-team round, N1: a total past what a semaphore holds panicked at start.
+        let huge = LocalServices::new().with_limits(ServeLimits {
+            max_connections: usize::MAX,
+            max_connections_per_peer: usize::MAX,
+            socket_buffer: 4096,
+        });
+        assert_eq!(huge.limits().max_connections, Semaphore::MAX_PERMITS);
+        assert_eq!(huge.limits().max_connections_per_peer, usize::MAX);
         assert_eq!(
             LocalServices::new().limits(),
             ServeLimits {

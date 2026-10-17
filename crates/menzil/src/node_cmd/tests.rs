@@ -573,3 +573,225 @@ async fn a_second_node_on_one_home_is_refused() {
     let again = start(&home, &config, &dir.path().join("c.sock")).await;
     assert!(again.is_ok(), "{:#}", again.err().unwrap());
 }
+
+// ----------------------------------------------------------------------------------------
+// The fifth red-team round, M1: the path to a socket must not be changeable by anybody else.
+// One user id is all a test has, so "made by another user" is a link-owner function that says
+// so, and "somebody else can write here" is the directory mode.
+// ----------------------------------------------------------------------------------------
+
+#[cfg(unix)]
+fn owner_of(path: &Path) -> u32 {
+    use std::os::unix::fs::MetadataExt;
+    fs::metadata(path).unwrap().uid()
+}
+
+#[cfg(unix)]
+fn set_mode(path: &Path, mode: u32) {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
+}
+
+/// `prepare_chain` with the real owner of a link.
+#[cfg(unix)]
+fn chain(dir: &Path, uid: u32) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    prepare_chain(dir, uid, &|link| link.uid())
+}
+
+#[cfg(unix)]
+#[test]
+fn a_link_in_the_path_made_by_another_user_is_refused() {
+    let base = tempfile::tempdir().unwrap();
+    let me = owner_of(base.path());
+    fs::create_dir(base.path().join("real")).unwrap();
+    std::os::unix::fs::symlink("real", base.path().join("via")).unwrap();
+    let through = base.path().join("via");
+    // A link of this user is fine...
+    chain(&through, me).unwrap();
+    // ...the same link made by somebody else is not, however private what it leads to is.
+    let error = format!(
+        "{:#}",
+        prepare_chain(&through, me, &|_| me + 1).unwrap_err()
+    );
+    assert!(error.contains("a link made by another user"), "{error}");
+    // Root's links are the system's own (`/tmp` is one on macOS).
+    prepare_chain(&through, me, &|_| 0).unwrap();
+}
+
+/// The shape of the report: a link in a sticky directory, pointing at a private one.
+#[cfg(unix)]
+#[test]
+fn a_link_that_others_can_replace_is_refused_even_when_this_user_made_it() {
+    let base = tempfile::tempdir().unwrap();
+    let me = owner_of(base.path());
+    let shared = base.path().join("shared");
+    fs::create_dir(&shared).unwrap();
+    fs::create_dir(base.path().join("real")).unwrap();
+    std::os::unix::fs::symlink("../real", shared.join("via")).unwrap();
+    let through = shared.join("via");
+    // A directory only this user can change: fine.
+    chain(&through, me).unwrap();
+    // Others can write to it (without the sticky bit): they can replace the link.
+    set_mode(&shared, 0o777);
+    let error = format!("{:#}", chain(&through, me).unwrap_err());
+    assert!(error.contains("can be written by other users"), "{error}");
+    // With the sticky bit (as `/tmp` has) they cannot.
+    set_mode(&shared, 0o1777);
+    chain(&through, me).unwrap();
+}
+
+/// The fix covers what the link leads through, not only what the path says: a link to a
+/// directory whose own parent others can write to.
+#[cfg(unix)]
+#[test]
+fn a_directory_behind_a_link_is_checked_as_it_really_is() {
+    let base = tempfile::tempdir().unwrap();
+    let me = owner_of(base.path());
+    let open = base.path().join("open");
+    fs::create_dir(&open).unwrap();
+    fs::create_dir(open.join("inner")).unwrap();
+    set_mode(&open.join("inner"), 0o700);
+    std::os::unix::fs::symlink("open/inner", base.path().join("via")).unwrap();
+    let through = base.path().join("via");
+    chain(&through, me).unwrap();
+    // `open` is not on the path as written (`via` is), but the kernel goes through it.
+    set_mode(&open, 0o777);
+    let error = format!("{:#}", chain(&through, me).unwrap_err());
+    assert!(error.contains("can be written by other users"), "{error}");
+    assert!(error.contains("open"), "{error}");
+}
+
+/// Nothing is made below a step that failed (so nothing is made through a link someone else
+/// made, or in a directory others can write to), and what is made is private.
+#[cfg(unix)]
+#[test]
+fn missing_directories_are_made_private_and_only_below_steps_that_passed() {
+    use std::os::unix::fs::PermissionsExt;
+    let base = tempfile::tempdir().unwrap();
+    let me = owner_of(base.path());
+    let deep = base.path().join("a").join("b").join("c");
+    chain(&deep, me).unwrap();
+    for dir in ["a", "a/b", "a/b/c"] {
+        let mode = fs::metadata(base.path().join(dir))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o700, "{dir}");
+    }
+    // Below a directory others can write to: refused, and not made.
+    let open = base.path().join("open");
+    fs::create_dir(&open).unwrap();
+    set_mode(&open, 0o777);
+    let below = open.join("new").join("deeper");
+    assert!(chain(&below, me).is_err());
+    assert!(!open.join("new").exists(), "made below a step that failed");
+    // Below a link made by another user: refused, and not made in what it leads to.
+    let real = base.path().join("real");
+    fs::create_dir(&real).unwrap();
+    std::os::unix::fs::symlink("real", base.path().join("via")).unwrap();
+    let error = format!(
+        "{:#}",
+        prepare_chain(&base.path().join("via").join("new"), me, &|_| me + 1).unwrap_err()
+    );
+    assert!(error.contains("a link made by another user"), "{error}");
+    assert!(
+        !real.join("new").exists(),
+        "made through a link of another user"
+    );
+}
+
+/// Ownership is checked on every step, not only on the last directory.
+#[cfg(unix)]
+#[test]
+fn a_directory_that_belongs_to_another_user_is_refused_on_the_way_too() {
+    let base = tempfile::tempdir().unwrap();
+    let me = owner_of(base.path());
+    let inner = base.path().join("inner");
+    fs::create_dir(&inner).unwrap();
+    // With a user id that is not the owner's, the first directory that is not root's fails.
+    let error = format!("{:#}", chain(&inner, me + 1).unwrap_err());
+    assert!(error.contains("belongs to another user"), "{error}");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_socket_in_a_directory_behind_a_link_of_this_user_binds_and_is_found_again() {
+    let base = tempfile::tempdir().unwrap();
+    fs::create_dir(base.path().join("real")).unwrap();
+    std::os::unix::fs::symlink("real", base.path().join("via")).unwrap();
+    let path = base.path().join("via").join("a.sock");
+    let listener = bind_private_socket(&path, &AGENT_SOCKET).await.unwrap();
+    assert!(path.exists());
+    let identity = file_identity(&path).unwrap();
+    assert_eq!(
+        identity,
+        file_identity(&base.path().join("real").join("a.sock")).unwrap()
+    );
+    drop(listener);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_socket_is_removed_only_while_the_path_still_names_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("a.sock");
+    // The socket this run made: removed.
+    let first = bind_private_socket(&path, &AGENT_SOCKET).await.unwrap();
+    let identity = file_identity(&path).unwrap();
+    assert!(remove_if_unchanged(&path, identity));
+    assert!(!path.exists());
+    // Already gone: nothing to do.
+    assert!(!remove_if_unchanged(&path, identity));
+    drop(first);
+
+    // Another socket put at the path (by another run, or by somebody else): left alone.
+    let mine = bind_private_socket(&path, &AGENT_SOCKET).await.unwrap();
+    let identity = file_identity(&path).unwrap();
+    fs::remove_file(&path).unwrap();
+    let theirs = UnixListener::bind(&path).unwrap();
+    assert!(!remove_if_unchanged(&path, identity));
+    assert!(
+        path.exists(),
+        "removed a socket that is not the one that was made"
+    );
+    drop((mine, theirs));
+    fs::remove_file(&path).unwrap();
+
+    // A file, a link or a directory at the path: left alone.
+    let mine = bind_private_socket(&path, &AGENT_SOCKET).await.unwrap();
+    let identity = file_identity(&path).unwrap();
+    fs::remove_file(&path).unwrap();
+    fs::write(&path, b"precious").unwrap();
+    assert!(!remove_if_unchanged(&path, identity));
+    assert_eq!(fs::read(&path).unwrap(), b"precious");
+    drop(mine);
+}
+
+/// A trailing slash is not a file name (`Path` ignores it, which would take `dir/` for the file
+/// `dir`); the agent socket and the reach socket share the check.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_socket_path_must_name_a_file() {
+    let base = tempfile::tempdir().unwrap();
+    for bad in [
+        format!("{}/", base.path().join("dirx").display()),
+        format!("{}/.", base.path().display()),
+        format!("{}/..", base.path().display()),
+        "/".to_string(),
+    ] {
+        let error = format!(
+            "{:#}",
+            bind_private_socket(Path::new(&bad), &AGENT_SOCKET)
+                .await
+                .err()
+                .unwrap()
+        );
+        assert!(
+            error.contains("does not name a socket file"),
+            "{bad}: {error}"
+        );
+        assert!(error.contains("agent_socket"), "{bad}: {error}");
+    }
+    assert!(!base.path().join("dirx").exists());
+}

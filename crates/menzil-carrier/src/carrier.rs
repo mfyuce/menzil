@@ -10,6 +10,7 @@
 
 use std::collections::HashMap;
 use std::future::Future;
+use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
 use rustls::pki_types::ServerName;
@@ -28,6 +29,9 @@ use crate::{connect, socket_tuning, tls, websocket};
 /// The Noise message size limit (protocol.md 3.3): one WebSocket binary
 /// message is one L3 record, at most this many bytes.
 pub const MAX_MESSAGE_BYTES: usize = 65_535;
+
+/// The most time [`Carrier::close`] takes.
+const CLOSE_WAIT: Duration = Duration::from_secs(2);
 
 /// Configuration for one dial; cheap to clone and reuse across reconnects.
 #[derive(Debug, Clone)]
@@ -118,6 +122,25 @@ impl Carrier {
                 Message::Frame(_) => return Err(CarrierError::UnexpectedMessageType),
             }
         }
+    }
+
+    /// Ends the connection politely: sends a WebSocket Close, which flushes
+    /// everything sent before it, then waits for the other end's own Close,
+    /// reading and dropping whatever arrives meanwhile. A socket that is
+    /// dropped while it holds unread data is reset, and a reset can discard
+    /// what was sent just before it; reading to the other end's Close leaves
+    /// nothing unread. The whole of it, the flush included, takes two seconds
+    /// at most (a stalled connection would otherwise hold the flush for as
+    /// long as it stays stalled). Errors are ignored: the connection is going
+    /// away either way.
+    pub async fn close(&mut self) {
+        let _ = tokio::time::timeout(CLOSE_WAIT, async {
+            if self.ws.close(None).await.is_err() {
+                return;
+            }
+            while let Some(Ok(_)) = self.ws.next().await {}
+        })
+        .await;
     }
 }
 

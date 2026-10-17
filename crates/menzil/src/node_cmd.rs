@@ -34,6 +34,9 @@ use crate::text;
 /// How often a running node looks for newer documents on disk.
 const RELOAD_EVERY: Duration = Duration::from_secs(15);
 
+/// How long a stopping node spends telling its peers and the relay goodbye.
+const STOP_GRACE: Duration = Duration::from_secs(3);
+
 /// One member of one network, as a person names it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Entry {
@@ -180,20 +183,46 @@ pub fn agent_socket_path(home: &Home, config: &Config) -> PathBuf {
     }
 }
 
+/// A Unix socket this program serves, in the words of the errors about it: what it is, where the
+/// person changes its path, and who else could be holding it.
+#[derive(Debug, Clone, Copy)]
+pub struct SocketKind {
+    /// What the socket is: "the agent socket".
+    pub what: &'static str,
+    /// What the person sets to move it: "`agent_socket` in config.toml".
+    pub setting: &'static str,
+    /// Who is meant when a live socket is found at the path: "another menzil node".
+    pub holder: &'static str,
+}
+
+/// The socket `menzil node` answers `stdio` and `reach` on.
+pub const AGENT_SOCKET: SocketKind = SocketKind {
+    what: "the agent socket",
+    setting: "`agent_socket` in config.toml",
+    holder: "another menzil node",
+};
+
 /// The longest path a Unix domain socket can have is about 108 bytes (`sun_path`, less on some
 /// systems); beyond it binding or connecting fails with an error that does not say what to do.
 const MAX_SOCKET_PATH_BYTES: usize = 100;
 
 /// Refuses a socket path too long to use, with the remedy.
-pub fn check_socket_path_length(path: &Path) -> Result<()> {
+pub fn check_path_length(path: &Path, kind: &SocketKind) -> Result<()> {
     let length = path.as_os_str().len();
     if length > MAX_SOCKET_PATH_BYTES {
         bail!(
-            "the agent socket path is {length} bytes, more than a Unix socket path can be (about {MAX_SOCKET_PATH_BYTES}): set `agent_socket` in config.toml to a shorter path in a directory that only you can use, such as one under $XDG_RUNTIME_DIR: {}",
+            "{} path is {length} bytes, more than a Unix socket path can be (about {MAX_SOCKET_PATH_BYTES}): set {} to a shorter path in a directory that only you can use, such as one under $XDG_RUNTIME_DIR: {}",
+            kind.what,
+            kind.setting,
             path.display()
         );
     }
     Ok(())
+}
+
+/// [`check_path_length`] for the agent socket.
+pub fn check_socket_path_length(path: &Path) -> Result<()> {
+    check_path_length(path, &AGENT_SOCKET)
 }
 
 /// The directory a socket path is in: a bare file name has no directory part, and means the
@@ -213,7 +242,7 @@ pub fn text_environment(
         .collect()
 }
 
-/// The directory of the agent socket must belong to this user (or to root) and must not be
+/// The directory of a private socket must belong to this user (or to root) and must not be
 /// writable by other users, unless it has the sticky bit (as `/tmp` does: others cannot remove
 /// or rename what is not theirs). In a directory others can write to, a user could swap the
 /// socket, or the directory, for a link between the bind and the chmod that follows, and have
@@ -230,7 +259,7 @@ pub fn check_private_directory(dir: &Path, uid: u32) -> Result<()> {
     }
     if found.uid() != uid && found.uid() != 0 {
         bail!(
-            "{} belongs to another user (uid {}): put `agent_socket` in a directory of your own",
+            "{} belongs to another user (uid {}): use a directory of your own",
             dir.display(),
             found.uid()
         );
@@ -238,7 +267,7 @@ pub fn check_private_directory(dir: &Path, uid: u32) -> Result<()> {
     let mode = found.mode();
     if mode & 0o002 != 0 && mode & 0o1000 == 0 {
         bail!(
-            "{} can be written by other users (mode {:o}): a socket there could be swapped for a link; use a directory only you can write to, such as the default under $XDG_RUNTIME_DIR",
+            "{} can be written by other users (mode {:o}): what is in it, or the path through it, could be swapped for something else; use a directory only you can write to, such as one under $XDG_RUNTIME_DIR",
             dir.display(),
             mode & 0o7777
         );
@@ -246,32 +275,176 @@ pub fn check_private_directory(dir: &Path, uid: u32) -> Result<()> {
     Ok(())
 }
 
-/// Binds the agent socket. A socket file left by a node that died is removed; one with a node
-/// behind it is an error; anything that is not a socket (a file the configuration pointed at by
-/// mistake, a link) is an error and is left alone. The directory is made private (0700) when
-/// this creates it, and the socket readable by its owner only. A directory that another user
-/// can write to is refused (see [`check_private_directory`]). Whoever connects is checked
-/// against this user's uid when the agent accepts (see [`crate::agent`]).
+/// Binds the agent socket (see [`bind_private_socket`]). Whoever connects is checked against this
+/// user's uid when the agent accepts (see [`crate::agent`]).
 pub async fn bind_agent_socket(path: &Path) -> Result<UnixListener> {
-    check_socket_path_length(path)?;
+    bind_private_socket(path, &AGENT_SOCKET).await
+}
+
+/// A file's identity as the file system tells it: the device and the inode.
+#[cfg(unix)]
+pub type FileIdentity = (u64, u64);
+
+/// The identity of the file at `path`; a link is not followed.
+#[cfg(unix)]
+pub fn file_identity(path: &Path) -> std::io::Result<FileIdentity> {
+    use std::os::unix::fs::MetadataExt;
+    let found = fs::symlink_metadata(path)?;
+    Ok((found.dev(), found.ino()))
+}
+
+/// Removes the file at `path` if it is still the file with `identity` (a socket this process
+/// bound, the lock file next to it), and says whether it did. A path can come to name something
+/// else while a socket is served (a file put in its place, a directory in it pointed
+/// elsewhere), and removing by name would then delete somebody else's file and leave one's own
+/// behind (the fifth red-team round, M1). A link or a directory is never removed: their
+/// identity is not the file's.
+#[cfg(unix)]
+pub fn remove_if_unchanged(path: &Path, identity: FileIdentity) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    match fs::symlink_metadata(path) {
+        Ok(now) if !now.is_dir() && (now.dev(), now.ino()) == identity => {
+            fs::remove_file(path).is_ok()
+        }
+        _ => false,
+    }
+}
+
+/// Makes the directory of a socket, and everything on the way to it, such that nobody but this
+/// user and root can change where a socket in it is reached, now or later (the fifth red-team
+/// round, M1). The directory itself being private is not enough: a link in the path made by
+/// another user can be pointed somewhere else once the socket is bound, and whatever connects
+/// to the path (a database client, `nc -U`, which check nobody) then reaches that user's
+/// socket instead; a directory on the way that others can write to lets them replace a step
+/// of the path the same way.
+///
+/// The path is walked twice. As written, from the root (or the current directory), one step at
+/// a time: a step that is a link must be owned by this user or root ([`MetadataExt::uid`] of
+/// the link itself, `link_owner` in tests), and the directory it is or leads to is checked as
+/// [`check_private_directory`] checks the last one. A missing step is made (0700) only once
+/// everything above it has passed, so nothing is created through a link someone else made.
+/// Then as it really is, with the links resolved: every directory of the resolved path is
+/// checked the same way, which covers the links inside links. Nothing in the chain can then be
+/// changed by anybody else, so what was checked is what the kernel resolves when the socket is
+/// bound and when a client connects.
+///
+/// Write permission for the group is accepted on every step, as for the last one (see
+/// [`check_private_directory`]), and so is the sticky bit on a directory others can write to
+/// (as `/tmp` has: others cannot remove or rename what is not theirs).
+#[cfg(unix)]
+fn prepare_chain(dir: &Path, uid: u32, link_owner: &dyn Fn(&fs::Metadata) -> u32) -> Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+    let absolute = if dir.is_absolute() {
+        dir.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .context("finding the current directory")?
+            .join(dir)
+    };
+    let mut walked = PathBuf::new();
+    for component in absolute.components() {
+        walked.push(component);
+        match fs::symlink_metadata(&walked) {
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                match fs::DirBuilder::new().mode(0o700).create(&walked) {
+                    Ok(()) => {}
+                    // Somebody else made it a moment ago: what it is gets checked below.
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                    Err(error) => {
+                        return Err(error)
+                            .with_context(|| format!("creating {}", walked.display()));
+                    }
+                }
+            }
+            Err(error) => {
+                return Err(error).with_context(|| format!("looking at {}", walked.display()));
+            }
+        }
+        check_step(&walked, uid, link_owner)?;
+    }
+    let real =
+        fs::canonicalize(&absolute).with_context(|| format!("resolving {}", absolute.display()))?;
+    let mut walked = PathBuf::new();
+    for component in real.components() {
+        walked.push(component);
+        check_step(&walked, uid, link_owner)?;
+    }
+    Ok(())
+}
+
+/// One step of [`prepare_chain`]: a link must be made by this user or root, and what the step
+/// is or leads to must be a directory this user could be trusted with.
+#[cfg(unix)]
+fn check_step(step: &Path, uid: u32, link_owner: &dyn Fn(&fs::Metadata) -> u32) -> Result<()> {
+    let own =
+        fs::symlink_metadata(step).with_context(|| format!("looking at {}", step.display()))?;
+    if own.file_type().is_symlink() {
+        let owner = link_owner(&own);
+        if owner != uid && owner != 0 {
+            bail!(
+                "{} is a link made by another user (uid {owner}): its maker can point it somewhere else after the socket is made, and whatever connects to the path would reach that; use a path without it, or a directory of your own",
+                step.display()
+            );
+        }
+    }
+    check_private_directory(step, uid)
+}
+
+/// Binds a socket only this user can use ([`prepare_socket_directory`], then
+/// [`bind_in_prepared_directory`]).
+pub async fn bind_private_socket(path: &Path, kind: &SocketKind) -> Result<UnixListener> {
+    prepare_socket_directory(path, kind).await?;
+    bind_in_prepared_directory(path, kind).await
+}
+
+/// The first half of binding a private socket: refuses a path too long to use, and makes the
+/// directory (0700 for whatever this creates) and checks the whole path to it (see
+/// [`prepare_chain`]). Split from the bind so that a caller can take a lock in the directory
+/// once it is known to be safe.
+pub async fn prepare_socket_directory(path: &Path, kind: &SocketKind) -> Result<()> {
+    check_path_length(path, kind)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        // `Path` ignores a trailing slash and a trailing `.`, so `dir/` and `dir/.` would
+        // otherwise be taken for the file `dir` in the directory above, and the lock file of
+        // a reach socket for `dir/.lock`.
+        let last = path
+            .as_os_str()
+            .as_bytes()
+            .rsplit(|&byte| byte == b'/')
+            .next()
+            .unwrap_or_default();
+        if matches!(last, b"" | b"." | b"..") {
+            bail!(
+                "{} does not name a socket file (it ends in a slash, or in `.` or `..`): set {} to a path with a file name in it",
+                path.display(),
+                kind.setting
+            );
+        }
+    }
     let dir = socket_directory(path);
     #[cfg(unix)]
     {
-        use std::os::unix::fs::DirBuilderExt;
-        // Created private in one step: a directory that appears with the default mode and is
-        // chmodded afterwards can be swapped for a link in between.
-        fs::DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(dir)
-            .with_context(|| format!("creating {}", dir.display()))?;
         let uid = agent::current_uid()
             .await
             .context("finding out which user this is")?;
-        check_private_directory(dir, uid)?;
+        prepare_chain(dir, uid, &|link| {
+            use std::os::unix::fs::MetadataExt;
+            link.uid()
+        })?;
     }
     #[cfg(not(unix))]
     fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    Ok(())
+}
+
+/// The second half: a socket file left by a process that died is removed; one with a process
+/// behind it is an error; anything that is not a socket (a file the configuration pointed at
+/// by mistake, a link) is an error and is left alone. The socket is readable by its owner only.
+/// The directory must have been through [`prepare_socket_directory`].
+pub async fn bind_in_prepared_directory(path: &Path, kind: &SocketKind) -> Result<UnixListener> {
     match fs::symlink_metadata(path) {
         Ok(found) => {
             #[cfg(unix)]
@@ -283,15 +456,13 @@ pub async fn bind_agent_socket(path: &Path) -> Result<UnixListener> {
             let is_socket = true;
             if !is_socket {
                 bail!(
-                    "{} exists and is not a socket: not touching it (is `agent_socket` in config.toml pointing at the wrong file?)",
-                    path.display()
+                    "{} exists and is not a socket: not touching it (is {} pointing at the wrong file?)",
+                    path.display(),
+                    kind.setting
                 );
             }
             match UnixStream::connect(path).await {
-                Ok(_) => bail!(
-                    "another menzil node is already listening on {}",
-                    path.display()
-                ),
+                Ok(_) => bail!("{} is already listening on {}", kind.holder, path.display()),
                 Err(_) => fs::remove_file(path)
                     .with_context(|| format!("removing the stale socket {}", path.display()))?,
             }
@@ -390,6 +561,9 @@ pub struct RunningNode {
     pub node: Arc<Node>,
     /// Where the agent listens.
     pub socket: PathBuf,
+    /// Which file the socket is, so that stopping removes that file and not whatever the path
+    /// names by then (the fifth red-team round, M1).
+    socket_identity: FileIdentity,
     /// The names this node can resolve.
     pub directory: Arc<RwLock<Directory>>,
     tasks: Vec<JoinHandle<()>>,
@@ -427,6 +601,8 @@ pub async fn start(home: &Home, config: &Config, socket: &Path) -> Result<Runnin
     };
     let services = config.local_services()?;
     let listener = bind_agent_socket(socket).await?;
+    let socket_identity =
+        file_identity(socket).with_context(|| format!("looking at {}", socket.display()))?;
     let node = Arc::new(
         Node::start(
             NodeConfig {
@@ -463,6 +639,7 @@ pub async fn start(home: &Home, config: &Config, socket: &Path) -> Result<Runnin
     Ok(RunningNode {
         node,
         socket: socket.to_path_buf(),
+        socket_identity,
         directory,
         tasks: vec![agent_task, reload_task],
         _instance: instance,
@@ -558,7 +735,16 @@ pub async fn run(home: &Home) -> Result<()> {
     }
     .context("waiting for a signal")?;
     eprintln!("stopping ({why})");
-    let _ = fs::remove_file(&running.socket);
+    // No new request from here on: the socket goes first, then each peer is told (CLOSE
+    // `shutting_down`) and the relay connection is closed politely, so that they end the
+    // streams now instead of after the dead peer timeout. Bounded: a stalled link is not waited
+    // for.
+    remove_if_unchanged(&running.socket, running.socket_identity);
+    if !running.node.close_gracefully(STOP_GRACE).await {
+        eprintln!(
+            "menzil: could not say goodbye to every peer in time; they will notice by the dead peer timeout"
+        );
+    }
     drop(running);
     Ok(())
 }

@@ -99,4 +99,4 @@ pub use serve::{
     DEFAULT_SOCKET_BUFFER, LocalServices, LocalTarget, MAX_CONNECT_TIMEOUT, OpenedTarget,
     ServeConfigError, ServeLimits,
 };
-pub use session::{Session, SessionConfig, SessionEvent, run_session};
+pub use session::{Session, SessionConfig, SessionEvent, run_session, run_session_until};

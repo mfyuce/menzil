@@ -553,6 +553,11 @@ impl OutboundQueue {
             .is_some_and(|ledger| ledger.remaining() >= send.charge())
     }
 
+    /// Whether anything is queued at all, ready or still waiting for credit.
+    pub fn has_queued(&self) -> bool {
+        !self.queue.is_empty()
+    }
+
     /// Whether [`Self::next_ready_to_send`] would return a record right
     /// now. Lets a caller that writes one record at a time (see
     /// `run_session`) make "something is ready to write" a condition of its

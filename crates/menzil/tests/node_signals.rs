@@ -5,6 +5,12 @@
 //! open, which the kernel closes with a FIN, so the target saw a clean end of file where the
 //! stream had been cut off.
 //!
+//! The other end sees it at once as well (TODO.md L6): the phone's client of the stream ends with
+//! a reset within seconds of the signal, not after the liveness timeout (about 40 s), because the
+//! stopping node tells each peer (CLOSE `shutting_down`) before it goes. The same phone then
+//! reaches the laptop again in the next round, started afresh under the same identity, with no
+//! stale session in its way.
+//!
 //! The laptop is the real binary as a child process, the relay and the phone run in this
 //! process. One `#[tokio::test]`: `SSL_CERT_FILE` is process-global and must be set before
 //! anything dials.
@@ -14,7 +20,7 @@
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
-use menzil_cli::agent::connect_and_bridge;
+use menzil_cli::agent::{End, connect_and_bridge};
 use menzil_cli::config::Config;
 use menzil_cli::home::Home;
 use menzil_cli::local::{admit, grant, init, join, network_create};
@@ -151,22 +157,22 @@ async fn every_signal_that_stops_a_node_resets_the_connections_it_serves() {
     )
     .unwrap();
 
-    for signal in ["INT", "TERM", "HUP"] {
-        // A fresh phone node each round: the previous laptop process is gone, and a session to
-        // it would only be given up on after the liveness timeout.
-        let phone_socket = root.join(format!("p-{signal}.sock"));
-        let phone = node_cmd::start(
-            &phone_home,
-            &Config::load(&phone_home).unwrap(),
-            &phone_socket,
-        )
+    // One phone for all three rounds: each round's laptop leaves with a CLOSE, so the phone holds
+    // no session to a process that is gone when the next one comes up.
+    let phone_socket = root.join("p.sock");
+    let phone = node_cmd::start(
+        &phone_home,
+        &Config::load(&phone_home).unwrap(),
+        &phone_socket,
+    )
+    .await
+    .unwrap();
+    phone
+        .node
+        .wait_attached(WAIT)
         .await
-        .unwrap();
-        phone
-            .node
-            .wait_attached(WAIT)
-            .await
-            .expect("the phone attaches");
+        .expect("the phone attaches");
+    for signal in ["INT", "TERM", "HUP"] {
         let laptop = Guard(
             Command::new(env!("CARGO_BIN_EXE_menzil"))
                 .arg("node")
@@ -225,10 +231,23 @@ async fn every_signal_that_stops_a_node_resets_the_connections_it_serves() {
             ended, "error ConnectionReset",
             "[{signal}] a node stopped by a signal must reset the connections it serves"
         );
-        client.abort();
+        // The phone's end of the stream is reset at once too: the laptop said goodbye.
+        let end = timeout(Duration::from_secs(10), client)
+            .await
+            .unwrap_or_else(|_| {
+                panic!(
+                    "[{signal}] the phone's client was still waiting 10 s after the laptop stopped"
+                )
+            })
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(end, End::Reset(_)),
+            "[{signal}] a stream cut by the node's stopping is reset for its client: {end:?}"
+        );
         drop(feed);
         drop(laptop);
-        drop(phone);
         let _ = std::fs::remove_file(root.join("l.sock"));
     }
+    drop(phone);
 }

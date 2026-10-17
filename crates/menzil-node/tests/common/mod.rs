@@ -11,6 +11,10 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpSocket, TcpStream};
+use tokio::sync::watch;
+
 use ed25519_dalek::SigningKey;
 use menzil_carrier::{ConnectionInfo, DialConfig, ProxyOverride};
 use menzil_node::{LocalIdentity, SessionConfig};
@@ -191,4 +195,62 @@ pub fn session_config(relay: &TestRelay, id: &Identity, network_id: NetworkId) -
         caps: vec![],
         e2e_protos: vec![0x01],
     }
+}
+
+/// What a [`ControlledProxy`] does with the bytes a node sends.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Wire {
+    /// Forward them as fast as they come.
+    Flowing,
+    /// Read nothing, so the node's writes block once the kernel's small buffers fill.
+    Paused,
+}
+
+/// A TCP proxy between a node and the relay whose node-to-relay direction can be paused (the
+/// other direction is never touched). The receive buffer is set tiny on the listener, which the
+/// accepted sockets inherit, and the carrier sets `TCP_NOTSENT_LOWAT` to 16 KiB, so a paused
+/// proxy blocks the node's writes after about a hundred kilobytes whatever the machine's socket
+/// buffers are (the same arrangement as `live_session.rs`'s own proxy, which also throttles).
+pub struct ControlledProxy {
+    pub port: u16,
+    pub wire: watch::Sender<Wire>,
+}
+
+pub async fn controlled_proxy(relay: SocketAddr) -> ControlledProxy {
+    let socket = TcpSocket::new_v4().unwrap();
+    socket.set_recv_buffer_size(4 * 1024).unwrap();
+    socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    let listener = socket.listen(16).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (wire, wire_rx) = watch::channel(Wire::Flowing);
+    tokio::spawn(async move {
+        while let Ok((down, _)) = listener.accept().await {
+            let up = TcpStream::connect(relay).await.unwrap();
+            let (mut down_read, mut down_write) = down.into_split();
+            let (mut up_read, mut up_write) = up.into_split();
+            tokio::spawn(async move {
+                let _ = tokio::io::copy(&mut up_read, &mut down_write).await;
+            });
+            let mut wire_rx = wire_rx.clone();
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 4096];
+                loop {
+                    if *wire_rx.borrow() == Wire::Paused {
+                        if wire_rx.changed().await.is_err() {
+                            return;
+                        }
+                        continue;
+                    }
+                    let n = match down_read.read(&mut buf).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => n,
+                    };
+                    if up_write.write_all(&buf[..n]).await.is_err() {
+                        return;
+                    }
+                }
+            });
+        }
+    });
+    ControlledProxy { port, wire }
 }

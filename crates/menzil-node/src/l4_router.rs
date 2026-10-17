@@ -106,7 +106,7 @@
 //! per-peer limit, unproven state by timeouts, waiters by their own
 //! deadline.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -233,6 +233,10 @@ pub enum EnsureError {
     /// The router task is gone.
     #[error("the L4 router is not running")]
     RouterGone,
+    /// [`RouterHandle::stop`] was called: the node is on its way out and
+    /// opens no new session.
+    #[error("this node is shutting down")]
+    ShuttingDown,
 }
 
 /// A session that came up, for whoever serves its streams (TODO.md L4h7):
@@ -357,6 +361,28 @@ impl RouterHandle {
             .map_err(|_| EnsureError::RouterGone)?;
         answer.await.map_err(|_| EnsureError::RouterGone)?
     }
+
+    /// Ends every session with `reason` as its CLOSE, drops every initiation
+    /// that is out and tells every caller still waiting for a session
+    /// [`EnsureError::ShuttingDown`]; from then on the router answers no
+    /// `init` and starts no handshake. Returns once the sessions' actors have
+    /// ended, which is when each has handed its CLOSE to the L3 session's
+    /// outbound channel (the L3 session still has to write it), or after
+    /// `within`: `true` if every one ended in time. Meant for a node on its
+    /// way out ([`crate::Node::close_gracefully`]); there is no undoing it.
+    pub async fn stop(&self, reason: CloseReason, within: Duration) -> bool {
+        let (done, finished) = oneshot::channel();
+        if self
+            .commands
+            .send(Command::Stop { reason, done })
+            .await
+            .is_err()
+        {
+            // No router: no session to close.
+            return true;
+        }
+        matches!(tokio::time::timeout(within, finished).await, Ok(Ok(())))
+    }
 }
 
 /// Everything [`new_router`] hands back.
@@ -425,6 +451,11 @@ enum Command {
         peer: NodeId,
         network_id: NetworkId,
         reply: oneshot::Sender<Result<L4SessionHandle, EnsureError>>,
+    },
+    Stop {
+        reason: CloseReason,
+        /// Resolved when every session closed for it has ended.
+        done: oneshot::Sender<()>,
     },
 }
 
@@ -544,6 +575,11 @@ struct Engine {
     /// cannot hide it.
     overflow_log: LogThrottle,
     next_generation: u32,
+    /// Set by [`RouterHandle::stop`]: no new work from then on.
+    stopping: bool,
+    /// The tags of the sessions [`Self::on_stop`] closed whose actors have
+    /// not reported their end yet.
+    closing: HashSet<u64>,
 }
 
 impl Engine {
@@ -585,6 +621,8 @@ impl Engine {
             refused_log: LogThrottle::new(),
             overflow_log: LogThrottle::new(),
             next_generation: 1,
+            stopping: false,
+            closing: HashSet::new(),
         }
     }
 
@@ -647,6 +685,11 @@ impl Engine {
         }
         if flags & 0x01 != 0 {
             // The droppable (datagram) class: phase 2.
+            return None;
+        }
+        if self.stopping {
+            // Nothing is answered or routed any more: the sessions are closed
+            // and a new `init` would only start one that is never served.
             return None;
         }
         let Some(attached) = self.attached.filter(|a| a.epoch == epoch) else {
@@ -923,6 +966,10 @@ impl Engine {
     // ------------------------------------------------------------------
 
     fn ensure(&mut self, peer: NodeId, network: NetworkId, reply: Waiter, now: Now) {
+        if self.stopping {
+            let _ = reply.send(Err(EnsureError::ShuttingDown));
+            return;
+        }
         if peer == self.local_node_id {
             let _ = reply.send(Err(EnsureError::SelfPeer));
             return;
@@ -1115,10 +1162,37 @@ impl Engine {
     }
 
     // ------------------------------------------------------------------
+    // Stopping
+    // ------------------------------------------------------------------
+
+    /// Closes everything with `reason` and refuses new work (see
+    /// [`RouterHandle::stop`]). Each session is closed and removed in one
+    /// step, like one the router replaced: the CLOSE it was told to send
+    /// outranks the epoch ending that dropping its entry signals.
+    fn on_stop(&mut self, reason: &CloseReason) {
+        self.stopping = true;
+        for (_, waiting) in std::mem::take(&mut self.waiters) {
+            for waiter in waiting {
+                let _ = waiter.reply.send(Err(EnsureError::ShuttingDown));
+            }
+        }
+        drop(self.table.remove_pending_where(|_| true));
+        self.unsent.clear();
+        for (index, entry) in self.table.remove_where(|_| true) {
+            self.closing.insert(tag_of(entry.generation, index));
+            entry.handle.close(Some(reason.clone()));
+        }
+    }
+
+    // ------------------------------------------------------------------
     // Sessions' own notices, and the clock
     // ------------------------------------------------------------------
 
     fn on_notice(&mut self, tag: u64, notice: SessionNotice) {
+        if matches!(notice, SessionNotice::Ended) && self.closing.remove(&tag) {
+            // A session `on_stop` closed: it is out of the table already.
+            return;
+        }
         let (generation, index) = untag(tag);
         let Some(entry) = self.table.get(index) else {
             return;
@@ -1363,11 +1437,23 @@ async fn run_router(
 ) {
     let mut tick = tokio::time::interval(TICK);
     let mut commands_open = true;
+    let mut events_open = true;
     let mut dropped_log = LogThrottle::new();
+    // Who waits for the sessions `Command::Stop` closed to end.
+    let mut stop_done: Vec<oneshot::Sender<()>> = Vec::new();
     loop {
         tokio::select! {
-            event = events.recv() => {
-                let Some(event) = event else { break };
+            event = events.recv(), if events_open => {
+                let Some(event) = event else {
+                    if engine.stopping {
+                        // The L3 session ended because it was told to (a
+                        // graceful stop): the callers that ask now are still
+                        // told why, until every handle is gone.
+                        events_open = false;
+                        continue;
+                    }
+                    break;
+                };
                 match event {
                     SessionEvent::Attached { epoch, limits } => {
                         engine.on_attached(epoch, limits);
@@ -1389,6 +1475,10 @@ async fn run_router(
                     Some(Command::Ensure { peer, network_id, reply }) => {
                         engine.ensure(peer, network_id, reply, Now::capture());
                     }
+                    Some(Command::Stop { reason, done }) => {
+                        engine.on_stop(&reason);
+                        stop_done.push(done);
+                    }
                     // Every handle dropped: nobody can ask for a session
                     // any more, but the peers' `init`s still need serving.
                     None => commands_open = false,
@@ -1400,6 +1490,14 @@ async fn run_router(
             _ = tick.tick() => {
                 engine.on_tick(Now::capture());
             }
+        }
+        if engine.stopping && engine.closing.is_empty() {
+            for done in stop_done.drain(..) {
+                let _ = done.send(());
+            }
+        }
+        if !events_open && !commands_open {
+            break;
         }
     }
 }

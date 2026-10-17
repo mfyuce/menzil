@@ -11,18 +11,26 @@
 //! # What this node serves: service = "host:port".
 //! [services]
 //! "tcp:ssh" = "127.0.0.1:22"
+//!
+//! # Optional: what this node holds for its peers at most (these are the defaults).
+//! [serve]
+//! max_connections = 256           # served at once, all peers together, at most 1000000
+//! max_connections_per_peer = 64   # served at once for one peer, at most 1000000
+//! connect_timeout_secs = 5        # giving up on a service's local target, at most 9
 //! ```
 //!
 //! A file that does not exist is an empty configuration. Unknown keys are an error: a typo should
-//! not silently leave a service unconfigured.
+//! not silently leave a service unconfigured. A limit of zero or past its maximum, or a timeout
+//! past its maximum, is an error too, not a value that is quietly changed.
 
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 use menzil_carrier::{ConnectionInfo, ProxyOverride, redact_userinfo};
-use menzil_node::{LocalServices, LocalTarget};
+use menzil_node::{LocalServices, LocalTarget, MAX_CONNECT_TIMEOUT, ServeLimits};
 use menzil_proto::ServiceId;
 use serde::Deserialize;
 
@@ -41,6 +49,69 @@ pub struct Config {
     pub services: BTreeMap<String, String>,
     /// Where the agent listens; by default under the runtime directory or the home.
     pub agent_socket: Option<PathBuf>,
+    /// What this node holds for its peers at most: `[serve]`.
+    #[serde(default)]
+    pub serve: ServeSettings,
+}
+
+/// The most connections a `[serve]` limit may name. Each served connection holds a descriptor
+/// (two, with the stream's own side), and no process has a million of them by default; a value
+/// beyond what a semaphore can count used to panic the node at start (the fifth red-team round,
+/// N1).
+pub const MAX_SERVE_CONNECTIONS: usize = 1_000_000;
+
+/// The `[serve]` table: limits on the connections a node serves. A key that is left out keeps
+/// the library's default (see [`ServeLimits`]).
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ServeSettings {
+    /// Connections served at once, all peers together.
+    pub max_connections: Option<usize>,
+    /// Connections served at once for one peer (an initiating node).
+    pub max_connections_per_peer: Option<usize>,
+    /// Seconds to wait for the connect to a service's local target.
+    pub connect_timeout_secs: Option<u64>,
+}
+
+impl ServeSettings {
+    /// The limits these settings ask for, on top of the defaults.
+    fn limits(&self) -> Result<ServeLimits> {
+        let in_range = |key: &str, value: usize| {
+            if value == 0 {
+                bail!(
+                    "{key} in [serve] of config.toml is 0: a node that serves no connection serves nothing (leave the key out for the default)"
+                );
+            }
+            if value > MAX_SERVE_CONNECTIONS {
+                bail!(
+                    "{key} in [serve] of config.toml is {value}: it must be at most {MAX_SERVE_CONNECTIONS} (each connection holds a file descriptor)"
+                );
+            }
+            Ok(value)
+        };
+        let mut limits = ServeLimits::default();
+        if let Some(value) = self.max_connections {
+            limits.max_connections = in_range("max_connections", value)?;
+        }
+        if let Some(value) = self.max_connections_per_peer {
+            limits.max_connections_per_peer = in_range("max_connections_per_peer", value)?;
+        }
+        Ok(limits)
+    }
+
+    /// The connect timeout asked for, if any.
+    fn connect_timeout(&self) -> Result<Option<Duration>> {
+        let Some(seconds) = self.connect_timeout_secs else {
+            return Ok(None);
+        };
+        let longest = MAX_CONNECT_TIMEOUT.as_secs();
+        if seconds == 0 || seconds > longest {
+            bail!(
+                "connect_timeout_secs in [serve] of config.toml is {seconds}: it must be from 1 to {longest} (the node that opens the stream gives up after 10 seconds, and a refusal that comes later is lost)"
+            );
+        }
+        Ok(Some(Duration::from_secs(seconds)))
+    }
 }
 
 impl std::fmt::Debug for Config {
@@ -53,6 +124,7 @@ impl std::fmt::Debug for Config {
             .field("proxy", &self.proxy.as_deref().map(redact_userinfo))
             .field("services", &self.services)
             .field("agent_socket", &self.agent_socket)
+            .field("serve", &self.serve)
             .finish()
     }
 }
@@ -114,6 +186,10 @@ impl Config {
             services = services
                 .serve(id, target)
                 .map_err(|e| anyhow!("service {service:?} in config.toml: {e}"))?;
+        }
+        services = services.with_limits(self.serve.limits()?);
+        if let Some(timeout) = self.serve.connect_timeout()? {
+            services = services.with_connect_timeout(timeout);
         }
         Ok(services)
     }
@@ -269,6 +345,99 @@ mod tests {
             proxy("proxy = \"http://p:1\""),
             Some(ProxyOverride::Use("http://p:1".to_string()))
         );
+    }
+
+    /// TODO.md: the limits a node serves under were code-only. The keys are optional, each keeps
+    /// the default when it is left out, and the node ends up with exactly what was written.
+    #[test]
+    fn the_serve_table_sets_the_limits_and_the_connect_timeout() {
+        let services = |text: &str| Config::parse(text).unwrap().local_services().unwrap();
+        // Nothing written: the library's defaults.
+        let plain = services("");
+        assert_eq!(plain.limits(), ServeLimits::default());
+        assert_eq!(
+            plain.connect_timeout(),
+            menzil_node::DEFAULT_CONNECT_TIMEOUT
+        );
+        // Each key alone leaves the others as they were.
+        let one = services("[serve]\nmax_connections = 10\n");
+        assert_eq!(one.limits().max_connections, 10);
+        assert_eq!(
+            one.limits().max_connections_per_peer,
+            ServeLimits::default().max_connections_per_peer
+        );
+        assert_eq!(one.connect_timeout(), menzil_node::DEFAULT_CONNECT_TIMEOUT);
+        let all = services(
+            "[serve]\nmax_connections = 20\nmax_connections_per_peer = 3\nconnect_timeout_secs = 2\n",
+        );
+        assert_eq!(all.limits().max_connections, 20);
+        assert_eq!(all.limits().max_connections_per_peer, 3);
+        assert_eq!(all.connect_timeout(), Duration::from_secs(2));
+        // The longest the library allows is accepted as it is.
+        let longest = services(&format!(
+            "[serve]\nconnect_timeout_secs = {}\n",
+            MAX_CONNECT_TIMEOUT.as_secs()
+        ));
+        assert_eq!(longest.connect_timeout(), MAX_CONNECT_TIMEOUT);
+        // The socket buffer is not a setting.
+        assert_eq!(
+            all.limits().socket_buffer,
+            ServeLimits::default().socket_buffer
+        );
+        // The largest value is accepted as it is.
+        let largest = services(&format!(
+            "[serve]\nmax_connections = {MAX_SERVE_CONNECTIONS}\nmax_connections_per_peer = {MAX_SERVE_CONNECTIONS}\n"
+        ));
+        assert_eq!(largest.limits().max_connections, MAX_SERVE_CONNECTIONS);
+        assert_eq!(
+            largest.limits().max_connections_per_peer,
+            MAX_SERVE_CONNECTIONS
+        );
+    }
+
+    #[test]
+    fn a_serve_value_that_would_be_changed_quietly_is_an_error_that_names_it() {
+        let too_long = MAX_CONNECT_TIMEOUT.as_secs() + 1;
+        let too_many = format!("[serve]\nmax_connections = {}", MAX_SERVE_CONNECTIONS + 1);
+        let too_many_per_peer = format!(
+            "[serve]\nmax_connections_per_peer = {}",
+            MAX_SERVE_CONNECTIONS + 1
+        );
+        for (text, wanted) in [
+            // The fifth red-team round, N1: these panicked the node at start.
+            (too_many.as_str(), "at most 1000000"),
+            (
+                "[serve]\nmax_connections = 9223372036854775807",
+                "at most 1000000",
+            ),
+            (too_many_per_peer.as_str(), "at most 1000000"),
+            ("[serve]\nmax_connections = 0", "max_connections"),
+            (
+                "[serve]\nmax_connections_per_peer = 0",
+                "max_connections_per_peer",
+            ),
+            ("[serve]\nconnect_timeout_secs = 0", "connect_timeout_secs"),
+            (
+                &format!("[serve]\nconnect_timeout_secs = {too_long}"),
+                "from 1 to",
+            ),
+        ] {
+            let result = Config::parse(text).and_then(|c| c.local_services().map(|_| ()));
+            let error = match result {
+                Ok(()) => panic!("{text:?} was accepted"),
+                Err(e) => format!("{e:#}"),
+            };
+            assert!(error.contains(wanted), "{text:?}: {error}");
+        }
+        // A typo in the table, a negative number and a word are refused by the parser.
+        for (text, wanted) in [
+            ("[serve]\nmax_conections = 5", "max_conections"),
+            ("[serve]\nmax_connections = -1", "expected usize"),
+            ("[serve]\nmax_connections = \"many\"", "expected usize"),
+        ] {
+            let error = Config::parse(text).unwrap_err().to_string();
+            assert!(error.contains(wanted), "{text:?}: {error}");
+        }
     }
 
     #[test]

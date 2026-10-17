@@ -109,15 +109,30 @@ enum Command {
         /// Local port to expose.
         port: u16,
     },
-    /// Listen on a local port and carry each connection to a service of another member. A
-    /// connection that does not end cleanly (the service failed, the agent refused, this
-    /// command is stopped) is reset, never closed as if it had finished.
+    /// Listen on a local port (or a Unix socket) and carry each connection to a service of
+    /// another member.
+    ///
+    /// On a TCP port, a connection that does not end cleanly (the service failed, the agent
+    /// refused, this command is stopped) is reset, never closed as if it had finished. The port
+    /// is open to every user of this machine, and each of them gets this user's grants (as with
+    /// `ssh -L`); on a shared machine use `--unix`.
+    ///
+    /// A Unix socket (`--unix`) is private to this user: mode 0600, nothing on the way to it
+    /// that other users can change (the whole path is checked, links included), and the user of
+    /// every connection is checked. It cannot be relied on to carry a reset, though: a program
+    /// on it is in general not told whether the stream ended cleanly or not, so a program that
+    /// must tell a truncated answer from a whole one needs the TCP form.
     Reach {
         /// The service, as `<member>/<service>`, for example `laptop/ssh`.
         target: String,
-        /// Where to listen.
-        #[arg(long, default_value = "127.0.0.1:2222")]
+        /// Where to listen, as a TCP address.
+        #[arg(long, default_value = "127.0.0.1:2222", conflicts_with = "unix")]
         listen: SocketAddr,
+        /// Listen on a Unix socket at this path instead. Missing directories are made (0700); a
+        /// socket left by a `reach` that died is replaced; the socket and the lock file
+        /// `<PATH>.lock` next to it are removed when this stops.
+        #[arg(long, value_name = "PATH")]
+        unix: Option<PathBuf>,
     },
     /// Run a local SOCKS proxy that exits through a node.
     Proxy {
@@ -375,23 +390,39 @@ async fn run(cli: Cli) -> Result<()> {
                 }
             }
         }
-        Command::Reach { target, listen } => {
+        Command::Reach {
+            target,
+            listen,
+            unix,
+        } => {
             let home = home()?;
             let socket = node_cmd::agent_socket_path(&home, &Config::load(&home)?);
-            let listener = tokio::net::TcpListener::bind(listen)
-                .await
-                .with_context(|| format!("listening on {listen}"))?;
-            eprintln!(
-                "carrying connections to {} to {target}; ctrl-c stops and resets what is open",
-                listener.local_addr()?
-            );
-            reach::run(&socket, &target, listener, async {
+            let stop = async {
                 match signals::shutdown().await {
                     Ok(why) => eprintln!("stopping ({why})"),
                     Err(error) => eprintln!("menzil: cannot wait for a signal: {error}"),
                 }
-            })
-            .await?;
+            };
+            match unix {
+                Some(path) => {
+                    let bound = reach::bind_unix(&path).await?;
+                    eprintln!(
+                        "carrying connections to {} to {target}; ctrl-c stops and ends what is open",
+                        bound.path().display()
+                    );
+                    reach::run_unix(&socket, &target, bound, stop).await?;
+                }
+                None => {
+                    let listener = tokio::net::TcpListener::bind(listen)
+                        .await
+                        .with_context(|| format!("listening on {listen}"))?;
+                    eprintln!(
+                        "carrying connections to {} to {target}; ctrl-c stops and resets what is open",
+                        listener.local_addr()?
+                    );
+                    reach::run(&socket, &target, listener, stop).await?;
+                }
+            }
         }
         Command::Expose { .. } => not_implemented("expose"),
         Command::Proxy { .. } => not_implemented("proxy"),

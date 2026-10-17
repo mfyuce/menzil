@@ -116,6 +116,11 @@ pub enum ErrorCode {
     /// unreachable, or no answer within the node's connect timeout). May be
     /// transient: retrying later can succeed.
     TargetUnreachable,
+    /// `shutting_down` (protocol.md 5.2): an L4 CLOSE a node sends on each of its
+    /// sessions when it stops on purpose, so that its peers end the session and
+    /// reset its streams at once instead of waiting for the dead peer timeout. A
+    /// new session works as soon as the node is back.
+    ShuttingDown,
     /// A code this build does not recognize, preserved verbatim.
     Unknown(u16),
 }
@@ -144,6 +149,7 @@ impl ErrorCode {
     const INVALID_TARGET: u16 = 21;
     const UNKNOWN_SERVICE: u16 = 22;
     const TARGET_UNREACHABLE: u16 = 23;
+    const SHUTTING_DOWN: u16 = 24;
 
     /// The symbolic name from protocol.md, e.g. `"bad_cert"`.
     pub fn name(self) -> &'static str {
@@ -171,6 +177,7 @@ impl ErrorCode {
             Self::InvalidTarget => "invalid_target",
             Self::UnknownService => "unknown_service",
             Self::TargetUnreachable => "target_unreachable",
+            Self::ShuttingDown => "shutting_down",
             Self::Unknown(_) => "unknown",
         }
     }
@@ -202,6 +209,7 @@ impl From<ErrorCode> for u16 {
             ErrorCode::InvalidTarget => ErrorCode::INVALID_TARGET,
             ErrorCode::UnknownService => ErrorCode::UNKNOWN_SERVICE,
             ErrorCode::TargetUnreachable => ErrorCode::TARGET_UNREACHABLE,
+            ErrorCode::ShuttingDown => ErrorCode::SHUTTING_DOWN,
             ErrorCode::Unknown(code) => code,
         }
     }
@@ -233,6 +241,7 @@ impl From<u16> for ErrorCode {
             Self::INVALID_TARGET => Self::InvalidTarget,
             Self::UNKNOWN_SERVICE => Self::UnknownService,
             Self::TARGET_UNREACHABLE => Self::TargetUnreachable,
+            Self::SHUTTING_DOWN => Self::ShuttingDown,
             other => Self::Unknown(other),
         }
     }
@@ -280,6 +289,7 @@ mod tests {
             ErrorCode::InvalidTarget,
             ErrorCode::UnknownService,
             ErrorCode::TargetUnreachable,
+            ErrorCode::ShuttingDown,
         ];
         for code in codes {
             let wire: u16 = code.into();
@@ -294,6 +304,13 @@ mod tests {
         assert_eq!(u16::from(ErrorCode::TargetUnreachable), 23);
         assert_eq!(ErrorCode::UnknownService.name(), "unknown_service");
         assert_eq!(ErrorCode::TargetUnreachable.name(), "target_unreachable");
+    }
+
+    #[test]
+    fn shutting_down_keeps_its_number_and_name() {
+        assert_eq!(u16::from(ErrorCode::ShuttingDown), 24);
+        assert_eq!(ErrorCode::from(24), ErrorCode::ShuttingDown);
+        assert_eq!(ErrorCode::ShuttingDown.name(), "shutting_down");
     }
 
     #[test]

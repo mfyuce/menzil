@@ -41,7 +41,7 @@ use ed25519_dalek::SigningKey;
 use menzil_carrier::{ConnectionInfo, DialConfig, ProxyOverride};
 use menzil_node::{
     EnqueueOutcome, Epoch, LocalIdentity, OutboundSend, RosterStore, Session, SessionConfig,
-    SessionEvent, run_session,
+    SessionEvent, run_session, run_session_until,
 };
 use menzil_proto::{
     Limits, NetworkId, NodeCert, NodeCertBody, NodeId, PROTOCOL_VERSION, Record, Roster,
@@ -339,6 +339,7 @@ async fn run_session_over_a_live_relay() {
     a_reconnect_gets_a_fresh_epoch_and_refuses_a_stale_tagged_send(&trust).await;
     admission_is_not_held_up_by_a_stalled_write(&trust).await;
     an_arrival_during_a_slow_write_run_waits_for_one_write_not_the_queue(&trust).await;
+    a_stop_writes_what_was_handed_over_before_it_closes(&trust).await;
 }
 
 /// Regression test for TODO.md L4b's review, finding 1, at the wire: with
@@ -695,6 +696,10 @@ struct ThroughProxy {
     sender_outbound: mpsc::Sender<OutboundSend>,
     _sender_events: mpsc::Receiver<SessionEvent>,
     receiver_events: mpsc::Receiver<SessionEvent>,
+    /// Tells the sender's `run_session_until` to stop; the scenarios that do
+    /// not stop it leave this alone.
+    stop_sender: watch::Sender<bool>,
+    /// The sender's task and the receiver's.
     tasks: [tokio::task::JoinHandle<()>; 2],
 }
 
@@ -718,12 +723,14 @@ async fn node_through_a_controlled_proxy(trust: &TestTrust) -> ThroughProxy {
     let (sender_outbound, sender_outbound_rx) = mpsc::channel(256);
     let mut sender_config = session_config(&relay, &sender, network_id);
     sender_config.dial.connection_info.port = proxy.port;
-    let sender_task = tokio::spawn(run_session(
+    let (stop_sender, stop_rx) = watch::channel(false);
+    let sender_task = tokio::spawn(run_session_until(
         sender_config,
         HashMap::new(),
         sender_events_tx,
         sender_outbound_rx,
         Arc::new(RosterStore::new()),
+        stop_rx,
     ));
     wait_until_routable(
         &sender_outbound,
@@ -739,6 +746,7 @@ async fn node_through_a_controlled_proxy(trust: &TestTrust) -> ThroughProxy {
         sender_outbound,
         _sender_events: sender_events,
         receiver_events,
+        stop_sender,
         tasks: [sender_task, receiver_task],
     }
 }
@@ -813,6 +821,81 @@ async fn admission_is_not_held_up_by_a_stalled_write(trust: &TestTrust) {
     for task in node.tasks {
         task.abort();
     }
+}
+
+/// TODO.md L6, the relay session's half of a graceful stop: `run_session_until`,
+/// told to stop, writes what was already handed to it, closes the connection
+/// politely and returns. Here the wire is stalled with 16 records of 16 KiB
+/// admitted and unwritten (about a hundred kilobytes of them fit in the
+/// kernel's buffers, as in the scenarios above) and 4 more handed over but not
+/// even admitted yet (the node is stuck in a write), the stop arrives, and then
+/// the wire flows again. A stop that simply returned would lose everything the
+/// buffers did not hold, and one that did not take in the channel's records
+/// would lose the last 4; all 20 must arrive intact and in order, and the task
+/// must end by itself. The volume is small on purpose: the stop writes for two
+/// seconds at most, and a machine under heavy load moves a megabyte through
+/// the test's proxy in more than that (the first version, 56 records, failed
+/// every run under sixteen busy loops).
+async fn a_stop_writes_what_was_handed_over_before_it_closes(trust: &TestTrust) {
+    const ADMITTED: usize = 16;
+    const UNADMITTED: usize = 4;
+    const RECORDS: usize = ADMITTED + UNADMITTED;
+    const RECORD_LEN: usize = 16 * 1024;
+    let payload = |index: usize| vec![index as u8; RECORD_LEN];
+
+    let mut node = node_through_a_controlled_proxy(trust).await;
+    node.proxy.wire.send(Wire::Paused).unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let mut outcomes = Vec::new();
+    for index in 0..ADMITTED {
+        let (send, outcome) =
+            reliable_with_outcome(node.receiver.node_id, Epoch::first(), payload(index));
+        node.sender_outbound.send(send).await.unwrap();
+        outcomes.push(outcome);
+    }
+    // These admitted, so that they are in the queue when the stop comes, and
+    // the node is stuck writing the first of them.
+    let admitted = timeout(
+        Duration::from_secs(3),
+        futures_util::future::join_all(outcomes),
+    )
+    .await
+    .expect("every record must be admitted while the wire is stalled");
+    assert!(
+        admitted
+            .iter()
+            .all(|outcome| *outcome == Ok(EnqueueOutcome::Accepted))
+    );
+    // These stay in the channel: the node is not reading it.
+    for index in ADMITTED..RECORDS {
+        node.sender_outbound
+            .send(reliable(
+                node.receiver.node_id,
+                Epoch::first(),
+                payload(index),
+            ))
+            .await
+            .unwrap();
+    }
+
+    node.stop_sender.send(true).unwrap();
+    node.proxy.wire.send(Wire::Flowing).unwrap();
+    for index in 0..RECORDS {
+        let received = next_recv_from(&mut node.receiver_events, node.sender.node_id)
+            .await
+            .unwrap_or_else(|| panic!("record {index} was lost by the stop"));
+        assert_eq!(
+            received,
+            payload(index),
+            "record {index} arrived corrupted or out of order"
+        );
+    }
+    let [sender_task, receiver_task] = node.tasks;
+    timeout(Duration::from_secs(10), sender_task)
+        .await
+        .expect("a stopped session must return by itself")
+        .unwrap();
+    receiver_task.abort();
 }
 
 /// The same finding's second half: a request that arrives *while* a run of

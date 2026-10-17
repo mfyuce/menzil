@@ -39,6 +39,23 @@ pub struct FileLock {
     _file: fs::File,
 }
 
+impl FileLock {
+    /// Locks the file at `path` (made, 0600, if it does not exist) if nobody else holds it;
+    /// `Ok(None)` when somebody does. Never waits. For files that are not in a home, such as
+    /// the one `menzil reach` keeps next to its Unix socket to tell a live `reach` from a dead
+    /// one without connecting to it (the fifth red-team round, N2).
+    pub fn try_acquire(path: &Path) -> Result<Option<Self>> {
+        let file = open_lock_file(path)?;
+        match file.try_lock() {
+            Ok(()) => Ok(Some(Self { _file: file })),
+            Err(fs::TryLockError::WouldBlock) => Ok(None),
+            Err(fs::TryLockError::Error(error)) => {
+                Err(error).with_context(|| format!("locking {}", path.display()))
+            }
+        }
+    }
+}
+
 /// A user's menzil directory.
 #[derive(Debug, Clone)]
 pub struct Home {
@@ -199,8 +216,8 @@ impl Home {
     }
 }
 
-/// Opens (creating it, 0600) and exclusively locks the file at `path`, waiting up to `wait`.
-fn lock_file(path: &Path, wait: Duration) -> Result<FileLock> {
+/// Opens (creating it, 0600) the file a lock is taken on.
+fn open_lock_file(path: &Path) -> Result<fs::File> {
     let mut options = fs::OpenOptions::new();
     options.read(true).write(true).create(true);
     #[cfg(unix)]
@@ -208,9 +225,14 @@ fn lock_file(path: &Path, wait: Duration) -> Result<FileLock> {
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
     }
-    let file = options
+    options
         .open(path)
-        .with_context(|| format!("opening {}", path.display()))?;
+        .with_context(|| format!("opening {}", path.display()))
+}
+
+/// Opens (creating it, 0600) and exclusively locks the file at `path`, waiting up to `wait`.
+fn lock_file(path: &Path, wait: Duration) -> Result<FileLock> {
+    let file = open_lock_file(path)?;
     let started = Instant::now();
     loop {
         match file.try_lock() {

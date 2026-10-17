@@ -55,7 +55,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use ed25519_dalek::VerifyingKey;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 
 use menzil_carrier::{Backoff, Carrier, ConnectionInfo, DialConfig};
 use menzil_proto::{
@@ -310,6 +310,10 @@ const TICK: Duration = Duration::from_secs(1);
 /// liveness mechanism would otherwise have had a chance to.
 const SEND_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// How long a stop ([`run_session_until`]) spends writing what was already admitted before it
+/// closes the connection. The carrier's own close waits as long again for the relay's answer.
+const STOP_FLUSH_TIMEOUT: Duration = Duration::from_secs(2);
+
 /// The largest L3 record there is: protocol.md 4 says one message is one
 /// record, "payload at most 65,535 bytes (the Noise message limit)". A relay
 /// that announces a bigger `max_record` in WELCOME cannot make a bigger
@@ -389,6 +393,14 @@ impl Session {
     /// network's current Roster `seq`.
     pub fn welcome(&self) -> &WelcomeBody {
         &self.welcome
+    }
+
+    /// Closes the connection politely (a WebSocket Close, then a short wait
+    /// for the relay's own), so that the relay sees the node leave at once
+    /// and nothing written just before is lost to a reset. See
+    /// [`Carrier::close`].
+    pub async fn close(&mut self) {
+        self.carrier.close().await;
     }
 
     /// Encrypts and sends one L3 record.
@@ -768,6 +780,13 @@ fn admit(req: OutboundSend, epoch: Epoch, outbound_queue: &mut OutboundQueue) {
     let _ = req.outcome.send(outcome);
 }
 
+/// The caller's ends of the channels [`connect_with_retry`] keeps servicing while it dials.
+struct Callers<'a> {
+    outbound: &'a mut mpsc::Receiver<OutboundSend>,
+    events: &'a mpsc::Sender<SessionEvent>,
+    stop: &'a mut watch::Receiver<bool>,
+}
+
 /// Dials with [`Backoff`] retry, servicing `outbound` throughout —
 /// TODO.md L4h1's own review, finding 2: a send is tagged with an epoch
 /// the instant it is produced, so one tagged for the epoch *about to*
@@ -790,11 +809,15 @@ async fn connect_with_retry(
     config: &SessionConfig,
     env: &HashMap<String, String>,
     roster_store: Arc<RosterStore>,
-    outbound: &mut mpsc::Receiver<OutboundSend>,
-    events: &mpsc::Sender<SessionEvent>,
+    callers: Callers<'_>,
     backoff: &mut Backoff,
     epoch: Epoch,
 ) -> Option<(Session, Vec<OutboundSend>)> {
+    let Callers {
+        outbound,
+        events,
+        stop,
+    } = callers;
     let mut waiting: Vec<OutboundSend> = Vec::new();
     let mut waiting_bytes: usize = 0;
     loop {
@@ -805,6 +828,7 @@ async fn connect_with_retry(
                 result = &mut dial => break result,
                 Some(req) = outbound.recv() => hold_or_refuse(req, epoch, &mut waiting, &mut waiting_bytes),
                 () = events.closed() => return None,
+                () = stopped(stop) => return None,
             }
         };
         match result {
@@ -819,6 +843,7 @@ async fn connect_with_retry(
                         _ = &mut sleep => break,
                         Some(req) = outbound.recv() => hold_or_refuse(req, epoch, &mut waiting, &mut waiting_bytes),
                         () = events.closed() => return None,
+                        () = stopped(stop) => return None,
                     }
                 }
             }
@@ -904,8 +929,80 @@ pub async fn run_session(
     config: SessionConfig,
     env: HashMap<String, String>,
     events: mpsc::Sender<SessionEvent>,
+    outbound: mpsc::Receiver<OutboundSend>,
+    roster_store: Arc<RosterStore>,
+) {
+    // A stop that never comes: the sender lives as long as this call.
+    let (_keep, stop) = watch::channel(false);
+    run_session_until(config, env, events, outbound, roster_store, stop).await;
+}
+
+/// Resolves once `stop` holds `true`. A sender dropped without having sent
+/// `true` stops nothing.
+async fn stopped(stop: &mut watch::Receiver<bool>) {
+    if stop.wait_for(|stopping| *stopping).await.is_err() {
+        std::future::pending::<()>().await;
+    }
+}
+
+/// Writes what the queue holds and can send, waiting for CREDIT where a
+/// record needs it, then closes the connection politely. Bounded by
+/// [`STOP_FLUSH_TIMEOUT`] for the writing; the carrier bounds its own wait.
+async fn flush_and_close(session: &mut Session, queue: &mut OutboundQueue) {
+    let flushed = tokio::time::timeout(STOP_FLUSH_TIMEOUT, async {
+        while queue.has_queued() {
+            if let Some(record) = queue.next_ready_to_send() {
+                if session.send(record).await.is_err() {
+                    return;
+                }
+                continue;
+            }
+            // Everything left waits for credit: read the connection for it.
+            match session.recv().await {
+                Ok(Record::Credit(body)) => queue.note_credit(body.peer, body.bytes),
+                Ok(_) => {}
+                Err(_) => return,
+            }
+        }
+    })
+    .await;
+    if flushed.is_err() {
+        tracing::warn!("a stopping node session could not write everything it held in time");
+    }
+    session.close().await;
+}
+
+/// A stop while attached: takes in whatever the callers already handed over
+/// through `outbound`, writes it, and closes the connection politely.
+async fn stop_attached(
+    session: &mut Session,
+    outbound: &mut mpsc::Receiver<OutboundSend>,
+    queue: &mut OutboundQueue,
+    epoch: Epoch,
+) {
+    while let Ok(req) = outbound.try_recv() {
+        admit(req, epoch, queue);
+    }
+    flush_and_close(session, queue).await;
+}
+
+/// [`run_session`] that also ends when `stop` holds `true` (the rest of
+/// this description is [`run_session`]'s). A stop first takes in whatever the
+/// callers already handed over through `outbound` (the CLOSE records of the
+/// L4 sessions that are ending, say), writes it, closes the connection
+/// politely so that the relay sees the node leave at once, and returns
+/// without delivering a `Detached`: whoever stops this is going away with it.
+/// A write already in progress when the stop comes is finished first (it is
+/// bounded by [`SEND_TIMEOUT`]); a caller that cannot wait for that bounds
+/// its own wait and drops the task. A stop while the node is not attached
+/// just returns.
+pub async fn run_session_until(
+    config: SessionConfig,
+    env: HashMap<String, String>,
+    events: mpsc::Sender<SessionEvent>,
     mut outbound: mpsc::Receiver<OutboundSend>,
     roster_store: Arc<RosterStore>,
+    mut stop: watch::Receiver<bool>,
 ) {
     let mut backoff = Backoff::new();
     let mut epoch = Epoch::first();
@@ -914,8 +1011,11 @@ pub async fn run_session(
             &config,
             &env,
             Arc::clone(&roster_store),
-            &mut outbound,
-            &events,
+            Callers {
+                outbound: &mut outbound,
+                events: &events,
+                stop: &mut stop,
+            },
             &mut backoff,
             epoch,
         )
@@ -938,6 +1038,15 @@ pub async fn run_session(
         // inline before L4b added a second way to leave it (a send
         // failure, or a send timeout, while draining `outbound_queue`).
         let retry_after_ms = 'attached: loop {
+            // A stop that came while a write was in progress: that write could not
+            // see it, so it is seen here, before anything else is taken up. The
+            // select below would see it too, but among the arms that are ready it
+            // draws at random, and with records to write the stop could lose
+            // that draw several times in a row.
+            if *stop.borrow() {
+                stop_attached(&mut session, &mut outbound, &mut outbound_queue, epoch).await;
+                return;
+            }
             tokio::select! {
                 recv_result = session.recv(), if pending.is_empty() => {
                     match recv_result {
@@ -985,6 +1094,11 @@ pub async fn run_session(
                     while let Ok(req) = outbound.try_recv() {
                         admit(req, epoch, &mut outbound_queue);
                     }
+                }
+                // A stop (see the check at the top of the loop for one that came during a write).
+                () = stopped(&mut stop) => {
+                    stop_attached(&mut session, &mut outbound, &mut outbound_queue, epoch).await;
+                    return;
                 }
                 // Write one record per iteration, as an arm like the
                 // others rather than a run that finishes the whole queue
@@ -1044,6 +1158,7 @@ pub async fn run_session(
                     }
                 }
                 Some(req) = outbound.recv() => refuse_stale(req),
+                () = stopped(&mut stop) => return,
             }
         }
 
@@ -1059,6 +1174,7 @@ pub async fn run_session(
                 _ = &mut sleep => break,
                 Some(req) = outbound.recv() => refuse_stale(req),
                 () = events.closed() => return,
+                () = stopped(&mut stop) => return,
             }
         }
     }
