@@ -208,8 +208,8 @@ pub(crate) fn roster_doc_records(
     rosters: &RosterStore,
     network_id: &NetworkId,
 ) -> Option<Vec<Record>> {
-    let roster = rosters.signed(network_id)?;
-    let mut records = match rosters.base(network_id) {
+    let (roster, base) = rosters.signed_with_base(network_id)?;
+    let mut records = match base {
         Some(base) => menzil_proto::split_into_doc_records(DocType::BaseRoster, &base.encode()),
         None => Vec::new(),
     };

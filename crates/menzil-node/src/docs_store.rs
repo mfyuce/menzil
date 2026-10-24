@@ -4,9 +4,11 @@
 //! hold, and stores the outcome in both or in neither.
 //!
 //! The two write locks are taken in a fixed order, Roster store first and Policy store second,
-//! and held until both documents are stored, so a reader never sees a new Roster beside an old
-//! Policy of another `seq` that this call was about to replace, and two concurrent adoptions
-//! cannot interleave. Everything fallible (decoding the entries to hold, the size limit, the
+//! and held until both documents are stored, so two concurrent adoptions cannot interleave.
+//! The readers (`check_membership`, `has_grant`) take one read lock after the other and copy
+//! the body out, so a reader can still see the new Roster beside the old Policy, or the
+//! reverse, for the length of one adoption; each document alone is one that was verified, and
+//! both are only ever replaced by newer ones. Everything fallible (decoding the entries to hold, the size limit, the
 //! predicate itself) runs before the first insert, so a refused Policy leaves the Roster as it
 //! was.
 //!
@@ -306,6 +308,37 @@ mod tests {
         assert_eq!(rosters.signer(&net.network_id), Some(Signer::Owner));
         assert!(rosters.base(&net.network_id).is_none());
         assert!(policies.base(&net.network_id).is_none());
+    }
+
+    /// Round 6, L2: a node that pushes a steward signed Roster to a relay sends the base first,
+    /// as a relay does; without it every relay refuses the Roster.
+    #[test]
+    fn a_held_steward_roster_is_pushed_to_a_relay_after_its_base() {
+        use menzil_proto::{DocType, Record};
+        let net = Net::new();
+        let (rosters, policies) = stores_holding_base(&net);
+        DocStore::new(&rosters, &policies)
+            .adopt(&net.renewal(&net.steward, 11, true), NOW)
+            .unwrap();
+        let records = crate::session::push_records_for_newer_rosters(
+            &[net.network_id],
+            &rosters,
+            &std::collections::HashMap::new(),
+        );
+        let mut reassembler = menzil_proto::DocReassembler::new();
+        let mut sent = Vec::new();
+        for record in records {
+            let Record::Doc(body) = record else {
+                panic!("only DOC records")
+            };
+            if let Some((doc_type, bytes)) = reassembler.accept(&body).unwrap() {
+                sent.push((doc_type, bytes));
+            }
+        }
+        let types: Vec<DocType> = sent.iter().map(|(t, _)| *t).collect();
+        assert_eq!(types, vec![DocType::BaseRoster, DocType::Roster]);
+        assert_eq!(sent[0].1, net.base_roster.encode());
+        assert_eq!(sent[1].1, rosters.get(&net.network_id).unwrap().encode());
     }
 
     #[test]

@@ -184,6 +184,15 @@ impl RosterStore {
             .map(|held| held.signed.clone())
     }
 
+    /// The held signed Roster with its base (steward signed Rosters only), read under one lock.
+    pub fn get_with_base(&self, network_id: &NetworkId) -> Option<(Roster, Option<Roster>)> {
+        self.by_network
+            .read()
+            .unwrap()
+            .get(network_id)
+            .map(|held| (held.signed.clone(), held.base.clone()))
+    }
+
     /// The currently held `seq` for `network_id`, if any — what HELLO's
     /// `roster_seq` (protocol.md 4.1) reports for a claimed network this
     /// node already holds something for.

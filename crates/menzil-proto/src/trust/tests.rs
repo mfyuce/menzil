@@ -229,7 +229,7 @@ fn admit(new_key: &SigningKey, name: &str, r: &mut RosterBody, p: &mut PolicyBod
     p.members.push(PolicyMember {
         node_id,
         name: name.to_string(),
-        roles: vec!["ops".to_string()],
+        roles: vec![],
     });
     let cert = NodeCertBody {
         v: PROTOCOL_VERSION,
@@ -997,4 +997,68 @@ fn a_roster_the_steward_did_not_sign_is_refused_even_with_a_good_policy() {
         ..good
     };
     assert_eq!(rejected(fx.check(&bundle)), Reason::BadSignature);
+}
+
+/// Round 6, M3: a steward admits; it does not grant. An appended member has no role, and a name
+/// that no other member of the network has, whatever the letter case.
+#[test]
+fn a_steward_cannot_admit_into_a_role_or_under_a_taken_name() {
+    let fx = Fx::new();
+    let new_key = key();
+    let bundle = fx.steward_pair(|r, p| {
+        admit(&new_key, "phone", r, p);
+        p.members.last_mut().unwrap().roles = vec!["admin".to_string()];
+    });
+    assert_eq!(rejected(fx.check(&bundle)), Reason::BadName);
+    // The name of a member of the base, exactly and with other letter case.
+    for name in ["laptop", "Laptop", "SERVER"] {
+        let bundle = fx.steward_pair(|r, p| admit(&new_key, name, r, p));
+        assert_eq!(rejected(fx.check(&bundle)), Reason::BadName, "{name}");
+    }
+    // Two members appended together under one name.
+    let (a, b) = (key(), key());
+    let bundle = fx.steward_pair(|r, p| {
+        admit(&a, "phone", r, p);
+        admit(&b, "PHONE", r, p);
+    });
+    assert_eq!(rejected(fx.check(&bundle)), Reason::BadName);
+    // A fresh name with no role is still admitted.
+    let bundle = fx.steward_pair(|r, p| admit(&new_key, "phone", r, p));
+    adopted(fx.check(&bundle));
+}
+
+/// Round 6, M4: an appended member's `min_serial` may not exceed the serial of the certificate
+/// appended with it, and every appended member comes with exactly one certificate.
+#[test]
+fn a_steward_cannot_append_a_min_serial_above_the_appended_certificate() {
+    let fx = Fx::new();
+    let new_key = key();
+    let bundle = fx.steward_pair(|r, p| {
+        admit(&new_key, "phone", r, p);
+        r.members.last_mut().unwrap().min_serial = u32::MAX;
+    });
+    assert_eq!(rejected(fx.check(&bundle)), Reason::BadCert);
+    let bundle = fx.steward_pair(|r, p| {
+        admit(&new_key, "phone", r, p);
+        r.members.last_mut().unwrap().min_serial = 2;
+    });
+    assert_eq!(rejected(fx.check(&bundle)), Reason::BadCert);
+    // The serial of the certificate itself is allowed (the certificate has serial 1).
+    let bundle = fx.steward_pair(|r, p| {
+        admit(&new_key, "phone", r, p);
+        r.members.last_mut().unwrap().min_serial = 1;
+    });
+    adopted(fx.check(&bundle));
+    // A member appended with no certificate at all, or with two.
+    let bundle = fx.steward_pair(|r, p| {
+        admit(&new_key, "phone", r, p);
+        p.certs.clear();
+    });
+    assert_eq!(rejected(fx.check(&bundle)), Reason::BadCert);
+    let bundle = fx.steward_pair(|r, p| {
+        admit(&new_key, "phone", r, p);
+        let again = p.certs[0].clone();
+        p.certs.push(again);
+    });
+    assert_eq!(rejected(fx.check(&bundle)), Reason::BadCert);
 }

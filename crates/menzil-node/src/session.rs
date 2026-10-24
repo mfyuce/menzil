@@ -483,7 +483,8 @@ impl Session {
     }
 }
 
-/// DOC(roster) chunk records to send for every network in `networks`
+/// DOC chunk records to send for every network in `networks` (the base first for a
+/// steward signed Roster, then the Roster)
 /// where `roster_store` holds something newer than `welcome_rosters`
 /// reports the relay already has (protocol.md 4.3: "A node sends
 /// DOC(roster) to a relay when it holds a newer Roster than the relay's
@@ -496,7 +497,7 @@ impl Session {
 /// have `seq: 0` (protocol.md never forbids it), and folding "the relay
 /// has nothing at all for this network" into the same value as "the relay
 /// explicitly holds seq 0" would silently swallow exactly that push.
-fn push_records_for_newer_rosters(
+pub(crate) fn push_records_for_newer_rosters(
     networks: &[NetworkId],
     roster_store: &RosterStore,
     welcome_rosters: &HashMap<NetworkId, u64>,
@@ -518,9 +519,18 @@ fn push_records_for_newer_rosters(
         // panicking) is correct either way: the update that raced this
         // one is itself newer still, and gets its own chance to be
         // noticed and pushed the next time this runs.
-        let Some(roster) = roster_store.get(network_id) else {
+        let Some((roster, base)) = roster_store.get_with_base(network_id) else {
             continue;
         };
+        // A steward signed Roster goes with its base, sent first, as a relay does it
+        // (protocol.md 4.3); without it every relay refuses the Roster (the sixth red-team
+        // round, L2).
+        if let Some(base) = base {
+            records.extend(menzil_proto::split_into_doc_records(
+                DocType::BaseRoster,
+                &base.encode(),
+            ));
+        }
         records.extend(menzil_proto::split_into_doc_records(
             DocType::Roster,
             &roster.encode(),

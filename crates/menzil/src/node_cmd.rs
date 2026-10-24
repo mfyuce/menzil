@@ -17,10 +17,10 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow, bail};
 use menzil_carrier::DialConfig;
 use menzil_node::{
-    DocStore, EnsureError, LocalIdentity, Node, NodeConfig, NodeOpenError, OpenStreamError,
-    PolicyStore, RosterStore, SessionConfig,
+    DocStore, EnsureError, LocalIdentity, Node, NodeConfig, NodeError, NodeOpenError,
+    OpenStreamError, PolicyStore, RosterStore, SessionConfig,
 };
-use menzil_proto::trust::Bundle;
+use menzil_proto::trust::{Bundle, Reason};
 use menzil_proto::{NetworkId, NodeId, ServiceId, ServiceKind};
 use menzil_stream::Stream;
 use tokio::net::{UnixListener, UnixStream};
@@ -485,7 +485,11 @@ pub async fn bind_in_prepared_directory(path: &Path, kind: &SocketKind) -> Resul
 
 /// Loads every network's documents into the stores a node verifies against. A network whose
 /// documents cannot be read stops the node: running without it would look like a working
-/// network that rejects everyone.
+/// network that rejects everyone. Documents that are expired or not valid yet do not: that
+/// network is warned about by name and left out of the stores (it refuses everyone, and says why
+/// in the log) while the others run, because a member whose documents ran out is revived by a
+/// steward's push, which needs the member running (protocol.md 7.3; the sixth red-team round,
+/// M2).
 pub fn load_stores(home: &Home) -> Result<(Arc<PolicyStore>, Arc<RosterStore>, Vec<NetworkId>)> {
     let policies = Arc::new(PolicyStore::new());
     let rosters = Arc::new(RosterStore::new());
@@ -497,9 +501,37 @@ pub fn load_stores(home: &Home) -> Result<(Arc<PolicyStore>, Arc<RosterStore>, V
     }
     for network_id in &networks {
         let docs = load_documents(home, network_id)?;
-        adopt_documents(&rosters, &policies, &docs)?;
+        match adopt_documents(&rosters, &policies, &docs) {
+            Ok(_) => {}
+            Err(NodeError::DocumentRejected(reason @ (Reason::Expired | Reason::NotYetValid))) => {
+                tracing::warn!(
+                    network = %network_id,
+                    ?reason,
+                    "the documents on disk for this network are not valid now: it stays unusable until valid ones arrive (`menzil join` with a newer token, or a push from a steward or the relay)"
+                );
+                eprintln!(
+                    "warning: network {network_id}: the documents on disk are not valid now ({reason:?}); it stays unusable until valid ones arrive"
+                );
+            }
+            Err(error) => {
+                return Err(anyhow::Error::new(error).context(format!(
+                    "the documents of network {network_id} were refused"
+                )));
+            }
+        }
     }
     Ok((policies, rosters, networks))
+}
+
+/// What came of reading one network's pair from disk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Disk {
+    /// The pair was judged; whatever was newer than the stores held is stored now.
+    Judged,
+    /// The stores hold a Roster above the pair's `seq` (one that came over L3 ahead of the docs
+    /// token). The Policy of the pair cannot be adopted without a Roster of its `seq`, so
+    /// nothing is stored until a pair at or above the held Roster arrives.
+    Waiting { held_roster: u64 },
 }
 
 /// Adopts the owner signed pair read from disk, through the acceptance predicate of
@@ -509,7 +541,13 @@ fn adopt_documents(
     rosters: &RosterStore,
     policies: &PolicyStore,
     docs: &menzil_admin::Documents,
-) -> Result<()> {
+) -> Result<Disk, NodeError> {
+    let network_id = docs.roster().decode()?.network_id;
+    if let Some(held_roster) = rosters.seq(&network_id)
+        && held_roster > docs.seq()
+    {
+        return Ok(Disk::Waiting { held_roster });
+    }
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
@@ -519,7 +557,7 @@ fn adopt_documents(
         ..Bundle::default()
     };
     DocStore::new(rosters, policies).adopt(&bundle, now)?;
-    Ok(())
+    Ok(Disk::Judged)
 }
 
 /// Opens streams for the agent: resolves the name, then asks the node.
@@ -686,16 +724,30 @@ pub fn reload(
     let mut entries = Vec::new();
     for network_id in home.networks()? {
         let loaded = load_documents(home, &network_id).and_then(|docs| {
-            adopt_documents(rosters, policies, &docs)?;
-            Ok(docs)
+            let disk = adopt_documents(rosters, policies, &docs)?;
+            Ok((docs, disk))
         });
         match loaded {
-            Ok(docs) => {
+            Ok((docs, Disk::Judged)) => {
                 let seq = docs.seq();
                 entries.extend(Directory::members_of(&network_id, &docs));
                 if last.insert(network_id, seq) != Some(seq) {
                     tracing::info!(network = %network_id, seq, "holding newer documents");
                 }
+            }
+            // Not a failure: the pair on disk is older than the Roster the relay sent. The
+            // stores and the directory stay as they are until a pair at or above it is installed
+            // (the sixth red-team round, L1).
+            Ok((docs, Disk::Waiting { held_roster })) => {
+                if last.insert(network_id, docs.seq()) != Some(docs.seq()) {
+                    tracing::info!(
+                        network = %network_id,
+                        disk_seq = docs.seq(),
+                        held_roster,
+                        "the documents on disk are older than the Roster held from the relay: waiting for newer ones (`menzil join` with a newer token)"
+                    );
+                }
+                entries.extend(before.entries_in(&network_id).cloned());
             }
             Err(error) => {
                 tracing::warn!(network = %network_id, error = %format!("{error:#}"), "cannot reload this network's documents");

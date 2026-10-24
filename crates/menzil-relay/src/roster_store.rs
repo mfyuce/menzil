@@ -38,6 +38,12 @@ struct Held {
     body: RosterBody,
     base: Option<Roster>,
     view: HeldRoster,
+    /// How many of the leading `members` carry a `min_serial` that counts: all of an owner
+    /// signed Roster's, and for a steward signed one only those of its base. A steward appends
+    /// members and cannot be checked against their certificates here (the relay holds Rosters
+    /// only), so the `min_serial` it writes for them binds nothing, least of all across networks
+    /// (the sixth red-team round, M4).
+    counted: usize,
 }
 
 impl RosterStore {
@@ -84,6 +90,7 @@ impl RosterStore {
             body.network_id,
             Held {
                 signed: roster.clone(),
+                counted: body.members.len(),
                 body,
                 base: None,
                 view,
@@ -149,13 +156,19 @@ impl RosterStore {
             }
         };
         let view = HeldRoster::new(roster, base).map_err(RelayError::DocumentRejected)?;
+        let body = roster.decode()?;
+        let counted = match base {
+            Some(base) => base.decode()?.members.len().min(body.members.len()),
+            None => body.members.len(),
+        };
         guard.insert(
             network_id,
             Held {
                 signed: roster.clone(),
-                body: roster.decode()?,
+                body,
                 base: base.cloned(),
                 view,
+                counted,
             },
         );
         Ok(true)
@@ -189,6 +202,16 @@ impl RosterStore {
             .unwrap()
             .get(network_id)
             .map(|held| held.signed.clone())
+    }
+
+    /// The held signed Roster and its base, read under one lock, so that a concurrent adoption
+    /// cannot pair a Roster with the base of another (the sixth red-team round, N1).
+    pub fn signed_with_base(&self, network_id: &NetworkId) -> Option<(Roster, Option<Roster>)> {
+        self.by_network
+            .read()
+            .unwrap()
+            .get(network_id)
+            .map(|held| (held.signed.clone(), held.base.clone()))
     }
 
     /// Every held network's current `seq`, for WELCOME's `rosters` field
@@ -227,6 +250,7 @@ impl RosterStore {
                 held.body
                     .members
                     .iter()
+                    .take(held.counted)
                     .filter(|member| &member.node_id == node_id)
                     .map(|member| member.min_serial)
                     .max()
@@ -923,6 +947,35 @@ mod tests {
             store.get(&net.network_id).unwrap().seq,
             11 + menzil_proto::trust::STEWARD_SEQ_SPAN
         );
+    }
+
+    /// Round 6, M4: a steward of network A appends a member of network B with the highest
+    /// `min_serial`; the relay, which scans every held Roster for `min_serial`, must not then
+    /// refuse that node's HELLO. What a steward appends does not count.
+    #[test]
+    fn a_steward_cannot_lock_a_node_of_another_network_out_with_a_min_serial() {
+        use menzil_proto::RosterMember;
+        let now = crate::tests_support::real_now();
+        let victim = NodeId::from([0x77u8; 32]);
+        let a = StewardNet::new(10, now, node(1));
+        let b = StewardNet::new(20, now, victim);
+        let store = RosterStore::new();
+        store.adopt(&a.base, None, now).unwrap();
+        store.adopt(&b.base, None, now).unwrap();
+        assert_eq!(store.min_serial_for(&victim), Some(1));
+        let mut body = a.base.decode().unwrap();
+        body.seq = 11;
+        body.issued = now;
+        body.expires = now + 7 * crate::tests_support::DAY;
+        body.members.push(RosterMember {
+            node_id: victim,
+            min_serial: u32::MAX,
+        });
+        let steward_roster = Roster::sign(&a.steward, &body).unwrap();
+        assert!(store.adopt(&steward_roster, Some(&a.base), now).unwrap());
+        assert_eq!(store.min_serial_for(&victim), Some(1));
+        // The base members of a steward signed Roster still count.
+        assert_eq!(store.min_serial_for(&node(1)), Some(1));
     }
 
     #[test]

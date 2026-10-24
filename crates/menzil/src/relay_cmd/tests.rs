@@ -379,3 +379,34 @@ async fn a_running_relay_picks_up_a_newer_roster_added_to_its_directory() {
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert_eq!(running.roster_seq(&id), Some(2));
 }
+
+/// Round 6, M1: one network whose Roster on disk has expired (renewals travel by DOC, which the
+/// relay does not write back) holds back that network only; the relay starts and serves the
+/// others.
+#[tokio::test]
+async fn an_expired_roster_on_disk_holds_back_its_network_only() {
+    let (_oa, owner_a) = home();
+    init(&owner_a, clock() - 15 * DAY).unwrap();
+    let id_a = network_create(&owner_a, "laptop", clock() - 15 * DAY).unwrap();
+    let (_ob, owner_b, id_b, _) = token_of_a_network();
+    let (dir, relay_home) = home();
+    init(&relay_home, clock()).unwrap();
+    add_network(&relay_home, &relay_token(&owner_a), clock() - 15 * DAY + 60).unwrap();
+    add_network(&relay_home, &relay_token(&owner_b), clock()).unwrap();
+    let (cert, key) = pem_files(dir.path());
+    let options = RunOptions {
+        listen: "127.0.0.1:0".parse().unwrap(),
+        tls_cert: cert,
+        tls_key: key,
+        path: DEFAULT_PATH.to_string(),
+        host: Some("localhost".to_string()),
+        reload_every: Duration::from_millis(100),
+    };
+    let running = start(&relay_home, &options)
+        .await
+        .expect("an expired Roster of one network must not stop the relay");
+    assert_eq!(running.networks, vec![id_b]);
+    assert!(running.roster_seq(&id_b).is_some());
+    assert_eq!(running.roster_seq(&id_a), None);
+    running.stop();
+}

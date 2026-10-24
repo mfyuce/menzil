@@ -17,7 +17,7 @@
 //! time and sequence rules, then the signatures, then the field rules. A bundle is judged as a
 //! whole: one rejected document rejects the bundle.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use ed25519_dalek::VerifyingKey;
 
@@ -100,7 +100,8 @@ pub enum Reason {
     /// An appended certificate that does not verify against its own node id, or names a node that
     /// was not appended.
     BadCert,
-    /// An appended member's name or role fails the hygiene rule.
+    /// An appended member's name or role fails the hygiene rule, it has a role, or its name is taken
+    /// (letter case ignored).
     BadName,
     /// The Roster and the Policy were not signed by the same key from the same base.
     PairSigner,
@@ -323,7 +324,7 @@ enum RosterOf<'a> {
     /// In the bundle, with the members it appended when a steward signed it.
     Offered {
         body: &'a RosterBody,
-        appended: Option<Vec<NodeId>>,
+        appended: Option<Vec<RosterMember>>,
     },
     /// The held one, of the same `seq`.
     Held(&'a HeldRoster),
@@ -338,15 +339,12 @@ impl RosterOf<'_> {
     }
 
     /// The members appended to the base (steward signed Rosters only).
-    fn appended(&self) -> Result<Vec<NodeId>, Reason> {
+    fn appended(&self) -> Result<Vec<RosterMember>, Reason> {
         match self {
             Self::Offered { appended, .. } => appended.clone().ok_or(Reason::PairSigner),
             Self::Held(held) => {
                 let base = held.base.as_ref().ok_or(Reason::PairSigner)?;
-                Ok(held.body.members[base.members.len()..]
-                    .iter()
-                    .map(|m| m.node_id)
-                    .collect())
+                Ok(held.body.members[base.members.len()..].to_vec())
             }
         }
     }
@@ -537,12 +535,12 @@ fn right_for(entry: &Steward, appended_any: bool) -> Result<(), Reason> {
 }
 
 /// A steward signed Roster against its base: the same but for the dates, or for members appended
-/// at the end. Returns the appended node ids.
+/// at the end. Returns the appended members.
 fn roster_rules(
     roster: &RosterBody,
     base: &RosterBody,
     entry: &Steward,
-) -> Result<Vec<NodeId>, Reason> {
+) -> Result<Vec<RosterMember>, Reason> {
     if roster.v != base.v
         || roster.revoked != base.revoked
         || roster.stewards != base.stewards
@@ -561,7 +559,7 @@ fn roster_rules(
             return Err(Reason::BadAppend);
         }
     }
-    Ok(ids)
+    Ok(appended.to_vec())
 }
 
 /// The entries of `list` after `base`, which must be a prefix of it.
@@ -579,7 +577,7 @@ fn policy_rules(
     policy: &PolicyBody,
     base: &PolicyBody,
     entry: &Steward,
-    roster_appended: &[NodeId],
+    roster_appended: &[RosterMember],
 ) -> Result<(), Reason> {
     if policy.v != base.v
         || policy.grants != base.grants
@@ -592,30 +590,48 @@ fn policy_rules(
     let certs = appended_of(&policy.certs, &base.certs)?;
     right_for(entry, !members.is_empty())?;
     let ids: Vec<NodeId> = members.iter().map(|m: &PolicyMember| m.node_id).collect();
-    if ids != roster_appended {
+    if !ids.iter().eq(roster_appended.iter().map(|m| &m.node_id)) {
         return Err(Reason::BadAppend);
     }
     let known: HashSet<NodeId> = base.members.iter().map(|m| m.node_id).collect();
     if ids.iter().any(|id| known.contains(id)) {
         return Err(Reason::BadAppend);
     }
+    // A steward admits; it does not grant (protocol.md 2.3, 7.3): an appended member has no
+    // role, and a name no other member of the network has, whatever the letter case (the
+    // sixth red-team round, M3).
+    let mut taken: HashSet<String> = base.members.iter().map(|m| m.name.to_lowercase()).collect();
     for member in members {
         check_name(&member.name).map_err(|_| Reason::BadName)?;
         for role in &member.roles {
             check_role(role).map_err(|_| Reason::BadName)?;
         }
+        if !member.roles.is_empty() || !taken.insert(member.name.to_lowercase()) {
+            return Err(Reason::BadName);
+        }
     }
     // Only now, after the document's own signature has passed, the certificates: a genuine
     // steward admission costs one verification for each.
-    let appended: HashSet<NodeId> = ids.into_iter().collect();
+    //
+    // Each appended member comes with exactly one certificate, and its `min_serial` may not be
+    // above that certificate's serial: otherwise a steward of one network could lock a node of
+    // another network out of a shared relay, which takes the highest `min_serial` of any Roster
+    // it holds (the sixth red-team round, M4).
+    let mut serials: HashMap<NodeId, u32> = HashMap::new();
     for cert in certs {
         let body = cert.decode().map_err(|_| Reason::BadCert)?;
-        if !appended.contains(&body.node_id) {
+        if !ids.contains(&body.node_id) || serials.insert(body.node_id, body.serial).is_some() {
             return Err(Reason::BadCert);
         }
         let key = VerifyingKey::from_bytes(&<[u8; 32]>::from(body.node_id))
             .map_err(|_| Reason::BadCert)?;
         cert.verify(&key).map_err(|_| Reason::BadCert)?;
+    }
+    for member in roster_appended {
+        match serials.get(&member.node_id) {
+            Some(serial) if member.min_serial <= *serial => {}
+            _ => return Err(Reason::BadCert),
+        }
     }
     Ok(())
 }

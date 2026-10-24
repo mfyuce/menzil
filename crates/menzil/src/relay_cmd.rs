@@ -16,8 +16,9 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow, bail};
 use ed25519_dalek::VerifyingKey;
+use menzil_proto::trust::Reason;
 use menzil_proto::{Limits, NetworkId, Roster};
-use menzil_relay::{Listener, Relay, RelayIdentity};
+use menzil_relay::{Listener, Relay, RelayError, RelayIdentity};
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use tokio::task::JoinHandle;
@@ -248,8 +249,29 @@ pub async fn start(home: &Home, options: &RunOptions) -> Result<RunningRelay> {
     let relay = Relay::new(identity, LIMITS);
     let mut networks = Vec::new();
     for roster in &rosters {
-        relay.rosters().adopt(roster, None, unix_now())?;
-        networks.push(roster.decode()?.network_id);
+        let network_id = roster.decode()?.network_id;
+        match relay.rosters().adopt(roster, None, unix_now()) {
+            Ok(_) => networks.push(network_id),
+            // A Roster that ran out on disk (the relay does not write the ones it takes over
+            // DOC, so the file is as old as the last `add-network`) or is not valid yet holds
+            // back its own network, not the others (the sixth red-team round, M1). The relay
+            // keeps looking at the file and takes a newer one when it appears; members push
+            // theirs when they attach.
+            Err(RelayError::DocumentRejected(reason @ (Reason::Expired | Reason::NotYetValid))) => {
+                tracing::warn!(
+                    network = %network_id,
+                    ?reason,
+                    "the Roster on disk for this network is not valid now: the network is not served until a valid one arrives (`menzil relay add-network` with a newer token)"
+                );
+                eprintln!(
+                    "warning: network {network_id}: the Roster on disk is not valid now ({reason:?}); not served until a valid one arrives"
+                );
+            }
+            Err(error) => {
+                return Err(anyhow::Error::new(error)
+                    .context(format!("the Roster of network {network_id} was refused")));
+            }
+        }
     }
     let serving = relay.clone();
     let task = tokio::spawn(async move { serving.serve(&listener).await });
@@ -268,7 +290,8 @@ pub async fn start(home: &Home, options: &RunOptions) -> Result<RunningRelay> {
                         }
                         for roster in &rosters {
                             if let Err(error) = relay.rosters().adopt(roster, None, unix_now()) {
-                                tracing::warn!(%error, "a Roster on disk was refused");
+                                let network = roster.decode().map(|body| body.network_id).ok();
+                                tracing::warn!(?network, %error, "a Roster on disk was refused");
                             }
                         }
                     }

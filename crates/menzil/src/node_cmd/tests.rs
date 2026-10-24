@@ -805,3 +805,62 @@ async fn a_socket_path_must_name_a_file() {
     }
     assert!(!base.path().join("dirx").exists());
 }
+
+/// Round 6, M2: documents on disk that ran out hold back their own network, not the node: the
+/// stores load without it, and the other networks are held.
+#[test]
+fn expired_documents_on_disk_do_not_stop_the_node() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = Home::new(dir.path().join("menzil"));
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let then = now - 15 * 24 * 3600;
+    crate::local::init(&home, then).unwrap();
+    let old = crate::local::network_create(&home, "laptop", then).unwrap();
+    let fresh = crate::local::network_create(&home, "laptop", now).unwrap();
+    let (policies, rosters, networks) =
+        load_stores(&home).expect("expired documents of one network must not stop the node");
+    assert!(networks.contains(&old) && networks.contains(&fresh));
+    assert_eq!(rosters.seq(&old), None);
+    assert_eq!(policies.seq(&old), None);
+    assert!(rosters.seq(&fresh).is_some());
+    assert!(policies.seq(&fresh).is_some());
+}
+
+/// Round 6, L1: a Roster that reached the node over L3 ahead of the docs token on disk is not a
+/// failure of the reload; the node waits, and takes the pair when a newer token is installed.
+#[test]
+fn a_roster_from_the_relay_ahead_of_the_disk_pair_makes_the_reload_wait() {
+    let owner_dir = tempfile::tempdir().unwrap();
+    let owner = Home::new(owner_dir.path());
+    init(&owner, clock()).unwrap();
+    let id = network_create(&owner, "laptop", clock()).unwrap();
+    let member_dir = tempfile::tempdir().unwrap();
+    let member = Home::new(member_dir.path());
+    let request = init(&member, clock()).unwrap().join_request;
+    let admitted = admit(&owner, None, &request, "phone", &[], clock()).unwrap();
+    join(&member, &admitted.token, clock()).unwrap();
+    let (policies, rosters, _) = load_stores(&member).unwrap();
+    let start = policies.seq(&id).unwrap();
+    let third = renew(&owner, None, clock() + 60).unwrap();
+    let fourth = renew(&owner, None, clock() + 120).unwrap();
+    let roster4 = crate::local::load_documents(&owner, &id)
+        .unwrap()
+        .roster()
+        .clone();
+    assert!(rosters.adopt_owner(&roster4, clock() + 120).unwrap());
+    let held = rosters.seq(&id).unwrap();
+    join(&member, &third.token, clock() + 60).unwrap();
+    let directory = RwLock::new(Directory::default());
+    let mut last = HashMap::new();
+    reload(&member, &policies, &rosters, &directory, &mut last)
+        .expect("a disk pair older than the held Roster is waited for, not an error");
+    assert_eq!(rosters.seq(&id), Some(held));
+    assert_eq!(policies.seq(&id), Some(start));
+    // The matching token is installed: the pair is taken.
+    join(&member, &fourth.token, clock() + 120).unwrap();
+    reload(&member, &policies, &rosters, &directory, &mut last).unwrap();
+    assert_eq!(policies.seq(&id), Some(held));
+}
