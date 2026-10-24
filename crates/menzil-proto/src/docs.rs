@@ -132,14 +132,17 @@ impl<'de> Deserialize<'de> for Outcome {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Message {
     /// `fetch`: the opener asks for what is newer than the seqs it holds. `base_seq` is the `seq`
-    /// of the base of its steward signed documents, if it holds any.
+    /// of the base of its steward signed Roster, `policy_base_seq` that of its steward signed
+    /// Policy (null for an owner signed one), if it holds any.
     Fetch {
         /// The seq of the Roster the opener holds.
         roster_seq: Option<u64>,
         /// The seq of the Policy the opener holds.
         policy_seq: Option<u64>,
-        /// The seq of the base the opener holds.
+        /// The seq of the base of the Roster the opener holds.
         base_seq: Option<u64>,
+        /// The seq of the base of the Policy the opener holds.
+        policy_base_seq: Option<u64>,
     },
     /// `push`: the opener sends documents.
     Push,
@@ -185,6 +188,8 @@ enum Wire {
         policy_seq: Option<u64>,
         #[serde(deserialize_with = "required")]
         base_seq: Option<u64>,
+        #[serde(deserialize_with = "required")]
+        policy_base_seq: Option<u64>,
     },
     Push {
         v: u16,
@@ -255,11 +260,13 @@ impl From<&Message> for Wire {
                 roster_seq,
                 policy_seq,
                 base_seq,
+                policy_base_seq,
             } => Wire::Fetch {
                 v: VERSION,
                 roster_seq: *roster_seq,
                 policy_seq: *policy_seq,
                 base_seq: *base_seq,
+                policy_base_seq: *policy_base_seq,
             },
             Message::Push => Wire::Push { v: VERSION },
             Message::Doc { kind, doc } => Wire::Doc {
@@ -298,12 +305,14 @@ impl Wire {
                 roster_seq,
                 policy_seq,
                 base_seq,
+                policy_base_seq,
             } => {
                 check_version(v)?;
                 Message::Fetch {
                     roster_seq,
                     policy_seq,
                     base_seq,
+                    policy_base_seq,
                 }
             }
             Wire::Push { v } => {

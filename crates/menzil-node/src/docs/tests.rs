@@ -278,7 +278,7 @@ fn kinds(messages: &[Message]) -> Vec<&'static str> {
 fn a_fetch_from_nothing_gets_both_documents_and_an_end_with_our_seqs() {
     let net = Net::new();
     let stores = Stores::with_base(&net);
-    let plan = plan_fetch(&stores.docs(&net), None, None, None, NOW);
+    let plan = plan_fetch(&stores.docs(&net), None, None, None, None, NOW);
     assert_eq!(kinds(&plan), vec!["roster", "policy", "end"]);
     assert_eq!(
         plan.last(),
@@ -302,13 +302,13 @@ fn nothing_newer_means_only_an_end() {
     let net = Net::new();
     let stores = Stores::with_base(&net);
     for (r, p) in [(Some(10), Some(10)), (Some(11), Some(12))] {
-        let plan = plan_fetch(&stores.docs(&net), r, p, None, NOW);
+        let plan = plan_fetch(&stores.docs(&net), r, p, None, None, NOW);
         assert_eq!(kinds(&plan), vec!["end"], "requester at {r:?} {p:?}");
     }
     // A requester behind on the Roster only gets the Roster... and the Policy it is behind on.
-    let plan = plan_fetch(&stores.docs(&net), Some(9), Some(10), None, NOW);
+    let plan = plan_fetch(&stores.docs(&net), Some(9), Some(10), None, None, NOW);
     assert_eq!(kinds(&plan), vec!["roster", "end"]);
-    let plan = plan_fetch(&stores.docs(&net), Some(10), Some(9), None, NOW);
+    let plan = plan_fetch(&stores.docs(&net), Some(10), Some(9), None, None, NOW);
     assert_eq!(kinds(&plan), vec!["policy", "end"]);
 }
 
@@ -322,13 +322,13 @@ fn a_policy_is_served_only_with_a_roster_of_the_same_seq() {
     assert!(stores.adopt(&net, &roster_only).roster);
     assert_eq!(stores.rosters.seq(&net.network_id), Some(11));
     assert_eq!(stores.policies.seq(&net.network_id), Some(10));
-    let plan = plan_fetch(&stores.docs(&net), None, None, None, NOW);
+    let plan = plan_fetch(&stores.docs(&net), None, None, None, None, NOW);
     assert_eq!(kinds(&plan), vec!["roster", "end"]);
     // The pair is complete at 11: the Policy follows.
     let mut policy_only = net.renewal(&net.owner, 11);
     policy_only.roster = None;
     assert!(stores.adopt(&net, &policy_only).policy);
-    let plan = plan_fetch(&stores.docs(&net), None, None, None, NOW);
+    let plan = plan_fetch(&stores.docs(&net), None, None, None, None, NOW);
     assert_eq!(kinds(&plan), vec!["roster", "policy", "end"]);
 }
 
@@ -337,15 +337,22 @@ fn a_policy_without_a_roster_goes_only_to_a_requester_holding_that_roster() {
     let net = Net::new();
     let stores = Stores::with_steward_pair(&net, 11);
     // The requester holds the Roster of seq 11 but an older Policy: the Policy alone fits.
-    let plan = plan_fetch(&stores.docs(&net), Some(11), Some(10), None, NOW);
+    let plan = plan_fetch(&stores.docs(&net), Some(11), Some(10), None, None, NOW);
     assert_eq!(kinds(&plan), vec!["base_policy", "policy", "end"]);
-    let plan = plan_fetch(&stores.docs(&net), Some(11), Some(10), Some(10), NOW);
+    let plan = plan_fetch(
+        &stores.docs(&net),
+        Some(11),
+        Some(10),
+        Some(10),
+        Some(10),
+        NOW,
+    );
     assert_eq!(kinds(&plan), vec!["policy", "end"]);
     // A requester ahead on the Roster (12) would be sent a Policy it cannot pair: nothing.
-    let plan = plan_fetch(&stores.docs(&net), Some(12), Some(10), None, NOW);
+    let plan = plan_fetch(&stores.docs(&net), Some(12), Some(10), None, None, NOW);
     assert_eq!(kinds(&plan), vec!["end"]);
     // A requester with no Roster is sent the Roster, so the Policy comes along.
-    let plan = plan_fetch(&stores.docs(&net), None, Some(10), None, NOW);
+    let plan = plan_fetch(&stores.docs(&net), None, Some(10), None, None, NOW);
     assert_eq!(
         kinds(&plan),
         vec!["base_roster", "base_policy", "roster", "policy", "end"]
@@ -359,7 +366,7 @@ fn bases_go_first_and_are_omitted_when_the_requester_holds_them() {
     let docs = stores.docs(&net);
     assert_eq!(docs.held().base_seq, Some(10));
     // Nothing held: all four, bases first.
-    let plan = plan_fetch(&docs, None, None, None, NOW);
+    let plan = plan_fetch(&docs, None, None, None, None, NOW);
     assert_eq!(
         kinds(&plan),
         vec!["base_roster", "base_policy", "roster", "policy", "end"]
@@ -379,16 +386,16 @@ fn bases_go_first_and_are_omitted_when_the_requester_holds_them() {
         }
     );
     // The requester's base is the one we hold (10): bases omitted, documents kept.
-    let plan = plan_fetch(&docs, Some(10), Some(10), Some(10), NOW);
+    let plan = plan_fetch(&docs, Some(10), Some(10), Some(10), Some(10), NOW);
     assert_eq!(kinds(&plan), vec!["roster", "policy", "end"]);
     // Another base seq than ours: sent again.
-    let plan = plan_fetch(&docs, Some(10), Some(10), Some(9), NOW);
+    let plan = plan_fetch(&docs, Some(10), Some(10), Some(9), Some(9), NOW);
     assert_eq!(
         kinds(&plan),
         vec!["base_roster", "base_policy", "roster", "policy", "end"]
     );
     // Only the Roster is sent: only its base comes.
-    let plan = plan_fetch(&docs, Some(10), Some(11), None, NOW);
+    let plan = plan_fetch(&docs, Some(10), Some(11), None, None, NOW);
     assert_eq!(kinds(&plan), vec!["base_roster", "roster", "end"]);
 }
 
@@ -397,16 +404,44 @@ fn an_expired_document_is_not_sent() {
     let net = Net::new();
     let stores = Stores::with_base(&net);
     // The pair expires at NOW + 5 days: at that second it no longer counts.
-    let plan = plan_fetch(&stores.docs(&net), None, None, None, NOW + 5 * DAY);
+    let plan = plan_fetch(&stores.docs(&net), None, None, None, None, NOW + 5 * DAY);
     assert_eq!(kinds(&plan), vec!["end"]);
-    let plan = plan_fetch(&stores.docs(&net), None, None, None, NOW + 5 * DAY - 1);
+    let plan = plan_fetch(
+        &stores.docs(&net),
+        None,
+        None,
+        None,
+        None,
+        NOW + 5 * DAY - 1,
+    );
     assert_eq!(kinds(&plan), vec!["roster", "policy", "end"]);
     // The Policy on its own (the requester holds the Roster) expires at the same second.
-    let plan = plan_fetch(&stores.docs(&net), Some(9), None, None, NOW + 5 * DAY - 1);
+    let plan = plan_fetch(
+        &stores.docs(&net),
+        Some(9),
+        None,
+        None,
+        None,
+        NOW + 5 * DAY - 1,
+    );
     assert_eq!(kinds(&plan), vec!["roster", "policy", "end"]);
-    let plan = plan_fetch(&stores.docs(&net), Some(10), None, None, NOW + 5 * DAY - 1);
+    let plan = plan_fetch(
+        &stores.docs(&net),
+        Some(10),
+        None,
+        None,
+        None,
+        NOW + 5 * DAY - 1,
+    );
     assert_eq!(kinds(&plan), vec!["policy", "end"]);
-    let plan = plan_fetch(&stores.docs(&net), Some(10), None, None, NOW + 5 * DAY);
+    let plan = plan_fetch(
+        &stores.docs(&net),
+        Some(10),
+        None,
+        None,
+        None,
+        NOW + 5 * DAY,
+    );
     assert_eq!(kinds(&plan), vec!["end"]);
 }
 
@@ -414,7 +449,7 @@ fn an_expired_document_is_not_sent() {
 fn a_store_with_nothing_answers_with_an_empty_end() {
     let net = Net::new();
     let stores = Stores::empty();
-    let plan = plan_fetch(&stores.docs(&net), None, None, None, NOW);
+    let plan = plan_fetch(&stores.docs(&net), None, None, None, None, NOW);
     assert_eq!(
         plan,
         vec![Message::End {
@@ -596,7 +631,14 @@ async fn a_steward_renewal_on_the_base_the_opener_holds_is_adopted_without_a_bas
     let client = Stores::with_steward_pair(&net, 11);
     assert_eq!(client.docs(&net).held().base_seq, Some(10));
     // The server sends no base: the opener holds the one it would send.
-    let planned = plan_fetch(&server.docs(&net), Some(11), Some(11), Some(10), NOW);
+    let planned = plan_fetch(
+        &server.docs(&net),
+        Some(11),
+        Some(11),
+        Some(10),
+        Some(10),
+        NOW,
+    );
     assert_eq!(kinds(&planned), ["roster", "policy", "end"]);
     let (mut a, mut b) = pair();
     let p = params(&net);
@@ -639,11 +681,14 @@ fn a_base_is_filled_in_only_when_its_seq_is_the_announced_one() {
         policy: Some(net.base_policy.clone()),
     };
     let mut other = bundle.clone();
-    fill_bases(&mut other, Some(9), bases.clone());
+    fill_bases(&mut other, Some(9), Some(9), bases.clone());
     assert!(other.base_roster.is_none() && other.base_policy.is_none());
-    fill_bases(&mut other, None, bases.clone());
+    fill_bases(&mut other, None, None, bases.clone());
     assert!(other.base_roster.is_none() && other.base_policy.is_none());
-    fill_bases(&mut bundle, Some(10), bases);
+    // Each base is judged against its own announcement.
+    fill_bases(&mut other, Some(10), Some(9), bases.clone());
+    assert!(other.base_roster.is_some() && other.base_policy.is_none());
+    fill_bases(&mut bundle, Some(10), Some(10), bases);
     assert!(bundle.base_roster.is_some() && bundle.base_policy.is_some());
 }
 
@@ -1032,6 +1077,7 @@ async fn a_docs_only_session_refuses_a_fetch_and_sends_nothing() {
             roster_seq: None,
             policy_seq: None,
             base_seq: None,
+            policy_base_seq: None,
         };
         raw.write_all(&encode_frame(&fetch).unwrap()).await.unwrap();
     };
@@ -1599,4 +1645,160 @@ async fn a_fetch_sink_failure_is_reported_as_such() {
             (check, other) => panic!("{check}: {other:?}"),
         }
     }
+}
+
+/// Round 7 M1, first shape: a node holds the owner pair (seq 10), then the steward's Roster 11
+/// arrives alone (the relay's L3 DOC). Its Policy is owner signed, so it announces no Policy
+/// base; the server therefore sends the Policy's base and the Policy 11 is adopted.
+#[tokio::test]
+async fn a_policy_fetch_after_a_roster_first_steward_renewal_is_adopted() {
+    let net = Net::new();
+    let server = Stores::with_steward_pair(&net, 11);
+    let client = Stores::with_base(&net);
+    let renewal = net.renewal(&net.steward, 11);
+    let roster_only = Bundle {
+        base_roster: renewal.base_roster.clone(),
+        roster: renewal.roster.clone(),
+        ..Bundle::default()
+    };
+    client.docs(&net).adopt(&roster_only, NOW).unwrap();
+    let held = client.docs(&net).held();
+    assert_eq!(held.base_seq, Some(10));
+    assert_eq!(held.policy_base_seq, None);
+    let planned = plan_fetch(
+        &server.docs(&net),
+        held.roster_seq,
+        held.policy_seq,
+        held.base_seq,
+        held.policy_base_seq,
+        NOW,
+    );
+    assert_eq!(kinds(&planned), ["base_policy", "policy", "end"]);
+    let (mut a, mut b) = pair();
+    let p = params(&net);
+    let (fetched, served) = tokio::join!(
+        fetch(&mut a, client.docs(&net), &p),
+        serve(
+            &mut b,
+            server.docs(&net),
+            server.docs(&net),
+            &p,
+            ServeMode::Full
+        ),
+    );
+    served.unwrap();
+    assert!(fetched.unwrap().adopted.policy);
+    assert_eq!(client.policies.seq(&net.network_id), Some(11));
+}
+
+/// Round 7 M1, second shape: the opener holds the steward pair 11 (base 10) and takes the Roster
+/// of a newer base alone. The Policy it holds stands on base 10, not on the Roster's base, so
+/// the server must send the new base Policy.
+#[tokio::test]
+async fn a_policy_fetch_after_a_roster_on_a_newer_base_is_adopted() {
+    let net = Net::new();
+    let b2 = 10 + menzil_proto::trust::STEWARD_SEQ_SPAN + 1;
+    let mut r2 = net.roster.clone();
+    let mut p2 = net.policy.clone();
+    r2.seq = b2;
+    p2.seq = b2;
+    let base2 = Bundle {
+        roster: Some(Roster::sign(&net.owner, &r2).unwrap()),
+        policy: Some(Policy::sign(&net.owner, &p2).unwrap()),
+        ..Bundle::default()
+    };
+    let mut r3 = r2.clone();
+    let mut p3 = p2.clone();
+    r3.seq = b2 + 1;
+    p3.seq = b2 + 1;
+    r3.issued = NOW;
+    p3.issued = NOW;
+    let renewal2 = Bundle {
+        base_roster: base2.roster.clone(),
+        base_policy: base2.policy.clone(),
+        roster: Some(Roster::sign(&net.steward, &r3).unwrap()),
+        policy: Some(Policy::sign(&net.steward, &p3).unwrap()),
+    };
+    let server = Stores::with_steward_pair(&net, 11);
+    server.docs(&net).adopt(&renewal2, NOW).unwrap();
+    let client = Stores::with_steward_pair(&net, 11);
+    let roster_only = Bundle {
+        base_roster: renewal2.base_roster.clone(),
+        roster: renewal2.roster.clone(),
+        ..Bundle::default()
+    };
+    client.docs(&net).adopt(&roster_only, NOW).unwrap();
+    let held = client.docs(&net).held();
+    assert_eq!(held.base_seq, Some(b2));
+    assert_eq!(held.policy_base_seq, Some(10));
+    let (mut a, mut b) = pair();
+    let p = params(&net);
+    let (fetched, served) = tokio::join!(
+        fetch(&mut a, client.docs(&net), &p),
+        serve(
+            &mut b,
+            server.docs(&net),
+            server.docs(&net),
+            &p,
+            ServeMode::Full
+        ),
+    );
+    served.unwrap();
+    assert!(fetched.unwrap().adopted.policy);
+    assert_eq!(client.policies.seq(&net.network_id), Some(b2 + 1));
+}
+
+/// The Policy's base is judged against `policy_base_seq`, the Roster's against `base_seq`.
+#[test]
+fn the_roster_and_policy_bases_are_announced_separately() {
+    let net = Net::new();
+    let stores = Stores::with_steward_pair(&net, 11);
+    let docs = stores.docs(&net);
+    let plan = plan_fetch(&docs, Some(10), Some(10), Some(10), None, NOW);
+    assert_eq!(kinds(&plan), ["base_policy", "roster", "policy", "end"]);
+    let plan = plan_fetch(&docs, Some(10), Some(10), None, Some(10), NOW);
+    assert_eq!(kinds(&plan), ["base_roster", "roster", "policy", "end"]);
+}
+
+/// A sink whose Roster base announcement differs from its Policy base announcement.
+struct SkewedSink<K: DocsSink>(K);
+
+impl<K: DocsSink> DocsSink for SkewedSink<K> {
+    fn adopt(&self, bundle: &Bundle, now: u64) -> Result<Adopted, NodeError> {
+        self.0.adopt(bundle, now)
+    }
+    fn held(&self) -> HeldDocs {
+        HeldDocs {
+            base_seq: Some(9),
+            ..self.0.held()
+        }
+    }
+    fn held_bases(&self) -> HeldBases {
+        self.0.held_bases()
+    }
+}
+
+/// The Policy base left out of a fetch answer is put back by the Policy's own announcement, not
+/// the Roster's.
+#[tokio::test]
+async fn a_left_out_policy_base_is_filled_by_the_policy_announcement() {
+    let net = Net::new();
+    let server = Stores::with_steward_pair(&net, 12);
+    let client = Stores::with_steward_pair(&net, 11);
+    let sink = SkewedSink(client.docs(&net));
+    let (mut a, mut b) = pair();
+    let p = params(&net);
+    let (fetched, served) = tokio::join!(
+        fetch(&mut a, &sink, &p),
+        serve(
+            &mut b,
+            server.docs(&net),
+            server.docs(&net),
+            &p,
+            ServeMode::Full
+        ),
+    );
+    served.unwrap();
+    assert!(fetched.unwrap().adopted.policy);
+    assert_eq!(client.policies.seq(&net.network_id), Some(12));
 }

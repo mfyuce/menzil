@@ -25,6 +25,7 @@ fn fetch_entries() -> Vec<(&'static str, Value)> {
         ("roster_seq", int(4)),
         ("policy_seq", Value::Null),
         ("base_seq", Value::Null),
+        ("policy_base_seq", int(9)),
     ]
 }
 
@@ -34,6 +35,7 @@ fn all_messages() -> Vec<Message> {
             roster_seq: Some(7),
             policy_seq: None,
             base_seq: Some(3),
+            policy_base_seq: None,
         },
         Message::Push,
         Message::Doc {
@@ -159,7 +161,8 @@ fn a_well_formed_hand_built_fetch_decodes() {
         Message::Fetch {
             roster_seq: Some(4),
             policy_seq: None,
-            base_seq: None
+            base_seq: None,
+            policy_base_seq: Some(9),
         }
     );
 }
@@ -203,7 +206,7 @@ fn an_unknown_key_is_refused_in_every_message() {
 
 #[test]
 fn a_duplicate_key_is_refused() {
-    for key in ["t", "v", "roster_seq", "base_seq"] {
+    for key in ["t", "v", "roster_seq", "base_seq", "policy_base_seq"] {
         let mut entries = fetch_entries();
         let original = entries.iter().find(|(k, _)| *k == key).unwrap().clone();
         entries.push(original);
@@ -220,7 +223,14 @@ fn a_duplicate_key_is_refused() {
 
 #[test]
 fn a_missing_key_is_refused_even_for_a_nullable_one() {
-    for missing in ["v", "roster_seq", "policy_seq", "base_seq", "t"] {
+    for missing in [
+        "v",
+        "roster_seq",
+        "policy_seq",
+        "base_seq",
+        "policy_base_seq",
+        "t",
+    ] {
         let entries: Vec<_> = fetch_entries()
             .into_iter()
             .filter(|(k, _)| *k != missing)

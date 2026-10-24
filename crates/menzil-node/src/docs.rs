@@ -76,8 +76,11 @@ pub struct HeldDocs {
     pub roster_seq: Option<u64>,
     /// The seq of the held Policy.
     pub policy_seq: Option<u64>,
-    /// The seq of the base of the held documents, when they are steward signed.
+    /// The seq of the base of the held Roster, when it is steward signed.
     pub base_seq: Option<u64>,
+    /// The seq of the base of the held Policy, when it is steward signed (an owner signed Policy
+    /// has none, whatever the Roster stands on).
+    pub policy_base_seq: Option<u64>,
 }
 
 /// The owner signed bases a node holds beside its steward signed documents.
@@ -239,10 +242,15 @@ impl DocsSink for StoreDocs<'_> {
             Some(Signer::Steward { base_seq, .. }) => Some(base_seq),
             _ => None,
         };
+        let policy_base_seq = match self.policies.signer(&self.network_id) {
+            Some(Signer::Steward { base_seq, .. }) => Some(base_seq),
+            _ => None,
+        };
         HeldDocs {
             roster_seq: self.rosters.seq(&self.network_id),
             policy_seq: self.policies.seq(&self.network_id),
             base_seq,
+            policy_base_seq,
         }
     }
 }
@@ -265,13 +273,17 @@ fn bundle_is_of(bundle: &Bundle, network_id: &NetworkId) -> bool {
 }
 
 /// Puts back the bases a fetch answer left out because the opener announced them: a missing
-/// base is filled from the one held when its `seq` is the `announced` one.
-fn fill_bases(bundle: &mut Bundle, announced: Option<u64>, bases: HeldBases) {
-    let Some(announced) = announced else {
-        return;
-    };
+/// base is filled from the one held when its `seq` is the one announced for that document (the
+/// Roster's and the Policy's bases are announced separately).
+fn fill_bases(
+    bundle: &mut Bundle,
+    announced_roster: Option<u64>,
+    announced_policy: Option<u64>,
+    bases: HeldBases,
+) {
     if bundle.roster.is_some()
         && bundle.base_roster.is_none()
+        && let Some(announced) = announced_roster
         && let Some(base) = bases.roster
         && roster_seq_of(&base) == Some(announced)
     {
@@ -279,6 +291,7 @@ fn fill_bases(bundle: &mut Bundle, announced: Option<u64>, bases: HeldBases) {
     }
     if bundle.policy.is_some()
         && bundle.base_policy.is_none()
+        && let Some(announced) = announced_policy
         && let Some(base) = bases.policy
         && policy_seq_of(&base) == Some(announced)
     {
@@ -309,14 +322,16 @@ fn newer(seq: u64, held: Option<u64>) -> bool {
 
 /// What to send in answer to a `fetch` with these seqs, at `now`: each unexpired document that
 /// is newer; the Policy only when the Roster held has its `seq` and (it is sent, or the
-/// opener's Roster has that `seq`); a base only when the opener does not hold it (its
-/// `base_seq` differs); bases first; then `end`. Pure, so that the rules can be tested one by
+/// opener's Roster has that `seq`); a base only when the opener does not hold it (the Roster's
+/// base against `request_base_seq`, the Policy's base against `request_policy_base_seq`);
+/// bases first; then `end`. Pure, so that the rules can be tested one by
 /// one.
 pub fn plan_fetch<S: DocsSource>(
     source: &S,
     request_roster_seq: Option<u64>,
     request_policy_seq: Option<u64>,
     request_base_seq: Option<u64>,
+    request_policy_base_seq: Option<u64>,
     now: u64,
 ) -> Vec<Message> {
     let roster = source.roster();
@@ -350,7 +365,7 @@ pub fn plan_fetch<S: DocsSource>(
     }
     if send_policy
         && let Some((_, Some(base))) = &policy
-        && base_wanted(policy_seq_of(base), request_base_seq)
+        && base_wanted(policy_seq_of(base), request_policy_base_seq)
     {
         out.push(Message::Doc {
             kind: DocKind::BasePolicy,
@@ -658,11 +673,19 @@ where
             roster_seq,
             policy_seq,
             base_seq,
+            policy_base_seq,
         } => {
             if mode == ServeMode::PushOnly {
                 return Err(DocsStreamError::Unexpected("fetch on a docs only session"));
             }
-            for message in plan_fetch(&source, roster_seq, policy_seq, base_seq, params.now) {
+            for message in plan_fetch(
+                &source,
+                roster_seq,
+                policy_seq,
+                base_seq,
+                policy_base_seq,
+                params.now,
+            ) {
                 write_message(stream, &message).await?;
             }
             Ok(Served::Fetch)
@@ -711,6 +734,7 @@ where
                 roster_seq: held.roster_seq,
                 policy_seq: held.policy_seq,
                 base_seq: held.base_seq,
+                policy_base_seq: held.policy_base_seq,
             },
         )
         .await?;
@@ -719,7 +743,12 @@ where
         if let Some(reason) = collected.defect {
             return Err(DocsStreamError::Rejected(reason));
         }
-        fill_bases(&mut collected.bundle, held.base_seq, sink.held_bases());
+        fill_bases(
+            &mut collected.bundle,
+            held.base_seq,
+            held.policy_base_seq,
+            sink.held_bases(),
+        );
         let mut report = FetchReport {
             adopted: Adopted::default(),
             peer_roster_seq: collected.end_roster_seq,

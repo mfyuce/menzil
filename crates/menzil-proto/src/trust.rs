@@ -105,6 +105,9 @@ pub enum Reason {
     BadName,
     /// The Roster and the Policy were not signed by the same key from the same base.
     PairSigner,
+    /// A steward document on the base of a held steward Roster does not keep the members the
+    /// held one appended (a steward cannot un-admit, nor give an admitted name to another node).
+    AppendedDropped,
 }
 
 impl Reason {
@@ -155,6 +158,15 @@ impl HeldRoster {
             base: Some(base),
             signer,
         })
+    }
+
+    /// The members the held Roster appended to its base, when it is steward signed and its base
+    /// has `base_seq`; nothing otherwise.
+    fn appended_on(&self, base_seq: u64) -> &[RosterMember] {
+        match &self.base {
+            Some(base) if base.seq == base_seq => &self.body.members[base.members.len()..],
+            _ => &[],
+        }
     }
 
     /// The held Roster's `seq`.
@@ -283,7 +295,13 @@ fn check(held: &HeldView, bundle: &Bundle, now: u64) -> Result<Option<Adoption>,
             let signer = roster_signer(&ctx, signed, body, base, held_base_seq)?;
             let appended = match (&signer, base) {
                 (Signer::Steward { .. }, Some((_, base_body))) => {
-                    Some(roster_rules(body, base_body, &steward_of(base_body)?)?)
+                    let held_appended = held
+                        .roster
+                        .as_ref()
+                        .map_or(&[][..], |h| h.appended_on(base_body.seq));
+                    let appended =
+                        roster_rules(body, base_body, &steward_of(base_body)?, held_appended)?;
+                    Some((appended, held_appended.len()))
                 }
                 _ => None,
             };
@@ -309,8 +327,8 @@ fn check(held: &HeldView, bundle: &Bundle, now: u64) -> Result<Option<Adoption>,
         }
         if let (Signer::Steward { .. }, Some((_, base_body))) = (&policy_signer, base) {
             let entry = steward_of_stewards(&roster_body.stewards)?;
-            let appended = roster_ctx.appended()?;
-            policy_rules(body, base_body, &entry, &appended)?;
+            let (appended, held_len) = roster_ctx.appended()?;
+            policy_rules(body, base_body, &entry, &appended, held_len)?;
         }
     }
 
@@ -326,7 +344,7 @@ enum RosterOf<'a> {
     /// In the bundle, with the members it appended when a steward signed it.
     Offered {
         body: &'a RosterBody,
-        appended: Option<Vec<RosterMember>>,
+        appended: Option<(Vec<RosterMember>, usize)>,
     },
     /// The held one, of the same `seq`.
     Held(&'a HeldRoster),
@@ -340,13 +358,15 @@ impl RosterOf<'_> {
         }
     }
 
-    /// The members appended to the base (steward signed Rosters only).
-    fn appended(&self) -> Result<Vec<RosterMember>, Reason> {
+    /// The members appended to the base (steward signed Rosters only), and how many of them the
+    /// verifier held already: a Policy that comes alone has no earlier document to compare with,
+    /// so for it none (the Roster of its `seq` was judged when it was adopted).
+    fn appended(&self) -> Result<(Vec<RosterMember>, usize), Reason> {
         match self {
             Self::Offered { appended, .. } => appended.clone().ok_or(Reason::PairSigner),
             Self::Held(held) => {
                 let base = held.base.as_ref().ok_or(Reason::PairSigner)?;
-                Ok(held.body.members[base.members.len()..].to_vec())
+                Ok((held.body.members[base.members.len()..].to_vec(), 0))
             }
         }
     }
@@ -525,10 +545,12 @@ fn verify_entry(ctx: &Ctx, entry: &Steward) -> Result<(), Reason> {
         .map_err(|_| Reason::BadStewardEntry)
 }
 
-/// Whether `entry` lets the steward make the change that appended `appended_any` members.
-fn right_for(entry: &Steward, appended_any: bool) -> Result<(), Reason> {
+/// Whether `entry` lets the steward make the change: `admit` when the document appends members
+/// the verifier did not hold (`appended_new`), else `renew`. A steward that may only admit
+/// cannot renew a pair that carries its earlier admissions.
+fn right_for(entry: &Steward, appended_new: bool) -> Result<(), Reason> {
     let entry = entry.decode().map_err(|_| Reason::BadStewardEntry)?;
-    let right = if appended_any { "admit" } else { "renew" };
+    let right = if appended_new { "admit" } else { "renew" };
     if entry.may.iter().any(|may| may == right) {
         Ok(())
     } else {
@@ -537,11 +559,13 @@ fn right_for(entry: &Steward, appended_any: bool) -> Result<(), Reason> {
 }
 
 /// A steward signed Roster against its base: the same but for the dates, or for members appended
-/// at the end. Returns the appended members.
+/// at the end. `held_appended` are the members a held steward Roster of the same base appended:
+/// they must stay, in order, at the front of the appended ones. Returns the appended members.
 fn roster_rules(
     roster: &RosterBody,
     base: &RosterBody,
     entry: &Steward,
+    held_appended: &[RosterMember],
 ) -> Result<Vec<RosterMember>, Reason> {
     if roster.v != base.v
         || roster.revoked != base.revoked
@@ -551,7 +575,10 @@ fn roster_rules(
         return Err(Reason::FieldChanged);
     }
     let appended = appended_of(&roster.members, &base.members)?;
-    right_for(entry, !appended.is_empty())?;
+    if !appended.starts_with(held_appended) {
+        return Err(Reason::AppendedDropped);
+    }
+    right_for(entry, appended.len() > held_appended.len())?;
     let known: HashSet<NodeId> = base.members.iter().map(|m| m.node_id).collect();
     let revoked: HashSet<NodeId> = base.revoked.iter().map(|r| r.node_id).collect();
     let mut seen = HashSet::new();
@@ -580,6 +607,7 @@ fn policy_rules(
     base: &PolicyBody,
     entry: &Steward,
     roster_appended: &[RosterMember],
+    held_len: usize,
 ) -> Result<(), Reason> {
     if policy.v != base.v
         || policy.grants != base.grants
@@ -590,7 +618,7 @@ fn policy_rules(
     }
     let members = appended_of(&policy.members, &base.members)?;
     let certs = appended_of(&policy.certs, &base.certs)?;
-    right_for(entry, !members.is_empty())?;
+    right_for(entry, members.len() > held_len)?;
     let ids: Vec<NodeId> = members.iter().map(|m: &PolicyMember| m.node_id).collect();
     if !ids.iter().eq(roster_appended.iter().map(|m| &m.node_id)) {
         return Err(Reason::BadAppend);

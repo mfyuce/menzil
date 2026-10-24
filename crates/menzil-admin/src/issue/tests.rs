@@ -1427,3 +1427,87 @@ fn the_pair_of_a_steward_is_one_steward_pair_not_two_halves() {
     .unwrap();
     assert!(mixed.verify().is_err());
 }
+
+/// Round 7 L1: a steward pair whose Policy was issued some hours after its Roster is adopted by
+/// every verifier at the real clock, so `verify` (and with it join, renew, load) accepts it.
+#[test]
+fn a_steward_pair_with_a_policy_issued_after_its_roster_verifies() {
+    let s = stewarded();
+    let renewed = steward_renew(&s.steward, &s.base, NOW + DAY).unwrap();
+    let (base_r, base_p) = renewed.base().unwrap();
+    let mut rb = renewed.roster_body().clone();
+    let mut pb = renewed.policy_body().clone();
+    rb.issued = NOW + DAY;
+    pb.issued = NOW + DAY + 3 * 3600;
+    rb.expires = rb.issued + DAY;
+    pb.expires = pb.issued + DAY;
+    let pair = Documents::from_signed_with_base(
+        Roster::sign(s.steward.signing_key(), &rb).unwrap(),
+        Policy::sign(s.steward.signing_key(), &pb).unwrap(),
+        base_r.clone(),
+        base_p.clone(),
+    )
+    .unwrap();
+    let clock = pb.issued;
+    let signer = Signer::Steward {
+        key: s.steward.public(),
+        base_seq: s.base.seq(),
+    };
+    // Every verifier adopts it at the real clock, from nothing and holding the base.
+    assert_eq!(adopted_signer(judged(None, &pair, clock)), signer);
+    assert_eq!(adopted_signer(judged(Some(&s.base), &pair, clock)), signer);
+    assert_eq!(pair.verify().unwrap(), signer);
+    // The owner can still extend it.
+    assert!(renew(&s.owner, &pair, clock).is_ok());
+}
+
+/// Round 7 L3: a steward that may only admit cannot renew indefinitely once it has admitted a
+/// member; renewing what it holds appends nothing new and needs `renew`. An admission still
+/// carries fresh dates and needs only `admit`.
+#[test]
+fn an_admit_only_steward_cannot_renew_what_it_admitted_but_can_admit_again() {
+    let s = stewarded_with(&["admit"]);
+    let (_, a) = node();
+    let (_, b) = node();
+    assert!(matches!(
+        steward_renew(&s.steward, &s.base, NOW + DAY),
+        Err(AdminError::Rejected(Reason::RightMissing))
+    ));
+    let admitted = steward_admit(&s.steward, &s.base, &a, "printer", NOW + DAY).unwrap();
+    assert!(matches!(
+        steward_renew(&s.steward, &admitted, NOW + 13 * DAY),
+        Err(AdminError::Rejected(Reason::RightMissing))
+    ));
+    let again = steward_admit(&s.steward, &admitted, &b, "scanner", NOW + 13 * DAY).unwrap();
+    assert_eq!(again.roster_body().expires, NOW + 27 * DAY);
+    assert_eq!(
+        adopted_signer(judged(Some(&admitted), &again, NOW + 13 * DAY)),
+        Signer::Steward {
+            key: s.steward.public(),
+            base_seq: s.base.seq()
+        }
+    );
+    // With both rights the renewal of a pair that keeps the admission is fine.
+    let both = stewarded();
+    let admitted = steward_admit(&both.steward, &both.base, &a, "printer", NOW + DAY).unwrap();
+    let renewed = steward_renew(&both.steward, &admitted, NOW + 13 * DAY).unwrap();
+    assert_eq!(renewed.roster_body().members.len(), 2);
+    renewed.verify().unwrap();
+}
+
+/// Round 7 L2: a renewal a steward makes from the base (a device that does not hold its own
+/// admissions) drops them; a verifier that holds the admission refuses it.
+#[test]
+fn a_steward_renewal_from_the_base_is_refused_by_a_verifier_holding_its_admissions() {
+    let s = stewarded();
+    let (_, a) = node();
+    let admitted = steward_admit(&s.steward, &s.base, &a, "printer", NOW + DAY).unwrap();
+    // The stale device renews twice, so that its pair outranks the admission's.
+    let stale = steward_renew(&s.steward, &s.base, NOW + 2 * DAY).unwrap();
+    let stale = steward_renew(&s.steward, &stale, NOW + 2 * DAY).unwrap();
+    assert!(!stale.is_member(&a.decode().unwrap().node_id));
+    assert!(matches!(
+        judged(Some(&admitted), &stale, NOW + 2 * DAY),
+        Verdict::Reject(Reason::AppendedDropped)
+    ));
+}

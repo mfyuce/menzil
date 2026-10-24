@@ -170,7 +170,8 @@ impl Documents {
     /// signed by the network key (no base is looked at), or both signed by the steward the
     /// base lists, under every rule of the acceptance predicate
     /// ([`menzil_proto::trust::check_bundle`], protocol.md 2.3) as of the moment they were
-    /// issued. Documents that have expired since are still formed, and an owner can still
+    /// issued (the later of the two `issued` times: a pair whose Policy was issued after its
+    /// Roster is one every verifier adopts, so it is not refused here). Documents that have expired since are still formed, and an owner can still
     /// renew them. Returns who signed.
     pub fn verify(&self) -> Result<Signer, AdminError> {
         let key = VerifyingKey::from_bytes(&<[u8; 32]>::from(self.network_id()))
@@ -188,7 +189,8 @@ impl Documents {
             roster: None,
             policy_seq: None,
         };
-        match check_bundle(&empty, &self.bundle(), self.roster_body.issued) {
+        let at = self.roster_body.issued.max(self.policy_body.issued);
+        match check_bundle(&empty, &self.bundle(), at) {
             Verdict::Adopt(adoption) => Ok(adoption.signer),
             Verdict::Held => Err(AdminError::MismatchedDocuments("nothing to adopt")),
             Verdict::Reject(reason) => Err(AdminError::Rejected(reason)),

@@ -1088,3 +1088,185 @@ fn a_held_roster_whose_members_do_not_extend_its_base_is_refused() {
     let same = fx.steward_pair(|_, _| {});
     assert!(HeldRoster::new(same.roster.as_ref().unwrap(), Some(&fx.base_roster)).is_ok());
 }
+
+// ---------------------------------------------------------------------------------------------
+// Round 7: what a held steward Roster appended stays (L2); renew and admit follow what is new (L3)
+// ---------------------------------------------------------------------------------------------
+
+/// A fixture whose steward entry carries exactly the rights `may`.
+fn fx_with_may(may: &[&str]) -> Fx {
+    let mut fx = Fx::new();
+    let entry_body = StewardBody {
+        v: PROTOCOL_VERSION,
+        network_id: fx.net,
+        steward_pub: StewardKey::from(fx.steward.verifying_key().to_bytes()),
+        may: may.iter().map(|m| m.to_string()).collect(),
+        not_after: fx.not_after,
+    };
+    fx.rb.stewards = vec![Steward::sign(&fx.owner, &entry_body).unwrap()];
+    fx.base_roster = Roster::sign(&fx.owner, &fx.rb).unwrap();
+    fx
+}
+
+/// What a verifier holds that adopted the steward pair `held` (made from `fx`'s base).
+fn holding(fx: &Fx, held: &Bundle) -> HeldView {
+    HeldView {
+        network_id: fx.net,
+        roster: Some(
+            HeldRoster::new(held.roster.as_ref().unwrap(), Some(&fx.base_roster)).unwrap(),
+        ),
+        policy_seq: held.policy.as_ref().map(|p| p.decode().unwrap().seq),
+    }
+}
+
+/// The pair `fx.steward_pair` makes at `seq` after `edit`, with the steward's admissions `kept`
+/// first (the members `keep` names are appended in this order).
+fn pair_at(fx: &Fx, seq: u64, edit: impl FnOnce(&mut RosterBody, &mut PolicyBody)) -> Bundle {
+    fx.pair(&fx.steward, seq, edit)
+}
+
+#[test]
+fn a_steward_cannot_drop_a_member_it_admitted_and_give_its_name_to_another_node() {
+    let fx = Fx::new();
+    let (a, b) = (key(), key());
+    let held_pair = pair_at(&fx, 11, |r, p| admit(&a, "printer", r, p));
+    let held = holding(&fx, &held_pair);
+    // From the same base: A gone, B under A's name.
+    let rebind = pair_at(&fx, 12, |r, p| admit(&b, "printer", r, p));
+    assert_eq!(
+        rejected(check_bundle(&held, &rebind, NOW)),
+        Reason::AppendedDropped
+    );
+    // A renewal that forgets A is no better.
+    let forgets = pair_at(&fx, 12, |_, _| {});
+    assert_eq!(
+        rejected(check_bundle(&held, &forgets, NOW)),
+        Reason::AppendedDropped
+    );
+    // A reordering is a change of the held members as well.
+    let reordered = pair_at(&fx, 12, |r, p| {
+        admit(&b, "scanner", r, p);
+        admit(&a, "printer", r, p);
+    });
+    assert_eq!(
+        rejected(check_bundle(&held, &reordered, NOW)),
+        Reason::AppendedDropped
+    );
+    // Keeping A and adding B is an admission.
+    let keeps = pair_at(&fx, 12, |r, p| {
+        admit(&a, "printer", r, p);
+        admit(&b, "scanner", r, p);
+    });
+    assert_eq!(
+        adopted(check_bundle(&held, &keeps, NOW))
+            .roster
+            .unwrap()
+            .members
+            .len(),
+        4
+    );
+    // Nobody holding nothing, or only the base, has anything to compare with.
+    adopted(fx.check(&rebind));
+}
+
+#[test]
+fn what_a_held_steward_roster_appended_is_compared_on_the_same_base_only() {
+    let fx = Fx::new();
+    let a = key();
+    let held_pair = pair_at(&fx, 11, |r, p| admit(&a, "printer", r, p));
+    let held = holding(&fx, &held_pair);
+    // A steward pair on a newer owner base is judged against that base alone.
+    let mut r2 = fx.rb.clone();
+    let mut p2 = fx.pb.clone();
+    r2.seq = 10 + STEWARD_SEQ_SPAN + 1;
+    p2.seq = r2.seq;
+    let base2 = (
+        Roster::sign(&fx.owner, &r2).unwrap(),
+        Policy::sign(&fx.owner, &p2).unwrap(),
+    );
+    let mut r3 = r2.clone();
+    let mut p3 = p2.clone();
+    r3.seq += 1;
+    p3.seq += 1;
+    r3.issued = NOW;
+    p3.issued = NOW;
+    r3.expires = NOW + 7 * DAY;
+    p3.expires = NOW + 7 * DAY;
+    let bundle = Bundle {
+        base_roster: Some(base2.0),
+        base_policy: Some(base2.1),
+        roster: Some(Roster::sign(&fx.steward, &r3).unwrap()),
+        policy: Some(Policy::sign(&fx.steward, &p3).unwrap()),
+    };
+    adopted(check_bundle(&held, &bundle, NOW));
+}
+
+#[test]
+fn a_steward_that_may_only_admit_cannot_renew_what_it_admitted() {
+    let fx = fx_with_may(&["admit"]);
+    let (a, b) = (key(), key());
+    // Nothing held, nothing appended: a renewal of the base is refused.
+    assert_eq!(
+        rejected(fx.check(&fx.steward_pair(|_, _| {}))),
+        Reason::RightMissing
+    );
+    let held_pair = pair_at(&fx, 11, |r, p| admit(&a, "printer", r, p));
+    adopted(fx.check(&held_pair));
+    let held = holding(&fx, &held_pair);
+    // Appending nothing beyond the held pair is a renewal, whatever the base is.
+    let renewal = pair_at(&fx, 12, |r, p| admit(&a, "printer", r, p));
+    assert_eq!(
+        rejected(check_bundle(&held, &renewal, NOW)),
+        Reason::RightMissing
+    );
+    // The Roster alone (it travels alone in an L3 DOC) is judged by the same rule.
+    let roster_only = Bundle {
+        base_roster: renewal.base_roster.clone(),
+        roster: renewal.roster.clone(),
+        ..Bundle::default()
+    };
+    assert_eq!(
+        rejected(check_bundle(&held, &roster_only, NOW)),
+        Reason::RightMissing
+    );
+    // A new member beyond the held ones is an admission, and it carries fresh dates.
+    let admission = pair_at(&fx, 12, |r, p| {
+        admit(&a, "printer", r, p);
+        admit(&b, "scanner", r, p);
+    });
+    adopted(check_bundle(&held, &admission, NOW));
+}
+
+#[test]
+fn a_steward_that_may_renew_and_admit_renews_a_pair_with_its_admissions() {
+    let fx = Fx::new();
+    let a = key();
+    let held_pair = pair_at(&fx, 11, |r, p| admit(&a, "printer", r, p));
+    let held = holding(&fx, &held_pair);
+    let renewal = pair_at(&fx, 12, |r, p| admit(&a, "printer", r, p));
+    adopted(check_bundle(&held, &renewal, NOW));
+    // A steward that may only renew can renew the base, and never has admissions to keep.
+    let renew_only = fx_with_may(&["renew"]);
+    adopted(renew_only.check(&renew_only.steward_pair(|_, _| {})));
+}
+
+#[test]
+fn the_policy_follows_the_same_rule_for_what_is_new() {
+    let fx = fx_with_may(&["admit"]);
+    let (a, b) = (key(), key());
+    let held_pair = pair_at(&fx, 11, |r, p| admit(&a, "printer", r, p));
+    let held = holding(&fx, &held_pair);
+    // The Roster admits B (an admission), the Policy appends nothing new beyond the held
+    // member: by the same rule that is a renewal, which this steward may not do.
+    let inconsistent = pair_at(&fx, 12, |r, p| {
+        admit(&a, "printer", r, p);
+        let mut scratch_r = r.clone();
+        let mut scratch_p = p.clone();
+        admit(&b, "scanner", &mut scratch_r, &mut scratch_p);
+        r.members.push(scratch_r.members.pop().unwrap());
+    });
+    assert_eq!(
+        rejected(check_bundle(&held, &inconsistent, NOW)),
+        Reason::RightMissing
+    );
+}

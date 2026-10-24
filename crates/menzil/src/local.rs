@@ -541,6 +541,7 @@ pub(crate) fn refusal(reason: Reason) -> String {
         Reason::BadAppend => "the steward admitted members it may not",
         Reason::BadCert => "a certificate the steward added does not verify",
         Reason::BadName => "a member the steward admitted has a name or role it may not",
+        Reason::AppendedDropped => "the steward dropped members that it admitted earlier",
     };
     format!("{text} ({reason:?})")
 }
