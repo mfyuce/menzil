@@ -1,5 +1,6 @@
 //! Errors from issuing identities and documents.
 
+use menzil_proto::trust::Reason;
 use menzil_proto::{NameError, NodeId, ProtoError};
 use thiserror::Error;
 
@@ -73,6 +74,31 @@ pub enum AdminError {
     /// The sequence number cannot go up any more.
     #[error("the sequence number is at its maximum")]
     SeqOverflow,
+    /// Verifiers would refuse the documents (or documents held for a network do not stand on
+    /// the owner's signature or a steward's valid one): the acceptance predicate
+    /// (`menzil_proto::trust`, protocol.md 2.3) says why.
+    #[error("verifiers would not accept these documents: {0:?}")]
+    Rejected(Reason),
+    /// A steward operation on documents whose Roster lists no steward.
+    #[error("the Roster lists no steward")]
+    NoSteward,
+    /// The steward key is not the one the Roster lists.
+    #[error("this steward key is not the one the Roster lists")]
+    StewardNotListed,
+    /// The public key is not a valid Ed25519 key.
+    #[error("the steward key is not a valid Ed25519 public key")]
+    BadStewardKey,
+    /// A right that is neither `admit` nor `renew`, or none at all.
+    #[error("a steward may hold the rights \"admit\" and \"renew\" and no other, at least one")]
+    BadStewardRights,
+    /// A `not_after` in the past, or more than 90 days away (protocol.md 7.3).
+    #[error("a steward lasts from now to at most 90 days ahead")]
+    BadStewardLifetime,
+    /// A steward has used up the sequence numbers its base allows (protocol.md 2.3).
+    #[error(
+        "the steward has no sequence numbers left from its base: the owner must issue new documents"
+    )]
+    SeqSpanExhausted,
     /// A document would be larger than verifiers accept.
     #[error("the {what} would be {len} bytes, more than the {max} bytes verifiers accept")]
     TooLarge {

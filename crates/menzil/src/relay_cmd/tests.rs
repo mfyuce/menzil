@@ -59,10 +59,10 @@ fn a_relay_keeps_the_roster_of_a_network_and_not_its_policy() {
 
     let rosters = load_rosters(&relay).unwrap();
     assert_eq!(rosters.len(), 1);
-    assert_eq!(rosters[0].decode().unwrap().network_id, id);
+    assert_eq!(rosters[0].roster.decode().unwrap().network_id, id);
     // Nothing of the Policy is on disk: members' names and grants are none of a relay's business.
     let bytes = fs::read(roster_path(&relay, &id)).unwrap();
-    assert_eq!(bytes, rosters[0].encode());
+    assert_eq!(bytes, rosters[0].roster.encode());
     assert!(
         !bytes.windows(6).any(|w| w == b"laptop"),
         "a member's name is in the Policy, not in what a relay keeps"
@@ -104,7 +104,7 @@ fn add_network_runs_at_the_same_moment_leave_the_newest_roster() {
         let kept = load_rosters(&relay).unwrap();
         assert_eq!(kept.len(), 1, "round {round}");
         assert_eq!(
-            kept[0].decode().unwrap().seq,
+            kept[0].roster.decode().unwrap().seq,
             TOKENS as u64,
             "round {round}: the relay must end up with the newest Roster of {id}"
         );
@@ -124,7 +124,14 @@ fn an_older_or_equal_roster_does_not_replace_a_newer_one() {
     );
     // The first token again: the relay keeps what is newer and says so.
     assert_eq!(add_network(&relay, &first, clock() + DAY).unwrap(), (id, 2));
-    assert_eq!(load_rosters(&relay).unwrap()[0].decode().unwrap().seq, 2);
+    assert_eq!(
+        load_rosters(&relay).unwrap()[0]
+            .roster
+            .decode()
+            .unwrap()
+            .seq,
+        2
+    );
 }
 
 #[test]
@@ -148,7 +155,7 @@ fn add_network_refuses_forged_expired_and_wrong_tokens() {
     let cert = keys.issue_cert(1, clock() - 10, clock() + 1000).unwrap();
     let docs = create_network(&owner, &cert, "x", clock()).unwrap();
     let thief = ed25519_dalek::SigningKey::generate(&mut rand::rng());
-    let forged = encode_roster(&Roster::sign(&thief, docs.roster_body()).unwrap());
+    let forged = encode_roster(&Roster::sign(&thief, docs.roster_body()).unwrap(), None);
     assert!(message(&forged, clock()).contains("not signed by the network's owner"));
 
     // The full membership token carries the Policy, and a relay is not given that.
@@ -158,8 +165,11 @@ fn add_network_refuses_forged_expired_and_wrong_tokens() {
         "{refused}"
     );
     let forged_docs = encode_documents(
-        &Roster::sign(&thief, docs.roster_body()).unwrap(),
-        &Policy::sign(&thief, docs.policy_body()).unwrap(),
+        &menzil_admin::Documents::from_signed(
+            Roster::sign(&thief, docs.roster_body()).unwrap(),
+            Policy::sign(&thief, docs.policy_body()).unwrap(),
+        )
+        .unwrap(),
     );
     assert!(message(&forged_docs, clock()).contains("--for-relay"));
     assert!(load_rosters(&relay).unwrap().is_empty());
@@ -178,7 +188,8 @@ fn the_token_for_a_relay_holds_the_roster_and_none_of_the_policy() {
         "the Policy is not in it"
     );
     // It decodes as a Roster, and as nothing else.
-    let roster = crate::token::decode_roster(&relay_token).unwrap();
+    let (roster, base) = crate::token::decode_roster(&relay_token).unwrap();
+    assert!(base.is_none());
     assert_eq!(roster.decode().unwrap().members.len(), 1);
     assert!(crate::token::decode_documents(&relay_token).is_err());
     assert!(crate::local::join(&home().1, &relay_token, clock()).is_err());
@@ -408,5 +419,118 @@ async fn an_expired_roster_on_disk_holds_back_its_network_only() {
     assert_eq!(running.networks, vec![id_b]);
     assert!(running.roster_seq(&id_b).is_some());
     assert_eq!(running.roster_seq(&id_a), None);
+    running.stop();
+}
+
+/// A network whose steward renewed: the owner's home, the steward device's home and the network.
+fn steward_renewed_network() -> (tempfile::TempDir, Home, tempfile::TempDir, Home, NetworkId) {
+    let (od, owner) = home();
+    init(&owner, clock()).unwrap();
+    let id = network_create(&owner, "laptop", clock()).unwrap();
+    let (sd, steward) = home();
+    let request = init(&steward, clock()).unwrap().join_request;
+    let admitted = crate::local::admit(&owner, None, &request, "steward", &[], clock()).unwrap();
+    join(&steward, &admitted.token, clock()).unwrap();
+    let asked = crate::local::steward_request(&steward, None).unwrap();
+    let listed = crate::local::steward_add(
+        &owner,
+        None,
+        &asked.token,
+        &["admit".to_string(), "renew".to_string()],
+        30,
+        clock(),
+    )
+    .unwrap();
+    join(&steward, &listed.issued.token, clock()).unwrap();
+    crate::local::renew(&steward, None, clock() + 60).unwrap();
+    (od, owner, sd, steward, id)
+}
+
+/// Protocol.md 2.3, 4.3: a Roster a steward signed is kept by a relay together with the owner
+/// signed Roster it was made from, and is refused without it.
+#[test]
+fn a_relay_keeps_a_steward_signed_roster_with_its_base() {
+    let (_o, owner, _s, steward, id) = steward_renewed_network();
+    let (_d, relay) = home();
+    let token = relay_token(&steward);
+    assert_eq!(add_network(&relay, &token, clock() + 61).unwrap(), (id, 4));
+    let stored = load_rosters(&relay).unwrap();
+    assert_eq!(stored.len(), 1);
+    assert_eq!(stored[0].roster.decode().unwrap().seq, 4);
+    assert_eq!(stored[0].base.as_ref().unwrap().decode().unwrap().seq, 3);
+    assert_eq!(fs::read(roster_path(&relay, &id)).unwrap()[0], 2);
+    // What was kept is what the relay's store takes.
+    let store = menzil_relay::RosterStore::new();
+    assert!(
+        store
+            .adopt(&stored[0].roster, stored[0].base.as_ref(), clock() + 61)
+            .unwrap()
+    );
+
+    // Without the base the same Roster is refused, and nothing is written.
+    let (_d2, bare_relay) = home();
+    let (roster, _) = crate::token::decode_roster(&token).unwrap();
+    let message = format!(
+        "{:#}",
+        add_network(&bare_relay, &encode_roster(&roster, None), clock() + 61).unwrap_err()
+    );
+    assert!(
+        message.contains("not signed by the network's owner"),
+        "{message}"
+    );
+    assert!(load_rosters(&bare_relay).unwrap().is_empty());
+
+    // The owner's older Roster does not replace it...
+    let owner_token = relay_token(&owner);
+    assert_eq!(
+        add_network(&relay, &owner_token, clock() + 61).unwrap(),
+        (id, 4)
+    );
+    // ...and the owner's newer one does, with no base kept.
+    let renewed = crate::local::renew(&owner, None, clock() + 120).unwrap();
+    assert_eq!(
+        add_network(&relay, &relay_token(&owner), clock() + 120).unwrap(),
+        (id, renewed.seq)
+    );
+    assert!(load_rosters(&relay).unwrap()[0].base.is_none());
+    assert_eq!(fs::read(roster_path(&relay, &id)).unwrap()[0] & 0xf0, 0x80);
+}
+
+#[tokio::test]
+async fn a_relay_starts_and_reloads_with_a_steward_signed_roster() {
+    let (_o, owner, _s, steward, id) = steward_renewed_network();
+    let (dir, relay_home) = home();
+    init(&relay_home, clock()).unwrap();
+    let (cert, key) = pem_files(dir.path());
+    let options = RunOptions {
+        listen: "127.0.0.1:0".parse().unwrap(),
+        tls_cert: cert,
+        tls_key: key,
+        path: DEFAULT_PATH.to_string(),
+        host: Some("localhost".to_string()),
+        reload_every: Duration::from_millis(100),
+    };
+    // The relay got the owner's Roster first; the steward's, made from it, is added later.
+    add_network(&relay_home, &relay_token(&owner), clock()).unwrap();
+    let running = start(&relay_home, &options).await.unwrap();
+    assert_eq!(running.roster_seq(&id), Some(3));
+    add_network(&relay_home, &relay_token(&steward), clock() + 61).unwrap();
+    let mut seq = running.roster_seq(&id);
+    for _ in 0..50 {
+        if seq == Some(4) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        seq = running.roster_seq(&id);
+    }
+    assert_eq!(
+        seq,
+        Some(4),
+        "the reload takes the steward's Roster with its base"
+    );
+    running.stop();
+    // And a start from a file that holds one.
+    let running = start(&relay_home, &options).await.unwrap();
+    assert_eq!(running.roster_seq(&id), Some(4));
     running.stop();
 }

@@ -781,3 +781,649 @@ fn roles_are_held_to_the_same_characters_as_names() {
     )
     .unwrap();
 }
+
+// ---------------------------------------------------------------------------------------------
+// Stewards (protocol.md 2.3, 7.3; TODO L4j S3)
+// ---------------------------------------------------------------------------------------------
+
+use menzil_proto::StewardKey;
+use menzil_proto::trust::{Reason, STEWARD_SEQ_SPAN};
+
+use crate::StewardSecret;
+
+const ADMIT_RENEW: [&str; 2] = ["admit", "renew"];
+
+fn rights(rights: &[&str]) -> Vec<String> {
+    rights.iter().map(|r| r.to_string()).collect()
+}
+
+/// A network whose owner delegated `steward` (rights `admit` and `renew`) until NOW + 30 days.
+struct Stewarded {
+    owner: OwnerKey,
+    steward: StewardSecret,
+    /// The owner signed pair that lists the steward: the base of everything the steward signs.
+    base: Documents,
+}
+
+fn stewarded() -> Stewarded {
+    stewarded_with(&ADMIT_RENEW)
+}
+
+fn stewarded_with(may: &[&str]) -> Stewarded {
+    let (owner, _, _, docs) = founded();
+    let steward = StewardSecret::generate();
+    let base = delegate_steward(
+        &owner,
+        &docs,
+        steward.public(),
+        &rights(may),
+        NOW + 30 * DAY,
+        NOW,
+    )
+    .unwrap();
+    Stewarded {
+        owner,
+        steward,
+        base,
+    }
+}
+
+/// What a verifier that holds `held` (or nothing) says about `docs` at `now`.
+fn judged(held: Option<&Documents>, docs: &Documents, now: u64) -> Verdict {
+    let view = match held {
+        Some(held) => held.held_view().unwrap(),
+        None => HeldView {
+            network_id: docs.network_id(),
+            roster: None,
+            policy_seq: None,
+        },
+    };
+    check_bundle(&view, &docs.bundle(), now)
+}
+
+fn adopted_signer(verdict: Verdict) -> Signer {
+    match verdict {
+        Verdict::Adopt(adoption) => adoption.signer,
+        other => panic!("expected an adoption, got {other:?}"),
+    }
+}
+
+#[test]
+fn delegating_lists_one_owner_signed_steward_entry() {
+    let s = stewarded();
+    let owner_key = VerifyingKey::from_bytes(&<[u8; 32]>::from(s.owner.network_id())).unwrap();
+    assert_eq!(s.base.seq(), 2);
+    assert_eq!(s.base.verify().unwrap(), Signer::Owner);
+    assert!(s.base.base().is_none());
+    let [entry] = s.base.roster_body().stewards.as_slice() else {
+        panic!("one steward");
+    };
+    entry.verify(&owner_key).unwrap();
+    let body = entry.decode().unwrap();
+    assert_eq!(body.network_id, s.owner.network_id());
+    assert_eq!(body.steward_pub, s.steward.public());
+    assert_eq!(body.may, rights(&ADMIT_RENEW));
+    assert_eq!(body.not_after, NOW + 30 * DAY);
+    // Delegating a second steward replaces the first: exactly one is listed.
+    let other = StewardSecret::generate();
+    let replaced = delegate_steward(
+        &s.owner,
+        &s.base,
+        other.public(),
+        &rights(&["renew"]),
+        NOW + 10 * DAY,
+        NOW,
+    )
+    .unwrap();
+    let [entry] = replaced.roster_body().stewards.as_slice() else {
+        panic!("one steward");
+    };
+    assert_eq!(entry.decode().unwrap().steward_pub, other.public());
+    // The policy is untouched.
+    assert_eq!(replaced.policy_body().members, s.base.policy_body().members);
+}
+
+#[test]
+fn a_steward_entry_with_bad_rights_lifetime_or_key_is_not_issued() {
+    let (owner, _, _, docs) = founded();
+    let key = StewardSecret::generate().public();
+    let delegate = |may: &[&str], not_after: u64, key: StewardKey| {
+        delegate_steward(&owner, &docs, key, &rights(may), not_after, NOW)
+    };
+    for bad in [&[][..], &["grant"], &["admit", "revoke"], &["ADMIT"]] {
+        assert!(
+            matches!(
+                delegate(bad, NOW + DAY, key),
+                Err(AdminError::BadStewardRights)
+            ),
+            "{bad:?}"
+        );
+    }
+    // Duplicates are listed once.
+    let twice = delegate(&["renew", "renew", "admit"], NOW + DAY, key).unwrap();
+    let [entry] = twice.roster_body().stewards.as_slice() else {
+        panic!("one steward");
+    };
+    assert_eq!(entry.decode().unwrap().may, rights(&["renew", "admit"]));
+    // Up to 90 days, and not in the past.
+    let ninety = 90 * DAY;
+    delegate(&["renew"], NOW + ninety, key).unwrap();
+    for not_after in [NOW + ninety + 1, NOW, NOW - 1, 0, u64::MAX] {
+        assert!(
+            matches!(
+                delegate(&["renew"], not_after, key),
+                Err(AdminError::BadStewardLifetime)
+            ),
+            "{not_after}"
+        );
+    }
+    // A key that is no Ed25519 point (this one is a small order point's compressed encoding of
+    // a value off the curve).
+    let mut off_curve = [0xffu8; 32];
+    off_curve[31] = 0x7f;
+    if VerifyingKey::from_bytes(&off_curve).is_err() {
+        assert!(matches!(
+            delegate(&["renew"], NOW + DAY, StewardKey::from(off_curve)),
+            Err(AdminError::BadStewardKey)
+        ));
+    }
+    // Another owner cannot delegate for these documents.
+    let stranger = OwnerKey::generate();
+    assert!(matches!(
+        delegate_steward(&stranger, &docs, key, &rights(&["renew"]), NOW + DAY, NOW),
+        Err(AdminError::NotThisOwner)
+    ));
+}
+
+/// Protocol.md 2.3: while its last documents list a steward, the owner's next documents have
+/// a `seq` above the base's plus 2^20. One more than the span, not the span itself: a steward
+/// may sign exactly base + span.
+#[test]
+fn the_owner_jumps_past_the_steward_span_while_a_steward_is_listed() {
+    let s = stewarded();
+    let base_seq = s.base.seq();
+    let (_, cert) = node();
+    let admitted = admit(&s.owner, &s.base, &cert, "phone", &[], NOW).unwrap();
+    assert_eq!(admitted.seq(), base_seq + STEWARD_SEQ_SPAN + 1);
+    assert_eq!(
+        s.base.next_owner_seq().unwrap(),
+        base_seq + STEWARD_SEQ_SPAN + 1
+    );
+    // Every owner operation follows the rule.
+    assert_eq!(
+        renew(&s.owner, &s.base, NOW).unwrap().seq(),
+        base_seq + STEWARD_SEQ_SPAN + 1
+    );
+    let g = node_grant(
+        s.base.network_id(),
+        s.base.policy_body().members[0].node_id,
+        s.base.policy_body().members[0].node_id,
+        &["tcp:ssh"],
+    );
+    assert_eq!(
+        grant(&s.owner, &s.base, g, NOW).unwrap().seq(),
+        base_seq + STEWARD_SEQ_SPAN + 1
+    );
+    // The steward is still listed, so the next one jumps again, from the new pair.
+    assert_eq!(
+        renew(&s.owner, &admitted, NOW).unwrap().seq(),
+        admitted.seq() + STEWARD_SEQ_SPAN + 1
+    );
+}
+
+#[test]
+fn without_a_steward_the_owner_counts_one_at_a_time() {
+    let (owner, _, _, docs) = founded();
+    assert_eq!(docs.next_owner_seq().unwrap(), 2);
+    let (_, cert) = node();
+    let admitted = admit(&owner, &docs, &cert, "phone", &[], NOW).unwrap();
+    assert_eq!(admitted.seq(), 2);
+    assert_eq!(renew(&owner, &admitted, NOW).unwrap().seq(), 3);
+    // The same after the steward was removed: the removal pair carried the jump, the pairs
+    // after it do not.
+    let s = stewarded();
+    let removed = remove_steward(&s.owner, &s.base, NOW).unwrap();
+    assert_eq!(removed.next_owner_seq().unwrap(), removed.seq() + 1);
+    assert_eq!(
+        renew(&s.owner, &removed, NOW).unwrap().seq(),
+        removed.seq() + 1
+    );
+}
+
+#[test]
+fn the_owner_extends_a_pair_a_steward_signed_from_its_base() {
+    let s = stewarded();
+    let (_, cert) = node();
+    let by_steward = steward_admit(&s.steward, &s.base, &cert, "phone", NOW + DAY).unwrap();
+    let renewed = steward_renew(&s.steward, &by_steward, NOW + 2 * DAY).unwrap();
+    assert_eq!(renewed.seq(), s.base.seq() + 2);
+    let by_owner = renew(&s.owner, &renewed, NOW + 3 * DAY).unwrap();
+    // Past the steward's whole range, counted from its base and not from where it had got to.
+    assert_eq!(by_owner.seq(), s.base.seq() + STEWARD_SEQ_SPAN + 1);
+    assert_eq!(by_owner.verify().unwrap(), Signer::Owner);
+    assert!(by_owner.base().is_none());
+    // The member the steward admitted is still there; the steward is still listed.
+    assert!(by_owner.is_member(&cert.decode().unwrap().node_id));
+    assert_eq!(by_owner.roster_body().stewards.len(), 1);
+    // A verifier holding the steward's last pair adopts it.
+    assert_eq!(
+        adopted_signer(judged(Some(&renewed), &by_owner, NOW + 3 * DAY)),
+        Signer::Owner
+    );
+}
+
+#[test]
+fn what_a_steward_renews_passes_the_acceptance_predicate() {
+    let s = stewarded();
+    let renewed = steward_renew(&s.steward, &s.base, NOW + 10 * DAY).unwrap();
+    assert_eq!(renewed.seq(), s.base.seq() + 1);
+    let (rb, pb) = (renewed.roster_body(), renewed.policy_body());
+    assert_eq!((rb.issued, pb.issued), (NOW + 10 * DAY, NOW + 10 * DAY));
+    assert_eq!((rb.expires, pb.expires), (NOW + 24 * DAY, NOW + 24 * DAY));
+    assert_eq!(
+        (rb.members.clone(), pb.grants.clone()),
+        (
+            s.base.roster_body().members.clone(),
+            s.base.policy_body().grants.clone()
+        )
+    );
+    // Held by someone who holds the base, and by someone who holds nothing.
+    let signer = Signer::Steward {
+        key: s.steward.public(),
+        base_seq: s.base.seq(),
+    };
+    assert_eq!(
+        adopted_signer(judged(Some(&s.base), &renewed, NOW + 10 * DAY)),
+        signer
+    );
+    assert_eq!(
+        adopted_signer(judged(None, &renewed, NOW + 10 * DAY)),
+        signer
+    );
+    assert_eq!(renewed.verify().unwrap(), signer);
+    assert_eq!(renewed.base().map(|(r, _)| r), Some(s.base.roster()));
+
+    // A pair the steward made from its own pair keeps the owner's base, counts on from the
+    // pair it holds, and is adopted by those who hold the first.
+    let again = steward_renew(&s.steward, &renewed, NOW + 11 * DAY).unwrap();
+    assert_eq!(again.seq(), s.base.seq() + 2);
+    assert_eq!(again.base().map(|(r, _)| r), Some(s.base.roster()));
+    assert_eq!(
+        adopted_signer(judged(Some(&renewed), &again, NOW + 11 * DAY)),
+        signer
+    );
+    // And it is a renewal in the verifier's eyes whatever the clock of the issuer: after an
+    // outage of the steward the documents may have run out; a renewal still works.
+    let late = steward_renew(&s.steward, &renewed, NOW + 25 * DAY).unwrap();
+    assert_eq!(
+        adopted_signer(judged(Some(&renewed), &late, NOW + 25 * DAY)),
+        signer
+    );
+}
+
+#[test]
+fn a_steward_pair_never_outlives_the_delegation() {
+    let s = stewarded();
+    // 20 days in, 14 days would end after not_after (30 days): it ends at not_after.
+    let renewed = steward_renew(&s.steward, &s.base, NOW + 20 * DAY).unwrap();
+    assert_eq!(renewed.roster_body().expires, NOW + 30 * DAY);
+    assert_eq!(renewed.policy_body().expires, NOW + 30 * DAY);
+    assert!(matches!(
+        judged(Some(&s.base), &renewed, NOW + 20 * DAY),
+        Verdict::Adopt(_)
+    ));
+    // At or after not_after there is nothing to sign with.
+    for at in [NOW + 30 * DAY, NOW + 31 * DAY] {
+        assert!(matches!(
+            steward_renew(&s.steward, &s.base, at),
+            Err(AdminError::Rejected(Reason::StewardExpired))
+        ));
+    }
+}
+
+#[test]
+fn a_steward_admits_a_member_without_roles_and_the_network_adopts_it() {
+    let s = stewarded();
+    let (keys, cert) = node();
+    let next = steward_admit(&s.steward, &s.base, &cert, "phone", NOW + DAY).unwrap();
+    assert_eq!(next.seq(), s.base.seq() + 1);
+    let id = keys.node_id();
+    assert!(next.is_member(&id));
+    let (rb, pb) = (next.roster_body(), next.policy_body());
+    // Appended at the end, with the certificate's own serial and no roles.
+    assert_eq!(rb.members.last().unwrap().node_id, id);
+    assert_eq!(rb.members.last().unwrap().min_serial, 1);
+    assert_eq!(pb.members.last().unwrap().name, "phone");
+    assert!(pb.members.last().unwrap().roles.is_empty());
+    assert_eq!(pb.certs.last().unwrap(), &cert);
+    assert_eq!(rb.members.len(), 2);
+    assert_eq!(pb.certs.len(), 2);
+    let signer = Signer::Steward {
+        key: s.steward.public(),
+        base_seq: s.base.seq(),
+    };
+    assert_eq!(
+        adopted_signer(judged(Some(&s.base), &next, NOW + DAY)),
+        signer
+    );
+    assert_eq!(adopted_signer(judged(None, &next, NOW + DAY)), signer);
+    // The result is held through the stores a node keeps.
+    let (rosters, policies) = (RosterStore::new(), PolicyStore::new());
+    rosters.set(s.base.roster()).unwrap();
+    policies.set(s.base.policy()).unwrap();
+    let store = menzil_node::DocStore::new(&rosters, &policies);
+    let adopted = store.adopt(&next.bundle(), NOW + DAY).unwrap();
+    assert!(adopted.roster && adopted.policy);
+    assert_eq!(policies.seq(&next.network_id()), Some(next.seq()));
+}
+
+#[test]
+fn a_steward_admits_by_the_issuers_checks_and_its_own_right() {
+    let s = stewarded();
+    let (_, cert) = node();
+    let at = NOW + DAY;
+    // The issuer's checks of `admit`.
+    let founder = s.base.roster_body().members[0].node_id;
+    let founders_cert = s.base.policy_body().certs[0].clone();
+    assert!(matches!(
+        steward_admit(&s.steward, &s.base, &founders_cert, "other", at),
+        Err(AdminError::AlreadyMember(id)) if id == founder
+    ));
+    assert!(matches!(
+        steward_admit(&s.steward, &s.base, &cert, "LAPTOP", at),
+        Err(AdminError::NameTaken(_))
+    ));
+    assert!(matches!(
+        steward_admit(&s.steward, &s.base, &cert, "bad name", at),
+        Err(AdminError::BadName(_))
+    ));
+    let expired = {
+        let keys = NodeKeys::generate();
+        keys.issue_cert(1, 1, 100).unwrap()
+    };
+    assert!(matches!(
+        steward_admit(&s.steward, &s.base, &expired, "late", at),
+        Err(AdminError::CertNotValidNow)
+    ));
+    // A revoked node is not admitted again, by a steward neither.
+    let (revoked_keys, revoked_cert) = node();
+    let mut roster = s.base.roster_body().clone();
+    roster.seq += 1;
+    roster.revoked.push(RevokedMember {
+        node_id: revoked_keys.node_id(),
+        since: NOW,
+    });
+    let mut policy = s.base.policy_body().clone();
+    policy.seq += 1;
+    let with_revoked = Documents::signed(&s.owner, roster, policy).unwrap();
+    assert!(matches!(
+        steward_admit(&s.steward, &with_revoked, &revoked_cert, "ghost", at),
+        Err(AdminError::Revoked(id)) if id == revoked_keys.node_id()
+    ));
+
+    // Rights: a steward that may only renew cannot admit; one that may only admit cannot renew.
+    let renew_only = stewarded_with(&["renew"]);
+    assert!(matches!(
+        steward_admit(&renew_only.steward, &renew_only.base, &cert, "phone", at),
+        Err(AdminError::Rejected(Reason::RightMissing))
+    ));
+    steward_renew(&renew_only.steward, &renew_only.base, at).unwrap();
+    let admit_only = stewarded_with(&["admit"]);
+    assert!(matches!(
+        steward_renew(&admit_only.steward, &admit_only.base, at),
+        Err(AdminError::Rejected(Reason::RightMissing))
+    ));
+    steward_admit(&admit_only.steward, &admit_only.base, &cert, "phone", at).unwrap();
+}
+
+#[test]
+fn only_the_listed_steward_can_sign_and_only_when_one_is_listed() {
+    let s = stewarded();
+    let stranger = StewardSecret::generate();
+    assert!(matches!(
+        steward_renew(&stranger, &s.base, NOW + DAY),
+        Err(AdminError::StewardNotListed)
+    ));
+    let removed = remove_steward(&s.owner, &s.base, NOW + DAY).unwrap();
+    assert!(matches!(
+        steward_renew(&s.steward, &removed, NOW + 2 * DAY),
+        Err(AdminError::NoSteward)
+    ));
+    // Documents with no owner signature and no steward base are no ground to stand on.
+    let (_, _, _, docs) = founded();
+    let thief = SigningKey::generate(&mut rand::rng());
+    let forged = Documents::signed_with(
+        &thief,
+        docs.roster_body().clone(),
+        docs.policy_body().clone(),
+        None,
+    )
+    .unwrap();
+    assert!(matches!(
+        steward_renew(&s.steward, &forged, NOW),
+        Err(AdminError::Proto(_))
+    ));
+    assert!(matches!(
+        delegate_steward(
+            &s.owner,
+            &forged,
+            s.steward.public(),
+            &rights(&["renew"]),
+            NOW + DAY,
+            NOW
+        ),
+        Err(AdminError::NotThisOwner | AdminError::Proto(_))
+    ));
+}
+
+/// A steward pair signed at the very end of its range: `base + span`.
+fn at_the_end_of_the_range(s: &Stewarded) -> Documents {
+    let mut roster = s.base.roster_body().clone();
+    let mut policy = s.base.policy_body().clone();
+    roster.seq = s.base.seq() + STEWARD_SEQ_SPAN;
+    policy.seq = roster.seq;
+    roster.issued = NOW + DAY;
+    policy.issued = NOW + DAY;
+    roster.expires = NOW + 8 * DAY;
+    policy.expires = NOW + 8 * DAY;
+    Documents::signed_with(
+        s.steward.signing_key(),
+        roster,
+        policy,
+        Some(Base {
+            roster: s.base.roster().clone(),
+            policy: s.base.policy().clone(),
+            seq: s.base.seq(),
+        }),
+    )
+    .unwrap()
+}
+
+#[test]
+fn a_steward_with_no_sequence_numbers_left_from_its_base_stops() {
+    let s = stewarded();
+    let last = at_the_end_of_the_range(&s);
+    // The last number of the range is a valid pair...
+    assert!(matches!(
+        judged(Some(&s.base), &last, NOW + DAY),
+        Verdict::Adopt(_)
+    ));
+    assert_eq!(
+        last.verify().unwrap(),
+        Signer::Steward {
+            key: s.steward.public(),
+            base_seq: s.base.seq(),
+        }
+    );
+    // ...and one more is the owner's to issue.
+    assert!(matches!(
+        steward_renew(&s.steward, &last, NOW + 2 * DAY),
+        Err(AdminError::SeqSpanExhausted)
+    ));
+    // One before the end still works.
+    let mut before = s.base.roster_body().clone();
+    let mut policy = s.base.policy_body().clone();
+    before.seq = s.base.seq() + STEWARD_SEQ_SPAN - 1;
+    policy.seq = before.seq;
+    before.issued = NOW + DAY;
+    policy.issued = NOW + DAY;
+    before.expires = NOW + 8 * DAY;
+    policy.expires = NOW + 8 * DAY;
+    let before = Documents::signed_with(
+        s.steward.signing_key(),
+        before,
+        policy,
+        Some(Base {
+            roster: s.base.roster().clone(),
+            policy: s.base.policy().clone(),
+            seq: s.base.seq(),
+        }),
+    )
+    .unwrap();
+    assert_eq!(
+        steward_renew(&s.steward, &before, NOW + 2 * DAY)
+            .unwrap()
+            .seq(),
+        s.base.seq() + STEWARD_SEQ_SPAN
+    );
+}
+
+/// "Removing a steward leaves a Roster no steward document can follow": whatever the steward
+/// signed from its base is at or below base + span, and the removal is above that.
+#[test]
+fn removing_a_steward_leaves_a_pair_no_steward_document_can_follow() {
+    let s = stewarded();
+    let last = at_the_end_of_the_range(&s);
+    let removed = remove_steward(&s.owner, &s.base, NOW + 2 * DAY).unwrap();
+    assert!(removed.roster_body().stewards.is_empty());
+    assert_eq!(removed.verify().unwrap(), Signer::Owner);
+    assert_eq!(removed.seq(), s.base.seq() + STEWARD_SEQ_SPAN + 1);
+    // The member of the network who holds the steward's very last pair takes the removal...
+    assert_eq!(
+        adopted_signer(judged(Some(&last), &removed, NOW + 2 * DAY)),
+        Signer::Owner
+    );
+    // ...and once it holds the removal, nothing the steward made from that base is newer.
+    assert!(matches!(
+        judged(Some(&removed), &last, NOW + 2 * DAY),
+        Verdict::Held
+    ));
+    let first = steward_renew(&s.steward, &s.base, NOW + DAY).unwrap();
+    assert!(matches!(
+        judged(Some(&removed), &first, NOW + 2 * DAY),
+        Verdict::Held
+    ));
+    // A steward pair made from the removal itself has nothing to stand on: it lists nobody.
+    assert!(matches!(
+        steward_renew(&s.steward, &removed, NOW + 3 * DAY),
+        Err(AdminError::NoSteward)
+    ));
+    // Removing when none is listed is an error, not a silent new pair.
+    assert!(matches!(
+        remove_steward(&s.owner, &removed, NOW + 3 * DAY),
+        Err(AdminError::NoSteward)
+    ));
+}
+
+#[test]
+fn removing_a_steward_after_it_admitted_keeps_the_members() {
+    let s = stewarded();
+    let (_, cert) = node();
+    let admitted = steward_admit(&s.steward, &s.base, &cert, "phone", NOW + DAY).unwrap();
+    let removed = remove_steward(&s.owner, &admitted, NOW + 2 * DAY).unwrap();
+    assert!(removed.is_member(&cert.decode().unwrap().node_id));
+    assert_eq!(removed.policy_body().certs.len(), 2);
+    assert!(removed.roster_body().stewards.is_empty());
+    assert_eq!(removed.seq(), s.base.seq() + STEWARD_SEQ_SPAN + 1);
+}
+
+#[test]
+fn documents_with_a_base_are_checked_as_a_whole() {
+    let s = stewarded();
+    let renewed = steward_renew(&s.steward, &s.base, NOW + DAY).unwrap();
+    let (base_roster, base_policy) = renewed.base().unwrap();
+    let rebuilt = Documents::from_signed_with_base(
+        renewed.roster().clone(),
+        renewed.policy().clone(),
+        base_roster.clone(),
+        base_policy.clone(),
+    )
+    .unwrap();
+    assert_eq!(rebuilt.verify().unwrap(), renewed.verify().unwrap());
+
+    // Without its base, a steward signed pair stands on nothing.
+    let bare = Documents::from_signed(renewed.roster().clone(), renewed.policy().clone()).unwrap();
+    assert!(matches!(bare.verify(), Err(AdminError::Proto(_))));
+    // With the base of another network, or a base that is not a pair, it is not even paired.
+    let other = stewarded();
+    assert!(matches!(
+        Documents::from_signed_with_base(
+            renewed.roster().clone(),
+            renewed.policy().clone(),
+            other.base.roster().clone(),
+            other.base.policy().clone(),
+        ),
+        Err(AdminError::MismatchedDocuments(_))
+    ));
+    let later = renew(&s.owner, &s.base, NOW).unwrap();
+    assert!(matches!(
+        Documents::from_signed_with_base(
+            renewed.roster().clone(),
+            renewed.policy().clone(),
+            s.base.roster().clone(),
+            later.policy().clone(),
+        ),
+        Err(AdminError::MismatchedDocuments(_))
+    ));
+    // A base that is not the one the pair was made from: the predicate refuses it.
+    let wrong_base = Documents::from_signed_with_base(
+        renewed.roster().clone(),
+        renewed.policy().clone(),
+        later.roster().clone(),
+        later.policy().clone(),
+    )
+    .unwrap();
+    assert!(wrong_base.verify().is_err());
+    // Extra bases on an owner signed pair are dropped when it is verified.
+    let owner_signed = Documents::from_signed_with_base(
+        s.base.roster().clone(),
+        s.base.policy().clone(),
+        s.base.roster().clone(),
+        s.base.policy().clone(),
+    )
+    .unwrap();
+    assert_eq!(owner_signed.verify().unwrap(), Signer::Owner);
+    assert!(owner_signed.into_verified().unwrap().base().is_none());
+}
+
+/// An expired pair is formed all the same (`verify` has no clock but the pair's own): the
+/// owner can renew it, and so can the steward.
+#[test]
+fn expired_steward_documents_can_still_be_extended() {
+    let s = stewarded();
+    let renewed = steward_renew(&s.steward, &s.base, NOW + DAY).unwrap();
+    assert_eq!(renewed.roster_body().expires, NOW + 15 * DAY);
+    let long_after = NOW + 29 * DAY;
+    assert!(renewed.verify().is_ok());
+    let by_steward = steward_renew(&s.steward, &renewed, long_after).unwrap();
+    assert_eq!(by_steward.roster_body().expires, NOW + 30 * DAY);
+    let by_owner = renew(&s.owner, &renewed, NOW + 40 * DAY).unwrap();
+    assert_eq!(by_owner.roster_body().expires, NOW + 54 * DAY);
+}
+
+#[test]
+fn the_pair_of_a_steward_is_one_steward_pair_not_two_halves() {
+    // The steward signs both; a pair with a Policy signed by someone else is not formed.
+    let s = stewarded();
+    let renewed = steward_renew(&s.steward, &s.base, NOW + DAY).unwrap();
+    let thief = SigningKey::generate(&mut rand::rng());
+    let policy = Policy::sign(&thief, renewed.policy_body()).unwrap();
+    let mixed = Documents::from_signed_with_base(
+        renewed.roster().clone(),
+        policy,
+        s.base.roster().clone(),
+        s.base.policy().clone(),
+    )
+    .unwrap();
+    assert!(mixed.verify().is_err());
+}

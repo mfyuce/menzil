@@ -15,8 +15,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow, bail};
-use ed25519_dalek::VerifyingKey;
-use menzil_proto::trust::Reason;
+use menzil_proto::trust::{HeldView, Reason, Verdict, check_bundle};
 use menzil_proto::{Limits, NetworkId, Roster};
 use menzil_relay::{Listener, Relay, RelayError, RelayIdentity};
 use rustls::pki_types::pem::PemObject;
@@ -25,7 +24,7 @@ use tokio::task::JoinHandle;
 
 use crate::home::{Home, parse_hex32};
 use crate::local::load_identity;
-use crate::token::decode_roster;
+use crate::token::{decode_roster, roster_from_bytes, roster_to_bytes};
 
 /// The WebSocket path nodes ask for unless the operator picks another (protocol.md 3.1).
 pub const DEFAULT_PATH: &str = "/_menzil/v1";
@@ -46,38 +45,69 @@ fn roster_path(home: &Home, network_id: &NetworkId) -> PathBuf {
     relay_dir(home).join(format!("{}.roster", network_id.to_hex()))
 }
 
-/// Keeps the Roster in a relay token as a network this relay serves. The signature is checked
-/// against the network's own key, an expired Roster is refused, and a Roster no newer than the
-/// one kept is left alone. Returns the network and the sequence number now kept.
+/// A Roster this relay serves, as it is kept on disk: with the owner signed Roster it was made
+/// from when a steward signed it (protocol.md 2.3).
+#[derive(Debug, Clone)]
+pub struct StoredRoster {
+    /// The Roster.
+    pub roster: Roster,
+    /// Its base, for a Roster a steward signed.
+    pub base: Option<Roster>,
+}
+
+/// Keeps the Roster in a relay token as a network this relay serves. It must pass the
+/// acceptance predicate of protocol.md 2.3 (`menzil_proto::trust`: signed by the network's own
+/// key, or by the steward its base lists, and not expired), and a Roster no newer than the one
+/// kept is left alone. Returns the network and the sequence number now kept.
 pub fn add_network(home: &Home, token: &str, now: u64) -> Result<(NetworkId, u64)> {
-    let roster = decode_roster(token)?;
+    let (roster, base) = decode_roster(token)?;
     let body = roster.decode()?;
-    let key = VerifyingKey::from_bytes(&<[u8; 32]>::from(body.network_id))
-        .map_err(|_| anyhow!("{} is not a valid network id", body.network_id))?;
-    roster
-        .verify(&key)
-        .context("this Roster was not signed by the network's owner")?;
-    if body.expires <= now {
-        bail!("this Roster has expired: ask the owner for a current token");
-    }
+    let bundle = menzil_proto::trust::Bundle {
+        base_roster: base.clone(),
+        roster: Some(roster.clone()),
+        ..Default::default()
+    };
+    let nothing_held = HeldView {
+        network_id: body.network_id,
+        roster: None,
+        policy_seq: None,
+    };
+    let adoption = match check_bundle(&nothing_held, &bundle, now) {
+        Verdict::Adopt(adoption) => adoption,
+        Verdict::Held => bail!("this token holds no Roster"),
+        Verdict::Reject(Reason::Expired) => {
+            bail!("this Roster has expired: ask the owner for a current token")
+        }
+        Verdict::Reject(reason) => {
+            bail!(
+                "this Roster is not acceptable: {}",
+                crate::local::refusal(reason)
+            )
+        }
+    };
+    // The owner's own signature makes a base pointless: it is not kept.
+    let base = match adoption.signer {
+        menzil_proto::trust::Signer::Owner => None,
+        menzil_proto::trust::Signer::Steward { .. } => base,
+    };
     // From the look at what is held to the write: two runs at once could each see the older
     // Roster and the slower write would put it over the newer.
     let _lock = home.lock_relay()?;
     let path = roster_path(home, &body.network_id);
     if let Ok(held) = fs::read(&path)
-        && let Ok(held) = Roster::decode_strict(&held)
+        && let Ok((held, _)) = roster_from_bytes(&held)
         && let Ok(held) = held.decode()
         && held.seq >= body.seq
     {
         return Ok((body.network_id, held.seq));
     }
-    home.write_public(&path, &roster.encode())?;
+    home.write_public(&path, &roster_to_bytes(&roster, base.as_ref()))?;
     Ok((body.network_id, body.seq))
 }
 
 /// The Rosters this relay serves. A file that cannot be read is an error, not a network that
 /// quietly goes unserved.
-pub fn load_rosters(home: &Home) -> Result<Vec<Roster>> {
+pub fn load_rosters(home: &Home) -> Result<Vec<StoredRoster>> {
     let (rosters, mut failures) = load_rosters_each(home)?;
     if failures.is_empty() {
         Ok(rosters)
@@ -90,7 +120,7 @@ pub fn load_rosters(home: &Home) -> Result<Vec<Roster>> {
 /// cannot: one damaged file is not allowed to hide the others (the fourth red-team round, L3: a
 /// running relay that read them as a whole picked up no newer Roster, a revocation among them,
 /// for any network while one file was damaged).
-pub fn load_rosters_each(home: &Home) -> Result<(Vec<Roster>, Vec<anyhow::Error>)> {
+pub fn load_rosters_each(home: &Home) -> Result<(Vec<StoredRoster>, Vec<anyhow::Error>)> {
     let dir = relay_dir(home);
     let entries = match fs::read_dir(&dir) {
         Ok(entries) => entries,
@@ -113,8 +143,9 @@ pub fn load_rosters_each(home: &Home) -> Result<(Vec<Roster>, Vec<anyhow::Error>
         let read = fs::read(&path)
             .with_context(|| format!("reading {}", path.display()))
             .and_then(|bytes| {
-                Roster::decode_strict(&bytes)
-                    .with_context(|| format!("{} is damaged", path.display()))
+                roster_from_bytes(&bytes)
+                    .map(|(roster, base)| StoredRoster { roster, base })
+                    .map_err(|e| anyhow!("{} is damaged: {e}", path.display()))
             });
         match read {
             Ok(roster) => rosters.push(roster),
@@ -248,9 +279,12 @@ pub async fn start(home: &Home, options: &RunOptions) -> Result<RunningRelay> {
     )?;
     let relay = Relay::new(identity, LIMITS);
     let mut networks = Vec::new();
-    for roster in &rosters {
-        let network_id = roster.decode()?.network_id;
-        match relay.rosters().adopt(roster, None, unix_now()) {
+    for stored in &rosters {
+        let network_id = stored.roster.decode()?.network_id;
+        match relay
+            .rosters()
+            .adopt(&stored.roster, stored.base.as_ref(), unix_now())
+        {
             Ok(_) => networks.push(network_id),
             // A Roster that ran out on disk (the relay does not write the ones it takes over
             // DOC, so the file is as old as the last `add-network`) or is not valid yet holds
@@ -288,9 +322,14 @@ pub async fn start(home: &Home, options: &RunOptions) -> Result<RunningRelay> {
                         for failure in &failures {
                             tracing::warn!(error = %format!("{failure:#}"), "a Roster file cannot be read");
                         }
-                        for roster in &rosters {
-                            if let Err(error) = relay.rosters().adopt(roster, None, unix_now()) {
-                                let network = roster.decode().map(|body| body.network_id).ok();
+                        for stored in &rosters {
+                            if let Err(error) = relay.rosters().adopt(
+                                &stored.roster,
+                                stored.base.as_ref(),
+                                unix_now(),
+                            ) {
+                                let network =
+                                    stored.roster.decode().map(|body| body.network_id).ok();
                                 tracing::warn!(?network, %error, "a Roster on disk was refused");
                             }
                         }

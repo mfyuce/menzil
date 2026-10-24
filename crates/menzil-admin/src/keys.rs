@@ -2,7 +2,9 @@
 
 use curve25519_dalek::montgomery::MontgomeryPoint;
 use ed25519_dalek::SigningKey;
-use menzil_proto::{NetworkId, NodeCert, NodeCertBody, NodeId, PROTOCOL_VERSION, X25519PublicKey};
+use menzil_proto::{
+    NetworkId, NodeCert, NodeCertBody, NodeId, PROTOCOL_VERSION, StewardKey, X25519PublicKey,
+};
 use rand::Rng;
 use zeroize::Zeroize;
 
@@ -180,6 +182,64 @@ impl OwnerKey {
     }
 }
 
+/// The secret half of a steward key (protocol.md 2.3, 7.3): the Ed25519 key a device signs
+/// re-issues and admissions with on the owner's behalf. The device that will use it makes it
+/// and keeps it; the owner only ever sees the public half ([`Self::public`]), in a request
+/// token, and lists it in a `Steward` entry (`delegate_steward`). Named apart from
+/// [`menzil_proto::StewardKey`], which is the public key.
+#[derive(Clone)]
+pub struct StewardSecret {
+    signing: SigningKey,
+}
+
+impl std::fmt::Debug for StewardSecret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StewardSecret")
+            .field("public", &self.public())
+            .field("secret", &"<redacted>")
+            .finish()
+    }
+}
+
+impl StewardSecret {
+    /// The length of [`Self::secret_bytes`].
+    pub const SECRET_LEN: usize = 32;
+
+    /// A fresh random steward key.
+    pub fn generate() -> Self {
+        Self {
+            signing: SigningKey::generate(&mut rand::rng()),
+        }
+    }
+
+    /// The key back from [`Self::secret_bytes`].
+    pub fn from_secret_bytes(bytes: &[u8]) -> Result<Self, AdminError> {
+        let seed: &[u8; Self::SECRET_LEN] =
+            bytes.try_into().map_err(|_| AdminError::BadKeyLength {
+                expected: Self::SECRET_LEN,
+                found: bytes.len(),
+            })?;
+        Ok(Self {
+            signing: SigningKey::from_bytes(seed),
+        })
+    }
+
+    /// The Ed25519 seed: what a steward key file holds.
+    pub fn secret_bytes(&self) -> [u8; Self::SECRET_LEN] {
+        self.signing.to_bytes()
+    }
+
+    /// The public key the owner lists in the `Steward` entry.
+    pub fn public(&self) -> StewardKey {
+        StewardKey::from(self.signing.verifying_key().to_bytes())
+    }
+
+    /// The key documents are signed with.
+    pub fn signing_key(&self) -> &SigningKey {
+        &self.signing
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -332,5 +392,31 @@ mod tests {
             <[u8; 32]>::from(owner.network_id()),
             owner.signing_key().verifying_key().to_bytes()
         );
+    }
+
+    #[test]
+    fn a_steward_key_round_trips_and_never_shows_its_secret() {
+        let key = StewardSecret::generate();
+        let again = StewardSecret::from_secret_bytes(&key.secret_bytes()).unwrap();
+        assert_eq!(again.public(), key.public());
+        assert_ne!(StewardSecret::generate().public(), key.public());
+        assert_eq!(
+            <[u8; 32]>::from(key.public()),
+            key.signing_key().verifying_key().to_bytes()
+        );
+        for len in [0, 31, 33, 64] {
+            assert!(matches!(
+                StewardSecret::from_secret_bytes(&vec![0u8; len]),
+                Err(AdminError::BadKeyLength { expected: 32, found }) if found == len
+            ));
+        }
+        let shown = format!("{key:?}");
+        assert!(shown.contains("redacted"));
+        let hex: String = key
+            .secret_bytes()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        assert!(!shown.contains(&hex));
     }
 }

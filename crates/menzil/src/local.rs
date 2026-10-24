@@ -1,5 +1,5 @@
 //! The operations on a user's menzil directory: what `menzil init`, `network create`, `admit`,
-//! `grant`, `join`, `renew` and `status` do. No printing and no clock here: the caller passes the
+//! `grant`, `join`, `renew`, `steward` and `status` do. No printing and no clock here: the caller passes the
 //! time and prints what these return.
 //!
 //! A device has one identity ([`init`]). It may own networks ([`network_create`]), in which case
@@ -7,23 +7,31 @@
 //! them; every member, the owner included, keeps the current Roster and Policy of each network
 //! it belongs to as one file, updated by [`join`] when an owner hands over a newer pair. Until
 //! `menzil:docs` exists (TODO.md L4j) that hand over is a pasted token.
+//!
+//! A device may also hold a steward key for a network ([`steward_request`]): the owner lists
+//! its public half ([`steward_add`]), and from then on [`admit`] and [`renew`] on that device
+//! sign with it. Documents a steward signed are kept and passed on together with the owner
+//! signed pair they were made from, and every document that comes in, from a file or a token,
+//! goes through the acceptance predicate of `menzil_proto::trust` (protocol.md 2.3).
 
 use std::collections::HashMap;
 use std::fs;
 
 use anyhow::{Context, Result, anyhow, bail};
-use ed25519_dalek::VerifyingKey;
-use menzil_admin::{Documents, NodeKeys, OwnerKey};
+use menzil_admin::{Documents, NodeKeys, OwnerKey, StewardSecret};
+use menzil_proto::trust::{Reason, Verdict, check_bundle};
 use menzil_proto::{
     Grant, NetworkId, NodeCert, NodeId, NodeOrWildcard, Principal, PrincipalTarget, ServiceId,
+    StewardKey,
 };
 use zeroize::Zeroizing;
 
 use crate::home::{Home, parse_hex32};
 use crate::text;
 use crate::token::{
-    decode_documents, decode_join_request, documents_from_bytes, documents_to_bytes,
-    encode_documents, encode_join_request, encode_roster,
+    decode_documents, decode_join_request, decode_steward_request, documents_from_bytes,
+    documents_to_bytes, encode_documents, encode_join_request, encode_roster,
+    encode_steward_request,
 };
 
 /// Seconds in a day.
@@ -105,11 +113,6 @@ pub fn join_request(home: &Home) -> Result<String> {
     Ok(encode_join_request(&load_identity(home)?.1))
 }
 
-fn network_key(network_id: &NetworkId) -> Result<VerifyingKey> {
-    VerifyingKey::from_bytes(&<[u8; 32]>::from(*network_id))
-        .map_err(|_| anyhow!("{network_id} is not a valid network id"))
-}
-
 /// Makes a new network owned by this device, with the device as its first member under
 /// `device_name`. The owner key is saved before the documents: documents without their key would
 /// be a network nobody can change.
@@ -150,8 +153,9 @@ pub fn resolve_network(home: &Home, named: Option<&str>) -> Result<NetworkId> {
     }
 }
 
-/// The documents this device holds for a network, with both signatures checked against the
-/// network's own key: a file that was edited or damaged is refused, not trusted.
+/// The documents this device holds for a network, checked to stand on the network's own key
+/// or on a steward it lists ([`Documents::verify`]): a file that was edited or damaged is
+/// refused, not trusted.
 pub fn load_documents(home: &Home, network_id: &NetworkId) -> Result<Documents> {
     let path = home.documents_path(network_id);
     let bytes = fs::read(&path).with_context(|| {
@@ -160,26 +164,26 @@ pub fn load_documents(home: &Home, network_id: &NetworkId) -> Result<Documents> 
             path.display()
         )
     })?;
-    let (roster, policy) =
+    let docs =
         documents_from_bytes(&bytes).with_context(|| format!("{} is damaged", path.display()))?;
-    let docs = Documents::from_signed(roster, policy)?;
     if docs.network_id() != *network_id {
         bail!("{} holds documents of another network", path.display());
     }
-    let key = network_key(network_id)?;
-    docs.roster()
-        .verify(&key)
-        .and_then(|()| docs.policy().verify(&key))
-        .with_context(|| format!("{} was not signed by the network's owner", path.display()))?;
-    Ok(docs)
+    docs.into_verified().with_context(|| {
+        format!(
+            "{} was not signed by the network's owner (or by a steward the owner listed)",
+            path.display()
+        )
+    })
 }
 
 /// Keeps `docs` as this device's current documents for their network, readable by this user
-/// only: the Policy says who may use what and names every device.
+/// only: the Policy says who may use what and names every device. A pair a steward signed is
+/// kept with its base.
 pub fn save_documents(home: &Home, docs: &Documents) -> Result<()> {
     home.write_secret(
         &home.documents_path(&docs.network_id()),
-        &documents_to_bytes(docs.roster(), docs.policy()),
+        &documents_to_bytes(docs),
     )
 }
 
@@ -200,7 +204,128 @@ pub fn load_owner(home: &Home, network_id: &NetworkId) -> Result<OwnerKey> {
     Ok(owner)
 }
 
-/// What [`admit`], [`grant`] and [`renew`] hand back: the new pair's number and the token that
+/// The steward key of a network, if this device has one.
+pub fn load_steward(home: &Home, network_id: &NetworkId) -> Result<StewardSecret> {
+    let path = home.steward_key_path(network_id);
+    let secret = Zeroizing::new(fs::read(&path).with_context(|| {
+        format!(
+            "this device is no steward of network {network_id} ({} is missing)",
+            path.display()
+        )
+    })?);
+    StewardSecret::from_secret_bytes(&secret)
+        .with_context(|| format!("{} is damaged", path.display()))
+}
+
+/// What [`steward_request`] made.
+#[derive(Debug, Clone)]
+pub struct StewardRequest {
+    /// The network the key is for.
+    pub network_id: NetworkId,
+    /// The public key.
+    pub public: StewardKey,
+    /// The request to give to the owner (`menzil1-steward:...`).
+    pub token: String,
+    /// False when the device had a key for the network already, which was left as it was.
+    pub created: bool,
+}
+
+/// Makes this device's steward key for a network (protocol.md 7.3: the steward device
+/// generates it and the owner only ever sees the public half), or finds the one it made
+/// before, and returns the request that names the public half. A key that exists is never
+/// replaced: the owner may have listed it already.
+pub fn steward_request(home: &Home, network: Option<&str>) -> Result<StewardRequest> {
+    let network_id = resolve_network(home, network)?;
+    let _lock = home.lock_network(&network_id)?;
+    let path = home.steward_key_path(&network_id);
+    let (secret, created) = if path.exists() {
+        (load_steward(home, &network_id)?, false)
+    } else {
+        let secret = StewardSecret::generate();
+        home.write_secret(&path, &Zeroizing::new(secret.secret_bytes())[..])?;
+        (secret, true)
+    };
+    Ok(StewardRequest {
+        network_id,
+        public: secret.public(),
+        token: encode_steward_request(network_id, secret.public()),
+        created,
+    })
+}
+
+/// The longest a steward is listed for, in days (protocol.md 7.3).
+pub const STEWARD_MAX_DAYS: u64 = 90;
+
+/// What [`steward_add`] did.
+#[derive(Debug, Clone)]
+pub struct StewardAdded {
+    /// The new pair.
+    pub issued: Issued,
+    /// The steward's public key.
+    pub steward: StewardKey,
+    /// When the delegation ends, Unix seconds.
+    pub not_after: u64,
+}
+
+/// Lists the steward a request names (protocol.md 2.3), for `days` days from `now`, with the
+/// rights `may` (`admit`, `renew`). Owner only; replaces any steward listed before.
+pub fn steward_add(
+    home: &Home,
+    network: Option<&str>,
+    request: &str,
+    may: &[String],
+    days: u64,
+    now: u64,
+) -> Result<StewardAdded> {
+    let (network_id, steward) = decode_steward_request(request)?;
+    if let Some(named) = network
+        && resolve_network(home, Some(named))? != network_id
+    {
+        bail!("this steward request is for network {network_id}, not for the one named");
+    }
+    if days == 0 || days > STEWARD_MAX_DAYS {
+        bail!("a steward is listed for 1 to {STEWARD_MAX_DAYS} days");
+    }
+    let _lock = home.lock_network(&network_id)?;
+    let owner = load_owner(home, &network_id)?;
+    let current = load_documents(home, &network_id)?;
+    let not_after = now.saturating_add(days * DAY);
+    let next = menzil_admin::delegate_steward(&owner, &current, steward, may, not_after, now)?;
+    save_documents(home, &next)?;
+    Ok(StewardAdded {
+        issued: issued(&next, None),
+        steward,
+        not_after,
+    })
+}
+
+/// Removes the steward from a network this device owns (protocol.md 7.3). The new documents
+/// outrank everything the steward can sign.
+pub fn steward_remove(home: &Home, network: Option<&str>, now: u64) -> Result<Issued> {
+    let network_id = resolve_network(home, network)?;
+    let _lock = home.lock_network(&network_id)?;
+    let owner = load_owner(home, &network_id)?;
+    let current = load_documents(home, &network_id)?;
+    let next = menzil_admin::remove_steward(&owner, &current, now)?;
+    save_documents(home, &next)?;
+    Ok(issued(&next, None))
+}
+
+/// Who signs the next documents on this device: the owner key if there is one, else a steward
+/// key, else nobody (and the error says what `admit` and `renew` need).
+enum Signing {
+    Owner(OwnerKey),
+    Steward(StewardSecret),
+}
+
+fn signing_key(home: &Home, network_id: &NetworkId) -> Result<Signing> {
+    if !home.owner_key_path(network_id).exists() && home.steward_key_path(network_id).exists() {
+        return Ok(Signing::Steward(load_steward(home, network_id)?));
+    }
+    Ok(Signing::Owner(load_owner(home, network_id)?))
+}
+
+/// What [`admit`], [`grant`], [`renew`] and the steward commands hand back: the new pair's number and the token that
 /// carries it to the members.
 #[derive(Debug, Clone)]
 pub struct Issued {
@@ -219,12 +344,13 @@ fn issued(docs: &Documents, member: Option<NodeId>) -> Issued {
         network_id: docs.network_id(),
         seq: docs.seq(),
         member,
-        token: encode_documents(docs.roster(), docs.policy()),
+        token: encode_documents(docs),
     }
 }
 
-/// Admits the node a join request names to a network this device owns (protocol.md 7.1) under
-/// `name`, with `roles`. It can reach nothing until a [`grant`] says what.
+/// Admits the node a join request names to a network this device owns, or is a steward of
+/// (protocol.md 7.1), under `name`, with `roles`. It can reach nothing until a [`grant`] says
+/// what. A steward admits without roles: roles are grants, and granting is the owner's.
 pub fn admit(
     home: &Home,
     network: Option<&str>,
@@ -236,11 +362,21 @@ pub fn admit(
     let network_id = resolve_network(home, network)?;
     // Held from reading the documents to writing the next ones.
     let _lock = home.lock_network(&network_id)?;
-    let owner = load_owner(home, &network_id)?;
+    let signing = signing_key(home, &network_id)?;
     let current = load_documents(home, &network_id)?;
     let cert = decode_join_request(join_request)?;
     let member = cert.decode()?.node_id;
-    let next = menzil_admin::admit(&owner, &current, &cert, name, roles, now)?;
+    let next = match signing {
+        Signing::Owner(owner) => menzil_admin::admit(&owner, &current, &cert, name, roles, now)?,
+        Signing::Steward(steward) => {
+            if !roles.is_empty() {
+                bail!(
+                    "this device is a steward of the network, and a steward admits members without roles: the owner grants roles"
+                );
+            }
+            menzil_admin::steward_admit(&steward, &current, &cert, name, now)?
+        }
+    };
     save_documents(home, &next)?;
     Ok(issued(&next, Some(member)))
 }
@@ -310,13 +446,17 @@ pub fn grant(
     Ok(issued(&next, None))
 }
 
-/// Re-issues the documents of a network this device owns with a fresh lifetime, which a network
-/// needs at least every 14 days (protocol.md 7.3).
+/// Re-issues the documents of a network this device owns, or is a steward of, with a fresh
+/// lifetime, which a network needs at least every 14 days (protocol.md 7.3).
 pub fn renew(home: &Home, network: Option<&str>, now: u64) -> Result<Issued> {
     let network_id = resolve_network(home, network)?;
     let _lock = home.lock_network(&network_id)?;
-    let owner = load_owner(home, &network_id)?;
-    let next = menzil_admin::renew(&owner, &load_documents(home, &network_id)?, now)?;
+    let signing = signing_key(home, &network_id)?;
+    let current = load_documents(home, &network_id)?;
+    let next = match signing {
+        Signing::Owner(owner) => menzil_admin::renew(&owner, &current, now)?,
+        Signing::Steward(steward) => menzil_admin::steward_renew(&steward, &current, now)?,
+    };
     save_documents(home, &next)?;
     Ok(issued(&next, None))
 }
@@ -324,14 +464,17 @@ pub fn renew(home: &Home, network: Option<&str>, now: u64) -> Result<Issued> {
 /// The token for the documents this device holds now, to hand to a member again.
 pub fn token(home: &Home, network: Option<&str>) -> Result<String> {
     let docs = load_documents(home, &resolve_network(home, network)?)?;
-    Ok(encode_documents(docs.roster(), docs.policy()))
+    Ok(encode_documents(&docs))
 }
 
 /// The token for a relay: the Roster of the documents this device holds now, without the Policy
 /// (threat-model.md: hidden from relays).
 pub fn token_for_relay(home: &Home, network: Option<&str>) -> Result<String> {
     let docs = load_documents(home, &resolve_network(home, network)?)?;
-    Ok(encode_roster(docs.roster()))
+    Ok(encode_roster(
+        docs.roster(),
+        docs.base().map(|(roster, _)| roster),
+    ))
 }
 
 /// What [`join`] did.
@@ -362,27 +505,73 @@ pub enum Joined {
     },
 }
 
-/// Installs the documents in a membership token. Refused unless both were signed by the
-/// network's own key, belong together, have not expired, and name this device as a member of
-/// both: a token meant for another device pasted here by mistake is an error, not a network this
-/// device cannot use. An older or equal pair than the one held is left alone (protocol.md 2.3:
-/// never accept a lower `seq`).
+/// What a person is told when the acceptance predicate (`menzil_proto::trust`, protocol.md 2.3)
+/// refuses documents.
+pub(crate) fn refusal(reason: Reason) -> String {
+    let text = match reason {
+        Reason::Expired => "these documents have expired: ask the owner for new ones",
+        Reason::BadSignature => "these documents were not signed by the network's owner",
+        // Without a base there is no telling a steward's documents from a forger's: both are
+        // "not the owner's, and nothing to show that a steward may have signed them".
+        Reason::MissingBase => {
+            "these documents were not signed by the network's owner, and they come without the owner signed documents that documents from a steward are made from"
+        }
+        Reason::NotYetValid => {
+            "these documents were issued in the future by this device's clock: is the clock right?"
+        }
+        Reason::LifetimeTooLong => "these documents are valid for longer than 14 days",
+        Reason::Malformed => "these documents do not decode",
+        Reason::WrongNetwork => "these documents belong to different networks",
+        Reason::TooManyStewards => "the Roster lists more than one steward",
+        Reason::PairMismatch => "the Roster and the Policy are not a pair",
+        Reason::PairSigner => "the Roster and the Policy were not signed by the same key",
+        Reason::BadBase => "the owner signed documents these were made from do not belong to them",
+        Reason::SeqOutOfSpan => {
+            "the steward's sequence number is outside the range its base allows"
+        }
+        Reason::BaseOlderThanHeld => {
+            "the steward made these from documents older than ones this device holds"
+        }
+        Reason::NoSteward => "the owner signed documents they were made from list no steward",
+        Reason::BadStewardEntry => "the steward entry is not valid or not signed by the owner",
+        Reason::StewardExpired => "the steward's time is up: ask the owner for new documents",
+        Reason::ExpiresAfterNotAfter => "the steward signed documents that outlive its time",
+        Reason::RightMissing => "the steward changed something its rights do not allow",
+        Reason::FieldChanged => "the steward changed something a steward may not",
+        Reason::BadAppend => "the steward admitted members it may not",
+        Reason::BadCert => "a certificate the steward added does not verify",
+        Reason::BadName => "a member the steward admitted has a name or role it may not",
+    };
+    format!("{text} ({reason:?})")
+}
+
+/// Installs the documents in a membership token. Refused unless the acceptance predicate
+/// (`menzil_proto::trust`, protocol.md 2.3) takes them: both signed by the network's own key,
+/// or by the steward the owner listed with the owner signed documents they were made from;
+/// belong together; have not expired; and then, here, name this device as a member of both: a
+/// token meant for another device pasted here by mistake is an error, not a network this
+/// device cannot use. Documents a steward signed come with their base, and are refused
+/// without it. An older or equal pair than the one held is left alone (protocol.md 2.3: never
+/// accept a lower `seq`).
 pub fn join(home: &Home, token: &str, now: u64) -> Result<Joined> {
     let (_, cert) = load_identity(home)
         .context("a device needs an identity before it can join: run `menzil init`")?;
     let me = cert.decode()?.node_id;
-    let (roster, policy) = decode_documents(token)?;
-    let docs = Documents::from_signed(roster, policy)?;
+    let docs = decode_documents(token)?;
     let network_id = docs.network_id();
-    let key = network_key(&network_id)?;
-    docs.roster()
-        .verify(&key)
-        .and_then(|()| docs.policy().verify(&key))
-        .context("these documents were not signed by the network's owner")?;
-    let (roster, policy) = (docs.roster_body(), docs.policy_body());
-    if roster.expires <= now || policy.expires <= now {
-        bail!("these documents have expired: ask the owner for new ones");
+    let nothing_held = menzil_proto::trust::HeldView {
+        network_id,
+        roster: None,
+        policy_seq: None,
+    };
+    match check_bundle(&nothing_held, &docs.bundle(), now) {
+        Verdict::Adopt(_) => {}
+        Verdict::Held => bail!("these documents hold nothing"),
+        Verdict::Reject(reason) => bail!("{}", refusal(reason)),
     }
+    // What is kept is what the owner's own signature or the steward's base stands on.
+    let docs = docs.into_verified().map_err(|e| anyhow!("{e}"))?;
+    let policy = docs.policy_body();
     if !docs.is_member(&me) || !policy.members.iter().any(|m| m.node_id == me) {
         bail!("node {me} is not a member in these documents: they were made for another device");
     }
@@ -418,17 +607,26 @@ pub fn join(home: &Home, token: &str, now: u64) -> Result<Joined> {
     }
     let _lock = home.lock_network(&network_id)?;
     match load_documents(home, &network_id) {
-        Ok(held) if held.seq() >= docs.seq() => Ok(Joined::AlreadyCurrent {
-            network_id,
-            held_seq: held.seq(),
-        }),
         Ok(held) => {
-            save_documents(home, &docs)?;
-            Ok(Joined::Updated {
-                network_id,
-                from_seq: held.seq(),
-                seq: docs.seq(),
-            })
+            // Against what is held: a lower or equal `seq` is left alone, a steward may not
+            // build on a base older than the held one.
+            match check_bundle(&held.held_view()?, &docs.bundle(), now) {
+                Verdict::Adopt(adoption)
+                    if adoption.roster.is_some() && adoption.policy.is_some() =>
+                {
+                    save_documents(home, &docs)?;
+                    Ok(Joined::Updated {
+                        network_id,
+                        from_seq: held.seq(),
+                        seq: docs.seq(),
+                    })
+                }
+                Verdict::Adopt(_) | Verdict::Held => Ok(Joined::AlreadyCurrent {
+                    network_id,
+                    held_seq: held.seq(),
+                }),
+                Verdict::Reject(reason) => bail!("{}", refusal(reason)),
+            }
         }
         Err(_) if !home.documents_path(&network_id).exists() => {
             save_documents(home, &docs)?;
@@ -470,8 +668,23 @@ pub struct NetworkStatus {
     pub members: Vec<MemberStatus>,
     /// How many grants the Policy holds.
     pub grants: usize,
+    /// The steward the Roster lists, if any.
+    pub steward: Option<StewardStatus>,
     /// Set when the documents could not be read.
     pub problem: Option<String>,
+}
+
+/// The steward a Roster lists, as `status` shows it.
+#[derive(Debug, Clone)]
+pub struct StewardStatus {
+    /// Its public key.
+    pub key: StewardKey,
+    /// When its time is up, Unix seconds.
+    pub not_after: u64,
+    /// Whether this device holds the key.
+    pub is_this_device: bool,
+    /// Whether the documents this device holds were signed by the steward.
+    pub signed_by_steward: bool,
 }
 
 /// What `status` shows.
@@ -515,6 +728,18 @@ pub fn status(home: &Home) -> Result<Status> {
                     })
                     .collect(),
                 grants: docs.policy_body().grants.len(),
+                steward: docs
+                    .roster_body()
+                    .stewards
+                    .first()
+                    .and_then(|entry| entry.decode().ok())
+                    .map(|entry| StewardStatus {
+                        key: entry.steward_pub,
+                        not_after: entry.not_after,
+                        is_this_device: load_steward(home, &network_id)
+                            .is_ok_and(|mine| mine.public() == entry.steward_pub),
+                        signed_by_steward: docs.base().is_some(),
+                    }),
                 problem: None,
             },
             Err(error) => NetworkStatus {
@@ -524,6 +749,7 @@ pub fn status(home: &Home) -> Result<Status> {
                 expires: 0,
                 members: vec![],
                 grants: 0,
+                steward: None,
                 problem: Some(format!("{error:#}")),
             },
         });
@@ -601,6 +827,28 @@ impl Status {
                 network.grants,
                 if network.grants == 1 { "" } else { "s" }
             ));
+            if let Some(steward) = &network.steward {
+                let state = if steward.not_after <= now {
+                    "ended"
+                } else {
+                    "until"
+                };
+                out.push_str(&format!(
+                    "  steward {}{}, {state} {}{}\n",
+                    steward.key,
+                    if steward.is_this_device {
+                        " (this device)"
+                    } else {
+                        ""
+                    },
+                    relative(steward.not_after, now),
+                    if steward.signed_by_steward {
+                        "; these documents are the steward's"
+                    } else {
+                        ""
+                    }
+                ));
+            }
             for member in &network.members {
                 // Names and roles were signed by the owner, whose tool would not have issued
                 // anything but plain words; a hand made Policy could carry a terminal escape.

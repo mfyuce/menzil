@@ -15,6 +15,13 @@
 //!   pair with `seq + 1`, signed by the owner, and leaves the old one alone;
 //!   the clock is a parameter.
 //!
+//! * [`StewardSecret`], [`delegate_steward`], [`remove_steward`], [`steward_renew`],
+//!   [`steward_admit`]: a steward (protocol.md 2.3, 7.3) signs re-issues and admissions with
+//!   its own key; its pair travels with the owner signed base it was made from, and the owner's
+//!   next pair jumps 2^20 past that base ([`Documents::next_owner_seq`]). What a steward
+//!   issues is judged by `menzil_proto::trust::check_bundle`, the same predicate every verifier
+//!   runs, before it is returned.
+//!
 //! What is checked here is what the issuer is responsible for and the types
 //! do not enforce: a joining certificate must verify against its own NodeId,
 //! be valid now and not for longer than 400 days, a revoked node is not admitted again,
@@ -30,7 +37,9 @@ mod keys;
 
 pub use error::AdminError;
 pub use issue::{
-    DOCUMENT_LIFETIME_SECS, Documents, admit, check_name, check_role, create_network, grant,
-    is_invisible, is_unsafe, renew,
+    DOCUMENT_LIFETIME_SECS, Documents, admit, check_name, check_role, create_network,
+    delegate_steward, grant, is_invisible, is_unsafe, remove_steward, renew, steward_admit,
+    steward_renew,
 };
-pub use keys::{MAX_CERT_LIFETIME_SECS, NodeKeys, OwnerKey};
+pub use keys::{MAX_CERT_LIFETIME_SECS, NodeKeys, OwnerKey, StewardSecret};
+pub use menzil_proto::trust::{STEWARD_MAX_LIFETIME, STEWARD_SEQ_SPAN};

@@ -20,7 +20,7 @@ use menzil_node::{
     DocStore, EnsureError, LocalIdentity, Node, NodeConfig, NodeError, NodeOpenError,
     OpenStreamError, PolicyStore, RosterStore, SessionConfig,
 };
-use menzil_proto::trust::{Bundle, Reason};
+use menzil_proto::trust::Reason;
 use menzil_proto::{NetworkId, NodeId, ServiceId, ServiceKind};
 use menzil_stream::Stream;
 use tokio::net::{UnixListener, UnixStream};
@@ -534,9 +534,9 @@ enum Disk {
     Waiting { held_roster: u64 },
 }
 
-/// Adopts the owner signed pair read from disk, through the acceptance predicate of
-/// protocol.md 2.3 at the real clock: both are stored or neither is, and a pair that is
-/// expired, issued in the future or valid for more than 14 days is refused.
+/// Adopts the pair read from disk (the owner's, or a steward's with its base) through the
+/// acceptance predicate of protocol.md 2.3 at the real clock: both are stored or neither is, and
+/// a pair that is expired, issued in the future or valid for more than 14 days is refused.
 fn adopt_documents(
     rosters: &RosterStore,
     policies: &PolicyStore,
@@ -551,12 +551,9 @@ fn adopt_documents(
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
-    let bundle = Bundle {
-        roster: Some(docs.roster().clone()),
-        policy: Some(docs.policy().clone()),
-        ..Bundle::default()
-    };
-    DocStore::new(rosters, policies).adopt(&bundle, now)?;
+    // A pair a steward signed goes in with its base, which is what the stores judge it by and
+    // pass it on with.
+    DocStore::new(rosters, policies).adopt(&docs.bundle(), now)?;
     Ok(Disk::Judged)
 }
 

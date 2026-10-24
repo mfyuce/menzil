@@ -125,6 +125,14 @@ impl Home {
             .join(format!("{}.key", network_id.to_hex()))
     }
 
+    /// The steward key of a network this device is a steward of (protocol.md 7.3): made on this
+    /// device by `menzil steward request`, and never leaves it.
+    pub fn steward_key_path(&self, network_id: &NetworkId) -> PathBuf {
+        self.root
+            .join("steward")
+            .join(format!("{}.key", network_id.to_hex()))
+    }
+
     /// The networks this node holds documents for, in id order.
     pub fn networks(&self) -> Result<Vec<NetworkId>> {
         let dir = self.root.join("networks");

@@ -864,3 +864,86 @@ fn a_roster_from_the_relay_ahead_of_the_disk_pair_makes_the_reload_wait() {
     reload(&member, &policies, &rosters, &directory, &mut last).unwrap();
     assert_eq!(policies.seq(&id), Some(held));
 }
+
+/// Protocol.md 2.3 (TODO L4j S3): a node that holds documents a steward signed loads them
+/// through the acceptance predicate with their base, and picks up the steward's next ones when
+/// they are written to disk, without a restart.
+#[test]
+fn a_node_loads_and_reloads_documents_a_steward_signed() {
+    use menzil_proto::trust::Signer;
+    let owner_dir = tempfile::tempdir().unwrap();
+    let owner = Home::new(owner_dir.path());
+    init(&owner, clock()).unwrap();
+    let id = network_create(&owner, "laptop", clock()).unwrap();
+    let steward_dir = tempfile::tempdir().unwrap();
+    let steward = Home::new(steward_dir.path());
+    let request = init(&steward, clock()).unwrap().join_request;
+    let admitted = admit(&owner, None, &request, "steward", &[], clock()).unwrap();
+    join(&steward, &admitted.token, clock()).unwrap();
+    let asked = crate::local::steward_request(&steward, None).unwrap();
+    let listed = crate::local::steward_add(
+        &owner,
+        None,
+        &asked.token,
+        &["admit".to_string(), "renew".to_string()],
+        30,
+        clock(),
+    )
+    .unwrap();
+    join(&steward, &listed.issued.token, clock()).unwrap();
+    renew(&steward, None, clock() + 60).unwrap();
+
+    let (policies, rosters, networks) = load_stores(&steward).unwrap();
+    assert_eq!(networks, vec![id]);
+    assert_eq!((rosters.seq(&id), policies.seq(&id)), (Some(4), Some(4)));
+    assert!(matches!(
+        rosters.signer(&id),
+        Some(Signer::Steward { base_seq: 3, .. })
+    ));
+    assert_eq!(rosters.base(&id).unwrap().decode().unwrap().seq, 3);
+    assert_eq!(policies.base(&id).unwrap().decode().unwrap().seq, 3);
+
+    // The steward admits a device while the node runs; the reload takes it, base and all.
+    let phone_dir = tempfile::tempdir().unwrap();
+    let phone = Home::new(phone_dir.path());
+    let phone_request = init(&phone, clock()).unwrap().join_request;
+    let directory = RwLock::new(Directory::load(&steward).unwrap());
+    admit(&steward, None, &phone_request, "phone", &[], clock() + 120).unwrap();
+    let mut last = HashMap::new();
+    reload(&steward, &policies, &rosters, &directory, &mut last).unwrap();
+    assert_eq!((rosters.seq(&id), policies.seq(&id)), (Some(5), Some(5)));
+    assert_eq!(rosters.base(&id).unwrap().decode().unwrap().seq, 3);
+    assert!(directory.read().unwrap().resolve("phone").is_ok());
+
+    // A member that holds the owner's pair loads the steward's from the token like any other.
+    let (policies2, rosters2, _) = load_stores(&owner).unwrap();
+    assert_eq!(rosters2.seq(&id), Some(3));
+    assert!(rosters2.base(&id).is_none());
+    let docs = crate::local::load_documents(&steward, &id).unwrap();
+    join(
+        &owner,
+        &crate::token::encode_documents(&docs),
+        clock() + 120,
+    )
+    .unwrap();
+    let directory2 = RwLock::new(Directory::default());
+    reload(
+        &owner,
+        &policies2,
+        &rosters2,
+        &directory2,
+        &mut HashMap::new(),
+    )
+    .unwrap();
+    assert_eq!((rosters2.seq(&id), policies2.seq(&id)), (Some(5), Some(5)));
+    assert!(matches!(rosters2.signer(&id), Some(Signer::Steward { .. })));
+
+    // The file with its base cut off is not trusted: the node does not start on it.
+    let docs_path = steward.documents_path(&id);
+    let bare = crate::token::documents_to_bytes(
+        &menzil_admin::Documents::from_signed(docs.roster().clone(), docs.policy().clone())
+            .unwrap(),
+    );
+    std::fs::write(&docs_path, bare).unwrap();
+    assert!(load_stores(&steward).is_err());
+}

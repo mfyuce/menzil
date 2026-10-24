@@ -41,7 +41,7 @@ enum Command {
         #[command(subcommand)]
         command: NetworkCommand,
     },
-    /// Admit the device a join request names to a network this device owns.
+    /// Admit the device a join request names to a network this device owns, or is a steward of.
     Admit {
         /// The join request (`menzil1-join:...`) the new member's `menzil init` printed; `-`
         /// reads it from standard input.
@@ -49,7 +49,7 @@ enum Command {
         /// The name the member is addressed by (letters, digits, '-', '_' and '.').
         #[arg(long)]
         name: String,
-        /// A role for the member; may be repeated.
+        /// A role for the member; may be repeated. A steward admits without roles.
         #[arg(long = "role", value_name = "ROLE")]
         roles: Vec<String>,
         /// The network, when this device is in more than one.
@@ -72,11 +72,18 @@ enum Command {
         #[arg(long, value_name = "ID")]
         network: Option<String>,
     },
-    /// Re-issue a network's documents with a fresh lifetime (owner only; needed every 14 days).
+    /// Re-issue a network's documents with a fresh lifetime (owner or steward; needed every 14
+    /// days).
     Renew {
         /// The network, when this device is in more than one.
         #[arg(long, value_name = "ID")]
         network: Option<String>,
+    },
+    /// Hand admitting and renewing to a steward, a device with a key of its own that signs for
+    /// the owner for a while (owner: `add`, `remove`; steward device: `request`).
+    Steward {
+        #[command(subcommand)]
+        command: StewardCommand,
     },
     /// Install the documents in a membership token an owner gave this device.
     Join {
@@ -177,6 +184,40 @@ enum RelayCommand {
         /// The WebSocket path to answer on.
         #[arg(long, default_value = relay_cmd::DEFAULT_PATH)]
         path: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum StewardCommand {
+    /// On the device that will be the steward: make its steward key for a network and print the
+    /// request to give to the owner. The secret key stays on this device; asking again prints
+    /// the same request.
+    Request {
+        /// The network, when this device is in more than one.
+        #[arg(long, value_name = "ID")]
+        network: Option<String>,
+    },
+    /// On the owner's device: list the steward a request names (replaces any other).
+    Add {
+        /// The request (`menzil1-steward:...`) from `menzil steward request`; `-` reads it from
+        /// standard input.
+        request: String,
+        /// What the steward may do: `admit`, `renew`; may be repeated [default: both].
+        #[arg(long = "may", value_name = "RIGHT")]
+        may: Vec<String>,
+        /// How long the steward is listed for, 1 to 90 days.
+        #[arg(long, default_value_t = 30, value_name = "DAYS")]
+        days: u64,
+        /// The network, when this device owns more than one.
+        #[arg(long, value_name = "ID")]
+        network: Option<String>,
+    },
+    /// On the owner's device: remove the steward. Whatever the steward signed from its last
+    /// documents is outranked; members it admitted stay until revoked.
+    Remove {
+        /// The network, when this device owns more than one.
+        #[arg(long, value_name = "ID")]
+        network: Option<String>,
     },
 }
 
@@ -304,6 +345,64 @@ async fn run(cli: Cli) -> Result<()> {
             println!("every member needs the new documents (`menzil join <token>`):");
             println!("{}", issued.token);
         }
+        Command::Steward { command } => match command {
+            StewardCommand::Request { network } => {
+                let request = local::steward_request(&home()?, network.as_deref())?;
+                if request.created {
+                    println!(
+                        "made this device's steward key for network {}",
+                        request.network_id
+                    );
+                } else {
+                    println!(
+                        "this device has a steward key for network {} already (left as it was)",
+                        request.network_id
+                    );
+                }
+                println!(
+                    "give this request to the owner, who runs `menzil steward add <request>`:"
+                );
+                println!("{}", request.token);
+            }
+            StewardCommand::Add {
+                request,
+                may,
+                days,
+                network,
+            } => {
+                let may = if may.is_empty() {
+                    vec!["admit".to_string(), "renew".to_string()]
+                } else {
+                    may
+                };
+                let added = local::steward_add(
+                    &home()?,
+                    network.as_deref(),
+                    &token_argument(request)?,
+                    &may,
+                    days,
+                    now(),
+                )?;
+                println!(
+                    "listed steward {} for {days} day(s): the network's documents are now #{}",
+                    added.steward.to_hex(),
+                    added.issued.seq
+                );
+                println!(
+                    "every member and the steward need the new documents (`menzil join <token>`):"
+                );
+                println!("{}", added.issued.token);
+            }
+            StewardCommand::Remove { network } => {
+                let issued = local::steward_remove(&home()?, network.as_deref(), now())?;
+                println!(
+                    "removed the steward: the network's documents are now #{}",
+                    issued.seq
+                );
+                println!("every member needs the new documents (`menzil join <token>`):");
+                println!("{}", issued.token);
+            }
+        },
         Command::Join { token } => match local::join(&home()?, &token_argument(token)?, now())? {
             Joined::New { network_id, seq } => {
                 println!("joined network {network_id} (documents #{seq})")
