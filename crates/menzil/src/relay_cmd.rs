@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow, bail};
-use menzil_proto::trust::{HeldView, Reason, Verdict, check_bundle};
+use menzil_proto::trust::{HeldRoster, HeldView, Reason, Verdict, check_bundle};
 use menzil_proto::{Limits, NetworkId, Roster};
 use menzil_relay::{Listener, Relay, RelayError, RelayIdentity};
 use rustls::pki_types::pem::PemObject;
@@ -67,14 +67,27 @@ pub fn add_network(home: &Home, token: &str, now: u64) -> Result<(NetworkId, u64
         roster: Some(roster.clone()),
         ..Default::default()
     };
-    let nothing_held = HeldView {
+    // From the look at what is held to the write: two runs at once could each see the older
+    // Roster and the slower write would put it over the newer, so the judgement is made under
+    // the lock.
+    let _lock = home.lock_relay()?;
+    let path = roster_path(home, &body.network_id);
+    // Judge the token again against what is kept (protocol.md 2.3): a newer `seq` alone is not
+    // enough, a steward's Roster on a base older than the kept Roster's base would undo what
+    // the owner changed since. A file that cannot be read counts as nothing held, as before.
+    let held = fs::read(&path)
+        .ok()
+        .and_then(|bytes| roster_from_bytes(&bytes).ok())
+        .and_then(|(roster, base)| HeldRoster::new(&roster, base.as_ref()).ok());
+    let held_seq = held.as_ref().map(HeldRoster::seq);
+    let view = HeldView {
         network_id: body.network_id,
-        roster: None,
+        roster: held,
         policy_seq: None,
     };
-    let adoption = match check_bundle(&nothing_held, &bundle, now) {
+    let adoption = match check_bundle(&view, &bundle, now) {
         Verdict::Adopt(adoption) => adoption,
-        Verdict::Held => bail!("this token holds no Roster"),
+        Verdict::Held => return Ok((body.network_id, held_seq.unwrap_or(body.seq))),
         Verdict::Reject(Reason::Expired) => {
             bail!("this Roster has expired: ask the owner for a current token")
         }
@@ -90,17 +103,6 @@ pub fn add_network(home: &Home, token: &str, now: u64) -> Result<(NetworkId, u64
         menzil_proto::trust::Signer::Owner => None,
         menzil_proto::trust::Signer::Steward { .. } => base,
     };
-    // From the look at what is held to the write: two runs at once could each see the older
-    // Roster and the slower write would put it over the newer.
-    let _lock = home.lock_relay()?;
-    let path = roster_path(home, &body.network_id);
-    if let Ok(held) = fs::read(&path)
-        && let Ok((held, _)) = roster_from_bytes(&held)
-        && let Ok(held) = held.decode()
-        && held.seq >= body.seq
-    {
-        return Ok((body.network_id, held.seq));
-    }
     home.write_public(&path, &roster_to_bytes(&roster, base.as_ref()))?;
     Ok((body.network_id, body.seq))
 }

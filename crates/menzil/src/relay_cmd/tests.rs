@@ -496,6 +496,75 @@ fn a_relay_keeps_a_steward_signed_roster_with_its_base() {
     assert_eq!(fs::read(roster_path(&relay, &id)).unwrap()[0] & 0xf0, 0x80);
 }
 
+/// Protocol.md 2.3: a newer `seq` is not enough. A steward's Roster made from a base older than
+/// the base of the Roster the relay keeps would undo what the owner changed since. (The owner
+/// normally jumps past the steward's span; this is an owner who did not.)
+#[test]
+fn a_steward_roster_on_an_older_base_does_not_replace_a_newer_owner_roster() {
+    use ed25519_dalek::SigningKey;
+    use menzil_proto::{
+        NodeId, PROTOCOL_VERSION, RosterBody, RosterMember, Steward, StewardBody, StewardKey,
+    };
+    let owner = SigningKey::generate(&mut rand::rng());
+    let steward = SigningKey::generate(&mut rand::rng());
+    let id = NetworkId::from(owner.verifying_key().to_bytes());
+    let entry = Steward::sign(
+        &owner,
+        &StewardBody {
+            v: PROTOCOL_VERSION,
+            network_id: id,
+            steward_pub: StewardKey::from(steward.verifying_key().to_bytes()),
+            may: vec!["renew".to_string()],
+            not_after: clock() + 30 * DAY,
+        },
+    )
+    .unwrap();
+    let roster = |seq: u64, members: u8| RosterBody {
+        v: PROTOCOL_VERSION,
+        network_id: id,
+        seq,
+        issued: clock(),
+        expires: clock() + 7 * DAY,
+        members: (1..=members)
+            .map(|n| RosterMember {
+                node_id: NodeId::from([n; 32]),
+                min_serial: 1,
+            })
+            .collect(),
+        revoked: vec![],
+        stewards: vec![entry.clone()],
+        labels: vec![],
+    };
+    let base5 = Roster::sign(&owner, &roster(5, 1)).unwrap();
+    let owner8 = Roster::sign(&owner, &roster(8, 1)).unwrap();
+    let stale = Roster::sign(&steward, &roster(10, 1)).unwrap();
+
+    let (_d, relay) = home();
+    assert_eq!(
+        add_network(&relay, &encode_roster(&owner8, None), clock() + 1).unwrap(),
+        (id, 8)
+    );
+    // Seq 10 is above 8, but its base (5) is older than the kept Roster's base (8).
+    let message = format!(
+        "{:#}",
+        add_network(&relay, &encode_roster(&stale, Some(&base5)), clock() + 1).unwrap_err()
+    );
+    assert!(message.contains("not acceptable"), "{message}");
+    let kept = load_rosters(&relay).unwrap();
+    assert_eq!(kept[0].roster.decode().unwrap().seq, 8);
+    assert!(kept[0].base.is_none());
+
+    // A steward Roster made from the owner's seq 8 is still taken.
+    let fresh = Roster::sign(&steward, &roster(11, 1)).unwrap();
+    assert_eq!(
+        add_network(&relay, &encode_roster(&fresh, Some(&owner8)), clock() + 1).unwrap(),
+        (id, 11)
+    );
+    let kept = load_rosters(&relay).unwrap();
+    assert_eq!(kept[0].roster.decode().unwrap().seq, 11);
+    assert_eq!(kept[0].base.as_ref().unwrap().decode().unwrap().seq, 8);
+}
+
 #[tokio::test]
 async fn a_relay_starts_and_reloads_with_a_steward_signed_roster() {
     let (_o, owner, _s, steward, id) = steward_renewed_network();

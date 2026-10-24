@@ -191,6 +191,15 @@ impl PolicyStore {
             .map(|held| held.signed.clone())
     }
 
+    /// The held signed Policy with its base (steward signed Policies only), read under one lock.
+    pub fn get_with_base(&self, network_id: &NetworkId) -> Option<(Policy, Option<Policy>)> {
+        self.by_network
+            .read()
+            .unwrap()
+            .get(network_id)
+            .map(|held| (held.signed.clone(), held.base.clone()))
+    }
+
     /// The currently held `seq` for `network_id`, if any — what an L4
     /// handshake payload's `policy_seq` (protocol.md 5.1) reports for a
     /// network this node already holds a Policy for.

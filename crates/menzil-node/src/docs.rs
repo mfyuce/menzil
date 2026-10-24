@@ -80,6 +80,15 @@ pub struct HeldDocs {
     pub base_seq: Option<u64>,
 }
 
+/// The owner signed bases a node holds beside its steward signed documents.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HeldBases {
+    /// The base of the held Roster.
+    pub roster: Option<Roster>,
+    /// The base of the held Policy.
+    pub policy: Option<Policy>,
+}
+
 /// Where documents to give away come from.
 pub trait DocsSource {
     /// The held Roster with its base (steward signed Rosters only).
@@ -97,6 +106,11 @@ pub trait DocsSink {
     fn adopt(&self, bundle: &Bundle, now: u64) -> Result<Adopted, NodeError>;
     /// What is held now.
     fn held(&self) -> HeldDocs;
+    /// The bases held now. A fetch answer leaves out a base the opener announced (plan_fetch),
+    /// so the opener puts its own back before judging. The default holds none.
+    fn held_bases(&self) -> HeldBases {
+        HeldBases::default()
+    }
 }
 
 impl<T: DocsSource + ?Sized> DocsSource for &T {
@@ -114,6 +128,9 @@ impl<T: DocsSink + ?Sized> DocsSink for &T {
     }
     fn held(&self) -> HeldDocs {
         (**self).held()
+    }
+    fn held_bases(&self) -> HeldBases {
+        (**self).held_bases()
     }
 }
 
@@ -198,15 +215,23 @@ impl DocsSource for StoreDocs<'_> {
     }
 
     fn policy(&self) -> Option<(Policy, Option<Policy>)> {
-        // Two reads; an adoption between them is caught by the receiver's pair check.
-        let policy = self.policies.get(&self.network_id)?;
-        Some((policy, self.policies.base(&self.network_id)))
+        self.policies.get_with_base(&self.network_id)
     }
 }
 
 impl DocsSink for StoreDocs<'_> {
     fn adopt(&self, bundle: &Bundle, now: u64) -> Result<Adopted, NodeError> {
+        if !bundle_is_of(bundle, &self.network_id) {
+            return Err(NodeError::DocumentRejected(Reason::WrongNetwork));
+        }
         DocStore::new(self.rosters, self.policies).adopt(bundle, now)
+    }
+
+    fn held_bases(&self) -> HeldBases {
+        HeldBases {
+            roster: self.rosters.base(&self.network_id),
+            policy: self.policies.base(&self.network_id),
+        }
     }
 
     fn held(&self) -> HeldDocs {
@@ -219,6 +244,45 @@ impl DocsSink for StoreDocs<'_> {
             policy_seq: self.policies.seq(&self.network_id),
             base_seq,
         }
+    }
+}
+
+/// Whether every document of `bundle` belongs to `network_id`. A document that does not decode
+/// does not.
+fn bundle_is_of(bundle: &Bundle, network_id: &NetworkId) -> bool {
+    let roster_ok = |doc: &Option<Roster>| {
+        doc.as_ref()
+            .is_none_or(|d| d.decode().is_ok_and(|b| b.network_id == *network_id))
+    };
+    let policy_ok = |doc: &Option<Policy>| {
+        doc.as_ref()
+            .is_none_or(|d| d.decode().is_ok_and(|b| b.network_id == *network_id))
+    };
+    roster_ok(&bundle.roster)
+        && roster_ok(&bundle.base_roster)
+        && policy_ok(&bundle.policy)
+        && policy_ok(&bundle.base_policy)
+}
+
+/// Puts back the bases a fetch answer left out because the opener announced them: a missing
+/// base is filled from the one held when its `seq` is the `announced` one.
+fn fill_bases(bundle: &mut Bundle, announced: Option<u64>, bases: HeldBases) {
+    let Some(announced) = announced else {
+        return;
+    };
+    if bundle.roster.is_some()
+        && bundle.base_roster.is_none()
+        && let Some(base) = bases.roster
+        && roster_seq_of(&base) == Some(announced)
+    {
+        bundle.base_roster = Some(base);
+    }
+    if bundle.policy.is_some()
+        && bundle.base_policy.is_none()
+        && let Some(base) = bases.policy
+        && policy_seq_of(&base) == Some(announced)
+    {
+        bundle.base_policy = Some(base);
     }
 }
 
@@ -651,10 +715,11 @@ where
         )
         .await?;
         let mut counter = MessageCounter::new();
-        let collected = collect(stream, &mut counter, &params.network_id).await?;
+        let mut collected = collect(stream, &mut counter, &params.network_id).await?;
         if let Some(reason) = collected.defect {
             return Err(DocsStreamError::Rejected(reason));
         }
+        fill_bases(&mut collected.bundle, held.base_seq, sink.held_bases());
         let mut report = FetchReport {
             adopted: Adopted::default(),
             peer_roster_seq: collected.end_roster_seq,

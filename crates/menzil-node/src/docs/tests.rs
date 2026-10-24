@@ -587,6 +587,112 @@ async fn a_fetch_over_a_stream_brings_the_steward_pair_and_its_bases() {
     assert_eq!(client.policies.seq(&net.network_id), Some(11));
 }
 
+/// Protocol.md 5.5: the answer leaves out a base the opener announced, so the opener has to put
+/// its own back before the predicate judges a steward renewal made from that same base.
+#[tokio::test]
+async fn a_steward_renewal_on_the_base_the_opener_holds_is_adopted_without_a_base_on_the_wire() {
+    let net = Net::new();
+    let server = Stores::with_steward_pair(&net, 12);
+    let client = Stores::with_steward_pair(&net, 11);
+    assert_eq!(client.docs(&net).held().base_seq, Some(10));
+    // The server sends no base: the opener holds the one it would send.
+    let planned = plan_fetch(&server.docs(&net), Some(11), Some(11), Some(10), NOW);
+    assert_eq!(kinds(&planned), ["roster", "policy", "end"]);
+    let (mut a, mut b) = pair();
+    let p = params(&net);
+    let (fetched, served) = tokio::join!(
+        fetch(&mut a, client.docs(&net), &p),
+        serve(
+            &mut b,
+            server.docs(&net),
+            server.docs(&net),
+            &p,
+            ServeMode::Full
+        ),
+    );
+    assert_eq!(served.unwrap(), Served::Fetch);
+    assert_eq!(
+        fetched.unwrap().adopted,
+        Adopted {
+            roster: true,
+            policy: true
+        }
+    );
+    assert_eq!(client.rosters.seq(&net.network_id), Some(12));
+    assert_eq!(client.policies.seq(&net.network_id), Some(12));
+    // The base was kept with the new documents.
+    let (_, base) = client.docs(&net).roster().unwrap();
+    assert_eq!(roster_seq_of(&base.unwrap()), Some(10));
+    let (_, base) = client.docs(&net).policy().unwrap();
+    assert_eq!(policy_seq_of(&base.unwrap()), Some(10));
+}
+
+/// A sink that holds a base of another `seq` than it announced gets nothing filled in.
+#[test]
+fn a_base_is_filled_in_only_when_its_seq_is_the_announced_one() {
+    let net = Net::new();
+    let mut bundle = net.renewal(&net.steward, 12);
+    bundle.base_roster = None;
+    bundle.base_policy = None;
+    let bases = HeldBases {
+        roster: Some(net.base_roster.clone()),
+        policy: Some(net.base_policy.clone()),
+    };
+    let mut other = bundle.clone();
+    fill_bases(&mut other, Some(9), bases.clone());
+    assert!(other.base_roster.is_none() && other.base_policy.is_none());
+    fill_bases(&mut other, None, bases.clone());
+    assert!(other.base_roster.is_none() && other.base_policy.is_none());
+    fill_bases(&mut bundle, Some(10), bases);
+    assert!(bundle.base_roster.is_some() && bundle.base_policy.is_some());
+}
+
+/// `StoreDocs` is for one network: a bundle of another is refused, not adopted into the store.
+#[test]
+fn store_docs_refuses_a_bundle_of_another_network() {
+    let net = Net::new();
+    let other = Net::new();
+    let stores = Stores::empty();
+    let error = stores
+        .docs(&net)
+        .adopt(&other.base_bundle(), NOW)
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        NodeError::DocumentRejected(Reason::WrongNetwork)
+    ));
+    assert_eq!(stores.rosters.seq(&other.network_id), None);
+    assert_eq!(stores.policies.seq(&other.network_id), None);
+    // Its own network's bundle goes in.
+    assert_eq!(
+        stores.docs(&net).adopt(&net.base_bundle(), NOW).unwrap(),
+        Adopted {
+            roster: true,
+            policy: true
+        }
+    );
+}
+
+/// The Policy and its base come from one read.
+#[test]
+fn the_policy_and_its_base_are_read_together() {
+    let net = Net::new();
+    let owned = Stores::with_base(&net);
+    let (policy, base) = owned.docs(&net).policy().unwrap();
+    assert_eq!(policy_seq_of(&policy), Some(10));
+    assert!(base.is_none());
+    let stewarded = Stores::with_steward_pair(&net, 11);
+    let (policy, base) = stewarded.policies.get_with_base(&net.network_id).unwrap();
+    assert_eq!(policy_seq_of(&policy), Some(11));
+    assert_eq!(policy_seq_of(&base.unwrap()), Some(10));
+    assert!(
+        Stores::empty()
+            .policies
+            .get_with_base(&net.network_id)
+            .is_none()
+    );
+}
+
 #[tokio::test]
 async fn a_fetch_of_documents_of_another_network_is_refused_and_nothing_is_stored() {
     let net = Net::new();

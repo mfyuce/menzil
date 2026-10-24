@@ -1062,3 +1062,29 @@ fn a_steward_cannot_append_a_min_serial_above_the_appended_certificate() {
     });
     assert_eq!(rejected(fx.check(&bundle)), Reason::BadCert);
 }
+
+/// `RosterOf::appended` slices the held members after the base's, so a held Roster whose members
+/// do not start with the base's (shorter, or other) must not be built at all.
+#[test]
+fn a_held_roster_whose_members_do_not_extend_its_base_is_refused() {
+    let fx = Fx::new();
+    let shorter = fx.steward_pair(|r, _| {
+        r.members.truncate(1);
+    });
+    assert!(matches!(
+        HeldRoster::new(shorter.roster.as_ref().unwrap(), Some(&fx.base_roster)),
+        Err(Reason::FieldChanged)
+    ));
+    let other = fx.steward_pair(|r, _| {
+        r.members[0].min_serial += 1;
+    });
+    assert!(matches!(
+        HeldRoster::new(other.roster.as_ref().unwrap(), Some(&fx.base_roster)),
+        Err(Reason::FieldChanged)
+    ));
+    // The same members, or more, are fine.
+    let longer = fx.steward_pair(|r, p| admit(&key(), "new", r, p));
+    assert!(HeldRoster::new(longer.roster.as_ref().unwrap(), Some(&fx.base_roster)).is_ok());
+    let same = fx.steward_pair(|_, _| {});
+    assert!(HeldRoster::new(same.roster.as_ref().unwrap(), Some(&fx.base_roster)).is_ok());
+}

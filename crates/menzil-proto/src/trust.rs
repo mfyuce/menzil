@@ -142,6 +142,8 @@ impl HeldRoster {
             });
         };
         let base = base.decode().map_err(|_| Reason::Malformed)?;
+        // `RosterOf::appended` slices the members after the base's: they must be a prefix.
+        appended_of(&body.members, &base.members)?;
         let entry = body.stewards.first().ok_or(Reason::NoSteward)?;
         let entry = entry.decode().map_err(|_| Reason::BadStewardEntry)?;
         let signer = Signer::Steward {
