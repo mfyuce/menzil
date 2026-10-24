@@ -513,24 +513,20 @@ impl ForwardTable {
         // `dst` disconnected between the `is_attached` check above and
         // this handoff (see this method's own doc comment) — undo what
         // was reserved so this pair's accounting does not leak credit or
-        // queue budget nothing will ever drain, and reimburse `src`'s own
-        // local tracking the same way every other refusal above does.
-        if reliable {
-            registry.deliver(
-                src,
-                ForwardItem::Credit {
-                    peer: *dst,
-                    bytes: charge,
-                },
-            );
-        }
-        let mut pairs = self.pairs.lock().unwrap();
-        if let Some(pair) = pairs.get_mut(&(*src, *dst)) {
-            pair.queued_bytes = pair.queued_bytes.saturating_sub(charge as usize);
-            if reliable {
-                pair.credit.grant(charge);
-            }
-        }
+        // queue budget nothing will ever drain. This is exactly what a
+        // drained item does, including its `generation` and `is_current`
+        // guards: the pair may have been reset (a reconnect of `src` or
+        // `dst`) since the reservation, and then the new pair's ledger and
+        // the new session of `src` must not be touched.
+        self.drained(
+            registry,
+            src,
+            dst,
+            charge,
+            reliable,
+            generation,
+            src_session_id,
+        );
         ForwardOutcome::Refused(ErrorBody {
             code: ErrorCode::PeerOffline,
             msg: "destination disconnected before delivery".to_string(),

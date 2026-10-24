@@ -12,7 +12,9 @@ It is built for networks that allow only HTTPS through a corporate proxy, with a
 
 ## Status
 
-Design phase, no code yet (2026-09-26). The literature review of about sixty tunnels, overlays and zero trust tools, the transport analysis and the plan are in [docs/literature-review.md](docs/literature-review.md). The raw research fact sheets with their sources are in [docs/research/](docs/research/). Protocol and threat model documents will appear under docs/spec/.
+Early implementation, not ready for use (2026-10-25). The protocol (WebSocket, Noise and yamux, one key identity), the relay, the node and a first slice of the command line are built and tested: `init`, `network create`, `admit`, `grant`, `renew`, `join`, `token`, `status`, `relay`, `node`, `stdio` (an SSH `ProxyCommand`) and `reach` (a local listener), all for a private network of your own machines. Steward signed documents, which keep a network alive without the owner key on every machine, are being added. Not built yet: `expose` (a public https URL), egress through a machine you own (SOCKS5, TUN), certificate rotation, `revoke`, starting the agent on demand, Windows named pipes and packaging.
+
+The protocol is in [docs/spec/protocol.md](docs/spec/protocol.md) and the threat model in [docs/spec/threat-model.md](docs/spec/threat-model.md); design decisions are under [docs/spec/decisions/](docs/spec/decisions/). The literature review of about sixty tunnels, overlays and zero trust tools and the transport analysis are in [docs/literature-review.md](docs/literature-review.md), with the raw research fact sheets and their sources in [docs/research/](docs/research/).
 
 ## License
 
