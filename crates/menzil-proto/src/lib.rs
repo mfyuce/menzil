@@ -17,6 +17,7 @@
 
 mod bytes;
 mod doc;
+pub mod docs;
 mod e2e;
 mod error;
 mod handshake;

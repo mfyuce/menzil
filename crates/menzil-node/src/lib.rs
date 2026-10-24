@@ -60,6 +60,7 @@
 #![forbid(unsafe_code)]
 
 mod admission;
+pub mod docs;
 mod docs_store;
 mod error;
 mod identity;
