@@ -187,9 +187,11 @@ pub struct PushResult {
 pub struct FetchReport {
     /// What the sink adopted.
     pub adopted: Adopted,
-    /// The seq of the other side's Roster, from its `end`.
+    /// The seq of the other side's Roster, from its `end`. The peer's own claim, checked
+    /// against nothing: a hint for deciding whether to fetch or push, never a reason to trust
+    /// or skip a document.
     pub peer_roster_seq: Option<u64>,
-    /// The seq of the other side's Policy, from its `end`.
+    /// The seq of the other side's Policy, from its `end`. The peer's own claim, as above.
     pub peer_policy_seq: Option<u64>,
 }
 
