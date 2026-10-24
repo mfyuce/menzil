@@ -16,6 +16,8 @@ Early implementation, not ready for use (2026-10-25). The protocol (WebSocket, N
 
 The protocol is in [docs/spec/protocol.md](docs/spec/protocol.md) and the threat model in [docs/spec/threat-model.md](docs/spec/threat-model.md); design decisions are under [docs/spec/decisions/](docs/spec/decisions/). The literature review of about sixty tunnels, overlays and zero trust tools and the transport analysis are in [docs/literature-review.md](docs/literature-review.md), with the raw research fact sheets and their sources in [docs/research/](docs/research/).
 
+Some code comments cite item ids such as "TODO.md L4g" or "DONE.md". Those working notes (task list, history, open decisions) are kept in a separate private repository; the comments say what the code does without them, and the ids only point at the reasoning behind a fix.
+
 ## License
 
 Apache-2.0 OR MIT, at your option. No contributor license agreement.
