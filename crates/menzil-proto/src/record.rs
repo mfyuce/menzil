@@ -182,6 +182,9 @@ pub enum DocType {
     Roster = 0,
     /// The document is a [`Policy`].
     Policy = 1,
+    /// The document is the owner signed [`Roster`] that a steward signed [`Roster`] was made
+    /// from, sent ahead of it (protocol.md 2.3, 4.2).
+    BaseRoster = 2,
 }
 
 impl TryFrom<u8> for DocType {
@@ -191,6 +194,7 @@ impl TryFrom<u8> for DocType {
         match value {
             0 => Ok(Self::Roster),
             1 => Ok(Self::Policy),
+            2 => Ok(Self::BaseRoster),
             other => Err(ProtoError::MalformedRecord(format!(
                 "unknown DOC doc_type {other}"
             ))),
@@ -638,6 +642,16 @@ mod tests {
     use crate::invite::{Invite, InviteBody};
     use crate::network::{PolicyBody, RosterBody};
     use ed25519_dalek::SigningKey;
+
+    #[test]
+    fn doc_types_keep_their_numbers_and_unknown_ones_are_refused() {
+        // Wire values: a peer built from another checkout must read these the same.
+        assert_eq!(DocType::Roster as u8, 0);
+        assert_eq!(DocType::Policy as u8, 1);
+        assert_eq!(DocType::BaseRoster as u8, 2);
+        assert_eq!(DocType::try_from(2).unwrap(), DocType::BaseRoster);
+        assert!(DocType::try_from(3).is_err());
+    }
 
     fn sample_node_cert() -> NodeCert {
         let key = SigningKey::generate(&mut rand::rng());

@@ -92,7 +92,9 @@ The Roster is what a relay needs and may see. The Policy is delivered end to end
 Steward = Signed("steward"){ v: 1, network_id, steward_pub: bytes32, may: ["admit", "renew"], not_after: u64 }
 ```
 
-A steward may sign Roster and Policy re issues and admissions on the owner's behalf; verifiers accept a Roster or Policy signed by the owner or by a steward listed in the previous accepted Roster. There is exactly one active steward; the owner rotates it by issuing a new Roster. Only one writer issues sequence numbers; two devices holding the owner key must not both issue.
+A steward may sign Roster and Policy re issues and admissions on the owner's behalf. `steward_pub` is an Ed25519 public key, the Steward object is signed by the owner, and a Roster lists at most one. A steward signed Roster or Policy is accepted only together with its base, the owner signed document of the same kind it was made from, and only if: the base verifies against the owner key and the base Roster lists the steward; the verifier's clock is before `not_after`; `seq` is greater than the base's and at most the base's plus 2^20, and not lower than the newest base the verifier holds; `expires` is not after `not_after`; and the document equals its base except for `seq`, `issued` and `expires` (requires `renew`), or except for new, unrevoked members appended at the end of `members` and, in the Policy, their certificates appended at the end of `certs` (requires `admit`). A Policy is accepted only with the Roster of the same `seq`, signed by the same key. Every verifier checks every Roster and Policy for `issued` at most one hour ahead of its clock and `expires` at most 14 days after `issued`. Whenever its last documents list a steward, the owner issues its next documents with a `seq` above the base's plus 2^20, so nothing a steward can sign outranks them. There is exactly one active steward; the owner rotates or removes it by issuing a new Roster.
+
+Only one writer issues sequence numbers; two devices holding the owner key must not both issue.
 
 ### 2.4 Services
 
@@ -163,7 +165,7 @@ u8 type | body
 | 0x02 | RECV | relay to node | `bytes32 src \| u8 e2e_proto \| u8 flags \| payload` |
 | 0x03 | ADVERTISE | node to relay | CBOR (4.4) |
 | 0x04 | ADVERTISE_ACK | relay to node | CBOR `{ accepted: [str], rejected: [{ name, reason }] }` |
-| 0x05 | DOC | both | `u8 doc_type \| bytes16 doc_id \| u16 index \| u16 count \| chunk`; chunked Roster (relay and node) or Policy (node only, never to a relay); whole document at most 1 MiB |
+| 0x05 | DOC | both | `u8 doc_type \| bytes16 doc_id \| u16 index \| u16 count \| chunk`; chunked Roster (relay and node, `doc_type` roster, or base_roster for the owner signed base of a steward signed Roster, section 2.3) or Policy (node only, never to a relay); whole document at most 1 MiB |
 | 0x06 | PEER_STATE | relay to node | CBOR `{ node_id, online: bool, direct: [Addr] }` (direct empty in phase 1) |
 | 0x07 | CREDIT | relay to node | CBOR `{ peer: node_id, bytes: u32 }` |
 | 0x08 | PING | both | `bytes8 nonce` |
@@ -181,7 +183,7 @@ Forwarding rule: the relay forwards a SEND as a RECV to `dst` only if `src` and 
 
 Flow control and queues: the relay keeps one bounded queue per (source session, destination session), default 4 MiB. It never stops reading one session because another destination is slow. Reliable SENDs consume credit granted by CREDIT records for that peer (initial credit `limits.credit`, default 1 MiB, replenished as bytes are written to the destination socket); a reliable SEND beyond credit is a protocol violation and closes the session. Droppable SENDs are not credited, pass through a token bucket per (source, destination) and are the first records dropped when a queue is full. Senders order their output: control records, then reliable SEND, then droppable SEND.
 
-Error codes are a registry in `menzil-proto`; version 1 defines at least `bad_cert`, `stale_serial`, `stale_timestamp`, `unknown_network`, `not_member`, `revoked`, `roster_expired`, `forbidden`, `peer_offline`, `unknown_e2e`, `credit_exceeded`, `too_large`, `rate_limited`, `label_taken`, `label_unclaimed`, `bad_invite`, `bad_tag`. An admission that cannot be delivered yet is not an error; ADMIT_RESULT `{ pending: true }` reports it.
+Error codes are a registry in `menzil-proto`; version 1 defines at least `bad_cert`, `stale_serial`, `stale_timestamp`, `unknown_network`, `not_member`, `revoked`, `roster_expired`, `forbidden`, `peer_offline`, `unknown_e2e`, `credit_exceeded`, `too_large`, `rate_limited`, `label_taken`, `label_unclaimed`, `bad_invite`, `bad_tag`, `bad_document` (25), `docs_only` (26). An admission that cannot be delivered yet is not an error; ADMIT_RESULT `{ pending: true }` reports it.
 
 ### 4.3 Documents
 
@@ -211,9 +213,10 @@ data  = u8 0x03 | u32 receiver_index | u64 counter | ciphertext
 
 In every frame, `sender_index` is the index the sender of that frame chose for itself and `receiver_index` the index its receiver chose. So `init` carries the initiator's own index; `resp` carries the responder's own index as `sender_index` and echoes the initiator's, from `init`, as `receiver_index`; and each side stamps the other's index as `receiver_index` on every `data` frame it sends. A node never lets two of its live sessions share an index.
 
-Handshake payloads: `CBOR{ v: 1, node_cert: NodeCert, roster_seq: u64, policy_seq: u64, e2e_protos: [u8] }`. There is no application data in message 1.
+Handshake payloads: `CBOR{ v: 1, node_cert: NodeCert, roster_seq: u64, policy_seq: u64, e2e_protos: [u8], docs_only: bool }`; `docs_only` is optional and set only by a responder. There is no application data in message 1.
 
-Checks. The initiator verifies the responder's `node_cert.node_id` equals the NodeId it dialed and `x25519_pub` equals the handshake static key. The responder verifies the initiator's `node_id` equals the RECV `src` and its static key matches, that both are unrevoked members of `network_id` in an unexpired Roster and Policy, and that the initiator's serial is not below `min_serial`. The responder then decides whether any grant exists for the initiator on this node; if none, it answers with a data record of kind CLOSE `no_grant` and the initiator learns nothing further. Handshakes are rate limited per peer (10 per minute) because each costs four Diffie Hellman operations and two signature checks.
+Checks. The initiator verifies the responder's `node_cert.node_id` equals the NodeId it dialed and `x25519_pub` equals the handshake static key. The responder verifies the initiator's `node_id` equals the RECV `src` and its static key matches, that both are unrevoked members of `network_id` in an unexpired Roster and Policy, and that the initiator's serial is not below `min_serial`. The responder checks that the RECV `src` is an unrevoked member in its Roster before any Diffie Hellman, and stays silent otherwise. A member with no grant on this node is admitted like any other; what it may open is decided per stream (section 5.3). If the initiator is an unrevoked member in the responder's Roster but cannot be admitted, because no certificate in the responder's Policy matches the handshake key, it is not in that Policy, or the responder's documents have expired, the responder completes the handshake with `docs_only: true` in its payload and accepts only a `menzil:docs` push on that session (section 5.5). Every other failed check is answered with silence.
+Handshakes are rate limited per peer (10 per minute) because each costs four Diffie Hellman operations and two signature checks.
 
 Simultaneous open: if both sides initiate to each other, the session initiated by the lower NodeId (byte wise) is kept. A responder keeps its current session with a peer until a data record on the new session decrypts. A session is pinned to the relay path its initiation used; if that relay session ends, the L4 session ends (phase 1 consequence, decision 0001).
 
@@ -255,7 +258,31 @@ A channel is opened by a yamux stream whose OPEN names a `udp:` service or `egre
 
 ### 5.5 Documents end to end
 
-Handshake payloads carry each side's `roster_seq` and `policy_seq`. The side with the older documents opens a stream `menzil:docs` and receives the newer signed Roster and Policy, verifies them and adopts them. This is how a revocation reaches peers even when a relay withholds it. A steward node pushes new documents to every online member through the same stream and expects an acknowledgment.
+Status: proposed in the L4j design (2026-10-19), pending TOBEDECIDED 18; not built.
+
+`menzil:docs` is served by every node and named in no grant: any unrevoked member of the session's network, by the responder's Roster, may open it, checked again on every OPEN. It is never configured as a local service.
+
+After OPEN_ACK both sides send messages framed as `u32 len | CBOR`, the length big endian and at most 1,049,600 bytes, the CBOR strict as in section 2.1:
+
+```
+fetch  = { t: "fetch", v: 1, roster_seq: u64 | null, policy_seq: u64 | null, base_seq: u64 | null }
+push   = { t: "push", v: 1 }
+doc    = { t: "doc", kind: "base_roster" | "base_policy" | "roster" | "policy", doc: bstr }
+end    = { t: "end", roster_seq: u64 | null, policy_seq: u64 | null }
+result = { t: "result", roster: u8, policy: u8, code: u16 | null, roster_seq: u64 | null, policy_seq: u64 | null }
+```
+
+`doc` carries the verbatim encoding of one signed document. A steward signed document is sent with its base (section 2.3), bases first. In `result`, 0 means adopted, 1 already held or older than what is held, 2 rejected with `code`, 3 not sent; the seqs are what the receiver holds afterwards.
+
+Fetch: the opener sends `fetch` with the seqs it holds. The other side sends each unexpired document it holds that is newer, its Policy only together with the Roster of the same `seq`, no base the opener already holds, and then `end`. Push: the opener sends `push`, its documents and `end`; the receiver answers `result`.
+
+The receiver checks in this order and stops at the first failure: the frame length, before reading the frame; at most six messages and 30 seconds per stream; strict decoding; the network of the session; `seq` against what it holds, so that an older or equal document costs no signature check; the time and `seq` rules of section 2.3; the signatures; the steward rules of section 2.3; the certificates of appended members. It adopts the Roster and the Policy of one stream together. A failure is answered with `bad_document` (25) or `roster_expired`; a frame or document over the limit resets the stream.
+
+The session initiator compares the responder's `roster_seq` and `policy_seq` with its own. If the responder holds a newer Roster or Policy, the initiator fetches; if an older one, it pushes; if each side is ahead in one, it pushes first and then fetches. This is how a revocation reaches peers even when a relay withholds it. A responder that answered `docs_only: true` (section 5.1) accepts one push and nothing else, sends no documents on that session, and ends it with CLOSE `docs_only` (26) once it has answered or after 30 seconds; when the push was adopted, the initiator starts a new handshake.
+
+A node that issues documents (a steward node, or the device where the owner or the steward ran a command) sends the Roster to its relay at once (section 4.3) and pushes both documents to every unrevoked member, at most eight at a time, retrying a member that does not answer after 1, 5 and 30 minutes and after 2 hours. A node that adopts a Roster newer than its Policy fetches the Policy from peers it has sessions with, then from up to three members of its Policy.
+
+A node accepts at most one `menzil:docs` stream per peer at a time, four in all, six per peer per minute, and at most eight docs only sessions, one per peer; past a limit it answers OPEN_ACK `rate_limited`.
 
 ## 6. Public shares (S1)
 
@@ -302,9 +329,13 @@ The relay checks the Invite signature against the network's owner or steward and
 
 ### 7.3 Renewal and revocation
 
-Roster and Policy are re issued by the steward before `expires`; a member within 24 hours of expiry that has not received new documents requests them over `menzil:docs` from the steward node or any member with newer documents. Revocation is a Roster and Policy update: relays end the revoked node's session and refuse its HELLO on receipt; peers close its L4 sessions on receipt and refuse new ones. A node whose key is compromised gets `min_serial` raised in the Roster so that its stale NodeCerts die even before revocation propagates.
+A steward node renews by itself: at start and every hour, when its documents expire within 7 days and the newest owner signed Roster it holds lists its key with `renew` and a `not_after` still ahead, it signs the same Roster and Policy with `seq` plus one, `issued` now and `expires` 14 days later or at `not_after`, whichever comes first, and sends them as section 5.5 says. From 14 days before `not_after` it warns every day; the owner then issues a new Steward. Without a steward the owner renews by hand at least every 14 days.
 
-A stolen owner key is unrecoverable for that network; the remedy is a new network. Owners keep the owner key offline and give the always online admission device a steward key with `may: ["admit", "renew"]` and a lifetime of at most 90 days.
+A member whose documents expire within 24 hours and that has seen nothing newer fetches over `menzil:docs` every 30 to 90 minutes, chosen at random each time, from up to three peers, those it has sessions with first. A member whose documents have expired can still be admitted docs only (section 5.1), so a steward that comes back after an absence revives the network by renewing and pushing; once `not_after` has also passed, only the owner can.
+
+Revocation is a Roster and Policy update issued by the owner: relays end the revoked node's session and refuse its HELLO on receipt; peers close its L4 sessions on receipt and refuse new ones, `menzil:docs` and docs only sessions included. A node whose key is compromised gets `min_serial` raised in the Roster so that its stale NodeCerts die even before revocation propagates. A steward cannot revoke, unrevoke, grant, claim labels or change stewards. To cut a steward off, the owner issues a Roster without it, which outranks everything the steward can sign (section 2.3), and revokes the members it admitted if needed.
+
+A stolen owner key is unrecoverable for that network; the remedy is a new network. Owners keep the owner key offline and give the always online admission device a steward key with `may: ["admit", "renew"]` and a lifetime of at most 90 days; the steward device generates that key, and the owner only ever sees its public half.
 
 ## 8. Egress (S3)
 

@@ -241,8 +241,11 @@ impl Engine {
             );
             return;
         }
-        if let Err(err) = self.roster_store.set(&roster) {
-            tracing::warn!(error = %err, "reassembled DOC did not verify as a Roster");
+        // Owner signed Rosters only: a steward signed Roster arrives with its Policy, as a
+        // pair, through `DocStore::adopt`, and the base the relay sends first
+        // (`DocType::BaseRoster`) is not kept here.
+        if let Err(err) = self.roster_store.adopt_owner(&roster, unix_now()) {
+            tracing::warn!(error = %err, "reassembled DOC was not adopted as a Roster");
         }
     }
 
@@ -616,6 +619,14 @@ fn verify_relay_identity(
         ));
     }
     Ok(())
+}
+
+/// The system clock in Unix seconds, for the time rules of protocol.md 2.3.
+fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }
 
 /// The TAI64 label offset (2^62), added to a Unix-epoch second count to
@@ -1208,8 +1219,8 @@ mod tests {
             v: PROTOCOL_VERSION,
             network_id,
             seq,
-            issued: 0,
-            expires: 1_000_000_000,
+            issued: unix_now() - 60,
+            expires: unix_now() + 7 * 86_400,
             members: vec![RosterMember {
                 node_id: NodeId::from([1u8; 32]),
                 min_serial: 1,

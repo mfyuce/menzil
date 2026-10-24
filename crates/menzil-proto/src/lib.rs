@@ -22,12 +22,14 @@ mod error;
 mod handshake;
 mod identity;
 mod invite;
+mod names;
 mod network;
 mod record;
 mod service;
 mod signed;
 mod stream;
 mod strict;
+pub mod trust;
 
 pub use bytes::{
     ByteArray, DocId, InviteId, NetworkId, NodeId, SecretHash, StewardKey, Tai64N, X25519PublicKey,
@@ -45,6 +47,7 @@ pub use identity::{NodeCert, NodeCertBody};
 pub use invite::{
     AdmitPendingBody, AdmitRequestBody, Invite, InviteBody, compute_admit_tag, hash_invite_secret,
 };
+pub use names::{NameError, check_name, check_role, is_invisible, is_unsafe, shown};
 pub use network::{
     AcceptEntry, EgressRule, Grant, HostPortPattern, Label, NodeOrWildcard, Policy, PolicyBody,
     PolicyMember, Principal, PrincipalTarget, RevokedMember, Roster, RosterBody, RosterMember,

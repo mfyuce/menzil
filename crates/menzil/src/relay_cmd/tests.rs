@@ -8,7 +8,17 @@ use super::*;
 use crate::local::{init, join, network_create};
 use crate::token::{encode_documents, encode_roster};
 
-const NOW: u64 = 1_800_000_000;
+/// A fixed moment near the real clock: what the stores adopt is judged against the real clock
+/// (protocol.md 2.3), so a fixture issued years away from it would be refused.
+fn clock() -> u64 {
+    static BASE: std::sync::LazyLock<u64> = std::sync::LazyLock::new(|| {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+    });
+    *BASE
+}
 const DAY: u64 = 24 * 60 * 60;
 
 fn home() -> (tempfile::TempDir, Home) {
@@ -20,8 +30,8 @@ fn home() -> (tempfile::TempDir, Home) {
 /// An owner's token for a network, and the owner's home.
 fn token_of_a_network() -> (tempfile::TempDir, Home, NetworkId, String) {
     let (dir, owner) = home();
-    init(&owner, NOW).unwrap();
-    let id = network_create(&owner, "laptop", NOW).unwrap();
+    init(&owner, clock()).unwrap();
+    let id = network_create(&owner, "laptop", clock()).unwrap();
     let token = crate::local::token(&owner, None).unwrap();
     (dir, owner, id, token)
 }
@@ -44,7 +54,7 @@ fn pem_files(dir: &Path) -> (PathBuf, PathBuf) {
 fn a_relay_keeps_the_roster_of_a_network_and_not_its_policy() {
     let (_o, owner, id, _docs_token) = token_of_a_network();
     let (_d, relay) = home();
-    let (network, seq) = add_network(&relay, &relay_token(&owner), NOW + 1).unwrap();
+    let (network, seq) = add_network(&relay, &relay_token(&owner), clock() + 1).unwrap();
     assert_eq!((network, seq), (id, 1));
 
     let rosters = load_rosters(&relay).unwrap();
@@ -70,14 +80,14 @@ fn add_network_runs_at_the_same_moment_leave_the_newest_roster() {
     let (_o, owner, id, _docs_token) = token_of_a_network();
     let mut tokens = vec![relay_token(&owner)];
     for step in 1..TOKENS as u64 {
-        crate::local::renew(&owner, None, NOW + step * DAY).unwrap();
+        crate::local::renew(&owner, None, clock() + step * DAY).unwrap();
         tokens.push(relay_token(&owner));
     }
     for round in 0..ROUNDS {
         let (_d, relay) = home();
         let barrier = std::sync::Arc::new(std::sync::Barrier::new(TOKENS));
         // Every Roster is still valid on the day all of them are added.
-        let now = NOW + TOKENS as u64 * DAY;
+        let now = clock() + TOKENS as u64 * DAY;
         let threads: Vec<_> = tokens
             .iter()
             .map(|token| {
@@ -106,14 +116,14 @@ fn an_older_or_equal_roster_does_not_replace_a_newer_one() {
     let (_o, owner, id, _docs_token) = token_of_a_network();
     let first = relay_token(&owner);
     let (_d, relay) = home();
-    add_network(&relay, &first, NOW).unwrap();
-    crate::local::renew(&owner, None, NOW + DAY).unwrap();
+    add_network(&relay, &first, clock()).unwrap();
+    crate::local::renew(&owner, None, clock() + DAY).unwrap();
     assert_eq!(
-        add_network(&relay, &relay_token(&owner), NOW + DAY).unwrap(),
+        add_network(&relay, &relay_token(&owner), clock() + DAY).unwrap(),
         (id, 2)
     );
     // The first token again: the relay keeps what is newer and says so.
-    assert_eq!(add_network(&relay, &first, NOW + DAY).unwrap(), (id, 2));
+    assert_eq!(add_network(&relay, &first, clock() + DAY).unwrap(), (id, 2));
     assert_eq!(load_rosters(&relay).unwrap()[0].decode().unwrap().seq, 2);
 }
 
@@ -125,24 +135,24 @@ fn add_network_refuses_forged_expired_and_wrong_tokens() {
     let message =
         |token: &str, at: u64| format!("{:#}", add_network(&relay, token, at).unwrap_err());
 
-    assert!(message(&token, NOW + 15 * DAY).contains("expired"));
+    assert!(message(&token, clock() + 15 * DAY).contains("expired"));
     assert!(
-        message("menzil1-join:AAAA", NOW).contains("other kind")
-            || message("menzil1-join:AAAA", NOW).contains("expected")
+        message("menzil1-join:AAAA", clock()).contains("other kind")
+            || message("menzil1-join:AAAA", clock()).contains("expected")
     );
-    assert!(message("garbage", NOW).contains("expected"));
+    assert!(message("garbage", clock()).contains("expected"));
 
     // Documents of the owner's network, signed by somebody else.
     let owner = OwnerKey::generate();
     let keys = NodeKeys::generate();
-    let cert = keys.issue_cert(1, NOW - 10, NOW + 1000).unwrap();
-    let docs = create_network(&owner, &cert, "x", NOW).unwrap();
+    let cert = keys.issue_cert(1, clock() - 10, clock() + 1000).unwrap();
+    let docs = create_network(&owner, &cert, "x", clock()).unwrap();
     let thief = ed25519_dalek::SigningKey::generate(&mut rand::rng());
     let forged = encode_roster(&Roster::sign(&thief, docs.roster_body()).unwrap());
-    assert!(message(&forged, NOW).contains("not signed by the network's owner"));
+    assert!(message(&forged, clock()).contains("not signed by the network's owner"));
 
     // The full membership token carries the Policy, and a relay is not given that.
-    let refused = message(&docs_token, NOW);
+    let refused = message(&docs_token, clock());
     assert!(
         refused.contains("Policy") && refused.contains("--for-relay"),
         "{refused}"
@@ -151,7 +161,7 @@ fn add_network_refuses_forged_expired_and_wrong_tokens() {
         &Roster::sign(&thief, docs.roster_body()).unwrap(),
         &Policy::sign(&thief, docs.policy_body()).unwrap(),
     );
-    assert!(message(&forged_docs, NOW).contains("--for-relay"));
+    assert!(message(&forged_docs, clock()).contains("--for-relay"));
     assert!(load_rosters(&relay).unwrap().is_empty());
 }
 
@@ -171,7 +181,7 @@ fn the_token_for_a_relay_holds_the_roster_and_none_of_the_policy() {
     let roster = crate::token::decode_roster(&relay_token).unwrap();
     assert_eq!(roster.decode().unwrap().members.len(), 1);
     assert!(crate::token::decode_documents(&relay_token).is_err());
-    assert!(crate::local::join(&home().1, &relay_token, NOW).is_err());
+    assert!(crate::local::join(&home().1, &relay_token, clock()).is_err());
     // And the name of the device, which only the Policy holds, is nowhere in the text's bytes.
     use base64::Engine as _;
     let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
@@ -184,7 +194,7 @@ fn the_token_for_a_relay_holds_the_roster_and_none_of_the_policy() {
 fn a_damaged_roster_file_is_an_error_and_strangers_are_ignored() {
     let (_o, owner, id, _docs_token) = token_of_a_network();
     let (_d, relay) = home();
-    add_network(&relay, &relay_token(&owner), NOW).unwrap();
+    add_network(&relay, &relay_token(&owner), clock()).unwrap();
     fs::write(relay_dir(&relay).join("notes.txt"), b"x").unwrap();
     fs::write(relay_dir(&relay).join("readme.roster"), b"x").unwrap();
     assert_eq!(load_rosters(&relay).unwrap().len(), 1);
@@ -197,7 +207,7 @@ fn a_damaged_roster_file_is_an_error_and_strangers_are_ignored() {
 #[test]
 fn the_connection_information_names_the_relay_and_parses_back() {
     let (_d, relay) = home();
-    init(&relay, NOW).unwrap();
+    init(&relay, clock()).unwrap();
     let identity = relay_identity(&relay).unwrap();
     let text = connection_info("relay.example.org", 443, DEFAULT_PATH, &identity).unwrap();
     let info = ConnectionInfo::parse(&text).unwrap();
@@ -231,7 +241,7 @@ fn tls_comes_from_pem_files_and_bad_files_are_named() {
 async fn a_relay_starts_with_its_networks_and_says_how_to_reach_it() {
     let (_o, owner, id, _docs_token) = token_of_a_network();
     let (dir, relay_home) = home();
-    init(&relay_home, NOW).unwrap();
+    init(&relay_home, clock()).unwrap();
     let (cert, key) = pem_files(dir.path());
     let options = RunOptions {
         listen: "127.0.0.1:0".parse().unwrap(),
@@ -246,7 +256,7 @@ async fn a_relay_starts_with_its_networks_and_says_how_to_reach_it() {
     let error = start(&relay_home, &options).await.err().unwrap();
     assert!(format!("{error:#}").contains("add-network"));
 
-    add_network(&relay_home, &relay_token(&owner), NOW).unwrap();
+    add_network(&relay_home, &relay_token(&owner), clock()).unwrap();
     let running = start(&relay_home, &options).await.unwrap();
     assert_eq!(running.networks, vec![id]);
     assert_ne!(running.addr.port(), 0);
@@ -272,8 +282,8 @@ fn a_member_device_is_not_a_relay_and_cannot_join_as_one() {
     // The relay machine never `join`s: it is not a member, and `join` says so.
     let (_o, _owner, _id, token) = token_of_a_network();
     let (_d, relay) = home();
-    init(&relay, NOW).unwrap();
-    let error = format!("{:#}", join(&relay, &token, NOW).unwrap_err());
+    init(&relay, clock()).unwrap();
+    let error = format!("{:#}", join(&relay, &token, clock()).unwrap_err());
     assert!(error.contains("not a member"), "{error}");
 }
 
@@ -287,9 +297,9 @@ async fn one_damaged_roster_file_does_not_stop_the_reload_of_the_others() {
     let (_oa, owner_a, id_a, _) = token_of_a_network();
     let (_ob, owner_b, id_b, _) = token_of_a_network();
     let (dir, relay_home) = home();
-    init(&relay_home, NOW).unwrap();
-    add_network(&relay_home, &relay_token(&owner_a), NOW).unwrap();
-    add_network(&relay_home, &relay_token(&owner_b), NOW).unwrap();
+    init(&relay_home, clock()).unwrap();
+    add_network(&relay_home, &relay_token(&owner_a), clock()).unwrap();
+    add_network(&relay_home, &relay_token(&owner_b), clock()).unwrap();
     let (cert, key) = pem_files(dir.path());
     let running = start(
         &relay_home,
@@ -309,8 +319,8 @@ async fn one_damaged_roster_file_does_not_stop_the_reload_of_the_others() {
 
     // Network A's file is damaged; network B gets a newer Roster.
     fs::write(roster_path(&relay_home, &id_a), b"junk").unwrap();
-    crate::local::renew(&owner_b, None, NOW + DAY).unwrap();
-    add_network(&relay_home, &relay_token(&owner_b), NOW + DAY).unwrap();
+    crate::local::renew(&owner_b, None, clock() + 60).unwrap();
+    add_network(&relay_home, &relay_token(&owner_b), clock() + 60).unwrap();
     let mut seq = 0;
     for _ in 0..100 {
         seq = running.roster_seq(&id_b).unwrap();
@@ -334,8 +344,8 @@ async fn one_damaged_roster_file_does_not_stop_the_reload_of_the_others() {
 async fn a_running_relay_picks_up_a_newer_roster_added_to_its_directory() {
     let (_o, owner, id, _docs_token) = token_of_a_network();
     let (dir, relay_home) = home();
-    init(&relay_home, NOW).unwrap();
-    add_network(&relay_home, &relay_token(&owner), NOW).unwrap();
+    init(&relay_home, clock()).unwrap();
+    add_network(&relay_home, &relay_token(&owner), clock()).unwrap();
     let (cert, key) = pem_files(dir.path());
     let running = start(
         &relay_home,
@@ -352,8 +362,8 @@ async fn a_running_relay_picks_up_a_newer_roster_added_to_its_directory() {
     .unwrap();
     assert_eq!(running.roster_seq(&id), Some(1));
 
-    crate::local::renew(&owner, None, NOW + DAY).unwrap();
-    add_network(&relay_home, &relay_token(&owner), NOW + DAY).unwrap();
+    crate::local::renew(&owner, None, clock() + 60).unwrap();
+    add_network(&relay_home, &relay_token(&owner), clock() + 60).unwrap();
     let mut seq = 0;
     for _ in 0..100 {
         seq = running.roster_seq(&id).unwrap();

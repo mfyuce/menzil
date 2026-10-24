@@ -1,6 +1,6 @@
 //! Errors from issuing identities and documents.
 
-use menzil_proto::{NodeId, ProtoError};
+use menzil_proto::{NameError, NodeId, ProtoError};
 use thiserror::Error;
 
 /// Why an identity or a document could not be made.
@@ -83,4 +83,14 @@ pub enum AdminError {
         /// The limit.
         max: usize,
     },
+}
+
+impl From<NameError> for AdminError {
+    fn from(error: NameError) -> Self {
+        match error {
+            NameError::BadName(name) => Self::BadName(name),
+            NameError::NameLooksLikeNodeId(name) => Self::NameLooksLikeNodeId(name),
+            NameError::BadRole(role) => Self::BadRole(role),
+        }
+    }
 }

@@ -121,6 +121,13 @@ pub enum ErrorCode {
     /// reset its streams at once instead of waiting for the dead peer timeout. A
     /// new session works as soon as the node is back.
     ShuttingDown,
+    /// `bad_document` (protocol.md 4.2): a Roster or Policy offered to a node or a relay did
+    /// not decode, did not verify, broke a steward rule (section 2.3) or did not pair with its
+    /// Roster. The local log keeps the detail; the peer is told this and nothing more.
+    BadDocument,
+    /// `docs_only` (protocol.md 5.1): the L4 CLOSE of a session that was admitted only to push
+    /// documents (`menzil:docs`), sent once the push is answered or its time has run out.
+    DocsOnly,
     /// A code this build does not recognize, preserved verbatim.
     Unknown(u16),
 }
@@ -150,6 +157,8 @@ impl ErrorCode {
     const UNKNOWN_SERVICE: u16 = 22;
     const TARGET_UNREACHABLE: u16 = 23;
     const SHUTTING_DOWN: u16 = 24;
+    const BAD_DOCUMENT: u16 = 25;
+    const DOCS_ONLY: u16 = 26;
 
     /// The symbolic name from protocol.md, e.g. `"bad_cert"`.
     pub fn name(self) -> &'static str {
@@ -178,6 +187,8 @@ impl ErrorCode {
             Self::UnknownService => "unknown_service",
             Self::TargetUnreachable => "target_unreachable",
             Self::ShuttingDown => "shutting_down",
+            Self::BadDocument => "bad_document",
+            Self::DocsOnly => "docs_only",
             Self::Unknown(_) => "unknown",
         }
     }
@@ -210,6 +221,8 @@ impl From<ErrorCode> for u16 {
             ErrorCode::UnknownService => ErrorCode::UNKNOWN_SERVICE,
             ErrorCode::TargetUnreachable => ErrorCode::TARGET_UNREACHABLE,
             ErrorCode::ShuttingDown => ErrorCode::SHUTTING_DOWN,
+            ErrorCode::BadDocument => ErrorCode::BAD_DOCUMENT,
+            ErrorCode::DocsOnly => ErrorCode::DOCS_ONLY,
             ErrorCode::Unknown(code) => code,
         }
     }
@@ -242,6 +255,8 @@ impl From<u16> for ErrorCode {
             Self::UNKNOWN_SERVICE => Self::UnknownService,
             Self::TARGET_UNREACHABLE => Self::TargetUnreachable,
             Self::SHUTTING_DOWN => Self::ShuttingDown,
+            Self::BAD_DOCUMENT => Self::BadDocument,
+            Self::DOCS_ONLY => Self::DocsOnly,
             other => Self::Unknown(other),
         }
     }
@@ -290,6 +305,8 @@ mod tests {
             ErrorCode::UnknownService,
             ErrorCode::TargetUnreachable,
             ErrorCode::ShuttingDown,
+            ErrorCode::BadDocument,
+            ErrorCode::DocsOnly,
         ];
         for code in codes {
             let wire: u16 = code.into();
@@ -311,6 +328,16 @@ mod tests {
         assert_eq!(u16::from(ErrorCode::ShuttingDown), 24);
         assert_eq!(ErrorCode::from(24), ErrorCode::ShuttingDown);
         assert_eq!(ErrorCode::ShuttingDown.name(), "shutting_down");
+    }
+
+    #[test]
+    fn the_document_codes_keep_their_numbers_and_names() {
+        assert_eq!(u16::from(ErrorCode::BadDocument), 25);
+        assert_eq!(ErrorCode::from(25), ErrorCode::BadDocument);
+        assert_eq!(ErrorCode::BadDocument.name(), "bad_document");
+        assert_eq!(u16::from(ErrorCode::DocsOnly), 26);
+        assert_eq!(ErrorCode::from(26), ErrorCode::DocsOnly);
+        assert_eq!(ErrorCode::DocsOnly.name(), "docs_only");
     }
 
     #[test]

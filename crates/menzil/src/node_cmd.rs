@@ -17,9 +17,10 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow, bail};
 use menzil_carrier::DialConfig;
 use menzil_node::{
-    EnsureError, LocalIdentity, Node, NodeConfig, NodeOpenError, OpenStreamError, PolicyStore,
-    RosterStore, SessionConfig,
+    DocStore, EnsureError, LocalIdentity, Node, NodeConfig, NodeOpenError, OpenStreamError,
+    PolicyStore, RosterStore, SessionConfig,
 };
+use menzil_proto::trust::Bundle;
 use menzil_proto::{NetworkId, NodeId, ServiceId, ServiceKind};
 use menzil_stream::Stream;
 use tokio::net::{UnixListener, UnixStream};
@@ -496,10 +497,29 @@ pub fn load_stores(home: &Home) -> Result<(Arc<PolicyStore>, Arc<RosterStore>, V
     }
     for network_id in &networks {
         let docs = load_documents(home, network_id)?;
-        rosters.set(docs.roster())?;
-        policies.set(docs.policy())?;
+        adopt_documents(&rosters, &policies, &docs)?;
     }
     Ok((policies, rosters, networks))
+}
+
+/// Adopts the owner signed pair read from disk, through the acceptance predicate of
+/// protocol.md 2.3 at the real clock: both are stored or neither is, and a pair that is
+/// expired, issued in the future or valid for more than 14 days is refused.
+fn adopt_documents(
+    rosters: &RosterStore,
+    policies: &PolicyStore,
+    docs: &menzil_admin::Documents,
+) -> Result<()> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    let bundle = Bundle {
+        roster: Some(docs.roster().clone()),
+        policy: Some(docs.policy().clone()),
+        ..Bundle::default()
+    };
+    DocStore::new(rosters, policies).adopt(&bundle, now)?;
+    Ok(())
 }
 
 /// Opens streams for the agent: resolves the name, then asks the node.
@@ -666,8 +686,7 @@ pub fn reload(
     let mut entries = Vec::new();
     for network_id in home.networks()? {
         let loaded = load_documents(home, &network_id).and_then(|docs| {
-            rosters.set(docs.roster())?;
-            policies.set(docs.policy())?;
+            adopt_documents(rosters, policies, &docs)?;
             Ok(docs)
         });
         match loaded {

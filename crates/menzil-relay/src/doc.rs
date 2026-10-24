@@ -16,6 +16,12 @@
 //! same "attached members of that network" set rule two names, not a
 //! new mechanism.
 //!
+//! A Roster a steward signed travels with its base, the owner signed Roster it was made from
+//! (protocol.md 2.3, 4.3): the base is sent first, as a DOC of [`DocType::BaseRoster`], and the
+//! Roster after it. The receiving side keeps the base pending, per session and bounded
+//! ([`PendingBases`]), until the Roster it belongs to arrives or the session ends; a Roster is
+//! judged with the base that came before it, never with a guess.
+//!
 //! Pure logic only, matching `crate::hello`'s split: no I/O, so this is
 //! unit-testable directly. `crate::session` is the I/O glue that calls
 //! this from the dispatch loop and actually sends the resulting records.
@@ -28,6 +34,47 @@ use menzil_proto::{
 
 use crate::registry::SessionRegistry;
 use crate::roster_store::RosterStore;
+
+/// The most bases a session may have pending at once, one per network.
+const MAX_PENDING_BASES: usize = 8;
+
+/// The base Rosters a session has sent and that wait for the Roster they belong to (at most one
+/// per network, [`MAX_PENDING_BASES`] in all). Owned by the session's dispatch loop, so a
+/// session that ends takes its pending bases with it: nothing carries over to the next
+/// connection of the same node.
+#[derive(Debug, Default)]
+pub(crate) struct PendingBases {
+    by_network: HashMap<NetworkId, Roster>,
+}
+
+impl PendingBases {
+    /// No base pending.
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    /// Keeps `base` for `network_id`, replacing a pending one of that network. Returns false,
+    /// keeping nothing, when [`MAX_PENDING_BASES`] other networks are already pending.
+    fn keep(&mut self, network_id: NetworkId, base: Roster) -> bool {
+        if !self.by_network.contains_key(&network_id) && self.by_network.len() >= MAX_PENDING_BASES
+        {
+            return false;
+        }
+        self.by_network.insert(network_id, base);
+        true
+    }
+
+    /// The pending base of `network_id`, removed: it serves the one Roster that follows it.
+    fn take(&mut self, network_id: &NetworkId) -> Option<Roster> {
+        self.by_network.remove(network_id)
+    }
+
+    /// How many bases are pending.
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.by_network.len()
+    }
+}
 
 /// What [`accept_roster_chunk`] learned from one inbound DOC chunk.
 #[derive(Debug, PartialEq, Eq)]
@@ -94,8 +141,10 @@ pub(crate) enum AcceptOutcome {
 /// registry `ErrorCode` applies.
 pub(crate) fn accept_roster_chunk(
     reassembler: &mut DocReassembler,
+    pending: &mut PendingBases,
     body: &DocBody,
     rosters: &RosterStore,
+    now: u64,
 ) -> AcceptOutcome {
     let (doc_type, bytes) = match reassembler.accept(body) {
         Ok(Some(done)) => done,
@@ -108,7 +157,7 @@ pub(crate) fn accept_roster_chunk(
             return AcceptOutcome::Nothing;
         }
     };
-    if doc_type != DocType::Roster {
+    if !matches!(doc_type, DocType::Roster | DocType::BaseRoster) {
         tracing::debug!(?doc_type, "ignoring a non-Roster DOC transfer at L3");
         return AcceptOutcome::IgnoredDocType(doc_type);
     }
@@ -134,27 +183,41 @@ pub(crate) fn accept_roster_chunk(
         );
         return AcceptOutcome::NetworkNotServed(decoded.network_id);
     }
-    match rosters.set(&roster) {
+    if doc_type == DocType::BaseRoster {
+        // Judged with the Roster it belongs to, which follows; not stored.
+        if !pending.keep(decoded.network_id, roster) {
+            tracing::warn!("too many pending base Rosters on this session, dropping one");
+        }
+        return AcceptOutcome::Nothing;
+    }
+    let base = pending.take(&decoded.network_id);
+    match rosters.adopt(&roster, base.as_ref(), now) {
         Ok(true) => AcceptOutcome::NewRoster(decoded.network_id),
         Ok(false) => AcceptOutcome::Nothing,
         Err(err) => {
-            tracing::warn!(error = %err, "reassembled DOC did not verify as a Roster");
+            tracing::warn!(error = %err, "reassembled DOC was not adopted as a Roster");
             AcceptOutcome::Invalid
         }
     }
 }
 
-/// Builds the DOC(roster) chunk records for `network_id`'s currently held
-/// roster, or `None` if this relay holds none.
+/// Builds the DOC chunk records for `network_id`'s currently held roster, or `None` if this
+/// relay holds none: the base first when a steward signed the Roster
+/// (`DocType::BaseRoster`), then the Roster itself.
 pub(crate) fn roster_doc_records(
     rosters: &RosterStore,
     network_id: &NetworkId,
 ) -> Option<Vec<Record>> {
     let roster = rosters.signed(network_id)?;
-    Some(menzil_proto::split_into_doc_records(
+    let mut records = match rosters.base(network_id) {
+        Some(base) => menzil_proto::split_into_doc_records(DocType::BaseRoster, &base.encode()),
+        None => Vec::new(),
+    };
+    records.extend(menzil_proto::split_into_doc_records(
         DocType::Roster,
         &roster.encode(),
-    ))
+    ));
+    Some(records)
 }
 
 /// Sends `records` to every attached member of `network_id` except
@@ -208,13 +271,17 @@ mod tests {
     use ed25519_dalek::SigningKey;
     use menzil_proto::{DocId, RosterBody, RosterMember};
 
+    use crate::tests_support::{DAY, StewardNet};
+
+    const NOW: u64 = 1_800_000_000;
+
     fn signed_roster(owner: &SigningKey, network_id: NetworkId, seq: u64) -> Roster {
         let body = RosterBody {
             v: menzil_proto::PROTOCOL_VERSION,
             network_id,
             seq,
-            issued: 0,
-            expires: 1_000_000_000,
+            issued: NOW - 60,
+            expires: NOW + 7 * DAY,
             members: vec![RosterMember {
                 node_id: NodeId::from([1u8; 32]),
                 min_serial: 1,
@@ -231,12 +298,21 @@ mod tests {
         records: &[Record],
         rosters: &RosterStore,
     ) -> AcceptOutcome {
+        feed_pending(reassembler, &mut PendingBases::new(), records, rosters)
+    }
+
+    fn feed_pending(
+        reassembler: &mut DocReassembler,
+        pending: &mut PendingBases,
+        records: &[Record],
+        rosters: &RosterStore,
+    ) -> AcceptOutcome {
         let mut last = AcceptOutcome::Nothing;
         for record in records {
             let Record::Doc(body) = record else {
                 unreachable!()
             };
-            last = accept_roster_chunk(reassembler, body, rosters);
+            last = accept_roster_chunk(reassembler, pending, body, rosters, NOW);
         }
         last
     }
@@ -334,7 +410,13 @@ mod tests {
         };
         let rosters = RosterStore::new();
         let mut reassembler = DocReassembler::new();
-        let outcome = accept_roster_chunk(&mut reassembler, &body, &rosters);
+        let outcome = accept_roster_chunk(
+            &mut reassembler,
+            &mut PendingBases::new(),
+            &body,
+            &rosters,
+            NOW,
+        );
         assert_eq!(outcome, AcceptOutcome::IgnoredDocType(DocType::Policy));
     }
 
@@ -380,7 +462,13 @@ mod tests {
                 count,
                 chunk: big_chunk.clone(),
             };
-            let outcome = accept_roster_chunk(&mut reassembler, &body, &rosters);
+            let outcome = accept_roster_chunk(
+                &mut reassembler,
+                &mut PendingBases::new(),
+                &body,
+                &rosters,
+                NOW,
+            );
             if outcome == AcceptOutcome::TooLarge {
                 return;
             }
@@ -489,5 +577,147 @@ mod tests {
 
         let targets = catch_up_targets(&rosters, &[network_id], &HashMap::new());
         assert_eq!(targets, vec![network_id]);
+    }
+
+    fn doc_records(doc_type: DocType, roster: &Roster) -> Vec<Record> {
+        menzil_proto::split_into_doc_records(doc_type, &roster.encode())
+    }
+
+    #[test]
+    fn a_base_then_a_steward_roster_over_doc_is_adopted_and_the_base_is_used_up() {
+        let net = StewardNet::new(10, NOW, NodeId::from([1u8; 32]));
+        let rosters = RosterStore::new();
+        rosters.set(&net.base).unwrap();
+        let mut reassembler = DocReassembler::new();
+        let mut pending = PendingBases::new();
+
+        let base = doc_records(DocType::BaseRoster, &net.base);
+        assert_eq!(
+            feed_pending(&mut reassembler, &mut pending, &base, &rosters),
+            AcceptOutcome::Nothing
+        );
+        assert_eq!(pending.len(), 1);
+        let renewal = net.renewal(&net.steward, 11);
+        let records = doc_records(DocType::Roster, &renewal);
+        assert_eq!(
+            feed_pending(&mut reassembler, &mut pending, &records, &rosters),
+            AcceptOutcome::NewRoster(net.network_id)
+        );
+        assert_eq!(pending.len(), 0);
+        assert_eq!(rosters.base(&net.network_id).unwrap(), net.base);
+
+        // The base was spent on that Roster: the next one needs its own.
+        let next = doc_records(DocType::Roster, &net.renewal(&net.steward, 12));
+        assert_eq!(
+            feed_pending(&mut reassembler, &mut pending, &next, &rosters),
+            AcceptOutcome::Invalid
+        );
+        assert_eq!(rosters.get(&net.network_id).unwrap().seq, 11);
+    }
+
+    #[test]
+    fn a_steward_roster_over_doc_without_a_base_is_invalid() {
+        let net = StewardNet::new(10, NOW, NodeId::from([1u8; 32]));
+        let rosters = RosterStore::new();
+        rosters.set(&net.base).unwrap();
+        let records = doc_records(DocType::Roster, &net.renewal(&net.steward, 11));
+        assert_eq!(
+            feed_all(&mut DocReassembler::new(), &records, &rosters),
+            AcceptOutcome::Invalid
+        );
+        assert_eq!(rosters.get(&net.network_id).unwrap().seq, 10);
+    }
+
+    #[test]
+    fn a_base_for_a_network_this_relay_does_not_serve_is_not_kept() {
+        let net = StewardNet::new(10, NOW, NodeId::from([1u8; 32]));
+        let rosters = RosterStore::new();
+        let mut pending = PendingBases::new();
+        let base = doc_records(DocType::BaseRoster, &net.base);
+        assert_eq!(
+            feed_pending(&mut DocReassembler::new(), &mut pending, &base, &rosters),
+            AcceptOutcome::NetworkNotServed(net.network_id)
+        );
+        assert_eq!(pending.len(), 0);
+    }
+
+    #[test]
+    fn pending_bases_are_bounded_per_session() {
+        let rosters = RosterStore::new();
+        let mut pending = PendingBases::new();
+        let mut reassembler = DocReassembler::new();
+        let mut nets = Vec::new();
+        for _ in 0..=MAX_PENDING_BASES {
+            let net = StewardNet::new(10, NOW, NodeId::from([1u8; 32]));
+            rosters.set(&net.base).unwrap();
+            let base = doc_records(DocType::BaseRoster, &net.base);
+            feed_pending(&mut reassembler, &mut pending, &base, &rosters);
+            nets.push(net);
+        }
+        assert_eq!(pending.len(), MAX_PENDING_BASES);
+        // The ninth network's base was dropped, so its steward Roster has none.
+        let last = nets.last().unwrap();
+        let records = doc_records(DocType::Roster, &last.renewal(&last.steward, 11));
+        assert_eq!(
+            feed_pending(&mut reassembler, &mut pending, &records, &rosters),
+            AcceptOutcome::Invalid
+        );
+    }
+
+    #[test]
+    fn the_records_of_a_held_steward_roster_carry_the_base_first() {
+        let net = StewardNet::new(10, NOW, NodeId::from([1u8; 32]));
+        let rosters = RosterStore::new();
+        rosters.set(&net.base).unwrap();
+        // An owner signed Roster is sent alone.
+        let alone = roster_doc_records(&rosters, &net.network_id).unwrap();
+        assert_eq!(doc_types_of(&alone), vec![DocType::Roster]);
+
+        let renewal = net.renewal(&net.steward, 11);
+        rosters.adopt(&renewal, Some(&net.base), NOW).unwrap();
+        let records = roster_doc_records(&rosters, &net.network_id).unwrap();
+        assert_eq!(
+            doc_types_of(&records),
+            vec![DocType::BaseRoster, DocType::Roster]
+        );
+        // And what a receiver reassembles in that order is adopted.
+        let receiving = RosterStore::new();
+        receiving.set(&net.base).unwrap();
+        let mut reassembler = DocReassembler::new();
+        let mut pending = PendingBases::new();
+        assert_eq!(
+            feed_pending(&mut reassembler, &mut pending, &records, &receiving),
+            AcceptOutcome::NewRoster(net.network_id)
+        );
+    }
+
+    /// The `doc_type` of each complete transfer in `records`, in order.
+    fn doc_types_of(records: &[Record]) -> Vec<DocType> {
+        let mut seen = Vec::new();
+        for record in records {
+            let Record::Doc(body) = record else {
+                unreachable!()
+            };
+            if body.index == 0 {
+                seen.push(body.doc_type);
+            }
+        }
+        seen
+    }
+
+    #[test]
+    fn a_base_alone_is_never_stored() {
+        let net = StewardNet::new(10, NOW, NodeId::from([1u8; 32]));
+        let older = net.rebase(5);
+        let rosters = RosterStore::new();
+        rosters.set(&older.base).unwrap();
+        // A newer owner signed Roster arrives as a base only, with nothing after it.
+        let base = doc_records(DocType::BaseRoster, &net.base);
+        assert_eq!(
+            feed_all(&mut DocReassembler::new(), &base, &rosters),
+            AcceptOutcome::Nothing
+        );
+        assert_eq!(rosters.get(&net.network_id).unwrap().seq, 5);
+        assert!(rosters.base(&net.network_id).is_none());
     }
 }

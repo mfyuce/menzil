@@ -222,6 +222,13 @@ impl Drop for RunningRelay {
     }
 }
 
+/// The system clock in Unix seconds, for the time rules of protocol.md 2.3.
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
 /// Binds, loads the Rosters and starts serving.
 pub async fn start(home: &Home, options: &RunOptions) -> Result<RunningRelay> {
     let identity = relay_identity(home)?;
@@ -241,7 +248,7 @@ pub async fn start(home: &Home, options: &RunOptions) -> Result<RunningRelay> {
     let relay = Relay::new(identity, LIMITS);
     let mut networks = Vec::new();
     for roster in &rosters {
-        relay.rosters().set(roster)?;
+        relay.rosters().adopt(roster, None, unix_now())?;
         networks.push(roster.decode()?.network_id);
     }
     let serving = relay.clone();
@@ -260,7 +267,7 @@ pub async fn start(home: &Home, options: &RunOptions) -> Result<RunningRelay> {
                             tracing::warn!(error = %format!("{failure:#}"), "a Roster file cannot be read");
                         }
                         for roster in &rosters {
-                            if let Err(error) = relay.rosters().set(roster) {
+                            if let Err(error) = relay.rosters().adopt(roster, None, unix_now()) {
                                 tracing::warn!(%error, "a Roster on disk was refused");
                             }
                         }

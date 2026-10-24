@@ -12,9 +12,10 @@
 //! not be forgotten and relearned every time.
 
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, RwLock, RwLockWriteGuard};
 
 use ed25519_dalek::VerifyingKey;
+use menzil_proto::trust::{Bundle, HeldRoster, HeldView, Signer, Verdict, check_bundle};
 use menzil_proto::{NetworkId, ProtoError, Roster, RosterBody};
 
 use crate::error::NodeError;
@@ -28,8 +29,49 @@ use crate::error::NodeError;
 /// rather than only at the rate-limited L4 handshake.
 #[derive(Default)]
 pub struct RosterStore {
-    by_network: RwLock<HashMap<NetworkId, (Roster, Arc<RosterBody>)>>,
+    by_network: RwLock<HashMap<NetworkId, Held>>,
 }
+
+/// One held Roster: the signed form, its decoded body, who signed it and, when a steward did,
+/// the owner signed base it was made from (a steward signed Roster is never held without it).
+pub(crate) struct Held {
+    signed: Roster,
+    body: Arc<RosterBody>,
+    base: Option<Roster>,
+    signer: Signer,
+    view: HeldRoster,
+}
+
+impl Held {
+    /// The entry for `roster`, signed by `signer`, from `base` when a steward signed it.
+    /// The caller has already verified both (see [`check_bundle`]).
+    pub(crate) fn new(
+        roster: &Roster,
+        base: Option<&Roster>,
+        signer: Signer,
+    ) -> Result<Self, NodeError> {
+        let view = HeldRoster::new(roster, base).map_err(NodeError::DocumentRejected)?;
+        Ok(Self {
+            signed: roster.clone(),
+            body: Arc::new(roster.decode()?),
+            base: base.cloned(),
+            signer,
+            view,
+        })
+    }
+
+    pub(crate) fn seq(&self) -> u64 {
+        self.body.seq
+    }
+
+    pub(crate) fn view(&self) -> &HeldRoster {
+        &self.view
+    }
+}
+
+/// The write guard of a [`RosterStore`], for [`crate::DocStore`], which takes it before the
+/// Policy store's so that a Roster and Policy pair is adopted atomically.
+pub(crate) type RosterMap = HashMap<NetworkId, Held>;
 
 impl RosterStore {
     /// An empty store, holding nothing yet.
@@ -46,6 +88,11 @@ impl RosterStore {
     /// Rejects a Roster whose encoded form exceeds
     /// [`menzil_proto::MAX_DOC_BYTES`] before ever storing it — see
     /// `menzil-relay`'s identical `RosterStore::set` for why.
+    ///
+    /// For documents the owner signed and for tests and fixtures only: it checks neither the
+    /// time rules of protocol.md 2.3 nor a pair. A steward signed Roster never passes it (the
+    /// network key did not sign it). Everything this build adopts at run time goes through
+    /// [`crate::DocStore::adopt`] or [`Self::adopt_owner`].
     pub fn set(&self, roster: &Roster) -> Result<bool, NodeError> {
         let body = roster.decode()?;
         let verifying_key = VerifyingKey::from_bytes(&<[u8; 32]>::from(body.network_id))
@@ -60,13 +107,71 @@ impl RosterStore {
         }
 
         let mut guard = self.by_network.write().unwrap();
-        if let Some((_, existing)) = guard.get(&body.network_id)
-            && body.seq <= existing.seq
+        if let Some(existing) = guard.get(&body.network_id)
+            && body.seq <= existing.seq()
         {
             return Ok(false);
         }
-        guard.insert(body.network_id, (roster.clone(), Arc::new(body)));
+        guard.insert(body.network_id, Held::new(roster, None, Signer::Owner)?);
         Ok(true)
+    }
+
+    /// Adopts `roster` if the network key signed it and it passes the acceptance predicate of
+    /// protocol.md 2.3 at `now` (Unix seconds): newer than the held one, `issued` at most an
+    /// hour ahead, `expires - issued` at most 14 days, not expired. Returns whether it was
+    /// stored. A Roster a steward signed is refused (`MissingBase`): it is only adopted as part
+    /// of a pair, by [`crate::DocStore::adopt`].
+    pub fn adopt_owner(&self, roster: &Roster, now: u64) -> Result<bool, NodeError> {
+        let network_id = roster.decode()?.network_id;
+        let bundle = Bundle {
+            roster: Some(roster.clone()),
+            ..Bundle::default()
+        };
+        let encoded_len = roster.encode().len();
+        if encoded_len > menzil_proto::MAX_DOC_BYTES {
+            return Err(NodeError::DocumentTooLarge {
+                len: encoded_len,
+                max: menzil_proto::MAX_DOC_BYTES,
+            });
+        }
+        let mut guard = self.by_network.write().unwrap();
+        let view = HeldView {
+            network_id,
+            roster: guard.get(&network_id).map(|held| held.view().clone()),
+            policy_seq: None,
+        };
+        match check_bundle(&view, &bundle, now) {
+            Verdict::Adopt(adoption) => {
+                guard.insert(network_id, Held::new(roster, None, adoption.signer)?);
+                Ok(true)
+            }
+            Verdict::Held => Ok(false),
+            Verdict::Reject(reason) => Err(NodeError::DocumentRejected(reason)),
+        }
+    }
+
+    /// The write guard, for [`crate::DocStore`].
+    pub(crate) fn write(&self) -> RwLockWriteGuard<'_, RosterMap> {
+        self.by_network.write().unwrap()
+    }
+
+    /// The owner signed base a held steward signed Roster was made from. `None` when the
+    /// held Roster is the owner's own, or nothing is held.
+    pub fn base(&self, network_id: &NetworkId) -> Option<Roster> {
+        self.by_network
+            .read()
+            .unwrap()
+            .get(network_id)
+            .and_then(|held| held.base.clone())
+    }
+
+    /// Who signed the held Roster for `network_id`, if any is held.
+    pub fn signer(&self, network_id: &NetworkId) -> Option<Signer> {
+        self.by_network
+            .read()
+            .unwrap()
+            .get(network_id)
+            .map(|held| held.signer)
     }
 
     /// The currently held signed Roster for `network_id`, if any — the
@@ -76,7 +181,7 @@ impl RosterStore {
             .read()
             .unwrap()
             .get(network_id)
-            .map(|(signed, _)| signed.clone())
+            .map(|held| held.signed.clone())
     }
 
     /// The currently held `seq` for `network_id`, if any — what HELLO's
@@ -87,7 +192,7 @@ impl RosterStore {
             .read()
             .unwrap()
             .get(network_id)
-            .map(|(_, body)| body.seq)
+            .map(Held::seq)
     }
 
     /// The currently held, decoded [`RosterBody`] for `network_id`, if
@@ -101,7 +206,7 @@ impl RosterStore {
             .read()
             .unwrap()
             .get(network_id)
-            .map(|(_, body)| body.clone())
+            .map(|held| held.body.clone())
     }
 }
 

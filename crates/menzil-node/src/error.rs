@@ -58,6 +58,12 @@ pub enum NodeError {
     #[error("link idle too long, presumed dead")]
     LinkDead,
 
+    /// The acceptance predicate of protocol.md 2.3 refused the documents offered (see
+    /// [`menzil_proto::trust::check_bundle`]). The reason is for the local log; a peer is told
+    /// [`menzil_proto::trust::Reason::code`].
+    #[error("documents refused: {0:?}")]
+    DocumentRejected(menzil_proto::trust::Reason),
+
     /// A signed document (a Roster) exceeded
     /// [`menzil_proto::MAX_DOC_BYTES`] once encoded. Refused before it is
     /// stored — see `menzil-relay`'s identical

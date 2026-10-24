@@ -29,7 +29,7 @@ use tokio_tungstenite::tungstenite::Message;
 use crate::identity::RelayIdentity;
 use crate::listener::Listener;
 use crate::relay::Relay;
-use crate::tests_support::{self_signed_cert, test_client};
+use crate::tests_support::{DAY, StewardNet, real_now, self_signed_cert, test_client};
 
 fn ik_params() -> snow::params::NoiseParams {
     "Noise_IK_25519_ChaChaPoly_BLAKE2s".parse().unwrap()
@@ -180,6 +180,22 @@ impl TestClient {
             Some(Ok(Message::Close(_))) | None => None,
             Some(Ok(other)) => panic!("expected a binary or close message, got {other:?}"),
             Some(Err(_)) => None,
+        }
+    }
+
+    /// Reads records until one complete DOC transfer reassembles, whatever its
+    /// `doc_type`.
+    async fn recv_doc_transfer(&mut self) -> (DocType, Vec<u8>) {
+        let mut reassembler = DocReassembler::new();
+        loop {
+            match self.recv().await {
+                Some(Record::Doc(body)) => {
+                    if let Some(done) = reassembler.accept(&body).unwrap() {
+                        return done;
+                    }
+                }
+                other => panic!("expected a DOC chunk, got {other:?}"),
+            }
         }
     }
 
@@ -501,6 +517,8 @@ async fn a_newer_roster_from_one_member_propagates_to_another_attached_member() 
     // client_a now pushes a newer Roster to the relay over DOC.
     let roster_v2 = RosterBody {
         seq: 2,
+        issued: real_now(),
+        expires: real_now() + 7 * DAY,
         ..roster_v1.clone()
     };
     let signed_v2 = Roster::sign(&owner, &roster_v2).unwrap();
@@ -516,6 +534,167 @@ async fn a_newer_roster_from_one_member_propagates_to_another_attached_member() 
     // client_a, the sender, is excluded from its own fan-out: the next
     // thing it sees is an ordinary PONG, not a stray DOC echoed back.
     ping_pong(&mut client_a, [9; 8]).await;
+}
+
+/// A relay serving `net` with its owner signed base, and one member identity listed in it.
+async fn steward_relay(
+    net_member: &TestIdentity,
+) -> (
+    Relay,
+    Listener,
+    CertificateDer<'static>,
+    X25519PublicKey,
+    StewardNet,
+) {
+    let (relay, listener, cert, relay_x25519) = bind_test_relay().await;
+    let net = StewardNet::new(10, real_now(), net_member.node_id);
+    relay.rosters().set(&net.base).unwrap();
+    (relay, listener, cert, relay_x25519, net)
+}
+
+fn doc_records_of(doc_type: DocType, roster: &Roster) -> Vec<Record> {
+    menzil_proto::split_into_doc_records(doc_type, &roster.encode())
+}
+
+#[tokio::test]
+async fn catch_up_sends_the_base_of_a_steward_roster_before_the_roster() {
+    let identity = generate_identity();
+    let (relay, listener, cert, relay_x25519, net) = steward_relay(&identity).await;
+    let renewal = net.renewal(&net.steward, 11);
+    assert!(
+        relay
+            .rosters()
+            .adopt(&renewal, Some(&net.base), real_now())
+            .unwrap()
+    );
+    let addr = listener.local_addr().unwrap();
+    let serve_relay = relay.clone();
+    tokio::spawn(async move { serve_relay.serve(&listener).await });
+
+    let (mut client, _) = TestClient::connect(
+        addr,
+        cert,
+        &identity,
+        relay_x25519,
+        vec![net.network_id],
+        HashMap::new(),
+        1,
+        10,
+    )
+    .await;
+    client.send(Record::Attach).await;
+
+    let (first_type, first) = client.recv_doc_transfer().await;
+    assert_eq!(first_type, DocType::BaseRoster);
+    assert_eq!(Roster::decode_strict(&first).unwrap(), net.base);
+    let (second_type, second) = client.recv_doc_transfer().await;
+    assert_eq!(second_type, DocType::Roster);
+    assert_eq!(Roster::decode_strict(&second).unwrap(), renewal);
+}
+
+#[tokio::test]
+async fn a_steward_roster_sent_with_its_base_is_adopted_and_fanned_out_base_first() {
+    let identity_a = generate_identity();
+    let identity_b = generate_identity();
+    // Both identities are members, so both can attach and claim the network.
+    let (relay, listener, cert, relay_x25519) = bind_test_relay().await;
+    let net = StewardNet::new(10, real_now(), identity_a.node_id).with_member(identity_b.node_id);
+    relay.rosters().set(&net.base).unwrap();
+    let addr = listener.local_addr().unwrap();
+    let serve_relay = relay.clone();
+    tokio::spawn(async move { serve_relay.serve(&listener).await });
+
+    let (mut client_a, _) = TestClient::connect(
+        addr,
+        cert.clone(),
+        &identity_a,
+        relay_x25519,
+        vec![net.network_id],
+        HashMap::new(),
+        1,
+        10,
+    )
+    .await;
+    client_a.send(Record::Attach).await;
+    assert_eq!(client_a.recv_roster_doc().await, net.base);
+    let (mut client_b, _) = TestClient::connect(
+        addr,
+        cert,
+        &identity_b,
+        relay_x25519,
+        vec![net.network_id],
+        HashMap::new(),
+        1,
+        10,
+    )
+    .await;
+    client_b.send(Record::Attach).await;
+    assert_eq!(client_b.recv_roster_doc().await, net.base);
+
+    let renewal = net.renewal(&net.steward, 11);
+    for record in doc_records_of(DocType::BaseRoster, &net.base) {
+        client_a.send(record).await;
+    }
+    for record in doc_records_of(DocType::Roster, &renewal) {
+        client_a.send(record).await;
+    }
+
+    let (first_type, first) = client_b.recv_doc_transfer().await;
+    assert_eq!(first_type, DocType::BaseRoster);
+    assert_eq!(Roster::decode_strict(&first).unwrap(), net.base);
+    let (second_type, second) = client_b.recv_doc_transfer().await;
+    assert_eq!(second_type, DocType::Roster);
+    assert_eq!(Roster::decode_strict(&second).unwrap(), renewal);
+    assert_eq!(relay.rosters().base(&net.network_id).unwrap(), net.base);
+}
+
+#[tokio::test]
+async fn a_pending_base_does_not_outlive_its_session() {
+    let identity = generate_identity();
+    let (relay, listener, cert, relay_x25519, net) = steward_relay(&identity).await;
+    let addr = listener.local_addr().unwrap();
+    let serve_relay = relay.clone();
+    tokio::spawn(async move { serve_relay.serve(&listener).await });
+
+    // The first session sends the base and goes away.
+    let (mut first, _) = TestClient::connect(
+        addr,
+        cert.clone(),
+        &identity,
+        relay_x25519,
+        vec![net.network_id],
+        HashMap::new(),
+        1,
+        10,
+    )
+    .await;
+    first.send(Record::Attach).await;
+    assert_eq!(first.recv_roster_doc().await, net.base);
+    for record in doc_records_of(DocType::BaseRoster, &net.base) {
+        first.send(record).await;
+    }
+    ping_pong(&mut first, [1; 8]).await;
+    drop(first);
+
+    // The second session sends the steward Roster alone: it has no base to stand on.
+    let (mut second, _) = TestClient::connect(
+        addr,
+        cert,
+        &identity,
+        relay_x25519,
+        vec![net.network_id],
+        HashMap::new(),
+        1,
+        11,
+    )
+    .await;
+    second.send(Record::Attach).await;
+    assert_eq!(second.recv_roster_doc().await, net.base);
+    for record in doc_records_of(DocType::Roster, &net.renewal(&net.steward, 11)) {
+        second.send(record).await;
+    }
+    ping_pong(&mut second, [2; 8]).await;
+    assert_eq!(relay.rosters().get(&net.network_id).unwrap().seq, 10);
 }
 
 #[tokio::test]

@@ -3,7 +3,17 @@ use menzil_admin::NodeKeys;
 use super::*;
 use crate::local::{admit, init, join, network_create, renew};
 
-const NOW: u64 = 1_800_000_000;
+/// A fixed moment near the real clock: what the stores adopt is judged against the real clock
+/// (protocol.md 2.3), so a fixture issued years away from it would be refused.
+fn clock() -> u64 {
+    static BASE: std::sync::LazyLock<u64> = std::sync::LazyLock::new(|| {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+    });
+    *BASE
+}
 
 fn entry(network: u8, name: &str, node: u8) -> Entry {
     Entry {
@@ -82,17 +92,17 @@ fn names_resolve_uniquely_or_not_at_all() {
 fn the_directory_follows_the_documents_on_disk() {
     let owner_dir = tempfile::tempdir().unwrap();
     let owner = Home::new(owner_dir.path());
-    init(&owner, NOW).unwrap();
-    let id = network_create(&owner, "laptop", NOW).unwrap();
+    init(&owner, clock()).unwrap();
+    let id = network_create(&owner, "laptop", clock()).unwrap();
     let member_dir = tempfile::tempdir().unwrap();
     let member = Home::new(member_dir.path());
-    let request = init(&member, NOW).unwrap().join_request;
+    let request = init(&member, clock()).unwrap().join_request;
 
     let directory = Directory::load(&owner).unwrap();
     assert_eq!(directory.resolve("laptop").unwrap().network_id, id);
     assert!(directory.resolve("phone").is_err());
 
-    let admitted = admit(&owner, None, &request, "phone", &[], NOW).unwrap();
+    let admitted = admit(&owner, None, &request, "phone", &[], clock()).unwrap();
     let directory = Directory::load(&owner).unwrap();
     assert_eq!(
         directory.resolve("phone").unwrap().node_id,
@@ -100,12 +110,12 @@ fn the_directory_follows_the_documents_on_disk() {
     );
 
     // A node's stores take what is on disk, and a reload picks up a newer pair.
-    join(&member, &admitted.token, NOW).unwrap();
+    join(&member, &admitted.token, clock()).unwrap();
     let (policies, rosters, networks) = load_stores(&member).unwrap();
     assert_eq!(networks, vec![id]);
     assert_eq!(policies.seq(&id), Some(2));
-    let renewed = renew(&owner, None, NOW + 86_400).unwrap();
-    join(&member, &renewed.token, NOW + 86_400).unwrap();
+    let renewed = renew(&owner, None, clock() + 60).unwrap();
+    join(&member, &renewed.token, clock() + 60).unwrap();
     let directory = RwLock::new(Directory::default());
     let mut last = HashMap::new();
     reload(&member, &policies, &rosters, &directory, &mut last).unwrap();
@@ -128,10 +138,10 @@ fn a_node_with_no_network_or_no_identity_refuses_to_start_with_a_reason() {
     let dir = tempfile::tempdir().unwrap();
     let home = Home::new(dir.path());
     assert!(format!("{:#}", load_stores(&home).err().unwrap()).contains("no network"));
-    init(&home, NOW).unwrap();
+    init(&home, clock()).unwrap();
     assert!(format!("{:#}", load_stores(&home).err().unwrap()).contains("menzil network create"));
     // Damaged documents stop it instead of leaving a network that rejects everybody.
-    let id = network_create(&home, "me", NOW).unwrap();
+    let id = network_create(&home, "me", clock()).unwrap();
     fs::write(home.documents_path(&id), b"junk").unwrap();
     assert!(format!("{:#}", load_stores(&home).err().unwrap()).contains("damaged"));
 }
@@ -457,20 +467,20 @@ fn only_one_node_runs_per_home() {
 fn one_unreadable_network_does_not_stop_the_reload_of_the_others() {
     let owner_dir = tempfile::tempdir().unwrap();
     let owner = Home::new(owner_dir.path());
-    init(&owner, NOW).unwrap();
-    let id = network_create(&owner, "laptop", NOW).unwrap();
+    init(&owner, clock()).unwrap();
+    let id = network_create(&owner, "laptop", clock()).unwrap();
     let member_dir = tempfile::tempdir().unwrap();
     let member = Home::new(member_dir.path());
-    let request = init(&member, NOW).unwrap().join_request;
-    let admitted = admit(&owner, None, &request, "phone", &[], NOW).unwrap();
-    join(&member, &admitted.token, NOW).unwrap();
+    let request = init(&member, clock()).unwrap().join_request;
+    let admitted = admit(&owner, None, &request, "phone", &[], clock()).unwrap();
+    join(&member, &admitted.token, clock()).unwrap();
     let (policies, rosters, _) = load_stores(&member).unwrap();
     // A network that sorts before the good one and whose documents are damaged.
     let broken = member.root().join("networks").join("00".repeat(32));
     fs::create_dir_all(&broken).unwrap();
     fs::write(broken.join("documents.bin"), b"junk").unwrap();
-    let renewed = renew(&owner, None, NOW + 86_400).unwrap();
-    join(&member, &renewed.token, NOW + 86_400).unwrap();
+    let renewed = renew(&owner, None, clock() + 60).unwrap();
+    join(&member, &renewed.token, clock() + 60).unwrap();
 
     let directory = RwLock::new(Directory::default());
     let mut last = HashMap::new();
@@ -493,15 +503,15 @@ fn a_network_that_becomes_unreadable_keeps_its_names() {
     // One device in two networks, each owned by a device that calls itself "laptop".
     let member_dir = tempfile::tempdir().unwrap();
     let member = Home::new(member_dir.path());
-    let request = init(&member, NOW).unwrap().join_request;
+    let request = init(&member, clock()).unwrap().join_request;
     let (mut ids, mut keep_alive) = (Vec::new(), Vec::new());
     for _ in 0..2 {
         let dir = tempfile::tempdir().unwrap();
         let owner = Home::new(dir.path());
-        init(&owner, NOW).unwrap();
-        ids.push(network_create(&owner, "laptop", NOW).unwrap());
-        let admitted = admit(&owner, None, &request, "phone", &[], NOW).unwrap();
-        join(&member, &admitted.token, NOW).unwrap();
+        init(&owner, clock()).unwrap();
+        ids.push(network_create(&owner, "laptop", clock()).unwrap());
+        let admitted = admit(&owner, None, &request, "phone", &[], clock()).unwrap();
+        join(&member, &admitted.token, clock()).unwrap();
         keep_alive.push(dir);
     }
     let (policies, rosters, _) = load_stores(&member).unwrap();
@@ -529,8 +539,8 @@ fn a_network_that_becomes_unreadable_keeps_its_names() {
 fn a_directory_without_documents_is_not_a_network() {
     let dir = tempfile::tempdir().unwrap();
     let home = Home::new(dir.path());
-    init(&home, NOW).unwrap();
-    let id = network_create(&home, "laptop", NOW).unwrap();
+    init(&home, clock()).unwrap();
+    let id = network_create(&home, "laptop", clock()).unwrap();
     fs::create_dir_all(home.root().join("networks").join("00".repeat(32))).unwrap();
     assert_eq!(home.networks().unwrap(), vec![id]);
     assert!(load_stores(&home).is_ok());
@@ -542,8 +552,8 @@ fn a_directory_without_documents_is_not_a_network() {
 async fn a_second_node_on_one_home_is_refused() {
     let dir = tempfile::tempdir().unwrap();
     let home = Home::new(dir.path().join("home"));
-    init(&home, NOW).unwrap();
-    network_create(&home, "laptop", NOW).unwrap();
+    init(&home, clock()).unwrap();
+    network_create(&home, "laptop", clock()).unwrap();
     let info = crate::relay_cmd::connection_info(
         "relay.example.org",
         443,

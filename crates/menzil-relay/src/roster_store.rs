@@ -14,6 +14,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::RwLock;
 
 use ed25519_dalek::VerifyingKey;
+use menzil_proto::trust::{Bundle, HeldRoster, HeldView, Reason, Verdict, check_bundle};
 use menzil_proto::{NetworkId, NodeId, Roster, RosterBody};
 
 use crate::error::RelayError;
@@ -26,7 +27,17 @@ use crate::error::RelayError;
 /// (protocol.md 2.1), never re-encoding them.
 #[derive(Default)]
 pub struct RosterStore {
-    by_network: RwLock<HashMap<NetworkId, (Roster, RosterBody)>>,
+    by_network: RwLock<HashMap<NetworkId, Held>>,
+}
+
+/// One held Roster. A Roster a steward signed is held together with the owner signed base it
+/// was made from, never without it: DOC propagation sends the base first (protocol.md 4.3),
+/// and the base is what the next steward Roster is compared with.
+struct Held {
+    signed: Roster,
+    body: RosterBody,
+    base: Option<Roster>,
+    view: HeldRoster,
 }
 
 impl RosterStore {
@@ -63,13 +74,102 @@ impl RosterStore {
         }
 
         let mut guard = self.by_network.write().unwrap();
-        if let Some((_, existing)) = guard.get(&body.network_id)
-            && body.seq <= existing.seq
+        if let Some(existing) = guard.get(&body.network_id)
+            && body.seq <= existing.body.seq
         {
             return Ok(false);
         }
-        guard.insert(body.network_id, (roster.clone(), body));
+        let view = HeldRoster::new(roster, None).map_err(RelayError::DocumentRejected)?;
+        guard.insert(
+            body.network_id,
+            Held {
+                signed: roster.clone(),
+                body,
+                base: None,
+                view,
+            },
+        );
         Ok(true)
+    }
+
+    /// Adopts `roster` if the acceptance predicate of protocol.md 2.3
+    /// ([`menzil_proto::trust::check_bundle`]) says so at `now` (Unix
+    /// seconds): newer than the held one, `issued` at most an hour ahead,
+    /// `expires - issued` at most 14 days, not expired, and either signed by
+    /// the network key or signed by the steward its `base` names. `base` is
+    /// the owner signed Roster a steward signed `roster` was made from
+    /// (ignored for an owner signed one). A steward signed Roster with no
+    /// base, or the wrong one, is refused, and nothing is stored. Returns
+    /// whether `roster` was stored, like [`Self::set`].
+    ///
+    /// The relay holds Rosters only, so the predicate sees no Policy. This
+    /// is what the DOC handler and the operator's reload call; [`Self::set`]
+    /// stays for the owner's own documents in tests.
+    pub fn adopt(
+        &self,
+        roster: &Roster,
+        base: Option<&Roster>,
+        now: u64,
+    ) -> Result<bool, RelayError> {
+        let network_id = roster.decode()?.network_id;
+        let encoded_len = [Some(roster), base]
+            .into_iter()
+            .flatten()
+            .map(|doc| doc.encode().len())
+            .max()
+            .unwrap_or(0);
+        if encoded_len > menzil_proto::MAX_DOC_BYTES {
+            return Err(RelayError::DocumentTooLarge {
+                len: encoded_len,
+                max: menzil_proto::MAX_DOC_BYTES,
+            });
+        }
+        let bundle = Bundle {
+            base_roster: base.cloned(),
+            roster: Some(roster.clone()),
+            ..Bundle::default()
+        };
+        let mut guard = self.by_network.write().unwrap();
+        let view = HeldView {
+            network_id,
+            roster: guard.get(&network_id).map(|held| held.view.clone()),
+            policy_seq: None,
+        };
+        let adoption = match check_bundle(&view, &bundle, now) {
+            Verdict::Adopt(adoption) => adoption,
+            Verdict::Held => return Ok(false),
+            Verdict::Reject(reason) => return Err(RelayError::DocumentRejected(reason)),
+        };
+        // A steward signed Roster is held only with its base.
+        let base = match (adoption.signer, base) {
+            (menzil_proto::trust::Signer::Owner, _) => None,
+            (menzil_proto::trust::Signer::Steward { .. }, Some(base)) => Some(base),
+            (menzil_proto::trust::Signer::Steward { .. }, None) => {
+                return Err(RelayError::DocumentRejected(Reason::MissingBase));
+            }
+        };
+        let view = HeldRoster::new(roster, base).map_err(RelayError::DocumentRejected)?;
+        guard.insert(
+            network_id,
+            Held {
+                signed: roster.clone(),
+                body: roster.decode()?,
+                base: base.cloned(),
+                view,
+            },
+        );
+        Ok(true)
+    }
+
+    /// The owner signed base the held Roster for `network_id` was made
+    /// from, when a steward signed it; sent before the Roster itself to
+    /// anyone it is passed on to (protocol.md 4.3).
+    pub fn base(&self, network_id: &NetworkId) -> Option<Roster> {
+        self.by_network
+            .read()
+            .unwrap()
+            .get(network_id)
+            .and_then(|held| held.base.clone())
     }
 
     /// The currently held Roster body for `network_id`, if any.
@@ -78,7 +178,7 @@ impl RosterStore {
             .read()
             .unwrap()
             .get(network_id)
-            .map(|(_, body)| body.clone())
+            .map(|held| held.body.clone())
     }
 
     /// The currently held *signed* Roster for `network_id`, if any — the
@@ -88,7 +188,7 @@ impl RosterStore {
             .read()
             .unwrap()
             .get(network_id)
-            .map(|(signed, _)| signed.clone())
+            .map(|held| held.signed.clone())
     }
 
     /// Every held network's current `seq`, for WELCOME's `rosters` field
@@ -98,7 +198,7 @@ impl RosterStore {
             .read()
             .unwrap()
             .iter()
-            .map(|(id, (_, body))| (*id, body.seq))
+            .map(|(id, held)| (*id, held.body.seq))
             .collect()
     }
 
@@ -123,8 +223,9 @@ impl RosterStore {
             .read()
             .unwrap()
             .values()
-            .filter_map(|(_, body)| {
-                body.members
+            .filter_map(|held| {
+                held.body
+                    .members
                     .iter()
                     .filter(|member| &member.node_id == node_id)
                     .map(|member| member.min_serial)
@@ -170,14 +271,15 @@ impl RosterStore {
         networks
             .iter()
             .filter_map(|id| guard.get(id))
-            .filter(|(_, body)| {
+            .map(|held| &held.body)
+            .filter(|body| {
                 !body
                     .revoked
                     .iter()
                     .any(|revoked| &revoked.node_id == node_id)
                     && body.members.iter().any(|member| &member.node_id == node_id)
             })
-            .flat_map(|(_, body)| body.labels.iter())
+            .flat_map(|body| body.labels.iter())
             .filter(|label| &label.node_id == node_id)
             .map(|label| label.name.to_ascii_lowercase())
             .collect()
@@ -238,11 +340,14 @@ impl RosterStore {
     ) -> bool {
         let guard = self.by_network.read().unwrap();
         src_claimed.iter().any(|network_id| {
-            guard.get(network_id).is_some_and(|(_, body)| {
-                body.expires > now
-                    && is_unrevoked_member(body, src)
-                    && is_unrevoked_member(body, dst)
-            })
+            guard
+                .get(network_id)
+                .map(|held| &held.body)
+                .is_some_and(|body| {
+                    body.expires > now
+                        && is_unrevoked_member(body, src)
+                        && is_unrevoked_member(body, dst)
+                })
         })
     }
 }
@@ -264,7 +369,30 @@ fn is_unrevoked_member(body: &RosterBody, node_id: &NodeId) -> bool {
 mod tests {
     use super::*;
     use ed25519_dalek::SigningKey;
+    use menzil_proto::trust::Reason;
     use menzil_proto::{Roster, RosterBody, RosterMember};
+
+    use crate::tests_support::StewardNet;
+
+    const NOW: u64 = 1_800_000_000;
+
+    fn node(n: u8) -> NodeId {
+        NodeId::from([n; 32])
+    }
+
+    fn refused(result: Result<bool, RelayError>) -> Reason {
+        match result {
+            Err(RelayError::DocumentRejected(reason)) => reason,
+            other => panic!("expected a rejection, got {other:?}"),
+        }
+    }
+
+    /// A relay holding the owner signed base at seq 10, as an operator seeds it.
+    fn seeded(net: &StewardNet) -> RosterStore {
+        let store = RosterStore::new();
+        store.adopt(&net.base, None, NOW).unwrap();
+        store
+    }
 
     fn signed_roster(owner: &SigningKey, network_id: NetworkId, seq: u64) -> Roster {
         let body = RosterBody {
@@ -757,5 +885,84 @@ mod tests {
         // Claiming only an unrelated third network finds nothing.
         let unclaimed = NetworkId::from([0x55; 32]);
         assert!(!store.grants_forwarding(&a, &[unclaimed], &b, 1_000));
+    }
+
+    #[test]
+    fn a_steward_roster_without_its_base_is_refused_and_not_stored() {
+        let net = StewardNet::new(10, NOW, node(1));
+        let store = seeded(&net);
+        let renewal = net.renewal(&net.steward, 11);
+        assert_eq!(
+            refused(store.adopt(&renewal, None, NOW)),
+            Reason::MissingBase
+        );
+        assert_eq!(store.get(&net.network_id).unwrap().seq, 10);
+    }
+
+    #[test]
+    fn a_steward_roster_with_its_base_is_adopted_and_held_with_the_base() {
+        let net = StewardNet::new(10, NOW, node(1));
+        let store = seeded(&net);
+        assert!(store.base(&net.network_id).is_none());
+        let renewal = net.renewal(&net.steward, 11);
+        assert!(store.adopt(&renewal, Some(&net.base), NOW).unwrap());
+        assert_eq!(store.signed(&net.network_id).unwrap(), renewal);
+        assert_eq!(store.base(&net.network_id).unwrap(), net.base);
+    }
+
+    #[test]
+    fn an_owner_signed_roster_needs_no_base_and_drops_the_held_one() {
+        let net = StewardNet::new(10, NOW, node(1));
+        let store = seeded(&net);
+        let renewal = net.renewal(&net.steward, 11);
+        store.adopt(&renewal, Some(&net.base), NOW).unwrap();
+        let owner_next = net.renewal(&net.owner, 11 + menzil_proto::trust::STEWARD_SEQ_SPAN);
+        assert!(store.adopt(&owner_next, None, NOW).unwrap());
+        assert!(store.base(&net.network_id).is_none());
+        assert_eq!(
+            store.get(&net.network_id).unwrap().seq,
+            11 + menzil_proto::trust::STEWARD_SEQ_SPAN
+        );
+    }
+
+    #[test]
+    fn a_steward_roster_from_a_base_older_than_the_held_base_is_refused() {
+        let net = StewardNet::new(10, NOW, node(1));
+        let store = seeded(&net);
+        store
+            .adopt(&net.renewal(&net.steward, 11), Some(&net.base), NOW)
+            .unwrap();
+        let older = net.rebase(5);
+        let renewal = older.renewal(&older.steward, 12);
+        assert_eq!(
+            refused(store.adopt(&renewal, Some(&older.base), NOW)),
+            Reason::BaseOlderThanHeld
+        );
+        assert_eq!(store.get(&net.network_id).unwrap().seq, 11);
+    }
+
+    #[test]
+    fn a_steward_roster_with_a_base_of_another_network_is_refused() {
+        let net = StewardNet::new(10, NOW, node(1));
+        let store = seeded(&net);
+        let stranger = StewardNet::new(10, NOW, node(1));
+        let renewal = net.renewal(&net.steward, 11);
+        assert_eq!(
+            refused(store.adopt(&renewal, Some(&stranger.base), NOW)),
+            Reason::WrongNetwork
+        );
+        assert_eq!(store.get(&net.network_id).unwrap().seq, 10);
+    }
+
+    #[test]
+    fn the_time_rules_apply_to_what_is_adopted() {
+        let net = StewardNet::new(10, NOW, node(1));
+        let store = seeded(&net);
+        // The renewal is valid at NOW but expired a month later.
+        let renewal = net.renewal(&net.owner, 11);
+        assert_eq!(
+            refused(store.adopt(&renewal, None, NOW + 40 * crate::tests_support::DAY)),
+            Reason::Expired
+        );
     }
 }

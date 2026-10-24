@@ -57,9 +57,10 @@
 //! TODO.md line rather than silently assumed covered by this one.
 
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, RwLock, RwLockWriteGuard};
 
 use ed25519_dalek::VerifyingKey;
+use menzil_proto::trust::Signer;
 use menzil_proto::{
     ErrorCode, NetworkId, NodeId, NodeOrWildcard, Policy, PolicyBody, PolicyMember, Principal,
     PrincipalTarget, ProtoError, RosterBody, ServiceId,
@@ -73,8 +74,43 @@ use crate::roster_store::RosterStore;
 /// [`crate::RosterStore`]'s identical choice — see its doc comment.
 #[derive(Default)]
 pub struct PolicyStore {
-    by_network: RwLock<HashMap<NetworkId, (Policy, Arc<PolicyBody>)>>,
+    by_network: RwLock<PolicyMap>,
 }
+
+/// One held Policy: the signed form, its decoded body, who signed it and, when a steward did,
+/// the owner signed base Policy it was made from (a steward signed Policy is never held
+/// without it).
+pub(crate) struct Held {
+    signed: Policy,
+    body: Arc<PolicyBody>,
+    base: Option<Policy>,
+    signer: Signer,
+}
+
+impl Held {
+    /// The entry for `policy`, signed by `signer`, from `base` when a steward signed it. The
+    /// caller has already verified both (see [`menzil_proto::trust::check_bundle`]).
+    pub(crate) fn new(
+        policy: &Policy,
+        base: Option<&Policy>,
+        signer: Signer,
+    ) -> Result<Self, NodeError> {
+        Ok(Self {
+            signed: policy.clone(),
+            body: Arc::new(policy.decode()?),
+            base: base.cloned(),
+            signer,
+        })
+    }
+
+    pub(crate) fn seq(&self) -> u64 {
+        self.body.seq
+    }
+}
+
+/// The map behind a [`PolicyStore`]; [`crate::DocStore`] takes its write guard second, after
+/// the Roster store's.
+pub(crate) type PolicyMap = HashMap<NetworkId, Held>;
 
 impl PolicyStore {
     /// An empty store, holding nothing yet.
@@ -92,6 +128,10 @@ impl PolicyStore {
     /// Rejects a Policy whose encoded form exceeds
     /// [`menzil_proto::MAX_DOC_BYTES`] before ever storing it, same as
     /// `RosterStore::set` and `menzil-relay`'s identical check.
+    ///
+    /// For documents the owner signed and for tests and fixtures only, like
+    /// [`RosterStore::set`]: no time rules, no pair. Everything this build adopts at run time
+    /// goes through [`crate::DocStore::adopt`].
     pub fn set(&self, policy: &Policy) -> Result<bool, NodeError> {
         let body = policy.decode()?;
         let verifying_key = VerifyingKey::from_bytes(&<[u8; 32]>::from(body.network_id))
@@ -106,13 +146,37 @@ impl PolicyStore {
         }
 
         let mut guard = self.by_network.write().unwrap();
-        if let Some((_, existing)) = guard.get(&body.network_id)
-            && body.seq <= existing.seq
+        if let Some(existing) = guard.get(&body.network_id)
+            && body.seq <= existing.seq()
         {
             return Ok(false);
         }
-        guard.insert(body.network_id, (policy.clone(), Arc::new(body)));
+        guard.insert(body.network_id, Held::new(policy, None, Signer::Owner)?);
         Ok(true)
+    }
+
+    /// The write guard, for [`crate::DocStore`].
+    pub(crate) fn write(&self) -> RwLockWriteGuard<'_, PolicyMap> {
+        self.by_network.write().unwrap()
+    }
+
+    /// The owner signed base a held steward signed Policy was made from. `None` when the
+    /// held Policy is the owner's own, or nothing is held.
+    pub fn base(&self, network_id: &NetworkId) -> Option<Policy> {
+        self.by_network
+            .read()
+            .unwrap()
+            .get(network_id)
+            .and_then(|held| held.base.clone())
+    }
+
+    /// Who signed the held Policy for `network_id`, if any is held.
+    pub fn signer(&self, network_id: &NetworkId) -> Option<Signer> {
+        self.by_network
+            .read()
+            .unwrap()
+            .get(network_id)
+            .map(|held| held.signer)
     }
 
     /// The currently held signed Policy for `network_id`, if any — the
@@ -124,7 +188,7 @@ impl PolicyStore {
             .read()
             .unwrap()
             .get(network_id)
-            .map(|(signed, _)| signed.clone())
+            .map(|held| held.signed.clone())
     }
 
     /// The currently held `seq` for `network_id`, if any — what an L4
@@ -135,7 +199,7 @@ impl PolicyStore {
             .read()
             .unwrap()
             .get(network_id)
-            .map(|(_, body)| body.seq)
+            .map(Held::seq)
     }
 
     /// The currently held, decoded [`PolicyBody`] for `network_id`, if
@@ -148,7 +212,7 @@ impl PolicyStore {
             .read()
             .unwrap()
             .get(network_id)
-            .map(|(_, body)| body.clone())
+            .map(|held| held.body.clone())
     }
 
     /// protocol.md 5.1's per-side membership and serial check: whether

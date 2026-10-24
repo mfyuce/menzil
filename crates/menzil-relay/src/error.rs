@@ -91,4 +91,10 @@ pub enum RelayError {
         /// The limit it exceeded.
         max: usize,
     },
+
+    /// The acceptance predicate of protocol.md 2.3 refused a Roster (see
+    /// [`menzil_proto::trust::check_bundle`]); the reason is for the local
+    /// log, the peer is told [`menzil_proto::trust::Reason::code`].
+    #[error("Roster refused: {0:?}")]
+    DocumentRejected(menzil_proto::trust::Reason),
 }

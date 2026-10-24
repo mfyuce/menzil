@@ -60,6 +60,7 @@
 #![forbid(unsafe_code)]
 
 mod admission;
+mod docs_store;
 mod error;
 mod identity;
 mod l4_router;
@@ -76,6 +77,7 @@ pub use admission::{
     HandshakeAdmission, InitiatorAdmission, PolicyAuthorizer, decide_initiator_admission,
     decide_responder_admission, resolve_dial_cert,
 };
+pub use docs_store::{Adopted, DocStore};
 pub use error::NodeError;
 pub use identity::LocalIdentity;
 pub use l4_router::{

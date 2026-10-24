@@ -48,7 +48,7 @@ use menzil_session::{
 };
 
 use crate::connection::InboundConnection;
-use crate::doc::{self, AcceptOutcome};
+use crate::doc::{self, AcceptOutcome, PendingBases};
 use crate::error::RelayError;
 use crate::forward::{ForwardItem, ForwardOutcome};
 use crate::hello::check_hello;
@@ -219,6 +219,7 @@ async fn dispatch(
     transport: &mut Transport,
     liveness: &mut Liveness,
     doc_reassembler: &mut DocReassembler,
+    pending_bases: &mut PendingBases,
     relay: &Relay,
     node_id: &NodeId,
     session_id: u32,
@@ -252,7 +253,13 @@ async fn dispatch(
         }
         Record::Attach => Dispatch::Attach,
         Record::Doc(body) => {
-            match doc::accept_roster_chunk(doc_reassembler, &body, &relay.rosters) {
+            match doc::accept_roster_chunk(
+                doc_reassembler,
+                pending_bases,
+                &body,
+                &relay.rosters,
+                unix_now(),
+            ) {
                 AcceptOutcome::NewRoster(network_id) => {
                     if let Some(records) = doc::roster_doc_records(&relay.rosters, &network_id) {
                         doc::fan_out(&relay.registry, &network_id, node_id, &records);
@@ -416,6 +423,8 @@ async fn run_attached_loop(
     let mut rekey = RekeySchedule::new(Instant::now());
     let mut tick = tokio::time::interval(TICK);
     let mut doc_reassembler = DocReassembler::new();
+    // Bases sent ahead of a steward signed Roster; they live and die with this session.
+    let mut pending_bases = PendingBases::new();
 
     // Phase 1: not yet routable, waiting for ATTACH as the node's first
     // transport record. Liveness and REKEY are already driven here too,
@@ -425,7 +434,7 @@ async fn run_attached_loop(
         tokio::select! {
             incoming = conn.recv() => {
                 let outcome = dispatch(
-                    &mut conn, &mut transport, &mut liveness, &mut doc_reassembler, relay,
+                    &mut conn, &mut transport, &mut liveness, &mut doc_reassembler, &mut pending_bases, relay,
                     &node_id, session_id, &claimed_networks, incoming,
                 ).await;
                 match outcome {
@@ -474,7 +483,7 @@ async fn run_attached_loop(
         tokio::select! {
             incoming = conn.recv() => {
                 let outcome = dispatch(
-                    &mut conn, &mut transport, &mut liveness, &mut doc_reassembler, relay,
+                    &mut conn, &mut transport, &mut liveness, &mut doc_reassembler, &mut pending_bases, relay,
                     &node_id, session_id, &claimed_networks, incoming,
                 ).await;
                 match outcome {
