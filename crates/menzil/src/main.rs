@@ -72,6 +72,31 @@ enum Command {
         #[arg(long, value_name = "ID")]
         network: Option<String>,
     },
+    /// Take grants back (owner only): the services named, or with none named every grant from
+    /// `from` to `to`.
+    Ungrant {
+        /// Whose grants: a member's name, or `role:<role>`.
+        from: String,
+        /// On whose services: a member's name, or `*`.
+        to: String,
+        /// The services to take out, such as `tcp:ssh`; none means every grant from `from` to `to`.
+        services: Vec<ServiceId>,
+        /// The network, when this device is in more than one.
+        #[arg(long, value_name = "ID")]
+        network: Option<String>,
+    },
+    /// Revoke a member for good (owner only): it is cut off, and a revoked device joins again
+    /// only under a new identity.
+    Revoke {
+        /// The member's name, the start of its node id (8 or more hex digits), or a whole node id.
+        member: String,
+        /// The network, when this device is in more than one.
+        #[arg(long, value_name = "ID")]
+        network: Option<String>,
+        /// Allow revoking this device's own node.
+        #[arg(long = "self")]
+        allow_self: bool,
+    },
     /// Re-issue a network's documents with a fresh lifetime (owner or steward; needed every 14
     /// days).
     Renew {
@@ -239,6 +264,14 @@ fn token_argument(value: String) -> Result<String> {
     token::read_token(std::io::stdin())
 }
 
+/// What `ungrant` and `revoke` end with: like `grant`, plus that a running node pushes.
+fn print_new_documents(token: &str) {
+    println!(
+        "a `menzil node` running on this device sends them to the members within 15 seconds; otherwise every member needs the new documents (`menzil join <token>`):"
+    );
+    println!("{token}");
+}
+
 fn now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -338,6 +371,51 @@ async fn run(cli: Cli) -> Result<()> {
             println!("granted: the network's documents are now #{}", issued.seq);
             println!("every member needs the new documents (`menzil join <token>`):");
             println!("{}", issued.token);
+        }
+        Command::Ungrant {
+            from,
+            to,
+            services,
+            network,
+        } => {
+            let issued =
+                local::ungrant(&home()?, network.as_deref(), &from, &to, &services, now())?;
+            println!(
+                "took the grants back: the network's documents are now #{}",
+                issued.seq
+            );
+            print_new_documents(&issued.token);
+        }
+        Command::Revoke {
+            member,
+            network,
+            allow_self,
+        } => {
+            let revoked = local::revoke(&home()?, network.as_deref(), &member, allow_self, now())?;
+            let node = revoked
+                .issued
+                .member
+                .map(|m| m.to_string())
+                .unwrap_or_default();
+            match &revoked.name {
+                Some(name) => println!(
+                    "revoked {name:?} ({node}): the network's documents are now #{}",
+                    revoked.issued.seq
+                ),
+                None => println!(
+                    "revoked {node}: the network's documents are now #{}",
+                    revoked.issued.seq
+                ),
+            }
+            if !revoked.was_member {
+                println!("(it was not a member of the documents this device held)");
+            }
+            if revoked.steward_listed {
+                println!(
+                    "a steward is listed, and revoking its device does not remove its key: if this node hosted the steward, run `menzil steward remove`"
+                );
+            }
+            print_new_documents(&revoked.issued.token);
         }
         Command::Renew { network } => {
             let issued = local::renew(&home()?, network.as_deref(), now())?;

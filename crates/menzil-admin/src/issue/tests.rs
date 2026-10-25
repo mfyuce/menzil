@@ -1511,3 +1511,532 @@ fn a_steward_renewal_from_the_base_is_refused_by_a_verifier_holding_its_admissio
         Verdict::Reject(Reason::AppendedDropped)
     ));
 }
+
+// ---------------------------------------------------------------------------------------------
+// Revocation and grant removal (protocol.md 7.3; L4k K1)
+// ---------------------------------------------------------------------------------------------
+
+use menzil_proto::{AcceptEntry, EgressRule, HostPortPattern, Label};
+
+fn role_grant(network_id: NetworkId, role: &str, to: NodeOrWildcard, services: &[&str]) -> Grant {
+    Grant {
+        from: Principal {
+            network_id,
+            target: PrincipalTarget::Role(role.to_string()),
+        },
+        to_node: to,
+        services: services.iter().map(|s| service(s)).collect(),
+        expires: None,
+    }
+}
+
+/// laptop (the founder), phone and tablet, with every kind of entry that names the phone and
+/// a few that must survive its revocation.
+struct Busy {
+    owner: OwnerKey,
+    laptop: NodeId,
+    phone: NodeId,
+    phone_cert: NodeCert,
+    tablet: NodeId,
+    docs: Documents,
+}
+
+fn busy() -> Busy {
+    let (owner, laptop_keys, _, docs) = founded();
+    let (phone_keys, phone_cert) = node();
+    let (tablet_keys, tablet_cert) = node();
+    let (laptop, phone, tablet) = (
+        laptop_keys.node_id(),
+        phone_keys.node_id(),
+        tablet_keys.node_id(),
+    );
+    let docs = admit(&owner, &docs, &phone_cert, "phone", &["family".into()], NOW).unwrap();
+    let docs = admit(&owner, &docs, &tablet_cert, "tablet", &[], NOW).unwrap();
+    let network_id = docs.network_id();
+    let mut roster = docs.roster_body().clone();
+    let mut policy = docs.policy_body().clone();
+    roster.labels = vec![
+        Label {
+            name: "mine".into(),
+            node_id: phone,
+        },
+        Label {
+            name: "home".into(),
+            node_id: laptop,
+        },
+    ];
+    policy.grants = vec![
+        node_grant(network_id, phone, laptop, &["tcp:ssh"]),
+        node_grant(network_id, laptop, phone, &["http:app"]),
+        Grant {
+            to_node: NodeOrWildcard::Any,
+            ..node_grant(network_id, phone, laptop, &["tcp:web"])
+        },
+        role_grant(
+            network_id,
+            "family",
+            NodeOrWildcard::Node(laptop),
+            &["tcp:ssh"],
+        ),
+        Grant {
+            to_node: NodeOrWildcard::Any,
+            ..node_grant(network_id, laptop, laptop, &["tcp:ssh"])
+        },
+        node_grant(network_id, tablet, laptop, &["tcp:ssh"]),
+    ];
+    policy.egress = [phone, laptop]
+        .map(|node_id| EgressRule {
+            node_id,
+            allow: vec![HostPortPattern("example.org:443".into())],
+            deny: vec![],
+        })
+        .to_vec();
+    policy.accept = [phone, tablet]
+        .map(|node_id| AcceptEntry {
+            node_id,
+            peers: true,
+        })
+        .to_vec();
+    let docs = Documents::signed(&owner, roster, policy).unwrap();
+    Busy {
+        owner,
+        laptop,
+        phone,
+        phone_cert,
+        tablet,
+        docs,
+    }
+}
+
+#[test]
+fn revoking_lists_the_node_and_removes_every_trace_of_it_and_nothing_else() {
+    let b = busy();
+    let next = revoke(&b.owner, &b.docs, b.phone, NOW + 60).unwrap();
+    let (rb, pb) = (next.roster_body(), next.policy_body());
+
+    assert_eq!(next.seq(), b.docs.seq() + 1);
+    assert_eq!((rb.issued, rb.expires), (NOW + 60, NOW + 60 + 14 * DAY));
+    assert_eq!(rb.revoked.len(), 1);
+    assert_eq!(
+        (rb.revoked[0].node_id, rb.revoked[0].since),
+        (b.phone, NOW + 60)
+    );
+    // The Roster: no member entry, no label of it; the others are as they were.
+    let ids = |list: &[RosterMember]| list.iter().map(|m| m.node_id).collect::<Vec<_>>();
+    assert_eq!(ids(&rb.members), vec![b.laptop, b.tablet]);
+    assert_eq!(rb.labels.len(), 1);
+    assert_eq!(rb.labels[0].node_id, b.laptop);
+    // The Policy: no member, certificate, egress or accept entry of it, and only the grants
+    // that name it as `from` or `to_node` are gone: the role grant, the grants of others and
+    // the wildcard grant of the laptop stay.
+    assert_eq!(
+        pb.members.iter().map(|m| m.node_id).collect::<Vec<_>>(),
+        vec![b.laptop, b.tablet]
+    );
+    assert_eq!(pb.certs.len(), 2);
+    assert!(
+        pb.certs
+            .iter()
+            .all(|cert| cert.decode().unwrap().node_id != b.phone)
+    );
+    assert_eq!(pb.grants, {
+        let network_id = next.network_id();
+        vec![
+            role_grant(
+                network_id,
+                "family",
+                NodeOrWildcard::Node(b.laptop),
+                &["tcp:ssh"],
+            ),
+            Grant {
+                to_node: NodeOrWildcard::Any,
+                ..node_grant(network_id, b.laptop, b.laptop, &["tcp:ssh"])
+            },
+            node_grant(network_id, b.tablet, b.laptop, &["tcp:ssh"]),
+        ]
+    });
+    assert_eq!(
+        pb.egress.iter().map(|e| e.node_id).collect::<Vec<_>>(),
+        vec![b.laptop]
+    );
+    assert_eq!(
+        pb.accept.iter().map(|a| a.node_id).collect::<Vec<_>>(),
+        vec![b.tablet]
+    );
+    // Names of the survivors are untouched, and the old pair is as it was.
+    assert_eq!(pb.members[1].name, "tablet");
+    assert_eq!(b.docs.roster_body().revoked.len(), 0);
+    assert_eq!(b.docs.policy_body().grants.len(), 6);
+
+    // The owner signed it, and a verifier holding the previous pair adopts it as the owner's.
+    assert_eq!(next.verify().unwrap(), Signer::Owner);
+    assert_eq!(
+        adopted_signer(judged(Some(&b.docs), &next, NOW + 60)),
+        Signer::Owner
+    );
+    // The stores: the phone is refused from now on, the others are not.
+    let (rosters, policies) = load(&b.docs);
+    let store = menzil_node::DocStore::new(&rosters, &policies);
+    store.adopt(&next.bundle(), NOW + 60).unwrap();
+    let standing = |id| policies.check_membership(&rosters, &next.network_id(), &id, 1, NOW + 60);
+    assert_eq!(standing(b.phone), Err(ErrorCode::Revoked));
+    assert_eq!(standing(b.tablet), Ok(()));
+    // A revoked node cannot be admitted again with the certificate it had.
+    assert!(matches!(
+        admit(&b.owner, &next, &b.phone_cert, "phone", &[], NOW + 61),
+        Err(AdminError::Revoked(id)) if id == b.phone
+    ));
+}
+
+#[test]
+fn revoking_twice_is_refused_and_a_stranger_can_be_revoked_ahead_of_time() {
+    let b = busy();
+    let next = revoke(&b.owner, &b.docs, b.phone, NOW).unwrap();
+    assert!(matches!(
+        revoke(&b.owner, &next, b.phone, NOW + 1),
+        Err(AdminError::AlreadyRevoked(id)) if id == b.phone
+    ));
+
+    // A node these documents do not list (admitted by a steward after them, or never): only
+    // the revoked list changes, besides the numbers.
+    let (stranger, _) = node();
+    let ahead = revoke(&b.owner, &b.docs, stranger.node_id(), NOW + 5).unwrap();
+    assert_eq!(ahead.seq(), b.docs.seq() + 1);
+    assert_eq!(ahead.roster_body().revoked.len(), 1);
+    assert_eq!(ahead.roster_body().revoked[0].node_id, stranger.node_id());
+    assert_eq!(ahead.roster_body().members, b.docs.roster_body().members);
+    assert_eq!(ahead.roster_body().labels, b.docs.roster_body().labels);
+    let (before, after) = (b.docs.policy_body(), ahead.policy_body());
+    assert_eq!(
+        (
+            &after.members,
+            &after.certs,
+            &after.grants,
+            &after.egress,
+            &after.accept
+        ),
+        (
+            &before.members,
+            &before.certs,
+            &before.grants,
+            &before.egress,
+            &before.accept
+        )
+    );
+    assert_eq!(
+        adopted_signer(judged(Some(&b.docs), &ahead, NOW + 5)),
+        Signer::Owner
+    );
+    // And the list grows: a second revocation keeps the first.
+    let both = revoke(&b.owner, &ahead, b.tablet, NOW + 6).unwrap();
+    assert_eq!(
+        both.roster_body()
+            .revoked
+            .iter()
+            .map(|r| r.node_id)
+            .collect::<Vec<_>>(),
+        vec![stranger.node_id(), b.tablet]
+    );
+}
+
+#[test]
+fn a_revocation_beside_a_steward_jumps_the_span_and_the_steward_cannot_put_the_node_back() {
+    let s = stewarded();
+    let (phone_keys, phone_cert) = node();
+    // The steward admits the phone; the owner, holding that pair, revokes it.
+    let admitted = steward_admit(&s.steward, &s.base, &phone_cert, "phone", NOW + DAY).unwrap();
+    let revoked = revoke(&s.owner, &admitted, phone_keys.node_id(), NOW + 2 * DAY).unwrap();
+    assert_eq!(revoked.seq(), s.base.seq() + STEWARD_SEQ_SPAN + 1);
+    assert_eq!(revoked.verify().unwrap(), Signer::Owner);
+    assert!(revoked.base().is_none());
+    // The steward stays listed (a steward key is not a node), the phone is gone.
+    assert_eq!(
+        revoked.roster_body().stewards,
+        s.base.roster_body().stewards
+    );
+    assert!(!revoked.is_member(&phone_keys.node_id()));
+    assert_eq!(
+        adopted_signer(judged(Some(&admitted), &revoked, NOW + 2 * DAY)),
+        Signer::Owner
+    );
+
+    // The steward cannot admit it again through the tool ...
+    assert!(matches!(
+        steward_admit(&s.steward, &revoked, &phone_cert, "phone", NOW + 3 * DAY),
+        Err(AdminError::Revoked(id)) if id == phone_keys.node_id()
+    ));
+    // ... nor by hand: a pair of its own that appends the node is refused by a verifier.
+    let (mut roster, mut policy, base) = revoked
+        .steward_successor(&s.steward, NOW + 3 * DAY)
+        .unwrap();
+    roster.members.push(RosterMember {
+        node_id: phone_keys.node_id(),
+        min_serial: 1,
+    });
+    policy.members.push(PolicyMember {
+        node_id: phone_keys.node_id(),
+        name: "phone".into(),
+        roles: vec![],
+    });
+    policy.certs.push(phone_cert.clone());
+    let forced =
+        Documents::signed_with(s.steward.signing_key(), roster, policy, Some(base)).unwrap();
+    assert!(matches!(
+        judged(Some(&revoked), &forced, NOW + 3 * DAY),
+        Verdict::Reject(Reason::BadAppend)
+    ));
+
+    // What the steward may still do from the revocation pair: renew it, keeping the revocation.
+    let renewed = steward_renew(&s.steward, &revoked, NOW + 3 * DAY).unwrap();
+    assert_eq!(renewed.seq(), revoked.seq() + 1);
+    assert_eq!(renewed.roster_body().revoked, revoked.roster_body().revoked);
+    assert_eq!(
+        adopted_signer(judged(Some(&revoked), &renewed, NOW + 3 * DAY)),
+        Signer::Steward {
+            key: s.steward.public(),
+            base_seq: revoked.seq()
+        }
+    );
+    // A renewal that left the revocation out would be refused.
+    let mut plain = renewed.roster_body().clone();
+    plain.revoked.clear();
+    let tampered = Documents::signed_with(
+        s.steward.signing_key(),
+        plain,
+        renewed.policy_body().clone(),
+        renewed.base().map(|(r, p)| Base {
+            roster: r.clone(),
+            policy: p.clone(),
+            seq: revoked.seq(),
+        }),
+    )
+    .unwrap();
+    assert!(matches!(
+        judged(Some(&revoked), &tampered, NOW + 3 * DAY),
+        Verdict::Reject(Reason::FieldChanged)
+    ));
+}
+
+#[test]
+fn only_the_owner_of_these_documents_can_revoke() {
+    let b = busy();
+    assert!(matches!(
+        revoke(&OwnerKey::generate(), &b.docs, b.phone, NOW),
+        Err(AdminError::NotThisOwner)
+    ));
+}
+
+#[test]
+fn removing_grants_takes_exactly_the_matching_ones() {
+    let b = busy();
+    let network_id = b.docs.network_id();
+    let (phone, laptop) = (
+        PrincipalTarget::Node(b.phone),
+        NodeOrWildcard::Node(b.laptop),
+    );
+
+    // No services named: the grant from the phone to the laptop goes whole. The phone's
+    // grant to everyone (`*`) and everyone else's stay.
+    let whole = remove_grants(&b.owner, &b.docs, &phone, &laptop, None, NOW + 1).unwrap();
+    assert_eq!(whole.seq(), b.docs.seq() + 1);
+    assert_eq!(whole.policy_body().grants.len(), 5);
+    assert!(
+        whole
+            .policy_body()
+            .grants
+            .iter()
+            .all(|g| !(g.from.target == phone && g.to_node == laptop))
+    );
+    assert!(whole.policy_body().grants.contains(&Grant {
+        to_node: NodeOrWildcard::Any,
+        ..node_grant(network_id, b.phone, b.laptop, &["tcp:web"])
+    }));
+    // Nothing but the grants changed.
+    assert_eq!(whole.roster_body().members, b.docs.roster_body().members);
+    assert_eq!(whole.policy_body().members, b.docs.policy_body().members);
+    assert_eq!(whole.policy_body().certs, b.docs.policy_body().certs);
+    assert_eq!(whole.verify().unwrap(), Signer::Owner);
+    assert_eq!(
+        adopted_signer(judged(Some(&b.docs), &whole, NOW + 1)),
+        Signer::Owner
+    );
+
+    // `*` is its own target: the phone's grant to everyone goes and the one to the laptop stays.
+    let any = remove_grants(
+        &b.owner,
+        &b.docs,
+        &phone,
+        &NodeOrWildcard::Any,
+        None,
+        NOW + 1,
+    )
+    .unwrap();
+    assert_eq!(any.policy_body().grants.len(), 5);
+    assert!(any.policy_body().grants.contains(&node_grant(
+        network_id,
+        b.phone,
+        b.laptop,
+        &["tcp:ssh"]
+    )));
+
+    // A role is a target like a node.
+    let role = remove_grants(
+        &b.owner,
+        &b.docs,
+        &PrincipalTarget::Role("family".into()),
+        &laptop,
+        None,
+        NOW + 1,
+    )
+    .unwrap();
+    assert_eq!(role.policy_body().grants.len(), 5);
+    assert!(
+        role.policy_body()
+            .grants
+            .iter()
+            .all(|g| !matches!(g.from.target, PrincipalTarget::Role(_)))
+    );
+}
+
+#[test]
+fn removing_some_services_leaves_the_rest_and_a_grant_left_empty_goes() {
+    let (owner, laptop, _, docs) = founded();
+    let (phone, phone_cert) = node();
+    let docs = admit(&owner, &docs, &phone_cert, "phone", &[], NOW).unwrap();
+    let network_id = docs.network_id();
+    let (from, to) = (phone.node_id(), laptop.node_id());
+    let docs = grant(
+        &owner,
+        &docs,
+        node_grant(network_id, from, to, &["tcp:ssh", "http:app"]),
+        NOW,
+    )
+    .unwrap();
+    let docs = grant(
+        &owner,
+        &docs,
+        node_grant(network_id, from, to, &["tcp:db"]),
+        NOW,
+    )
+    .unwrap();
+    let (target, to_node) = (PrincipalTarget::Node(from), NodeOrWildcard::Node(to));
+
+    // One service of two: the grant stays with the other.
+    let partial = remove_grants(
+        &owner,
+        &docs,
+        &target,
+        &to_node,
+        Some(&[service("tcp:ssh")]),
+        NOW + 1,
+    )
+    .unwrap();
+    assert_eq!(
+        partial.policy_body().grants,
+        vec![
+            node_grant(network_id, from, to, &["http:app"]),
+            node_grant(network_id, from, to, &["tcp:db"]),
+        ]
+    );
+    assert_eq!(
+        adopted_signer(judged(Some(&docs), &partial, NOW + 1)),
+        Signer::Owner
+    );
+
+    // The last service of a grant takes the grant with it; services of several grants at once.
+    let more = remove_grants(
+        &owner,
+        &partial,
+        &target,
+        &to_node,
+        Some(&[service("http:app"), service("tcp:db")]),
+        NOW + 2,
+    )
+    .unwrap();
+    assert!(more.policy_body().grants.is_empty());
+    assert_eq!(more.seq(), partial.seq() + 1);
+
+    // Patterns match as written: `tcp:*` is not `tcp:ssh`, and a service no grant holds is
+    // nothing to remove. No pair is made, so no number is spent.
+    for list in [
+        &[service("tcp:*")][..],
+        &[service("http:ssh")][..],
+        &[service("tcp:other")][..],
+        &[][..],
+    ] {
+        assert!(matches!(
+            remove_grants(&owner, &docs, &target, &to_node, Some(list), NOW + 1),
+            Err(AdminError::NoSuchGrant)
+        ));
+    }
+    // Nothing from this principal, nothing to this target.
+    assert!(matches!(
+        remove_grants(
+            &owner,
+            &docs,
+            &PrincipalTarget::Node(to),
+            &to_node,
+            None,
+            NOW
+        ),
+        Err(AdminError::NoSuchGrant)
+    ));
+    assert!(matches!(
+        remove_grants(&owner, &docs, &target, &NodeOrWildcard::Any, None, NOW),
+        Err(AdminError::NoSuchGrant)
+    ));
+    assert!(matches!(
+        remove_grants(&owner, &more, &target, &to_node, None, NOW),
+        Err(AdminError::NoSuchGrant)
+    ));
+}
+
+#[test]
+fn an_expired_grant_is_removed_like_any_other_and_a_wildcard_pattern_is_an_exact_string() {
+    let (owner, laptop, _, docs) = founded();
+    let (phone, phone_cert) = node();
+    let docs = admit(&owner, &docs, &phone_cert, "phone", &[], NOW).unwrap();
+    let network_id = docs.network_id();
+    let (from, to) = (phone.node_id(), laptop.node_id());
+    let mut old = node_grant(network_id, from, to, &["tcp:*", "tcp:ssh"]);
+    old.expires = Some(NOW - DAY);
+    let docs = grant(&owner, &docs, old, NOW).unwrap();
+    let (target, to_node) = (PrincipalTarget::Node(from), NodeOrWildcard::Node(to));
+    let next = remove_grants(
+        &owner,
+        &docs,
+        &target,
+        &to_node,
+        Some(&[service("tcp:*")]),
+        NOW + 1,
+    )
+    .unwrap();
+    // Only the pattern written `tcp:*` went; `tcp:ssh` stays, and so does the expiry.
+    assert_eq!(next.policy_body().grants.len(), 1);
+    assert_eq!(
+        next.policy_body().grants[0].services,
+        vec![service("tcp:ssh")]
+    );
+    assert_eq!(next.policy_body().grants[0].expires, Some(NOW - DAY));
+    let gone = remove_grants(&owner, &next, &target, &to_node, None, NOW + 2).unwrap();
+    assert!(gone.policy_body().grants.is_empty());
+}
+
+#[test]
+fn removing_grants_beside_a_steward_jumps_the_span() {
+    let s = stewarded();
+    let me = s.base.roster_body().members[0].node_id;
+    let g = node_grant(s.base.network_id(), me, me, &["tcp:ssh"]);
+    let with = grant(&s.owner, &s.base, g, NOW).unwrap();
+    let next = remove_grants(
+        &s.owner,
+        &with,
+        &PrincipalTarget::Node(me),
+        &NodeOrWildcard::Node(me),
+        None,
+        NOW + 1,
+    )
+    .unwrap();
+    assert_eq!(next.seq(), with.seq() + STEWARD_SEQ_SPAN + 1);
+    assert_eq!(next.roster_body().stewards.len(), 1);
+}

@@ -1,5 +1,5 @@
 //! The operations on a user's menzil directory: what `menzil init`, `network create`, `admit`,
-//! `grant`, `join`, `renew`, `steward` and `status` do. No printing and no clock here: the caller passes the
+//! `grant`, `ungrant`, `revoke`, `join`, `renew`, `steward` and `status` do. No printing and no clock here: the caller passes the
 //! time and prints what these return.
 //!
 //! A device has one identity ([`init`]). It may own networks ([`network_create`]), in which case
@@ -407,6 +407,23 @@ pub fn resolve_member(docs: &Documents, who: &str) -> Result<NodeId> {
     )
 }
 
+/// The `from` of a grant on the command line: a member, or `role:<name>`.
+fn grant_from(docs: &Documents, from: &str) -> Result<PrincipalTarget> {
+    Ok(match from.strip_prefix("role:") {
+        Some(role) => PrincipalTarget::Role(role.to_string()),
+        None => PrincipalTarget::Node(resolve_member(docs, from)?),
+    })
+}
+
+/// The `to` of a grant on the command line: a member, or `*` for every node.
+fn grant_to(docs: &Documents, to: &str) -> Result<NodeOrWildcard> {
+    Ok(if to == "*" {
+        NodeOrWildcard::Any
+    } else {
+        NodeOrWildcard::Node(resolve_member(docs, to)?)
+    })
+}
+
 /// Lets `from` use `services` on `to` (protocol.md 2.3). `from` is a member's name, or
 /// `role:<name>` for everyone holding a role; `to` is a member's name, or `*` for every node. A
 /// grant may expire at a Unix time.
@@ -423,15 +440,8 @@ pub fn grant(
     let _lock = home.lock_network(&network_id)?;
     let owner = load_owner(home, &network_id)?;
     let current = load_documents(home, &network_id)?;
-    let from = match from.strip_prefix("role:") {
-        Some(role) => PrincipalTarget::Role(role.to_string()),
-        None => PrincipalTarget::Node(resolve_member(&current, from)?),
-    };
-    let to_node = if to == "*" {
-        NodeOrWildcard::Any
-    } else {
-        NodeOrWildcard::Node(resolve_member(&current, to)?)
-    };
+    let from = grant_from(&current, from)?;
+    let to_node = grant_to(&current, to)?;
     let grant = Grant {
         from: Principal {
             network_id,
@@ -444,6 +454,96 @@ pub fn grant(
     let next = menzil_admin::grant(&owner, &current, grant, now)?;
     save_documents(home, &next)?;
     Ok(issued(&next, None))
+}
+
+/// What [`ungrant`] does for `from` and `to` as [`grant`] reads them: takes `services` out of
+/// the grants from `from` to `to`, or, with no services named, every such grant. Owner only. An
+/// error (and the documents as they were) when nothing matches.
+pub fn ungrant(
+    home: &Home,
+    network: Option<&str>,
+    from: &str,
+    to: &str,
+    services: &[ServiceId],
+    now: u64,
+) -> Result<Issued> {
+    let network_id = resolve_network(home, network)?;
+    let _lock = home.lock_network(&network_id)?;
+    let owner = load_owner(home, &network_id)?;
+    let current = load_documents(home, &network_id)?;
+    let from = grant_from(&current, from)?;
+    let to_node = grant_to(&current, to)?;
+    let services = (!services.is_empty()).then_some(services);
+    let next = menzil_admin::remove_grants(&owner, &current, &from, &to_node, services, now)?;
+    save_documents(home, &next)?;
+    Ok(issued(&next, None))
+}
+
+/// What [`revoke`] did.
+#[derive(Debug, Clone)]
+pub struct Revoked {
+    /// The new pair; `member` is the revoked node.
+    pub issued: Issued,
+    /// The node's name in the Policy it was revoked from, if it had one.
+    pub name: Option<String>,
+    /// Whether the Roster of the old pair listed it. False for a node a steward admitted after
+    /// this device's pair, or one revoked ahead of time.
+    pub was_member: bool,
+    /// Whether the new Roster still lists a steward. A steward key is not tied to a node, so
+    /// when the revoked node hosted it only `menzil steward remove` cuts that off.
+    pub steward_listed: bool,
+}
+
+/// A node on the command line for `revoke`: a member by name or by the start of its NodeId
+/// ([`resolve_member`]), else a whole NodeId (64 hex digits), which need not be a member of the
+/// documents this device holds.
+fn revoke_target(docs: &Documents, who: &str) -> Result<NodeId> {
+    match resolve_member(docs, who) {
+        Ok(node_id) => Ok(node_id),
+        Err(not_a_member) => match parse_hex32(who) {
+            Some(bytes) => Ok(NodeId::from(bytes)),
+            None => Err(not_a_member),
+        },
+    }
+}
+
+/// Revokes a node (protocol.md 7.3), owner only: it is listed in `revoked`, and removed from
+/// the Roster and the Policy (see [`menzil_admin::revoke`]). Refused for this device's own
+/// node unless `allow_self`. A device that holds only a steward key is told that the owner
+/// revokes.
+pub fn revoke(
+    home: &Home,
+    network: Option<&str>,
+    who: &str,
+    allow_self: bool,
+    now: u64,
+) -> Result<Revoked> {
+    let network_id = resolve_network(home, network)?;
+    let _lock = home.lock_network(&network_id)?;
+    if !home.owner_key_path(&network_id).exists() && home.steward_key_path(&network_id).exists() {
+        bail!("only the owner revokes (protocol.md 7.3)");
+    }
+    let owner = load_owner(home, &network_id)?;
+    let current = load_documents(home, &network_id)?;
+    let node_id = revoke_target(&current, who)?;
+    if !allow_self && node_id == load_identity(home)?.0.node_id() {
+        return Err(menzil_admin::AdminError::RevokeSelf.into());
+    }
+    let name = current
+        .policy_body()
+        .members
+        .iter()
+        .find(|member| member.node_id == node_id)
+        .map(|member| member.name.clone());
+    let was_member = current.is_member(&node_id);
+    let next = menzil_admin::revoke(&owner, &current, node_id, now)?;
+    save_documents(home, &next)?;
+    Ok(Revoked {
+        steward_listed: !next.roster_body().stewards.is_empty(),
+        issued: issued(&next, Some(node_id)),
+        name,
+        was_member,
+    })
 }
 
 /// Re-issues the documents of a network this device owns, or is a steward of, with a fresh

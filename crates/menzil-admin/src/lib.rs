@@ -15,6 +15,10 @@
 //!   pair with `seq + 1`, signed by the owner, and leaves the old one alone;
 //!   the clock is a parameter.
 //!
+//! * [`revoke`], [`remove_grants`]: the owner takes a node out of the network for good (protocol.md
+//!   7.3: always as a revocation, because a steward could admit a merely removed node again) or
+//!   takes grants out of the Policy.
+//!
 //! * [`StewardSecret`], [`delegate_steward`], [`remove_steward`], [`steward_renew`],
 //!   [`steward_admit`]: a steward (protocol.md 2.3, 7.3) signs re-issues and admissions with
 //!   its own key; its pair travels with the owner signed base it was made from, and the owner's
@@ -38,8 +42,8 @@ mod keys;
 pub use error::AdminError;
 pub use issue::{
     DOCUMENT_LIFETIME_SECS, Documents, admit, check_name, check_role, create_network,
-    delegate_steward, grant, is_invisible, is_unsafe, remove_steward, renew, steward_admit,
-    steward_renew,
+    delegate_steward, grant, is_invisible, is_unsafe, remove_grants, remove_steward, renew, revoke,
+    steward_admit, steward_renew,
 };
 pub use keys::{MAX_CERT_LIFETIME_SECS, NodeKeys, OwnerKey, StewardSecret};
 pub use menzil_proto::trust::{STEWARD_MAX_LIFETIME, STEWARD_SEQ_SPAN};

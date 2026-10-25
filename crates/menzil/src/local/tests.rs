@@ -1397,3 +1397,308 @@ fn a_steward_token_on_a_base_older_than_the_held_one_is_refused() {
         5
     );
 }
+
+// ---------------------------------------------------------------------------------------------
+// `revoke` and `ungrant` (protocol.md 7.3; L4k K1)
+// ---------------------------------------------------------------------------------------------
+
+/// The owner device with `phone` admitted and joined, and some grants.
+fn with_phone() -> (Two, NodeId) {
+    let two = two_devices();
+    let admitted = admit(
+        &two.owner,
+        None,
+        &two.join_request,
+        "phone",
+        &["family".to_string()],
+        NOW,
+    )
+    .unwrap();
+    join(&two.member, &admitted.token, NOW).unwrap();
+    (two, admitted.member.unwrap())
+}
+
+fn documents_bytes(home: &Home, network_id: &NetworkId) -> Vec<u8> {
+    fs::read(home.documents_path(network_id)).unwrap()
+}
+
+#[test]
+fn revoking_a_member_by_name_by_prefix_or_by_whole_id() {
+    let (two, phone) = with_phone();
+    let ssh = [service("tcp:ssh")];
+    grant(&two.owner, None, "phone", "laptop", &ssh, None, NOW).unwrap();
+    grant(&two.owner, None, "role:family", "laptop", &ssh, None, NOW).unwrap();
+
+    // By name.
+    let revoked = revoke(&two.owner, None, "phone", false, NOW + 5).unwrap();
+    assert_eq!(revoked.name.as_deref(), Some("phone"));
+    assert!(revoked.was_member);
+    assert!(!revoked.steward_listed);
+    assert_eq!(revoked.issued.member, Some(phone));
+    assert_eq!(revoked.issued.seq, 5);
+    let docs = load_documents(&two.owner, &two.network_id).unwrap();
+    assert_eq!(docs.seq(), 5);
+    assert!(!docs.is_member(&phone));
+    assert_eq!(docs.roster_body().revoked.len(), 1);
+    assert_eq!(docs.roster_body().revoked[0].node_id, phone);
+    assert_eq!(docs.roster_body().revoked[0].since, NOW + 5);
+    assert_eq!(docs.policy_body().members.len(), 1);
+    // The token carries the same pair.
+    assert_eq!(decode_documents(&revoked.issued.token).unwrap().seq(), 5);
+    assert_eq!(token(&two.owner, None).unwrap(), revoked.issued.token);
+
+    // Twice is an error, and says so.
+    let again = format!(
+        "{:#}",
+        revoke(&two.owner, None, &phone.to_hex(), false, NOW + 6).unwrap_err()
+    );
+    assert!(again.contains("revoked already"), "{again}");
+    assert_eq!(
+        load_documents(&two.owner, &two.network_id).unwrap().seq(),
+        5
+    );
+
+    // By the start of the node id.
+    let (two, phone) = with_phone();
+    let hex = phone.to_hex();
+    let revoked = revoke(&two.owner, None, &hex[..8], false, NOW + 5).unwrap();
+    assert_eq!(revoked.issued.member, Some(phone));
+    assert_eq!(revoked.name.as_deref(), Some("phone"));
+
+    // By a whole node id that no document lists: only the revoked list grows.
+    let two = two_devices();
+    let (_d, stranger) = device();
+    let stranger_id = {
+        init(&stranger, NOW).unwrap();
+        load_identity(&stranger).unwrap().0.node_id()
+    };
+    let before = load_documents(&two.owner, &two.network_id).unwrap();
+    let revoked = revoke(
+        &two.owner,
+        None,
+        &stranger_id.to_hex().to_uppercase(),
+        false,
+        NOW + 5,
+    )
+    .unwrap();
+    assert_eq!(revoked.name, None);
+    assert!(!revoked.was_member);
+    let docs = load_documents(&two.owner, &two.network_id).unwrap();
+    assert_eq!(docs.roster_body().revoked[0].node_id, stranger_id);
+    assert_eq!(docs.roster_body().members, before.roster_body().members);
+
+    // Anything else is not a member, and the message lists the members.
+    let error = format!(
+        "{:#}",
+        revoke(&two.owner, None, "tablet", false, NOW).unwrap_err()
+    );
+    assert!(
+        error.contains("no member called") && error.contains("laptop"),
+        "{error}"
+    );
+    let short = format!(
+        "{:#}",
+        revoke(&two.owner, None, &stranger_id.to_hex()[..63], false, NOW).unwrap_err()
+    );
+    assert!(short.contains("no member called"), "{short}");
+    assert_eq!(
+        load_documents(&two.owner, &two.network_id).unwrap().seq(),
+        2
+    );
+}
+
+#[test]
+fn a_device_revokes_itself_only_when_told_to() {
+    let (two, _) = with_phone();
+    let laptop = load_identity(&two.owner).unwrap().0.node_id();
+    let before = documents_bytes(&two.owner, &two.network_id);
+    for who in [
+        "laptop".to_string(),
+        laptop.to_hex(),
+        laptop.to_hex()[..8].to_string(),
+    ] {
+        let error = format!(
+            "{:#}",
+            revoke(&two.owner, None, &who, false, NOW + 1).unwrap_err()
+        );
+        assert!(error.contains("--self"), "{who}: {error}");
+        assert_eq!(documents_bytes(&two.owner, &two.network_id), before);
+    }
+    // Someone else is not "self".
+    revoke(&two.owner, None, "phone", false, NOW + 1).unwrap();
+    // With the flag it goes through.
+    let done = revoke(&two.owner, None, "laptop", true, NOW + 2).unwrap();
+    assert_eq!(done.issued.member, Some(laptop));
+    let docs = load_documents(&two.owner, &two.network_id).unwrap();
+    assert!(docs.roster_body().members.is_empty());
+    assert!(
+        docs.roster_body()
+            .revoked
+            .iter()
+            .any(|r| r.node_id == laptop)
+    );
+}
+
+#[test]
+fn only_the_owner_revokes_and_a_steward_device_is_told_so() {
+    let s = stewarded();
+    let before = documents_bytes(&s.two.member, &s.two.network_id);
+    // The device that holds the steward key.
+    let error = format!(
+        "{:#}",
+        revoke(&s.two.member, None, "laptop", false, NOW + 20).unwrap_err()
+    );
+    assert!(
+        error.contains("only the owner revokes (protocol.md 7.3)"),
+        "{error}"
+    );
+    assert_eq!(documents_bytes(&s.two.member, &s.two.network_id), before);
+    // A plain member device: no owner key, so the plain refusal every owner command gives.
+    let (two, _) = with_phone();
+    let error = format!(
+        "{:#}",
+        revoke(&two.member, None, "laptop", false, NOW).unwrap_err()
+    );
+    assert!(error.contains("does not own"), "{error}");
+    assert!(!error.contains("only the owner revokes"), "{error}");
+}
+
+#[test]
+fn revoking_beside_a_steward_says_the_steward_key_stays() {
+    let s = stewarded();
+    // The owner device revokes the device that hosts the steward key: the steward stays listed,
+    // and the outcome says so, so that the command line can tell the user.
+    let revoked = revoke(&s.two.owner, None, "steward", false, NOW + 20).unwrap();
+    assert!(revoked.steward_listed);
+    assert_eq!(revoked.issued.seq, 3 + STEWARD_SEQ_SPAN + 1);
+    let docs = load_documents(&s.two.owner, &s.two.network_id).unwrap();
+    assert_eq!(docs.roster_body().stewards.len(), 1);
+    // After `steward remove` it is not listed any more.
+    steward_remove(&s.two.owner, None, NOW + 21).unwrap();
+    let (_d, third) = device();
+    let request = init(&third, NOW).unwrap().join_request;
+    admit(&s.two.owner, None, &request, "tablet", &[], NOW + 22).unwrap();
+    let revoked = revoke(&s.two.owner, None, "tablet", false, NOW + 23).unwrap();
+    assert!(!revoked.steward_listed);
+}
+
+#[test]
+fn ungranting_takes_back_services_or_every_grant_between_two_members() {
+    let (two, _) = with_phone();
+    let (ssh, web, db) = (service("tcp:ssh"), service("http:web"), service("tcp:db"));
+    grant(
+        &two.owner,
+        None,
+        "phone",
+        "laptop",
+        &[ssh.clone(), web.clone()],
+        None,
+        NOW,
+    )
+    .unwrap();
+    grant(
+        &two.owner,
+        None,
+        "phone",
+        "laptop",
+        std::slice::from_ref(&db),
+        Some(NOW + DAY),
+        NOW,
+    )
+    .unwrap();
+    grant(
+        &two.owner,
+        None,
+        "phone",
+        "*",
+        std::slice::from_ref(&ssh),
+        None,
+        NOW,
+    )
+    .unwrap();
+    grant(
+        &two.owner,
+        None,
+        "role:family",
+        "laptop",
+        std::slice::from_ref(&ssh),
+        None,
+        NOW,
+    )
+    .unwrap();
+    let grants = || {
+        load_documents(&two.owner, &two.network_id)
+            .unwrap()
+            .policy_body()
+            .grants
+            .clone()
+    };
+    assert_eq!(grants().len(), 4);
+
+    // One service of two.
+    let issued = ungrant(
+        &two.owner,
+        None,
+        "phone",
+        "laptop",
+        std::slice::from_ref(&ssh),
+        NOW + 1,
+    )
+    .unwrap();
+    assert_eq!(issued.seq, 7);
+    assert_eq!(decode_documents(&issued.token).unwrap().seq(), 7);
+    assert_eq!(grants()[0].services, vec![web.clone()]);
+    assert_eq!(grants().len(), 4);
+
+    // A role is read as `grant` reads it; `*` too.
+    ungrant(&two.owner, None, "role:family", "laptop", &[], NOW + 2).unwrap();
+    assert_eq!(grants().len(), 3);
+    ungrant(&two.owner, None, "phone", "*", &[], NOW + 3).unwrap();
+    assert_eq!(grants().len(), 2);
+
+    // Nothing matched: an error, and the file is as it was.
+    let before = documents_bytes(&two.owner, &two.network_id);
+    for (from, to, list) in [
+        ("phone", "laptop", vec![service("tcp:other")]),
+        ("laptop", "phone", vec![]),
+        ("phone", "*", vec![]),
+        ("role:family", "laptop", vec![]),
+    ] {
+        let error = format!(
+            "{:#}",
+            ungrant(&two.owner, None, from, to, &list, NOW + 9).unwrap_err()
+        );
+        assert!(error.contains("no grant matches"), "{from} {to}: {error}");
+        assert_eq!(documents_bytes(&two.owner, &two.network_id), before);
+    }
+    // An unknown member is the same message `grant` gives.
+    let error = format!(
+        "{:#}",
+        ungrant(&two.owner, None, "tablet", "laptop", &[], NOW).unwrap_err()
+    );
+    assert!(error.contains("no member called"), "{error}");
+
+    // No services named: every grant from the phone to the laptop.
+    ungrant(&two.owner, None, "phone", "laptop", &[], NOW + 4).unwrap();
+    assert!(grants().is_empty());
+}
+
+#[test]
+fn only_the_owner_ungrants() {
+    let (two, _) = with_phone();
+    grant(
+        &two.owner,
+        None,
+        "phone",
+        "laptop",
+        &[service("tcp:ssh")],
+        None,
+        NOW,
+    )
+    .unwrap();
+    let error = format!(
+        "{:#}",
+        ungrant(&two.member, None, "phone", "laptop", &[], NOW + 1).unwrap_err()
+    );
+    assert!(error.contains("does not own"), "{error}");
+}

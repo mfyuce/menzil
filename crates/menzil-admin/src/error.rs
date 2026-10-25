@@ -43,6 +43,9 @@ pub enum AdminError {
     /// verifiers refuse a revoked node, a member or not.
     #[error("node {0:?} is revoked in this network")]
     Revoked(NodeId),
+    /// The node is on the Roster's revoked list already.
+    #[error("node {0:?} is revoked already")]
+    AlreadyRevoked(NodeId),
     /// A member name that cannot head a `name/service` address.
     #[error(
         "member name {0:?} must be 1 to 63 bytes of letters, digits, '-', '_' and '.', starting with a letter or a digit"
@@ -71,6 +74,14 @@ pub enum AdminError {
     /// A grant naming no service.
     #[error("the grant names no service")]
     EmptyGrant,
+    /// No grant matches what a removal names (or none of the named services is in one).
+    #[error("no grant matches")]
+    NoSuchGrant,
+    /// A revocation of the node of the device that issues it, which the caller did not confirm.
+    #[error(
+        "that is this device's own node: revoking it cuts this device off, pass --self to do it"
+    )]
+    RevokeSelf,
     /// The sequence number cannot go up any more.
     #[error("the sequence number is at its maximum")]
     SeqOverflow,

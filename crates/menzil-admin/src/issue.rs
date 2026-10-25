@@ -7,8 +7,8 @@ use menzil_proto::trust::{
 };
 use menzil_proto::{
     Grant, MAX_DOC_BYTES, NetworkId, NodeCert, NodeId, NodeOrWildcard, PROTOCOL_VERSION, Policy,
-    PolicyBody, PolicyMember, PrincipalTarget, Roster, RosterBody, RosterMember, Steward,
-    StewardBody, StewardKey,
+    PolicyBody, PolicyMember, PrincipalTarget, RevokedMember, Roster, RosterBody, RosterMember,
+    ServiceId, Steward, StewardBody, StewardKey,
 };
 pub use menzil_proto::{is_invisible, is_unsafe};
 
@@ -642,6 +642,94 @@ pub fn grant(
     }
     let (roster, mut policy) = current.successor(owner, now)?;
     policy.grants.push(grant);
+    Documents::signed(owner, roster, policy)
+}
+
+/// Revokes `node_id` (protocol.md 7.3), owner only. The Roster lists it in `revoked` with `since`
+/// now and loses its `members` entry and the labels naming it; the Policy loses its `members`
+/// entry, its certificates, the grants whose `from` or `to_node` is the node (role grants and
+/// `*` grants stay) and its `egress` and `accept` entries. The `stewards` list is untouched.
+/// Removal is always revocation: a steward may admit any node the Roster does not revoke, so a
+/// node merely dropped from `members` could be put back by it. The node need not be a member of
+/// `current` (it may have been admitted by a steward after these documents, or be revoked ahead
+/// of time). Refused with [`AdminError::AlreadyRevoked`] when it is revoked already.
+pub fn revoke(
+    owner: &OwnerKey,
+    current: &Documents,
+    node_id: NodeId,
+    now: u64,
+) -> Result<Documents, AdminError> {
+    if current
+        .roster_body()
+        .revoked
+        .iter()
+        .any(|revoked| revoked.node_id == node_id)
+    {
+        return Err(AdminError::AlreadyRevoked(node_id));
+    }
+    let (mut roster, mut policy) = current.successor(owner, now)?;
+    roster.members.retain(|member| member.node_id != node_id);
+    roster.revoked.push(RevokedMember {
+        node_id,
+        since: now,
+    });
+    roster.labels.retain(|label| label.node_id != node_id);
+    policy.members.retain(|member| member.node_id != node_id);
+    let mut certs = Vec::with_capacity(policy.certs.len());
+    for cert in policy.certs.drain(..) {
+        if cert.decode()?.node_id != node_id {
+            certs.push(cert);
+        }
+    }
+    policy.certs = certs;
+    policy.grants.retain(|grant| {
+        grant.from.target != PrincipalTarget::Node(node_id)
+            && grant.to_node != NodeOrWildcard::Node(node_id)
+    });
+    policy.egress.retain(|rule| rule.node_id != node_id);
+    policy.accept.retain(|entry| entry.node_id != node_id);
+    Documents::signed(owner, roster, policy)
+}
+
+/// Takes grants out of the Policy (owner only): those with exactly this `from` and `to_node`.
+/// With `services` `None` they go whole; with `Some(list)` the patterns in the list (exact
+/// match, `tcp:*` is not `tcp:ssh`) are removed from each and a grant left with none goes too.
+/// Expired grants are matched like any other. When nothing matched the answer is
+/// [`AdminError::NoSuchGrant`] and no number is spent.
+pub fn remove_grants(
+    owner: &OwnerKey,
+    current: &Documents,
+    from: &PrincipalTarget,
+    to_node: &NodeOrWildcard,
+    services: Option<&[ServiceId]>,
+    now: u64,
+) -> Result<Documents, AdminError> {
+    let (roster, mut policy) = current.successor(owner, now)?;
+    let mut changed = false;
+    let mut kept = Vec::with_capacity(policy.grants.len());
+    for mut grant in policy.grants.drain(..) {
+        if grant.from.target != *from || grant.to_node != *to_node {
+            kept.push(grant);
+            continue;
+        }
+        match services {
+            None => changed = true,
+            Some(list) => {
+                let before = grant.services.len();
+                grant.services.retain(|service| !list.contains(service));
+                if grant.services.len() != before {
+                    changed = true;
+                }
+                if !grant.services.is_empty() {
+                    kept.push(grant);
+                }
+            }
+        }
+    }
+    if !changed {
+        return Err(AdminError::NoSuchGrant);
+    }
+    policy.grants = kept;
     Documents::signed(owner, roster, policy)
 }
 
