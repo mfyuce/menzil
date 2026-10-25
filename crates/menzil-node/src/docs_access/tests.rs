@@ -7,8 +7,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use ed25519_dalek::SigningKey;
 use menzil_proto::{
-    NetworkId, OpenBody, OpenMeta, PROTOCOL_VERSION, Policy, PolicyBody, PolicyMember, Roster,
-    RosterBody, RosterMember,
+    NetworkId, NodeCert, NodeCertBody, OpenBody, OpenMeta, PROTOCOL_VERSION, Policy, PolicyBody,
+    PolicyMember, Roster, RosterBody, RosterMember, X25519PublicKey,
 };
 use menzil_stream::{
     Authorizer, Mode, OpenDecision, OutboundFrames, Responded, StreamMux, initiate_open,
@@ -31,6 +31,35 @@ fn unix_now() -> u64 {
 
 fn peer(n: u8) -> NodeId {
     NodeId::from([n; 32])
+}
+
+/// The node under test has a real identity (round 11 N1: its own certificate in the Policy is
+/// part of its standing).
+fn server_key() -> SigningKey {
+    SigningKey::from_bytes(&[0xEE; 32])
+}
+
+fn server_id() -> NodeId {
+    NodeId::from(server_key().verifying_key().to_bytes())
+}
+
+fn server_static() -> X25519PublicKey {
+    X25519PublicKey::from([0xEE; 32])
+}
+
+fn server_cert() -> NodeCert {
+    NodeCert::sign(
+        &server_key(),
+        &NodeCertBody {
+            v: PROTOCOL_VERSION,
+            node_id: server_id(),
+            x25519_pub: server_static(),
+            serial: 1,
+            not_before: 0,
+            not_after: u64::MAX,
+        },
+    )
+    .unwrap()
 }
 
 #[tokio::test(start_paused = true)]
@@ -208,7 +237,11 @@ impl World {
                         roles: vec![],
                     })
                     .collect(),
-                certs: vec![],
+                certs: if members.contains(&server_id()) {
+                    vec![server_cert()]
+                } else {
+                    vec![]
+                },
                 grants: vec![],
                 egress: vec![],
                 accept: vec![],
@@ -282,7 +315,7 @@ impl Server {
             gate: DocsGate::new(DocsLimits::default()),
             inner: Arc::new(Inner::default()),
             network: world.network,
-            me: peer(0xEE),
+            me: server_id(),
         }
     }
 
@@ -293,6 +326,7 @@ impl Server {
             self.network,
             self.me,
             1,
+            server_static(),
         )
     }
 
@@ -398,7 +432,7 @@ impl Client {
 #[tokio::test]
 async fn a_member_with_no_grant_fetches_documents_and_is_refused_everything_else() {
     let w = world();
-    let (server_id, member) = (peer(0xEE), peer(1));
+    let (server_id, member) = (server_id(), peer(1));
     let (policies, rosters) = w.stores(2, &[server_id, member]);
     let server = Server::new(&w, policies, rosters);
     let client = server.ordinary(member);
@@ -426,7 +460,7 @@ async fn a_member_with_no_grant_fetches_documents_and_is_refused_everything_else
 #[tokio::test]
 async fn the_docs_service_never_reaches_the_inner_handler_and_other_services_do() {
     let w = world();
-    let (server_id, member) = (peer(0xEE), peer(1));
+    let (server_id, member) = (server_id(), peer(1));
     let (policies, rosters) = w.stores(2, &[server_id, member]);
     let server = Server::new(&w, policies, rosters);
     // Everything is authorized here: what is under test is the dispatch.
@@ -443,7 +477,7 @@ async fn the_docs_service_never_reaches_the_inner_handler_and_other_services_do(
 #[tokio::test]
 async fn a_peer_revoked_mid_session_is_refused_the_next_docs_open() {
     let w = world();
-    let (server_id, member) = (peer(0xEE), peer(1));
+    let (server_id, member) = (server_id(), peer(1));
     let (policies, rosters) = w.stores(2, &[server_id, member]);
     let server = Server::new(&w, policies, rosters.clone());
     let client = server.ordinary(member);
@@ -464,7 +498,7 @@ async fn a_peer_revoked_mid_session_is_refused_the_next_docs_open() {
 #[tokio::test]
 async fn a_peer_the_roster_does_not_list_is_refused_docs() {
     let w = world();
-    let (server_id, member, stranger) = (peer(0xEE), peer(1), peer(9));
+    let (server_id, member, stranger) = (server_id(), peer(1), peer(9));
     let (policies, rosters) = w.stores(2, &[server_id, member]);
     let server = Server::new(&w, policies, rosters);
     let client = server.ordinary(stranger);
@@ -476,7 +510,7 @@ async fn a_peer_the_roster_does_not_list_is_refused_docs() {
 #[tokio::test]
 async fn a_second_docs_stream_of_a_peer_is_rate_limited_until_the_first_is_over() {
     let w = world();
-    let (server_id, member) = (peer(0xEE), peer(1));
+    let (server_id, member) = (server_id(), peer(1));
     let (policies, rosters) = w.stores(2, &[server_id, member]);
     let server = Server::new(&w, policies, rosters);
     let client = server.ordinary(member);
@@ -508,7 +542,7 @@ async fn a_second_docs_stream_of_a_peer_is_rate_limited_until_the_first_is_over(
 #[tokio::test]
 async fn four_docs_streams_in_all_over_every_session() {
     let w = world();
-    let server_id = peer(0xEE);
+    let server_id = server_id();
     let members: Vec<NodeId> = (1..=5).map(peer).collect();
     let mut all = vec![server_id];
     all.extend(members.iter().copied());
@@ -531,7 +565,7 @@ async fn four_docs_streams_in_all_over_every_session() {
 #[tokio::test(start_paused = true)]
 async fn six_docs_streams_per_peer_per_minute_over_the_wire() {
     let w = world();
-    let (server_id, member) = (peer(0xEE), peer(1));
+    let (server_id, member) = (server_id(), peer(1));
     let (policies, rosters) = w.stores(2, &[server_id, member]);
     let server = Server::new(&w, policies, rosters);
     let client = server.ordinary(member);
@@ -558,7 +592,7 @@ async fn six_docs_streams_per_peer_per_minute_over_the_wire() {
 #[tokio::test]
 async fn a_docs_only_session_takes_one_push_then_ends_the_session() {
     let w = world();
-    let (server_id, member) = (peer(0xEE), peer(1));
+    let (server_id, member) = (server_id(), peer(1));
     // The server is behind (seq 1); the member comes with seq 2.
     let (policies, rosters) = w.stores(1, &[server_id, member]);
     let server = Server::new(&w, policies, rosters.clone());
@@ -595,7 +629,7 @@ async fn a_docs_only_session_takes_one_push_then_ends_the_session() {
 #[tokio::test]
 async fn a_docs_only_session_refuses_a_fetch_and_every_other_open() {
     let w = world();
-    let (server_id, member) = (peer(0xEE), peer(1));
+    let (server_id, member) = (server_id(), peer(1));
     let (policies, rosters) = w.stores(2, &[server_id, member]);
     let server = Server::new(&w, policies, rosters);
     let ended = Arc::new(AtomicUsize::new(0));

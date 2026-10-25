@@ -38,10 +38,11 @@ pub(super) fn auto_serve(
 ) -> Arc<DocsGate> {
     let (_unused, empty) = mpsc::unbounded_channel();
     let mut ready = std::mem::replace(&mut node.ready, empty);
-    let (policies, rosters, me, sync) = (
+    let (policies, rosters, me, me_static, sync) = (
         stores.policies.clone(),
         stores.rosters.clone(),
         party.id,
+        party.x25519_public,
         sync.cloned(),
     );
     let gate = DocsGate::new(DocsLimits::default());
@@ -55,6 +56,7 @@ pub(super) fn auto_serve(
                 &rosters,
                 me,
                 1,
+                me_static,
                 &handler,
                 &gate,
                 sync.as_ref(),

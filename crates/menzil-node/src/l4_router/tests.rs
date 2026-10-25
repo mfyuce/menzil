@@ -2711,12 +2711,25 @@ fn serve(
     me: NodeId,
     gate: &Arc<crate::docs_access::DocsGate>,
 ) {
+    // `me`'s static key is the one its certificate in the Policy names.
+    let me_static = stores
+        .policies
+        .body(&ready.network_id)
+        .and_then(|body| {
+            body.certs
+                .iter()
+                .filter_map(|cert| cert.decode().ok())
+                .find(|cert| cert.node_id == me)
+                .map(|cert| cert.x25519_pub)
+        })
+        .unwrap_or_else(|| X25519PublicKey::from([0u8; 32]));
     crate::node::serve_session(
         ready,
         &stores.policies,
         &stores.rosters,
         me,
         1,
+        me_static,
         &Arc::new(crate::node::RefuseAll),
         gate,
         None,

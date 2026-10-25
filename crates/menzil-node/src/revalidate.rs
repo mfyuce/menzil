@@ -6,7 +6,8 @@
 //! that asks, for every network with a live session, whether each session may go on:
 //!
 //! * a **full session** that fails [`session_standing`] (the peer or this node revoked,
-//!   unlisted, below its `min_serial`, the peer's certificate gone or expired) is closed with
+//!   unlisted, below its `min_serial`, the peer's certificate or this node's own gone, expired or
+//!   below the floor) is closed with
 //!   CLOSE `grant_removed`; one that passes has its served streams asked again
 //!   ([`AcceptedStreams::recheck`]), and the ones whose grant is gone are reset;
 //! * a **docs only session** is judged by the Roster alone ([`docs_only_standing`]) and closed
@@ -41,7 +42,8 @@ use menzil_proto::{ErrorCode, NetworkId, NodeId, PolicyBody, RosterBody, X25519P
 use tokio::sync::{Notify, broadcast};
 use tokio::time::MissedTickBehavior;
 
-use crate::admission::{PolicyAuthorizer, docs_only_standing, resolve_cert_in, session_standing};
+use crate::admission::{PolicyAuthorizer, docs_only_standing, session_standing};
+use crate::cert_index::CertIndex;
 use crate::l4_router::grant_removed_close;
 use crate::l4_session::L4SessionHandle;
 use crate::l5_stream::AcceptedStreams;
@@ -97,10 +99,21 @@ pub(crate) struct Revalidator {
     rosters: Arc<RosterStore>,
     local: NodeId,
     local_serial: u32,
+    /// This node's own static key, for its certificate in the Policy (round 11 N1).
+    local_static: X25519PublicKey,
     sweep: Duration,
     state: Mutex<State>,
     wake: Notify,
     passes: AtomicU64,
+    /// Test hook: the next pass panics (the supervision test).
+    #[cfg(test)]
+    pub(crate) panic_next_pass: std::sync::atomic::AtomicBool,
+    /// Test hook: the thread the last pass ran on.
+    #[cfg(test)]
+    pub(crate) last_pass_thread: Mutex<Option<std::thread::ThreadId>>,
+    /// Test hook: called before each session is judged.
+    #[cfg(test)]
+    pub(crate) judge_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
 }
 
 impl Revalidator {
@@ -109,8 +122,16 @@ impl Revalidator {
         rosters: Arc<RosterStore>,
         local: NodeId,
         local_serial: u32,
+        local_static: X25519PublicKey,
     ) -> Arc<Self> {
-        Self::with_sweep(policies, rosters, local, local_serial, SWEEP_INTERVAL)
+        Self::with_sweep(
+            policies,
+            rosters,
+            local,
+            local_serial,
+            local_static,
+            SWEEP_INTERVAL,
+        )
     }
 
     /// [`Self::new`] with another sweep interval (tests shorten it).
@@ -119,6 +140,7 @@ impl Revalidator {
         rosters: Arc<RosterStore>,
         local: NodeId,
         local_serial: u32,
+        local_static: X25519PublicKey,
         sweep: Duration,
     ) -> Arc<Self> {
         Arc::new(Self {
@@ -126,10 +148,17 @@ impl Revalidator {
             rosters,
             local,
             local_serial,
+            local_static,
             sweep,
             state: Mutex::new(State::default()),
             wake: Notify::new(),
             passes: AtomicU64::new(0),
+            #[cfg(test)]
+            panic_next_pass: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            last_pass_thread: Mutex::new(None),
+            #[cfg(test)]
+            judge_hook: Mutex::new(None),
         })
     }
 
@@ -180,6 +209,12 @@ impl Revalidator {
         self.state().sessions.len()
     }
 
+    /// Whether the registry lock is free right now, for tests.
+    #[cfg(test)]
+    pub(crate) fn state_is_free(&self) -> bool {
+        self.state.try_lock().is_ok()
+    }
+
     /// How many network passes have run, for tests.
     #[cfg(test)]
     pub(crate) fn passes(&self) -> u64 {
@@ -200,44 +235,81 @@ impl Revalidator {
 
     /// What is to be done for each session of `network_id` by the documents held now, at `now`
     /// (Unix seconds). A session that needs nothing is not listed. Ordered by registration.
+    ///
+    /// The registry lock is held only to copy out who the sessions are; the judging, which
+    /// reads the stores and checks a signature per session, runs without it (round 11 L1), so
+    /// `register` and `forget` never wait for a pass.
     pub(crate) fn plan(&self, network_id: &NetworkId, now: u64) -> Vec<(u64, Action)> {
-        let state = self.state();
-        let mut plan: Vec<(u64, Action)> = state
+        let mut sessions: Vec<(u64, NodeId, X25519PublicKey, bool)> = self
+            .state()
             .sessions
             .iter()
             .filter(|(_, session)| &session.network_id == network_id)
-            .filter_map(|(id, session)| {
-                let action = match &session.kind {
-                    Kind::Full { .. } => Some(
+            .map(|(id, session)| {
+                (
+                    *id,
+                    session.peer,
+                    session.peer_static,
+                    matches!(session.kind, Kind::Full { .. }),
+                )
+            })
+            .collect();
+        sessions.sort_by_key(|(id, ..)| *id);
+        self.judge(network_id, &sessions, now)
+    }
+
+    /// The standing of each of `sessions` (id, peer, peer static key, full or docs only). Takes
+    /// no lock of the registry.
+    fn judge(
+        &self,
+        network_id: &NetworkId,
+        sessions: &[(u64, NodeId, X25519PublicKey, bool)],
+        now: u64,
+    ) -> Vec<(u64, Action)> {
+        #[cfg(test)]
+        let hook = self
+            .judge_hook
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        sessions
+            .iter()
+            .filter_map(|(id, peer, peer_static, full)| {
+                #[cfg(test)]
+                if let Some(hook) = &hook {
+                    hook();
+                }
+                let action = if *full {
+                    Some(
                         match session_standing(
                             &self.policies,
                             &self.rosters,
                             network_id,
-                            &session.peer,
-                            &session.peer_static,
+                            peer,
+                            peer_static,
                             &self.local,
                             self.local_serial,
+                            &self.local_static,
                             now,
                         ) {
                             Ok(()) => Action::Recheck,
                             Err(reason) => Action::Close(reason),
                         },
-                    ),
-                    Kind::DocsOnly => docs_only_standing(
+                    )
+                } else {
+                    docs_only_standing(
                         &self.rosters,
                         network_id,
-                        &session.peer,
+                        peer,
                         &self.local,
                         self.local_serial,
                     )
                     .err()
-                    .map(Action::Close),
+                    .map(Action::Close)
                 };
                 action.map(|action| (*id, action))
             })
-            .collect();
-        plan.sort_by_key(|(id, _)| *id);
-        plan
+            .collect()
     }
 
     /// Carries out `plan`; returns how many sessions were closed and how many served streams
@@ -304,9 +376,10 @@ impl Revalidator {
     }
 
     /// The first instant, in Unix seconds, after `now` at which an answer for `network_id` may
-    /// change, if there is one: see [`next_deadline`].
-    fn deadline(&self, network_id: &NetworkId, now: u64) -> Option<u64> {
-        let peers: Vec<(NodeId, X25519PublicKey)> = self
+    /// change, if there is one: see [`next_deadline`]. This node's own certificate counts when a
+    /// full session is live (round 11 N1: its `not_after` ends them).
+    pub(crate) fn deadline(&self, network_id: &NetworkId, now: u64) -> Option<u64> {
+        let mut peers: Vec<(NodeId, X25519PublicKey)> = self
             .state()
             .sessions
             .values()
@@ -315,15 +388,28 @@ impl Revalidator {
             })
             .map(|session| (session.peer, session.peer_static))
             .collect();
+        if !peers.is_empty() {
+            peers.push((self.local, self.local_static));
+        }
         let roster = self.rosters.body(network_id)?;
-        let policy = self.policies.body(network_id)?;
-        next_deadline(&roster, &policy, &peers, now)
+        let view = self.policies.view(network_id)?;
+        next_deadline(&roster, &view.body, &view.certs, &peers, now)
     }
 
     /// One pass over `network_id`: plan, apply, and the new deadline (none when nothing is
     /// worth waiting for within the sweep interval).
     fn pass(&self, network_id: &NetworkId) -> Option<u64> {
         self.passes.fetch_add(1, Ordering::SeqCst);
+        #[cfg(test)]
+        {
+            *self
+                .last_pass_thread
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner) = Some(std::thread::current().id());
+            if self.panic_next_pass.swap(false, Ordering::SeqCst) {
+                panic!("test: a pass panics");
+            }
+        }
         let now = unix_now();
         let plan = self.plan(network_id, now);
         self.apply(&plan);
@@ -331,33 +417,62 @@ impl Revalidator {
         self.deadline(network_id, now).filter(|at| *at <= horizon)
     }
 
-    /// Runs until the task is dropped. Subscribes to both stores first, so a change that lands
-    /// while a pass runs is seen by the next wake.
+    /// Runs until the task is dropped, and keeps running after a panic: the work is done by
+    /// [`Self::run_once`] in a task of its own, and when that one panics the panic is logged and
+    /// a new one starts with every network looked at (a panic ends all re evaluation for the
+    /// life of the node otherwise). Dropping or aborting this future stops the inner task too.
     pub(crate) async fn run(self: Arc<Self>) {
+        let mut everything = false;
+        loop {
+            let inner = tokio::spawn(Arc::clone(&self).run_once(everything));
+            let _stop = AbortOnDrop(inner.abort_handle());
+            match inner.await {
+                Ok(()) => return,
+                Err(error) if error.is_panic() => {
+                    tracing::error!(
+                        "the revalidator panicked; it is restarted and every network looked at"
+                    );
+                    everything = true;
+                }
+                // Cancelled from outside: nothing more to watch.
+                Err(_) => return,
+            }
+        }
+    }
+
+    /// The loop itself. Subscribes to both stores first, so a change that lands while a pass
+    /// runs is seen by the next wake. `everything` starts with a pass over every network that
+    /// has a session (a restart after a panic).
+    async fn run_once(self: Arc<Self>, everything: bool) {
         let mut roster_rx = self.rosters.subscribe();
         let mut policy_rx = self.policies.subscribe();
         let mut sweep = tokio::time::interval(self.sweep);
         sweep.set_missed_tick_behavior(MissedTickBehavior::Delay);
         sweep.tick().await; // the first tick is immediate
         let mut deadlines: HashMap<NetworkId, u64> = HashMap::new();
+        let mut first = everything;
         loop {
             let next = deadlines.values().min().copied();
             let mut due: HashSet<NetworkId> = HashSet::new();
             let mut all = false;
-            tokio::select! {
-                changed = roster_rx.recv() => {
-                    if !note_change(changed, &mut due, &mut all) {
-                        return;
+            if std::mem::take(&mut first) {
+                all = true;
+            } else {
+                tokio::select! {
+                    changed = roster_rx.recv() => {
+                        if !note_change(changed, &mut due, &mut all) {
+                            return;
+                        }
                     }
-                }
-                changed = policy_rx.recv() => {
-                    if !note_change(changed, &mut due, &mut all) {
-                        return;
+                    changed = policy_rx.recv() => {
+                        if !note_change(changed, &mut due, &mut all) {
+                            return;
+                        }
                     }
+                    () = self.wake.notified() => {}
+                    _ = sweep.tick() => all = true,
+                    () = sleep_until_unix(next) => {}
                 }
-                () = self.wake.notified() => {}
-                _ = sweep.tick() => all = true,
-                () = sleep_until_unix(next) => {}
             }
             // Whatever else arrived meanwhile is one pass, not many.
             drain(&mut roster_rx, &mut due, &mut all);
@@ -374,7 +489,19 @@ impl Revalidator {
                     .map(|(network_id, _)| *network_id),
             );
             for network_id in due {
-                match self.pass(&network_id) {
+                // A pass reads the stores and checks a signature per session: not on a runtime
+                // worker (round 11 L1).
+                let this = Arc::clone(&self);
+                let passed = tokio::task::spawn_blocking(move || this.pass(&network_id)).await;
+                let outcome = match passed {
+                    Ok(next) => next,
+                    Err(error) => match error.try_into_panic() {
+                        // Let the supervisor in `run` log it and start over.
+                        Ok(panic) => std::panic::resume_unwind(panic),
+                        Err(_) => return,
+                    },
+                };
+                match outcome {
                     Some(at) => {
                         deadlines.insert(network_id, at);
                     }
@@ -420,6 +547,15 @@ fn drain(rx: &mut broadcast::Receiver<NetworkId>, due: &mut HashSet<NetworkId>, 
     }
 }
 
+/// Aborts a task when dropped.
+struct AbortOnDrop(tokio::task::AbortHandle);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 fn unix_now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -450,20 +586,23 @@ async fn sleep_until_unix(at: Option<u64>) {
 /// * a grant's `expires` (a grant holds while `expires > now`, so it is gone at `expires`),
 /// * the Roster's and the Policy's `expires` (`has_grant` fails from then on),
 /// * the second after the `not_after` of the certificate a live peer's session key is vouched
-///   for by (valid while `now <= not_after`).
+///   for by (valid while `now <= not_after`); `peers` also carries this node itself (its own
+///   certificate in the Policy is part of its standing, round 11 N1).
 ///
 /// `None` when nothing lies ahead. A certificate that is already gone or cannot be resolved has
 /// no future instant: the pass that finds it closes the session.
 pub(crate) fn next_deadline(
     roster: &RosterBody,
     policy: &PolicyBody,
+    certs: &CertIndex,
     peers: &[(NodeId, X25519PublicKey)],
     now: u64,
 ) -> Option<u64> {
     let grants = policy.grants.iter().filter_map(|grant| grant.expires);
     let documents = [roster.expires, policy.expires];
     let certs = peers.iter().filter_map(|(peer, peer_static)| {
-        resolve_cert_in(policy, peer, peer_static, now)
+        certs
+            .resolve(peer, peer_static, now)
             .and_then(|cert| cert.not_after.checked_add(1))
     });
     grants
@@ -537,6 +676,17 @@ mod tests {
         }
     }
 
+    /// `next_deadline` for the fixture, with the index of its certificates.
+    fn deadline_of(f: &Fixture, peers: &[(NodeId, X25519PublicKey)], now: u64) -> Option<u64> {
+        next_deadline(
+            &f.roster,
+            &f.policy,
+            &CertIndex::build(&f.policy.certs),
+            peers,
+            now,
+        )
+    }
+
     fn grant_expiring(f: &Fixture, expires: Option<u64>) -> Grant {
         Grant {
             from: Principal {
@@ -555,9 +705,9 @@ mod tests {
         f.roster.expires = 100;
         f.policy.expires = 100;
         f.policy.grants = vec![grant_expiring(&f, None), grant_expiring(&f, Some(50))];
-        assert_eq!(next_deadline(&f.roster, &f.policy, &[], 100), None);
+        assert_eq!(deadline_of(&f, &[], 100), None);
         assert_eq!(
-            next_deadline(&f.roster, &f.policy, &[(f.peer, f.peer_static)], 100),
+            deadline_of(&f, &[(f.peer, f.peer_static)], 100),
             None,
             "a certificate valid until the end of time has no end to wait for"
         );
@@ -572,9 +722,9 @@ mod tests {
             grant_expiring(&f, Some(300)),
             grant_expiring(&f, Some(50)),
         ];
-        assert_eq!(next_deadline(&f.roster, &f.policy, &[], 100), Some(300));
+        assert_eq!(deadline_of(&f, &[], 100), Some(300));
         // The expiry itself is no longer ahead: from that second the grant is gone.
-        assert_eq!(next_deadline(&f.roster, &f.policy, &[], 300), Some(900));
+        assert_eq!(deadline_of(&f, &[], 300), Some(900));
     }
 
     #[test]
@@ -582,27 +732,21 @@ mod tests {
         let mut f = fixture(u64::MAX);
         f.roster.expires = 700;
         f.policy.expires = 800;
-        assert_eq!(next_deadline(&f.roster, &f.policy, &[], 100), Some(700));
+        assert_eq!(deadline_of(&f, &[], 100), Some(700));
         f.roster.expires = 900;
-        assert_eq!(next_deadline(&f.roster, &f.policy, &[], 100), Some(800));
+        assert_eq!(deadline_of(&f, &[], 100), Some(800));
     }
 
     #[test]
     fn a_live_peers_certificate_ends_the_second_after_its_not_after() {
         let f = fixture(400);
         let peers = [(f.peer, f.peer_static)];
-        assert_eq!(next_deadline(&f.roster, &f.policy, &peers, 100), Some(401));
+        assert_eq!(deadline_of(&f, &peers, 100), Some(401));
         // A key that backs no session is no reason to wake.
         let other = [(f.peer, X25519PublicKey::from([8u8; 32]))];
-        assert_eq!(
-            next_deadline(&f.roster, &f.policy, &other, 100),
-            Some(5_000)
-        );
+        assert_eq!(deadline_of(&f, &other, 100), Some(5_000));
         // Past its end the certificate resolves no more: the pass closes the session.
-        assert_eq!(
-            next_deadline(&f.roster, &f.policy, &peers, 401),
-            Some(5_000)
-        );
+        assert_eq!(deadline_of(&f, &peers, 401), Some(5_000));
     }
 
     #[test]
@@ -610,9 +754,9 @@ mod tests {
         let mut f = fixture(450);
         f.policy.grants = vec![grant_expiring(&f, Some(500))];
         let peers = [(f.peer, f.peer_static)];
-        assert_eq!(next_deadline(&f.roster, &f.policy, &peers, 100), Some(451));
+        assert_eq!(deadline_of(&f, &peers, 100), Some(451));
         f.policy.grants = vec![grant_expiring(&f, Some(200))];
-        assert_eq!(next_deadline(&f.roster, &f.policy, &peers, 100), Some(200));
+        assert_eq!(deadline_of(&f, &peers, 100), Some(200));
     }
 
     #[test]

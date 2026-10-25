@@ -60,6 +60,7 @@
 #![forbid(unsafe_code)]
 
 mod admission;
+mod cert_index;
 pub mod docs;
 mod docs_access;
 mod docs_store;

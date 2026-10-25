@@ -71,7 +71,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use menzil_e2e::Role;
-use menzil_proto::{ErrorCode, NetworkId, NodeId, OpenTarget, ProtoError, ServiceId};
+use menzil_proto::{
+    ErrorCode, NetworkId, NodeId, OpenTarget, ProtoError, ServiceId, X25519PublicKey,
+};
 use menzil_stream::{Authorizer, OpenDecision, OpenRefusal, OpenRequest, ServiceHandler, Stream};
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
@@ -213,7 +215,8 @@ impl Node {
             return Err(StartError::NoL4Protocol);
         }
         let local_cert = session.identity.node_cert.decode()?;
-        let (local_node_id, local_serial) = (local_cert.node_id, local_cert.serial);
+        let (local_node_id, local_serial, local_static) =
+            (local_cert.node_id, local_cert.serial, local_cert.x25519_pub);
         let router_config = RouterConfig::new(
             session.identity.clone(),
             session.dial.connection_info.relay_node_id,
@@ -245,6 +248,7 @@ impl Node {
             rosters.clone(),
             local_node_id,
             local_serial,
+            local_static,
         );
         let (stop_session, stop_rx) = watch::channel(false);
         let (ended_tx, session_ended) = watch::channel(false);
@@ -263,6 +267,7 @@ impl Node {
                 rosters.clone(),
                 local_node_id,
                 local_serial,
+                local_static,
                 Arc::new(handler),
                 DocsGate::new(DocsLimits::default()),
                 Some(sync.clone()),
@@ -429,6 +434,7 @@ async fn serve_sessions<H>(
     rosters: Arc<RosterStore>,
     local_node_id: NodeId,
     local_serial: u32,
+    local_static: X25519PublicKey,
     handler: Arc<H>,
     gate: Arc<DocsGate>,
     sync: Option<Arc<DocsSync>>,
@@ -444,6 +450,7 @@ async fn serve_sessions<H>(
             &rosters,
             local_node_id,
             local_serial,
+            local_static,
             &handler,
             &gate,
             sync.as_ref(),
@@ -489,6 +496,7 @@ pub(crate) fn serve_session<H>(
     rosters: &Arc<RosterStore>,
     local_node_id: NodeId,
     local_serial: u32,
+    local_static: X25519PublicKey,
     handler: &Arc<H>,
     gate: &Arc<DocsGate>,
     sync: Option<&Arc<DocsSync>>,
@@ -515,6 +523,7 @@ pub(crate) fn serve_session<H>(
         network_id,
         local_node_id,
         local_serial,
+        local_static,
     );
     // Registered before the accept loop starts, so no OPEN is served unwatched; the
     // registration also has the network looked at once, for documents that changed since the

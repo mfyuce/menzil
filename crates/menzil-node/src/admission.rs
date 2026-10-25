@@ -140,6 +140,7 @@ use menzil_proto::{
 };
 use menzil_stream::{Authorizer, OpenDecision, OpenRefusal, OpenRequest};
 
+use crate::cert_index::CertIndex;
 use crate::policy_store::{PolicyStore, roster_standing};
 use crate::roster_store::RosterStore;
 
@@ -170,6 +171,27 @@ fn verify_cert(cert: &NodeCert, now: u64) -> Result<NodeCertBody, ProtoError> {
         ));
     }
     Ok(body)
+}
+
+/// This node's own certificate, as the held Policy lists it (protocol.md 5.3: a node ends its
+/// sessions when it "no longer is" a member, which includes a certificate there for its own
+/// static key): self signed, valid at `now` (so its `not_after` counts), and a serial not below
+/// this node's `min_serial` in `roster`. The error is for the local logs.
+pub(crate) fn own_cert_standing(
+    roster: &RosterBody,
+    certs: &CertIndex,
+    local: &NodeId,
+    local_static: &X25519PublicKey,
+    now: u64,
+) -> Result<(), ErrorCode> {
+    let min_serial = roster_standing(roster, local)?;
+    let cert = certs
+        .resolve(local, local_static, now)
+        .ok_or(ErrorCode::BadCert)?;
+    if cert.serial < min_serial {
+        return Err(ErrorCode::StaleSerial);
+    }
+    Ok(())
 }
 
 /// Resolves the member cert that must back `node_id`'s Noise static key
@@ -204,27 +226,8 @@ fn resolve_member_cert(
     claimed_key: &X25519PublicKey,
     now: u64,
 ) -> Option<NodeCertBody> {
-    let policy = policies.body(network_id)?;
-    resolve_cert_in(&policy, node_id, claimed_key, now)
-}
-
-/// [`resolve_member_cert`] against a Policy body the caller already holds, so that a check
-/// that reads other parts of the same body (see [`session_standing`]) sees one snapshot.
-pub(crate) fn resolve_cert_in(
-    policy: &PolicyBody,
-    node_id: &NodeId,
-    claimed_key: &X25519PublicKey,
-    now: u64,
-) -> Option<NodeCertBody> {
-    policy
-        .certs
-        .iter()
-        .filter(|cert| {
-            cert.decode()
-                .is_ok_and(|body| &body.node_id == node_id && &body.x25519_pub == claimed_key)
-        })
-        .filter_map(|cert| verify_cert(cert, now).ok())
-        .max_by_key(|body| body.serial)
+    let view = policies.view(network_id)?;
+    view.certs.resolve(node_id, claimed_key, now)
 }
 
 /// Resolves the cert to *dial* `node_id` with in `network_id` (protocol.md
@@ -275,17 +278,9 @@ fn resolve_dial_cert_with(
     now: u64,
     check_expiry: bool,
 ) -> Option<NodeCertBody> {
-    let policy = policies.body(network_id)?;
-    policy
-        .certs
-        .iter()
-        .filter(|cert| {
-            // The cheap comparison first, for the same reason as in
-            // `resolve_member_cert`: do not pay a signature check per
-            // entry just to compare it against the one being looked up.
-            cert.decode().is_ok_and(|body| &body.node_id == node_id)
-        })
-        .filter_map(|cert| verify_cert(cert, now).ok())
+    let view = policies.view(network_id)?;
+    view.certs
+        .valid_for_node(node_id, now)
         .filter(|body| {
             membership(
                 policies,
@@ -325,7 +320,9 @@ pub(crate) fn membership(
 /// changes, and that a caller about to reuse a session asks first. Pure and synchronous.
 ///
 /// 1. This node: unrevoked and listed in the Roster, `local_serial` not below its
-///    `min_serial`, and listed in the Policy `members`.
+///    `min_serial`, listed in the Policy `members`, and a certificate for its own static key
+///    `local_static` in the Policy `certs` (self signed, valid at `now`, serial not below
+///    `min_serial`).
 /// 2. The peer: unrevoked and listed in the Roster, listed in the Policy `members`, and a
 ///    certificate for `peer_static` still in the Policy `certs` (self signed, valid at `now`)
 ///    with a serial not below the peer's `min_serial`.
@@ -339,7 +336,7 @@ pub(crate) fn membership(
 ///
 /// The error is for the caller's logs. Like [`PolicyStore::check_membership`]'s it must not
 /// reach the wire: the peer is told one uniform CLOSE `grant_removed` (T1).
-// Eight independent scalars, like `decide_responder_admission`.
+// Independent scalars, like `decide_responder_admission`.
 #[allow(clippy::too_many_arguments)]
 pub fn session_standing(
     policies: &PolicyStore,
@@ -349,17 +346,30 @@ pub fn session_standing(
     peer_static: &X25519PublicKey,
     local: &NodeId,
     local_serial: u32,
+    local_static: &X25519PublicKey,
     now: u64,
 ) -> Result<(), ErrorCode> {
     let roster = rosters.body(network_id).ok_or(ErrorCode::UnknownNetwork)?;
-    let policy = policies.body(network_id).ok_or(ErrorCode::UnknownNetwork)?;
-    own_standing(&roster, &policy, local, local_serial)?;
+    let view = policies.view(network_id).ok_or(ErrorCode::UnknownNetwork)?;
+    let policy = &view.body;
+    own_standing(
+        &roster,
+        policy,
+        &view.certs,
+        local,
+        local_serial,
+        local_static,
+        now,
+    )?;
 
     let peer_min_serial = roster_standing(&roster, peer)?;
     if !policy.members.iter().any(|member| &member.node_id == peer) {
         return Err(ErrorCode::NotMember);
     }
-    let cert = resolve_cert_in(&policy, peer, peer_static, now).ok_or(ErrorCode::BadCert)?;
+    let cert = view
+        .certs
+        .resolve(peer, peer_static, now)
+        .ok_or(ErrorCode::BadCert)?;
     if cert.serial < peer_min_serial {
         return Err(ErrorCode::StaleSerial);
     }
@@ -400,18 +410,23 @@ fn roster_own_standing(
 }
 
 /// This node's own standing, the first half of [`session_standing`]: unrevoked and listed in
-/// the Roster with `local_serial` not below its `min_serial`, and listed in the Policy.
+/// the Roster with `local_serial` not below its `min_serial`, listed in the Policy, and with a
+/// certificate there for its own static key `local_static` that is valid at `now` and not below
+/// the `min_serial` ([`own_cert_standing`], round 11 N1).
 fn own_standing(
     roster: &RosterBody,
     policy: &PolicyBody,
+    certs: &CertIndex,
     local: &NodeId,
     local_serial: u32,
+    local_static: &X25519PublicKey,
+    now: u64,
 ) -> Result<(), ErrorCode> {
     roster_own_standing(roster, local, local_serial)?;
     if !policy.members.iter().any(|member| &member.node_id == local) {
         return Err(ErrorCode::NotMember);
     }
-    Ok(())
+    own_cert_standing(roster, certs, local, local_static, now)
 }
 
 /// What protocol.md 5.1's responder-side checks decide about one just-read
@@ -734,7 +749,16 @@ pub struct PolicyAuthorizer {
     to_node: NodeId,
     /// The serial of this node's own NodeCert, for the floor of its own standing.
     to_node_serial: u32,
+    /// This node's own static key, for its certificate in the Policy (round 11 N1).
+    to_node_static: X25519PublicKey,
     docs_only: bool,
+}
+
+fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }
 
 impl PolicyAuthorizer {
@@ -750,6 +774,7 @@ impl PolicyAuthorizer {
         network_id: NetworkId,
         to_node: NodeId,
         to_node_serial: u32,
+        to_node_static: X25519PublicKey,
     ) -> Self {
         Self {
             policies,
@@ -757,6 +782,7 @@ impl PolicyAuthorizer {
             network_id,
             to_node,
             to_node_serial,
+            to_node_static,
             docs_only: false,
         }
     }
@@ -780,11 +806,18 @@ impl PolicyAuthorizer {
         }
         match (
             self.rosters.body(&self.network_id),
-            self.policies.body(&self.network_id),
+            self.policies.view(&self.network_id),
         ) {
-            (Some(roster), Some(policy)) => {
-                own_standing(&roster, &policy, &self.to_node, self.to_node_serial).is_ok()
-            }
+            (Some(roster), Some(view)) => own_standing(
+                &roster,
+                &view.body,
+                &view.certs,
+                &self.to_node,
+                self.to_node_serial,
+                &self.to_node_static,
+                unix_now(),
+            )
+            .is_ok(),
             _ => false,
         }
     }
@@ -827,10 +860,7 @@ impl Authorizer for PolicyAuthorizer {
         if self.docs_only {
             return Self::no_grant();
         }
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
+        let now = unix_now();
         if self.policies.has_grant(
             &self.rosters,
             &self.network_id,
@@ -869,7 +899,9 @@ mod tests {
         initiator_node_id: NodeId,
         initiator_x25519: X25519PublicKey,
         initiator_cert_serial: u32,
+        responder_signing_key: SigningKey,
         responder_node_id: NodeId,
+        responder_x25519: X25519PublicKey,
         responder_cert_serial: u32,
     }
 
@@ -882,7 +914,10 @@ mod tests {
         // handshake, only compare this value against itself, so any
         // distinct 32-byte value serves.
         let initiator_x25519 = X25519PublicKey::from([0x42u8; 32]);
-        let responder_node_id = NodeId::from([0x99u8; 32]);
+        // A real identity: its certificate in the Policy is part of its own standing.
+        let responder_signing_key = SigningKey::generate(&mut rand::rng());
+        let responder_node_id = NodeId::from(responder_signing_key.verifying_key().to_bytes());
+        let responder_x25519 = X25519PublicKey::from([0x43u8; 32]);
         Ids {
             owner,
             network_id,
@@ -890,7 +925,9 @@ mod tests {
             initiator_node_id,
             initiator_x25519,
             initiator_cert_serial: 3,
+            responder_signing_key,
             responder_node_id,
+            responder_x25519,
             // Deliberately different from `initiator_cert_serial`, so a
             // test that accidentally mixed the two up would be caught.
             responder_cert_serial: 5,
@@ -943,7 +980,26 @@ mod tests {
         Roster::sign(&ids.owner, &body).unwrap()
     }
 
-    fn signed_policy(ids: &Ids, certs: Vec<NodeCert>, grants: Vec<Grant>) -> Policy {
+    /// The responder's own certificate (serial `responder_cert_serial`).
+    fn responder_cert(ids: &Ids) -> NodeCert {
+        NodeCert::sign(
+            &ids.responder_signing_key,
+            &NodeCertBody {
+                v: menzil_proto::PROTOCOL_VERSION,
+                node_id: ids.responder_node_id,
+                x25519_pub: ids.responder_x25519,
+                serial: ids.responder_cert_serial,
+                not_before: 0,
+                not_after: 4_000_000_000,
+            },
+        )
+        .unwrap()
+    }
+
+    /// A Policy listing both parties, with `certs` and, always, the responder's own
+    /// certificate.
+    fn signed_policy(ids: &Ids, mut certs: Vec<NodeCert>, grants: Vec<Grant>) -> Policy {
+        certs.push(responder_cert(ids));
         let body = menzil_proto::PolicyBody {
             v: menzil_proto::PROTOCOL_VERSION,
             network_id: ids.network_id,
@@ -1576,6 +1632,7 @@ mod tests {
             f.ids.network_id,
             f.ids.responder_node_id,
             f.ids.responder_cert_serial,
+            f.ids.responder_x25519,
         );
         assert!(matches!(
             authorizer.authorize(&open_request(&f.ids)),
@@ -1609,6 +1666,7 @@ mod tests {
             f.ids.network_id,
             f.ids.responder_node_id,
             f.ids.responder_cert_serial,
+            f.ids.responder_x25519,
         );
         match authorizer.authorize(&open_request(&f.ids)) {
             OpenDecision::Deny(refusal) => {
@@ -1628,6 +1686,7 @@ mod tests {
             f.ids.network_id,
             f.ids.responder_node_id,
             f.ids.responder_cert_serial,
+            f.ids.responder_x25519,
         );
         let mut request = open_request(&f.ids);
         request.network_id = NetworkId::from([0x11u8; 32]);
@@ -1897,6 +1956,7 @@ mod tests {
                 f.ids.network_id,
                 f.ids.responder_node_id,
                 f.ids.responder_cert_serial,
+                f.ids.responder_x25519,
             ),
             rosters,
             policies,
@@ -2182,6 +2242,7 @@ mod tests {
             &f.ids.initiator_x25519,
             &f.ids.responder_node_id,
             f.ids.responder_cert_serial,
+            &f.ids.responder_x25519,
             now,
         )
     }
@@ -2191,6 +2252,89 @@ mod tests {
             node_id: who,
             since: 0,
         }
+    }
+
+    /// The responder's certificate, changed by `edit` and signed again.
+    fn own_cert_with(ids: &Ids, edit: impl FnOnce(&mut NodeCertBody)) -> NodeCert {
+        let mut body = responder_cert(ids).decode().unwrap();
+        edit(&mut body);
+        NodeCert::sign(&ids.responder_signing_key, &body).unwrap()
+    }
+
+    /// Round 11 N1 (protocol.md 5.3): this node's own certificate in the Policy, for its own
+    /// static key, valid at `now` and not below its `min_serial`, is part of its standing.
+    #[test]
+    fn session_standing_needs_this_nodes_own_certificate_in_the_policy() {
+        type Case = (&'static str, fn(&Fixture), ErrorCode);
+        let cases: [Case; 4] = [
+            (
+                "gone from the Policy",
+                |f| {
+                    edit_policy(f, |b| {
+                        b.certs
+                            .retain(|c| c.decode().unwrap().node_id != f.ids.responder_node_id);
+                    })
+                },
+                ErrorCode::BadCert,
+            ),
+            (
+                "for another static key",
+                |f| {
+                    edit_policy(f, |b| {
+                        b.certs
+                            .retain(|c| c.decode().unwrap().node_id != f.ids.responder_node_id);
+                        b.certs.push(own_cert_with(&f.ids, |c| {
+                            c.x25519_pub = X25519PublicKey::from([0x44u8; 32]);
+                        }));
+                    })
+                },
+                ErrorCode::BadCert,
+            ),
+            (
+                "run out (the peer's is still valid)",
+                |f| {
+                    edit_policy(f, |b| {
+                        b.certs
+                            .retain(|c| c.decode().unwrap().node_id != f.ids.responder_node_id);
+                        b.certs.push(own_cert_with(&f.ids, |c| c.not_after = 500));
+                    })
+                },
+                ErrorCode::BadCert,
+            ),
+            (
+                "below the min_serial although the node's own serial is not",
+                |f| {
+                    edit_policy(f, |b| {
+                        b.certs
+                            .retain(|c| c.decode().unwrap().node_id != f.ids.responder_node_id);
+                        b.certs.push(own_cert_with(&f.ids, |c| c.serial = 2));
+                    });
+                    edit_roster(f, |b| {
+                        for m in &mut b.members {
+                            if m.node_id == f.ids.responder_node_id {
+                                m.min_serial = 3;
+                            }
+                        }
+                    });
+                },
+                ErrorCode::StaleSerial,
+            ),
+        ];
+        for (label, change, expected) in cases {
+            let f = fixture(vec![]);
+            assert_eq!(standing(&f, 1_000), Ok(()), "{label}: before");
+            change(&f);
+            assert_eq!(standing(&f, 1_000), Err(expected), "{label}");
+        }
+        // Valid until `not_after` itself, gone the second after.
+        let f = fixture(vec![]);
+        edit_policy(&f, |b| {
+            b.certs
+                .retain(|c| c.decode().unwrap().node_id != f.ids.responder_node_id);
+            b.certs.push(own_cert_with(&f.ids, |c| c.not_after = 1_000));
+        });
+        assert_eq!(standing(&f, 1_000), Ok(()));
+        assert_eq!(standing(&f, 1_001), Err(ErrorCode::BadCert));
     }
 
     #[test]
@@ -2384,6 +2528,7 @@ mod tests {
                 &f.ids.initiator_x25519,
                 &f.ids.responder_node_id,
                 f.ids.responder_cert_serial,
+                &f.ids.responder_x25519,
                 1_000,
             )
         };
@@ -2430,7 +2575,7 @@ mod tests {
     #[test]
     fn the_authorizer_refuses_everything_once_this_node_has_lost_its_own_standing() {
         type Case = (&'static str, fn(&Ids, &RosterStore, &PolicyStore));
-        let cases: [Case; 4] = [
+        let cases: [Case; 6] = [
             ("revoked", |ids, rosters, _| {
                 edit_roster_in(ids, rosters, |b| {
                     b.revoked.push(revoked(ids.responder_node_id));
@@ -2455,6 +2600,25 @@ mod tests {
                     b.members.retain(|m| m.node_id != ids.responder_node_id);
                 })
             }),
+            (
+                "its certificate gone from the Policy",
+                |ids, _, policies| {
+                    edit_policy_in(ids, policies, |b| {
+                        b.certs
+                            .retain(|c| c.decode().unwrap().node_id != ids.responder_node_id);
+                    })
+                },
+            ),
+            (
+                "its certificate in the Policy has run out",
+                |ids, _, policies| {
+                    edit_policy_in(ids, policies, |b| {
+                        b.certs
+                            .retain(|c| c.decode().unwrap().node_id != ids.responder_node_id);
+                        b.certs.push(own_cert_with(ids, |c| c.not_after = 1_000));
+                    })
+                },
+            ),
         ];
         for (label, change) in cases {
             let f = fixture(vec![]);

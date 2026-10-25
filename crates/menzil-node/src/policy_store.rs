@@ -67,6 +67,7 @@ use menzil_proto::{
 };
 use tokio::sync::broadcast;
 
+use crate::cert_index::CertIndex;
 use crate::error::NodeError;
 use crate::roster_store::RosterStore;
 
@@ -100,6 +101,9 @@ const CHANGE_BACKLOG: usize = 64;
 pub(crate) struct Held {
     signed: Policy,
     body: Arc<PolicyBody>,
+    /// The body's certificates, decoded once with the entry (round 11 L1); an adoption
+    /// replaces the entry and with it the index.
+    certs: Arc<CertIndex>,
     base: Option<Policy>,
     signer: Signer,
 }
@@ -112,9 +116,12 @@ impl Held {
         base: Option<&Policy>,
         signer: Signer,
     ) -> Result<Self, NodeError> {
+        let body = policy.decode()?;
+        let certs = Arc::new(CertIndex::build(&body.certs));
         Ok(Self {
             signed: policy.clone(),
-            body: Arc::new(policy.decode()?),
+            body: Arc::new(body),
+            certs,
             base: base.cloned(),
             signer,
         })
@@ -128,6 +135,12 @@ impl Held {
     pub(crate) fn signed_with_base(&self) -> (Policy, Option<Policy>) {
         (self.signed.clone(), self.base.clone())
     }
+}
+
+/// One held Policy body with the index of its certificates ([`PolicyStore::view`]).
+pub(crate) struct PolicyView {
+    pub(crate) body: Arc<PolicyBody>,
+    pub(crate) certs: Arc<CertIndex>,
 }
 
 /// The map behind a [`PolicyStore`]; [`crate::DocStore`] takes its write guard second, after
@@ -260,6 +273,19 @@ impl PolicyStore {
             .unwrap()
             .get(network_id)
             .map(|held| held.body.clone())
+    }
+
+    /// The held Policy body and the index of its certificates, read under one lock, so that a
+    /// check that reads both sees one Policy.
+    pub(crate) fn view(&self, network_id: &NetworkId) -> Option<PolicyView> {
+        self.by_network
+            .read()
+            .unwrap()
+            .get(network_id)
+            .map(|held| PolicyView {
+                body: held.body.clone(),
+                certs: held.certs.clone(),
+            })
     }
 
     /// protocol.md 5.1's per-side membership and serial check: whether

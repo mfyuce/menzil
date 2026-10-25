@@ -9,8 +9,9 @@ use super::*;
 use crate::docs_access::{DocsGate, DocsLimits};
 use crate::l5_stream::open as open_stream;
 use crate::node::serve_session;
-use crate::revalidate::{Action, Revalidator};
+use crate::revalidate::{Action, Kind, Revalidator};
 use menzil_stream::{OpenRefusal, OpenRequest, ServiceHandler, Stream};
+use std::sync::atomic::Ordering;
 
 /// A service handler that accepts every stream and holds it open until its task is dropped,
 /// which is what resets it.
@@ -56,6 +57,24 @@ fn edit_policy_of(w: &World, stores: &Stores, edit: impl FnOnce(&mut PolicyBody)
     );
 }
 
+/// Replaces the Policy certificate of `who` with one changed by `edit`, re signed by `who`.
+fn change_cert_of(
+    w: &World,
+    stores: &Stores,
+    who: &Party,
+    edit: impl Fn(&mut menzil_proto::NodeCertBody),
+) {
+    edit_policy_of(w, stores, |body| {
+        for cert in &mut body.certs {
+            let mut cert_body = cert.decode().unwrap();
+            if cert_body.node_id == who.id {
+                edit(&mut cert_body);
+                *cert = NodeCert::sign(&who.signing, &cert_body).unwrap();
+            }
+        }
+    });
+}
+
 fn revoke_in(w: &World, stores: &Stores, who: NodeId) {
     edit_roster_of(w, stores, |body| {
         body.revoked.push(menzil_proto::RevokedMember {
@@ -95,7 +114,13 @@ async fn live(grants: impl FnOnce(&World, &Party, &Party) -> Vec<Grant>) -> Live
     let handle_a = ensure(&na, b.id, w.network).await.unwrap();
     let ready_a = na.next_ready().await;
     let ready_b = nb.next_ready().await;
-    let reval = Revalidator::new(stores_b.policies.clone(), stores_b.rosters.clone(), b.id, 1);
+    let reval = Revalidator::new(
+        stores_b.policies.clone(),
+        stores_b.rosters.clone(),
+        b.id,
+        1,
+        b.x25519_public,
+    );
     Live {
         w,
         a,
@@ -122,6 +147,7 @@ impl Live {
             &self.stores_b.rosters,
             self.b.id,
             1,
+            self.b.x25519_public,
             &Arc::new(Hold),
             &DocsGate::new(DocsLimits::default()),
             None,
@@ -229,6 +255,32 @@ async fn a_full_session_is_closed_or_rechecked_by_the_documents_held() {
             Action::Close(ErrorCode::NotMember),
         ),
         (
+            "this node's own cert is gone from the Policy (round 11 N1)",
+            |l| {
+                edit_policy_of(&l.w, &l.stores_b, |b| {
+                    b.certs.retain(|c| c.decode().unwrap().node_id != l.b.id);
+                })
+            },
+            1_000,
+            Action::Close(ErrorCode::BadCert),
+        ),
+        (
+            "this node's own cert in the Policy has run out",
+            |l| change_cert_of(&l.w, &l.stores_b, &l.b, |c| c.not_after = 500),
+            1_000,
+            Action::Close(ErrorCode::BadCert),
+        ),
+        (
+            "this node's own cert in the Policy names another key",
+            |l| {
+                change_cert_of(&l.w, &l.stores_b, &l.b, |c| {
+                    c.x25519_pub = X25519PublicKey::from([0x77; 32]);
+                })
+            },
+            1_000,
+            Action::Close(ErrorCode::BadCert),
+        ),
+        (
             "the grant is removed: the streams are asked again, the session stays",
             |l| edit_policy_of(&l.w, &l.stores_b, |b| b.grants.clear()),
             1_000,
@@ -287,13 +339,20 @@ async fn a_docs_only_session_is_judged_by_the_roster_alone() {
     let _at_m = nm.next_ready().await;
     assert!(at_r.docs_only);
 
-    let reval = Revalidator::new(r_stores.policies.clone(), r_stores.rosters.clone(), r.id, 1);
+    let reval = Revalidator::new(
+        r_stores.policies.clone(),
+        r_stores.rosters.clone(),
+        r.id,
+        1,
+        r.x25519_public,
+    );
     serve_session(
         at_r,
         &r_stores.policies,
         &r_stores.rosters,
         r.id,
         1,
+        r.x25519_public,
         &Arc::new(Hold),
         &DocsGate::new(DocsLimits::default()),
         None,
@@ -325,13 +384,20 @@ async fn a_docs_only_session_ends_when_this_node_loses_its_standing_in_the_roste
     );
     let at_r = nr.next_ready().await;
     let _at_m = nm.next_ready().await;
-    let reval = Revalidator::new(r_stores.policies.clone(), r_stores.rosters.clone(), r.id, 1);
+    let reval = Revalidator::new(
+        r_stores.policies.clone(),
+        r_stores.rosters.clone(),
+        r.id,
+        1,
+        r.x25519_public,
+    );
     serve_session(
         at_r,
         &r_stores.policies,
         &r_stores.rosters,
         r.id,
         1,
+        r.x25519_public,
         &Arc::new(Hold),
         &DocsGate::new(DocsLimits::default()),
         None,
@@ -367,13 +433,20 @@ async fn the_initiator_of_a_docs_only_session_is_watched_as_well() {
     );
     let at_m = nm.next_ready().await;
     assert!(at_m.docs_only && at_m.role == Role::Initiator);
-    let reval = Revalidator::new(m_stores.policies.clone(), m_stores.rosters.clone(), m.id, 1);
+    let reval = Revalidator::new(
+        m_stores.policies.clone(),
+        m_stores.rosters.clone(),
+        m.id,
+        1,
+        m.x25519_public,
+    );
     serve_session(
         at_m,
         &m_stores.policies,
         &m_stores.rosters,
         m.id,
         1,
+        m.x25519_public,
         &Arc::new(Hold),
         &DocsGate::new(DocsLimits::default()),
         None,
@@ -406,7 +479,13 @@ async fn a_docs_only_push_is_taken_by_a_node_its_own_policy_does_not_list_yet() 
     );
     let mut at_m = nm.next_ready().await;
     let at_r = nr.next_ready().await;
-    let reval = Revalidator::new(stores_r.policies.clone(), stores_r.rosters.clone(), r.id, 1);
+    let reval = Revalidator::new(
+        stores_r.policies.clone(),
+        stores_r.rosters.clone(),
+        r.id,
+        1,
+        r.x25519_public,
+    );
     tokio::spawn(reval.clone().run());
     let handle = at_m.handle.clone();
     let mut closed = std::pin::pin!(at_m.acceptor.closed());
@@ -416,6 +495,7 @@ async fn a_docs_only_push_is_taken_by_a_node_its_own_policy_does_not_list_yet() 
         &stores_r.rosters,
         r.id,
         1,
+        r.x25519_public,
         &Arc::new(Hold),
         &DocsGate::new(DocsLimits::default()),
         None,
@@ -544,6 +624,7 @@ async fn a_roster_alone_that_revokes_this_node_ends_a_session_it_initiated() {
         live.stores_a.rosters.clone(),
         live.a.id,
         1,
+        live.a.x25519_public,
     );
     tokio::spawn(reval_a.clone().run());
     let ready_a = std::mem::replace(
@@ -558,6 +639,7 @@ async fn a_roster_alone_that_revokes_this_node_ends_a_session_it_initiated() {
         &live.stores_a.rosters,
         live.a.id,
         1,
+        live.a.x25519_public,
         &Arc::new(Hold),
         &DocsGate::new(DocsLimits::default()),
         None,
@@ -596,6 +678,7 @@ async fn the_sweep_looks_again_at_every_session_on_its_interval() {
         live.stores_b.rosters.clone(),
         live.b.id,
         1,
+        live.b.x25519_public,
         Duration::from_secs(60),
     );
     tokio::spawn(live.reval.clone().run());
@@ -618,4 +701,172 @@ async fn the_sweep_looks_again_at_every_session_on_its_interval() {
     );
     tokio::time::sleep(Duration::from_secs(60)).await;
     assert_eq!(live.reval.passes(), after_registration + 2);
+}
+
+// ---- round 11: cost, own certificate, supervision ----------------------------------
+
+fn full_kind(live: &Live) -> Kind {
+    Kind::Full {
+        streams: crate::l5_stream::AcceptedStreams::new(),
+        authorizer: crate::PolicyAuthorizer::new(
+            live.stores_b.policies.clone(),
+            live.stores_b.rosters.clone(),
+            live.w.network,
+            live.b.id,
+            1,
+            live.b.x25519_public,
+        ),
+    }
+}
+
+/// L1: the certificates of a Policy are decoded once, when it is adopted; judging sessions,
+/// however many, and working out the next deadline decode none.
+#[tokio::test(start_paused = true)]
+async fn judging_decodes_no_certificate_however_many_sessions_there_are() {
+    use crate::cert_index::decodes_on_this_thread;
+    let mut live = live(|w, a, b| vec![grant_for(w, a, b, &["tcp:ssh"])]).await;
+    live.serve_b();
+    let network = live.w.network;
+    let built = decodes_on_this_thread();
+    assert!(built >= 2, "the adopted Policy was indexed: {built}");
+    assert_eq!(live.reval.plan(&network, 1_000).len(), 1);
+    assert_eq!(decodes_on_this_thread(), built, "one session");
+    for _ in 0..40 {
+        live.reval.register(
+            live.a.id,
+            network,
+            live.a.x25519_public,
+            live.handle_a.clone(),
+            full_kind(&live),
+        );
+    }
+    assert_eq!(live.reval.plan(&network, 1_000).len(), 41);
+    live.reval.deadline(&network, 1_000);
+    assert_eq!(decodes_on_this_thread(), built, "forty one sessions");
+    // A newer Policy is indexed once, on adoption.
+    edit_policy_of(&live.w, &live.stores_b, |b| b.issued += 1);
+    let adopted = decodes_on_this_thread();
+    assert_eq!(adopted, built + 2, "the new Policy's two certificates");
+    assert_eq!(live.reval.plan(&network, 1_000).len(), 41);
+    assert_eq!(decodes_on_this_thread(), adopted);
+}
+
+/// L1: the sessions are judged without the registry lock, so `register` and `forget` never wait
+/// for a pass.
+#[tokio::test(start_paused = true)]
+async fn sessions_are_judged_without_the_registry_lock() {
+    let mut live = live(|w, a, b| vec![grant_for(w, a, b, &["tcp:ssh"])]).await;
+    live.serve_b();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    {
+        let (reval, seen) = (Arc::downgrade(&live.reval), seen.clone());
+        let hook: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+            let free = reval.upgrade().is_some_and(|reval| reval.state_is_free());
+            seen.lock().unwrap().push(free);
+        });
+        *live.reval.judge_hook.lock().unwrap() = Some(hook);
+    }
+    assert_eq!(live.reval.plan(&live.w.network, 1_000).len(), 1);
+    assert_eq!(*seen.lock().unwrap(), vec![true], "judged once, lock free");
+}
+
+/// L1: a pass runs on the blocking pool, not on the runtime worker that runs the task.
+#[tokio::test]
+async fn a_pass_runs_off_the_runtime_worker() {
+    let mut live = live(|w, a, b| vec![grant_for(w, a, b, &["tcp:ssh"])]).await;
+    tokio::spawn(live.reval.clone().run());
+    live.serve_b();
+    wait_for(|| live.reval.passes() >= 1).await;
+    let ran_on = live.reval.last_pass_thread.lock().unwrap().unwrap();
+    assert_ne!(ran_on, std::thread::current().id());
+}
+
+async fn wait_for(mut done: impl FnMut() -> bool) {
+    for _ in 0..1_000 {
+        if done() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("gave up waiting");
+}
+
+/// A panic in the revalidator is survived: the task starts again with every network looked at,
+/// and keeps acting on changes.
+#[tokio::test]
+async fn a_panic_in_the_revalidator_restarts_it_with_every_network_looked_at() {
+    let mut live = live(|w, a, b| vec![grant_for(w, a, b, &["tcp:ssh"])]).await;
+    live.serve_b();
+    live.reval.panic_next_pass.store(true, Ordering::SeqCst);
+    let task = tokio::spawn(live.reval.clone().run());
+    // The pass the registration asked for panics; nothing else is pending, so only the restart's
+    // look at every network makes a second one.
+    wait_for(|| live.reval.passes() >= 2).await;
+    assert!(!task.is_finished(), "the supervisor goes on");
+    // And the restarted task still acts on a change.
+    revoke_in(&live.w, &live.stores_b, live.a.id);
+    match ended(&mut live.ready_a.acceptor).await.as_ref() {
+        EndReason::PeerClosed { code, .. } => assert_eq!(*code, ErrorCode::GrantRemoved),
+        other => panic!("expected the peer's close with grant_removed, got {other:?}"),
+    }
+    task.abort();
+}
+
+/// Dropping the supervisor drops the work: the node aborts the one task it holds, and the task
+/// it supervises goes with it (each holds an `Arc` of the revalidator).
+#[tokio::test]
+async fn aborting_the_revalidator_stops_the_task_it_supervises() {
+    let live = live(|w, a, b| vec![grant_for(w, a, b, &["tcp:ssh"])]).await;
+    let base = Arc::strong_count(&live.reval);
+    let task = tokio::spawn(live.reval.clone().run());
+    wait_for(|| Arc::strong_count(&live.reval) > base + 1).await;
+    task.abort();
+    let _ = task.await;
+    wait_for(|| Arc::strong_count(&live.reval) == base).await;
+}
+
+/// N1 (deadline): this node's own certificate running out is an instant to wake for.
+#[tokio::test(start_paused = true)]
+async fn this_nodes_own_certificate_expiry_is_a_deadline() {
+    let mut live = live(|w, a, b| vec![grant_for(w, a, b, &["tcp:ssh"])]).await;
+    live.serve_b();
+    let network = live.w.network;
+    assert_eq!(live.reval.deadline(&network, 100), Some(4_000_000_000));
+    change_cert_of(&live.w, &live.stores_b, &live.b, |c| c.not_after = 500);
+    assert_eq!(live.reval.deadline(&network, 100), Some(501));
+}
+
+/// N1 (responder): a node whose own Policy does not carry its certificate takes only the docs
+/// push; a session it would have to end at once is not started.
+#[tokio::test(start_paused = true)]
+async fn a_responder_without_its_own_certificate_in_the_policy_answers_docs_only() {
+    let w = world();
+    let (r, m) = (party(), party());
+    // R's Policy lists both as members and holds M's certificate, but not R's own.
+    let r_stores = w.split_stores(&[&r, &m], &[&r, &m], &[&m]);
+    let m_stores = w.stores(&[&r, &m], vec![]);
+    let net = Net::new();
+    let nm = node(&net, &m, &m_stores).await;
+    let mut nr = node(&net, &r, &r_stores).await;
+    assert_eq!(
+        ensure(&nm, r.id, w.network).await.err(),
+        Some(EnsureError::DocsOnly)
+    );
+    let at_r = nr.next_ready().await;
+    assert!(at_r.docs_only);
+}
+
+/// N1 (router): a session is not handed out while this node's own certificate is not in the
+/// Policy it now holds: it is closed with CLOSE `grant_removed` first.
+#[tokio::test(start_paused = true)]
+async fn a_session_is_closed_not_handed_out_once_this_nodes_own_certificate_left_the_policy() {
+    let mut live = live(|w, a, b| vec![grant_for(w, a, b, &["tcp:ssh"])]).await;
+    edit_policy_of(&live.w, &live.stores_a, |b| {
+        b.certs.retain(|c| c.decode().unwrap().node_id != live.a.id);
+    });
+    let _ = ensure(&live._na, live.b.id, live.w.network).await;
+    assert!(matches!(
+        ended(&mut live.ready_a.acceptor).await.as_ref(),
+        EndReason::ClosedLocally(Some(close)) if close.code == ErrorCode::GrantRemoved
+    ));
 }

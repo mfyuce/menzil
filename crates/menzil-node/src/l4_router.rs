@@ -334,6 +334,7 @@ pub struct RouterConfig {
     identity: LocalIdentity,
     local_node_id: NodeId,
     local_cert_serial: u32,
+    local_static: X25519PublicKey,
     relay_node_id: NodeId,
     policies: Arc<PolicyStore>,
     rosters: Arc<RosterStore>,
@@ -360,6 +361,7 @@ impl RouterConfig {
         Ok(Self {
             local_node_id: body.node_id,
             local_cert_serial: body.serial,
+            local_static: body.x25519_pub,
             identity,
             relay_node_id,
             policies,
@@ -634,6 +636,8 @@ struct Engine {
     identity: LocalIdentity,
     local_node_id: NodeId,
     local_cert_serial: u32,
+    /// This node's own static key, for its certificate in the Policy (round 11 N1).
+    local_static: X25519PublicKey,
     relay_node_id: NodeId,
     policies: Arc<PolicyStore>,
     rosters: Arc<RosterStore>,
@@ -701,6 +705,7 @@ impl Engine {
             identity: config.identity,
             local_node_id: config.local_node_id,
             local_cert_serial: config.local_cert_serial,
+            local_static: config.local_static,
             relay_node_id: config.relay_node_id,
             policies: config.policies,
             rosters: config.rosters,
@@ -949,7 +954,16 @@ impl Engine {
             self.local_cert_serial,
             now.unix,
         ) {
-            HandshakeAdmission::Allow | HandshakeAdmission::AllowNoGrant => false,
+            HandshakeAdmission::Allow | HandshakeAdmission::AllowNoGrant => {
+                // A session this node's own standing would end at the first re evaluation is
+                // not started: without its own certificate in the Policy (round 11 N1) it can
+                // only take the docs push that brings the documents it lacks.
+                let own = self.own_cert_standing(&network_id, now.unix);
+                if let Err(reason) = own {
+                    tracing::debug!(%src, ?reason, "answering an L4 init docs only: own certificate");
+                }
+                own.is_err()
+            }
             HandshakeAdmission::DocsOnly { reason } => {
                 tracing::debug!(%src, ?reason, "answering an L4 init docs only");
                 true
@@ -1176,6 +1190,26 @@ impl Engine {
     // Initiator: our own `init`, and the `resp` to it
     // ------------------------------------------------------------------
 
+    /// Whether the held Policy lists this node's own certificate (round 11 N1), for the
+    /// documents held now.
+    fn own_cert_standing(&self, network: &NetworkId, now: u64) -> Result<(), ErrorCode> {
+        let roster = self
+            .rosters
+            .body(network)
+            .ok_or(ErrorCode::UnknownNetwork)?;
+        let view = self
+            .policies
+            .view(network)
+            .ok_or(ErrorCode::UnknownNetwork)?;
+        crate::admission::own_cert_standing(
+            &roster,
+            &view.certs,
+            &self.local_node_id,
+            &self.local_static,
+            now,
+        )
+    }
+
     fn ensure(&mut self, peer: NodeId, network: NetworkId, docs: bool, reply: Waiter, now: Now) {
         if self.stopping {
             let _ = reply.send(Err(EnsureError::ShuttingDown));
@@ -1209,6 +1243,7 @@ impl Engine {
                 &entry.peer_static,
                 &self.local_node_id,
                 self.local_cert_serial,
+                &self.local_static,
                 now.unix,
             );
             match standing {
