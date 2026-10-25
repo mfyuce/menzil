@@ -25,9 +25,21 @@ use menzil_proto::{ErrorBody, ErrorCode};
 /// How long an attachment must last, with no ERROR that turns it away, to count as good.
 pub const ATTACH_SETTLED: Duration = Duration::from_secs(2);
 
-/// The longest relay message kept, in characters. The text is the relay's and is shown to a
-/// person: whoever shows it makes it printable ([`menzil_cli`'s `text::one_line`]).
-const MAX_MESSAGE_CHARS: usize = 256;
+/// The longest relay message kept, in bytes (cut on a character boundary). The text is the
+/// relay's and is shown to a person: whoever shows it makes it printable
+/// ([`menzil_cli`'s `text::one_line`]). Bytes, not characters: the text travels over the agent
+/// socket in lines of bounded length, and four byte characters would make 256 of them a line of
+/// 1024 bytes (round 13 L1).
+const MAX_MESSAGE_BYTES: usize = 256;
+
+/// `text` cut to at most `max` bytes, not inside a character.
+fn cut_bytes(text: &str, max: usize) -> String {
+    let mut end = max.min(text.len());
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text[..end].to_string()
+}
 
 /// One answer of the relay that turned this node away, or ended its session.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -76,6 +88,8 @@ impl Default for RelayNotes {
 /// Whether `code` says the relay turned this node away (or out), as opposed to refusing one
 /// record. `UnknownNetwork` counts only before the attachment settled: later it is the answer to
 /// a document sent for a network the relay does not serve, and the session goes on.
+/// `UnknownE2e` never counts: protocol.md 4.2 makes it the refusal of one SEND, after which the
+/// session goes on (round 13 N3).
 fn turns_away(code: ErrorCode, settled: bool) -> bool {
     match code {
         ErrorCode::BadCert
@@ -83,8 +97,7 @@ fn turns_away(code: ErrorCode, settled: bool) -> bool {
         | ErrorCode::StaleTimestamp
         | ErrorCode::NotMember
         | ErrorCode::Revoked
-        | ErrorCode::RosterExpired
-        | ErrorCode::UnknownE2e => true,
+        | ErrorCode::RosterExpired => true,
         ErrorCode::UnknownNetwork => !settled,
         _ => false,
     }
@@ -155,7 +168,7 @@ impl RelayNotes {
         inner.last = Some(Held {
             error: RelayError {
                 code: Some(body.code),
-                message: body.msg.chars().take(MAX_MESSAGE_CHARS).collect(),
+                message: cut_bytes(&body.msg, MAX_MESSAGE_BYTES),
                 goaway: None,
                 at: now,
             },
@@ -168,7 +181,7 @@ impl RelayNotes {
     pub fn note_goaway(&self, reason: &str, now: u64) {
         let mut inner = self.inner();
         let attachment = inner.attachment;
-        let reason: String = reason.chars().take(MAX_MESSAGE_CHARS).collect();
+        let reason = cut_bytes(reason, MAX_MESSAGE_BYTES);
         if let Some(held) = inner.last.as_mut()
             && held.attachment == attachment
             && held.error.goaway.is_none()
@@ -225,7 +238,6 @@ mod tests {
             ErrorCode::NotMember,
             ErrorCode::Revoked,
             ErrorCode::RosterExpired,
-            ErrorCode::UnknownE2e,
             ErrorCode::UnknownNetwork,
         ] {
             let notes = RelayNotes::new();
@@ -242,6 +254,7 @@ mod tests {
             ErrorCode::LabelTaken,
             ErrorCode::UnknownType,
             ErrorCode::BadDocument,
+            ErrorCode::UnknownE2e,
             ErrorCode::Unknown(999),
         ] {
             let notes = RelayNotes::new();
@@ -353,6 +366,57 @@ mod tests {
         assert_eq!(notes.last_error(), None);
     }
 
+    /// Round 13 N3: `unknown_e2e` refuses one SEND (protocol.md 4.2); the session goes on, so it
+    /// is not a turning away, on a settled attachment or before.
+    #[test]
+    fn unknown_e2e_is_the_refusal_of_one_send_and_is_not_recorded() {
+        for settle in [false, true] {
+            let notes = RelayNotes::new();
+            notes.begin_attachment();
+            if settle {
+                notes.settle(true);
+            }
+            notes.note_error(&error(ErrorCode::UnknownE2e, "unrecognized e2e_proto"), 5);
+            assert_eq!(notes.last_error(), None, "settled: {settle}");
+        }
+        // And it does not push out what the relay said before.
+        let notes = RelayNotes::new();
+        notes.begin_attachment();
+        notes.note_error(&error(ErrorCode::Revoked, "evicted"), 1);
+        notes.note_error(&error(ErrorCode::UnknownE2e, "x"), 2);
+        assert_eq!(notes.last_error().unwrap().at, 1);
+    }
+
+    /// Round 13 L1: the cut is by bytes, on a character boundary, never inside a character.
+    #[test]
+    fn a_long_message_is_cut_by_bytes_on_a_character_boundary() {
+        assert_eq!(cut_bytes("abc", 10), "abc");
+        assert_eq!(cut_bytes("abc", 3), "abc");
+        assert_eq!(cut_bytes("abcd", 3), "abc");
+        assert_eq!(cut_bytes("", 3), "");
+        // 'é' is two bytes: a cut at 3 keeps one of them whole.
+        assert_eq!(cut_bytes("éé", 3), "é");
+        assert_eq!(cut_bytes("éé", 4), "éé");
+        // A four byte character does not fit in 3 bytes.
+        assert_eq!(cut_bytes("\u{1F600}", 3), "");
+        let notes = RelayNotes::new();
+        notes.begin_attachment();
+        let emoji = "\u{1F600}".repeat(5_000);
+        notes.note_error(&error(ErrorCode::Revoked, &emoji), 1);
+        notes.note_goaway(&emoji, 2);
+        let last = notes.last_error().unwrap();
+        assert_eq!(last.message.len(), MAX_MESSAGE_BYTES);
+        assert_eq!(last.goaway.unwrap().len(), MAX_MESSAGE_BYTES);
+        // A goaway alone is cut the same.
+        let notes = RelayNotes::new();
+        notes.begin_attachment();
+        notes.note_goaway(&"é".repeat(1_000), 3);
+        assert_eq!(
+            notes.last_error().unwrap().goaway.unwrap().len(),
+            MAX_MESSAGE_BYTES
+        );
+    }
+
     #[test]
     fn a_long_message_is_cut_and_clones_share_the_record() {
         let notes = RelayNotes::new();
@@ -360,11 +424,11 @@ mod tests {
         notes.begin_attachment();
         notes.note_error(&error(ErrorCode::Revoked, &"é".repeat(1_000)), 1);
         let last = other.last_error().unwrap();
-        assert_eq!(last.message.chars().count(), MAX_MESSAGE_CHARS);
+        assert_eq!(last.message.len(), MAX_MESSAGE_BYTES);
         other.note_goaway(&"g".repeat(1_000), 2);
         assert_eq!(
-            notes.last_error().unwrap().goaway.unwrap().chars().count(),
-            MAX_MESSAGE_CHARS
+            notes.last_error().unwrap().goaway.unwrap().len(),
+            MAX_MESSAGE_BYTES
         );
     }
 }

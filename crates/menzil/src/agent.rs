@@ -61,8 +61,14 @@ use crate::text;
 
 /// The longest request line, newline included.
 pub const MAX_REQUEST_BYTES: usize = 512;
-/// The longest reply line the client reads.
-const MAX_REPLY_BYTES: usize = 1024;
+/// The longest reply line the client reads. It holds the longest line the agent writes: `error `
+/// and [`ERROR_LINE_CHARS`] characters of four bytes each, or a status value of 300 characters.
+const MAX_REPLY_BYTES: usize = 4096;
+/// The most characters of an error text that go over the agent socket and reach the person. An
+/// explanation with the relay's own words and the advice that follows them (a device that is not
+/// a member, with the relay's rejection) comes to about 900 characters; cut at 300 it lost the
+/// advice and the end of the relay's quote (round 13 N1).
+pub(crate) const ERROR_LINE_CHARS: usize = 1000;
 /// The largest payload of one frame. The agent sends at most one yamux frame's worth.
 const MAX_FRAME_PAYLOAD: usize = 64 * 1024;
 const COPY_BUFFER: usize = 16 * 1024;
@@ -221,10 +227,16 @@ pub fn parse_request(line: &str) -> Result<&str, String> {
     Ok(target)
 }
 
-/// Single line, printable: what goes back to a client after `error `, and what a client shows
-/// of what the agent sent (see [`text::one_line`]).
+/// Single line, printable, short: a status value, and what a client shows of a reset's reason
+/// (see [`text::one_line`]).
 fn one_line(message: &str) -> String {
     text::one_line(message, 300)
+}
+
+/// Single line, printable: what goes back to a client after `error `, and what a client shows
+/// of it. Longer than [`one_line`]: it is the explanation of why a stream could not be opened.
+fn error_line(message: &str) -> String {
+    text::one_line(message, ERROR_LINE_CHARS)
 }
 
 /// The uid this process runs as, found without unsafe code: the peer of a connected socket pair
@@ -265,34 +277,87 @@ async fn read_frame<R: AsyncRead + Unpin>(read: &mut R, payload: &mut Vec<u8>) -
     Ok(header[0])
 }
 
+/// What [`read_line_lenient`] found.
+#[derive(Debug, PartialEq, Eq)]
+enum Line {
+    /// A line of at most the limit, newline included, in UTF-8.
+    Text(String),
+    /// A line longer than the limit; its bytes were read and dropped, up to its newline.
+    TooLong,
+    /// A line that is not UTF-8.
+    NotUtf8,
+}
+
 /// Reads one line of at most `limit` bytes (the newline included); `None` at end of file before
-/// any byte.
+/// any byte. A line over the limit, or one that is not UTF-8, is an error, at the moment the
+/// limit is passed: nothing more is read of a peer that does not end its line.
 async fn read_line<R: AsyncBufReadExt + Unpin>(
     reader: &mut R,
     limit: usize,
 ) -> Result<Option<String>> {
+    match read_line_with(reader, limit, false).await? {
+        None => Ok(None),
+        Some(Line::Text(text)) => Ok(Some(text)),
+        Some(Line::TooLong) => bail!("the line is longer than {limit} bytes"),
+        Some(Line::NotUtf8) => bail!("the line is not UTF-8"),
+    }
+}
+
+/// [`read_line`] for a reply of lines of which one that cannot be taken must not cost the
+/// others: a line over the limit is read to its end and dropped ([`Line::TooLong`]), and a
+/// line that is not text is [`Line::NotUtf8`]. Only a connection that ends in the middle of
+/// an ordinary line is an error (one that ends in the middle of an over long line is
+/// [`Line::TooLong`]). The caller bounds the time and the number of lines.
+async fn read_line_lenient<R: AsyncBufReadExt + Unpin>(
+    reader: &mut R,
+    limit: usize,
+) -> Result<Option<Line>> {
+    read_line_with(reader, limit, true).await
+}
+
+/// The reader behind both; `lenient` says whether to go on to the end of an over long line.
+async fn read_line_with<R: AsyncBufReadExt + Unpin>(
+    reader: &mut R,
+    limit: usize,
+    lenient: bool,
+) -> Result<Option<Line>> {
     let mut line = Vec::new();
+    let mut too_long = false;
     loop {
         let available = reader.fill_buf().await?;
         if available.is_empty() {
+            if too_long {
+                return Ok(Some(Line::TooLong));
+            }
             if line.is_empty() {
                 return Ok(None);
             }
             bail!("the line ended without a newline");
         }
-        let take = match available.iter().position(|&b| b == b'\n') {
-            Some(i) => i + 1,
-            None => available.len(),
+        let (take, complete) = match available.iter().position(|&b| b == b'\n') {
+            Some(i) => (i + 1, true),
+            None => (available.len(), false),
         };
-        if line.len() + take > limit {
-            bail!("the line is longer than {limit} bytes");
+        if !too_long {
+            if line.len() + take > limit {
+                if !lenient {
+                    return Ok(Some(Line::TooLong));
+                }
+                too_long = true;
+                line = Vec::new();
+            } else {
+                line.extend_from_slice(&available[..take]);
+            }
         }
-        line.extend_from_slice(&available[..take]);
         reader.consume(take);
-        if line.ends_with(b"\n") {
-            return String::from_utf8(line)
-                .map(Some)
-                .map_err(|_| anyhow!("the line is not UTF-8"));
+        if complete {
+            if too_long {
+                return Ok(Some(Line::TooLong));
+            }
+            return Ok(Some(match String::from_utf8(line) {
+                Ok(text) => Line::Text(text),
+                Err(_) => Line::NotUtf8,
+            }));
         }
     }
 }
@@ -374,7 +439,7 @@ async fn handle<O: Opener>(connection: UnixStream, opener: &O) -> Result<()> {
         Ok(Ok(stream)) => stream,
         Ok(Err(message)) => {
             write
-                .write_all(format!("error {}\n", one_line(&message)).as_bytes())
+                .write_all(format!("error {}\n", error_line(&message)).as_bytes())
                 .await?;
             return Ok(());
         }
@@ -527,7 +592,7 @@ where
     match reply.trim_end() {
         "ok" => {}
         other => match other.strip_prefix("error ") {
-            Some(message) => bail!("{}", one_line(message)),
+            Some(message) => bail!("{}", error_line(message)),
             None => bail!("the agent answered something this client does not understand"),
         },
     }
@@ -620,18 +685,29 @@ async fn query_status_as(socket: &Path, uid: u32) -> Result<RelayStatus> {
         let mut read = BufReader::new(read);
         write.write_all(b"status\n").await?;
         let mut lines = Vec::new();
-        while let Some(line) = read_line(&mut read, MAX_REPLY_BYTES).await? {
+        let mut seen = 0;
+        while let Some(line) = read_line_lenient(&mut read, MAX_REPLY_BYTES).await? {
+            seen += 1;
+            // A line that is too long or not text is left out, not the whole reply: the lines
+            // around it still say whether the node is attached and why it was turned away
+            // (round 13 L1). They count toward the limit all the same.
+            let Line::Text(line) = line else {
+                if seen >= MAX_STATUS_LINES {
+                    break;
+                }
+                continue;
+            };
             let line = line.trim_end_matches(['\r', '\n']).to_string();
-            if lines.is_empty()
+            if seen == 1
                 && let Some(message) = line.strip_prefix("error ")
             {
                 bail!(
                     "the agent does not report its status: {}",
-                    one_line(message)
+                    error_line(message)
                 );
             }
             lines.push(line);
-            if lines.len() >= MAX_STATUS_LINES {
+            if seen >= MAX_STATUS_LINES {
                 break;
             }
         }

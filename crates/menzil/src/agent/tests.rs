@@ -117,6 +117,8 @@ impl Opener for TestOpener {
         match who {
             "refuse" => return Err("no member called refuse".to_string()),
             "garbled" => return Err("bad\nname \u{1b}[31mred".to_string()),
+            // `long/<n>`: an explanation of n four byte characters.
+            "long" => return Err("\u{1F600}".repeat(behavior.parse().unwrap())),
             _ => {}
         }
         let mut stream = self.mux.open().await.map_err(|e| e.to_string())?;
@@ -255,6 +257,29 @@ async fn what_the_opener_says_is_one_clean_line() {
         "{error:?}"
     );
     assert!(error.starts_with("bad name"), "{error:?}");
+}
+
+/// Round 13 N1: an explanation that reaches the person is not cut at 300 characters (the advice
+/// at its end was lost), and one far over the limit is cut to the limit and still arrives as the
+/// error, not as a client that gave up on a long line.
+#[tokio::test]
+async fn a_long_explanation_reaches_the_client_up_to_the_error_limit() {
+    let rig = rig();
+    let whole = run_client(&rig, "long/900", b"")
+        .await
+        .unwrap_err()
+        .to_string();
+    assert_eq!(
+        whole.chars().count(),
+        900,
+        "{} chars",
+        whole.chars().count()
+    );
+    let cut = run_client(&rig, "long/5000", b"")
+        .await
+        .unwrap_err()
+        .to_string();
+    assert_eq!(cut.chars().count(), ERROR_LINE_CHARS);
 }
 
 #[tokio::test]
@@ -984,4 +1009,137 @@ fn the_agent_and_the_client_each_make_the_status_text_printable() {
     assert_eq!(rejected.code.as_deref(), Some("re [2Jvoked"));
     assert_eq!(rejected.message, "a b");
     assert_eq!(rejected.goaway.as_deref(), Some("g "));
+}
+
+// ---- round 13 ----
+
+/// A reply whose lines the test writes itself, then closes.
+async fn ask_raw(reply: Vec<u8>) -> Result<RelayStatus> {
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("raw.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let uid = current_uid().await.unwrap();
+    let agent = tokio::spawn(async move {
+        let (mut connection, _) = listener.accept().await.unwrap();
+        let mut request = [0u8; 64];
+        let _ = connection.read(&mut request).await;
+        // The client may have stopped reading by now.
+        let _ = connection.write_all(&reply).await;
+    });
+    let got = timeout(WAIT, query_status_as(&socket, uid)).await.unwrap();
+    agent.await.unwrap();
+    got
+}
+
+/// L1: what a relay can make the node keep (256 bytes, here four byte characters) goes through
+/// the agent and the client as it is, and the whole status is read.
+#[tokio::test]
+async fn four_byte_relay_text_does_not_hide_the_status() {
+    let notes = menzil_node::RelayNotes::new();
+    notes.begin_attachment();
+    let emoji = "\u{1F600}".repeat(5_000);
+    notes.note_error(
+        &menzil_proto::ErrorBody {
+            code: menzil_proto::ErrorCode::Revoked,
+            msg: emoji.clone(),
+        },
+        1_700_000_000,
+    );
+    notes.note_goaway(&emoji, 1_700_000_001);
+    let kept = notes.last_error().unwrap();
+    let sent = RelayStatus {
+        attached: Some(false),
+        rejected: Some(Rejected {
+            at: kept.at,
+            code: Some("revoked".to_string()),
+            message: kept.message.clone(),
+            goaway: kept.goaway.clone(),
+        }),
+    };
+    let got = ask(sent).await.unwrap();
+    assert_eq!(got.attached, Some(false));
+    let rejected = got.rejected.unwrap();
+    assert_eq!(rejected.code.as_deref(), Some("revoked"));
+    assert_eq!(rejected.message, kept.message);
+    assert_eq!(rejected.goaway, kept.goaway);
+}
+
+/// L1: a line the client cannot take (over long, or not text) is left out; the lines around it
+/// still make the status.
+#[tokio::test]
+async fn an_over_long_or_garbled_line_is_skipped_and_the_rest_of_the_reply_is_read() {
+    let mut reply = b"attached no\nrejected_at 5\nrejected_code revoked\n".to_vec();
+    reply.extend_from_slice(b"rejected_message ");
+    reply.extend_from_slice(&vec![b'x'; 3 * MAX_REPLY_BYTES]);
+    reply.extend_from_slice(b"\nsomething \xff\xfe not text\nrejected_goaway superseded\n");
+    let got = ask_raw(reply).await.unwrap();
+    assert_eq!(got.attached, Some(false));
+    let rejected = got.rejected.unwrap();
+    assert_eq!(rejected.code.as_deref(), Some("revoked"));
+    assert_eq!(rejected.message, "", "the long line is gone");
+    assert_eq!(rejected.goaway.as_deref(), Some("superseded"));
+    // The reply ends in the middle of an over long line: what came before is still a status.
+    let mut reply = b"attached yes\n".to_vec();
+    reply.extend_from_slice(&vec![b'y'; 2 * MAX_REPLY_BYTES]);
+    let got = ask_raw(reply).await.unwrap();
+    assert_eq!(got.attached, Some(true));
+    // Skipped lines count toward the most lines read: nothing after them is waited for.
+    let mut reply = Vec::new();
+    for _ in 0..MAX_STATUS_LINES {
+        reply.extend_from_slice(&vec![b'z'; MAX_REPLY_BYTES + 1]);
+        reply.push(b'\n');
+    }
+    reply.extend_from_slice(b"attached yes\n");
+    let got = ask_raw(reply).await.unwrap();
+    assert_eq!(got.attached, None, "past the limit of lines");
+}
+
+/// The reader of lines: an over long line is dropped to its newline, whatever the size of the
+/// chunks it arrives in, and the next line is intact.
+#[tokio::test]
+async fn the_lenient_line_reader_drops_a_long_line_and_keeps_the_next() {
+    for capacity in [1, 3, 8, 64] {
+        let data = b"ab\nabcdefghijklmnop\nok\n\xff\nlast";
+        let mut reader = BufReader::with_capacity(capacity, &data[..]);
+        assert_eq!(
+            read_line_lenient(&mut reader, 6).await.unwrap(),
+            Some(Line::Text("ab\n".to_string()))
+        );
+        assert_eq!(
+            read_line_lenient(&mut reader, 6).await.unwrap(),
+            Some(Line::TooLong)
+        );
+        assert_eq!(
+            read_line_lenient(&mut reader, 6).await.unwrap(),
+            Some(Line::Text("ok\n".to_string()))
+        );
+        assert_eq!(
+            read_line_lenient(&mut reader, 6).await.unwrap(),
+            Some(Line::NotUtf8)
+        );
+        // A connection that ends in the middle of an ordinary line is an error.
+        assert!(read_line_lenient(&mut reader, 6).await.is_err());
+        // A connection that ends in the middle of an over long line: that line, then the end.
+        let mut cut = BufReader::with_capacity(capacity, &b"abcdefghij"[..]);
+        assert_eq!(
+            read_line_lenient(&mut cut, 6).await.unwrap(),
+            Some(Line::TooLong)
+        );
+        assert_eq!(read_line_lenient(&mut cut, 6).await.unwrap(), None);
+        // The strict reader still refuses an over long line.
+        let mut strict = BufReader::with_capacity(capacity, &b"abcdefghij\n"[..]);
+        assert!(read_line(&mut strict, 6).await.is_err());
+    }
+}
+
+/// N2: a time near the end of the range does not overflow (a debug build panicked).
+#[test]
+fn a_rejection_with_a_huge_time_renders_without_overflow() {
+    let status = RelayStatus::from_lines(&[
+        "attached no".to_string(),
+        "rejected_at 18446744073709551615".to_string(),
+        "rejected_code revoked".to_string(),
+    ]);
+    let text = status.render(1_700_000_000);
+    assert!(text.contains("just now"), "{text}");
 }

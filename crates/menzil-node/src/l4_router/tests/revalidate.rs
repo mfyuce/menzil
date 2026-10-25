@@ -902,6 +902,79 @@ async fn a_pass_that_completes_resets_the_restart_wait() {
     );
 }
 
+/// Round 13 L2: one network whose pass always panics, next to one whose pass completes. The
+/// networks are judged in no set order; a completed pass of the good one must not start the
+/// waits over, or the node restarts several times a second. The waits double to the cap.
+#[tokio::test]
+async fn a_bad_network_next_to_a_good_one_does_not_reset_the_restart_wait() {
+    let mut live = live(|w, a, b| vec![grant_for(w, a, b, &["tcp:ssh"])]).await;
+    timed(&mut live);
+    let bad = NetworkId::from([0x5au8; 32]);
+    *live.reval.panic_network.lock().unwrap() = Some(bad);
+    live.reval.register(
+        live.a.id,
+        bad,
+        live.a.x25519_public,
+        live.handle_a.clone(),
+        Kind::DocsOnly,
+    );
+    let task = tokio::spawn(live.reval.clone().run());
+    wait_for(|| live.reval.restart_waits.lock().unwrap().len() >= 12).await;
+    task.abort();
+    let waits = live.reval.restart_waits.lock().unwrap().clone();
+    let ms = |n: u64| Duration::from_millis(n);
+    assert_eq!(
+        waits[..8],
+        [
+            ms(40),
+            ms(80),
+            ms(160),
+            ms(160),
+            ms(160),
+            ms(160),
+            ms(160),
+            ms(160)
+        ],
+        "doubling, then the cap, whichever network was judged first"
+    );
+    assert!(
+        waits.iter().all(|w| *w >= T_INITIAL && *w <= T_MAX),
+        "{waits:?}"
+    );
+}
+
+/// A run that judged everything due after its restart, and panics later for a new reason, starts
+/// the waits over (this is what `a_pass_that_completes_resets_the_restart_wait` also shows, with
+/// one network): here the restart is clean, with two networks.
+#[tokio::test]
+async fn a_restart_that_judged_every_network_resets_the_restart_wait() {
+    let mut live = live(|w, a, b| vec![grant_for(w, a, b, &["tcp:ssh"])]).await;
+    timed(&mut live);
+    let other = NetworkId::from([0x5au8; 32]);
+    live.reval.register(
+        live.a.id,
+        other,
+        live.a.x25519_public,
+        live.handle_a.clone(),
+        Kind::DocsOnly,
+    );
+    // The first pass panics, then the restart's pass over both networks panics once more (its
+    // first network), then everything completes.
+    live.reval.panic_passes_left.store(2, Ordering::SeqCst);
+    let task = tokio::spawn(live.reval.clone().run());
+    wait_for(|| live.reval.completed_passes() >= 2).await;
+    live.reval.panic_next_pass.store(true, Ordering::SeqCst);
+    revoke_in(&live.w, &live.stores_b, live.a.id);
+    wait_for(|| live.reval.restart_waits.lock().unwrap().len() >= 3).await;
+    task.abort();
+    let waits = live.reval.restart_waits.lock().unwrap().clone();
+    assert_eq!(
+        waits[..3],
+        [T_INITIAL, 2 * T_INITIAL, T_INITIAL],
+        "{waits:?}"
+    );
+}
+
 /// Dropping the supervisor drops the work: the node aborts the one task it holds, and the task
 /// it supervises goes with it (each holds an `Arc` of the revalidator).
 #[tokio::test]

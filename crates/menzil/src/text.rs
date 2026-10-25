@@ -16,7 +16,7 @@ pub const CUT_OFF: &str = "a member that was revoked, or whose grant was taken b
 /// When the relay turned the device away, in words: "just now" under a minute, else "3 minutes
 /// ago" and so on. A time in the future (the clocks differ) reads as "just now".
 fn ago(at: u64, now: u64) -> String {
-    if at + 60 > now {
+    if now.saturating_sub(at) < 60 {
         "just now".to_string()
     } else {
         crate::local::relative(at, now)
@@ -205,6 +205,15 @@ mod tests {
         assert_eq!(one_line("", 3), "");
         // The limit counts characters, not bytes.
         assert_eq!(one_line("ğğğğ", 2), "ğğ");
+    }
+
+    #[test]
+    fn ago_does_not_overflow_near_the_end_of_the_range() {
+        assert_eq!(ago(u64::MAX, 1_700_000_000), "just now");
+        assert_eq!(ago(u64::MAX - 59, u64::MAX), "just now");
+        assert_eq!(ago(u64::MAX, u64::MAX), "just now");
+        assert_eq!(ago(1_000, 1_000 + 180), "3 minutes ago");
+        assert_eq!(ago(1_000 + 60, 1_000 + 60 + 59), "just now");
     }
 
     fn rejected(code: Option<&str>, goaway: Option<&str>, message: &str) -> crate::agent::Rejected {

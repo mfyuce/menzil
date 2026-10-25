@@ -1358,3 +1358,67 @@ fn a_deleted_documents_file_is_not_written_back_by_an_adopted_pair() {
     join(&m.member, &renewed.token, clock() + 60).unwrap();
     assert!(path.exists());
 }
+
+/// Round 13 N1: the explanation of a device that is not a member, with the relay's rejection,
+/// fits the error line the agent lets through, so the end of it (the relay's quote, the GOAWAY
+/// clause and the advice) reaches the person.
+#[test]
+fn the_not_a_member_explanation_with_a_rejection_fits_the_agent_error_line() {
+    let long = "\u{1F600}".repeat(256);
+    for rejected in [
+        agent::Rejected {
+            at: 1_000,
+            code: Some("revoked".to_string()),
+            message: "node is revoked in network x".to_string(),
+            goaway: Some("revoked".to_string()),
+        },
+        agent::Rejected {
+            at: 1_000,
+            code: Some("not_member".to_string()),
+            message: long.clone(),
+            goaway: Some(long.clone()),
+        },
+        agent::Rejected {
+            at: 1_000,
+            code: Some("c".repeat(300)),
+            message: long.clone(),
+            goaway: Some(long),
+        },
+    ] {
+        for error in [
+            NodeOpenError::Session(EnsureError::NotAMember),
+            NodeOpenError::Session(EnsureError::NotAttached),
+        ] {
+            let told = explain_with(&error, Some(&rejected), 1_010);
+            let sent = crate::text::one_line(&told, agent::ERROR_LINE_CHARS);
+            assert_eq!(sent.chars().count(), told.chars().count(), "cut: {told}");
+            // The agent writes spaces for what is not printable; the words are all there.
+            assert!(
+                sent.contains("ask the owner")
+                    || sent.contains("menzil join")
+                    || sent.contains("see the relay's own words")
+                    || sent.contains("check `relay`"),
+                "{sent}"
+            );
+        }
+    }
+    // The ordinary case, in full: the quote, the GOAWAY clause and the advice.
+    let rejected = agent::Rejected {
+        at: 1_000,
+        code: Some("revoked".to_string()),
+        message: "node is revoked in network x".to_string(),
+        goaway: Some("revoked".to_string()),
+    };
+    let told = explain_with(
+        &NodeOpenError::Session(EnsureError::NotAMember),
+        Some(&rejected),
+        1_010,
+    );
+    let sent = crate::text::one_line(&told, agent::ERROR_LINE_CHARS);
+    assert!(
+        sent.ends_with("ask the owner whether that was meant")
+            && sent.contains("node is revoked in network x\"")
+            && sent.contains("GOAWAY revoked"),
+        "{sent}"
+    );
+}

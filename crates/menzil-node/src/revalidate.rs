@@ -34,7 +34,7 @@
 //! ends it.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -62,10 +62,13 @@ pub(crate) const RESTART_DELAY_INITIAL: Duration = Duration::from_millis(100);
 /// The longest wait before a restart, however many panics in a row.
 pub(crate) const RESTART_DELAY_MAX: Duration = Duration::from_secs(30);
 
-/// The wait before the restart that follows a panic: `initial` after a run that completed at
-/// least one pass (or the first panic), else twice the previous wait, never more than `max`.
-/// A panic that repeats at once, a bug that every pass hits, then costs a few restarts a minute
-/// and not a busy loop that fills the log.
+/// The wait before the restart that follows a panic: `initial` after a run that `progressed`
+/// (it judged every network it was due to judge after its own restart; see [`Revalidator::run`])
+/// or the first panic, else twice the previous wait, never more than `max`. A panic that repeats
+/// at once, a bug that every pass hits, then costs a few restarts a minute and not a busy loop
+/// that fills the log. One pass that completes is not progress: with several networks, the
+/// order they are judged in is arbitrary, and a bad one would reset the wait whenever a good
+/// one came first (round 13 L2).
 pub(crate) fn restart_delay(
     previous: Option<Duration>,
     progressed: bool,
@@ -129,11 +132,17 @@ pub(crate) struct Revalidator {
     state: Mutex<State>,
     wake: Notify,
     passes: AtomicU64,
-    /// Passes that ran to their end (the supervisor resets its backoff when one did).
+    /// Passes that ran to their end.
     completed: AtomicU64,
+    /// Whether the run the supervisor started last judged, to the end, every network it was due
+    /// to judge after the restart: the supervisor resets its backoff when it did (round 13 L2).
+    restart_judged: AtomicBool,
     /// Test hook: the next pass panics (the supervision test).
     #[cfg(test)]
     pub(crate) panic_next_pass: std::sync::atomic::AtomicBool,
+    /// Test hook: every pass over this network panics.
+    #[cfg(test)]
+    pub(crate) panic_network: Mutex<Option<NetworkId>>,
     /// Test hook: how many of the next passes panic.
     #[cfg(test)]
     pub(crate) panic_passes_left: std::sync::atomic::AtomicU32,
@@ -212,8 +221,11 @@ impl Revalidator {
             wake: Notify::new(),
             passes: AtomicU64::new(0),
             completed: AtomicU64::new(0),
+            restart_judged: AtomicBool::new(false),
             #[cfg(test)]
             panic_next_pass: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            panic_network: Mutex::new(None),
             #[cfg(test)]
             panic_passes_left: std::sync::atomic::AtomicU32::new(0),
             #[cfg(test)]
@@ -487,7 +499,12 @@ impl Revalidator {
                     left.checked_sub(1)
                 })
                 .is_ok();
-            if counted || self.panic_next_pass.swap(false, Ordering::SeqCst) {
+            let bad = *self
+                .panic_network
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                == Some(*network_id);
+            if bad || counted || self.panic_next_pass.swap(false, Ordering::SeqCst) {
                 panic!("test: a pass panics");
             }
         }
@@ -505,21 +522,24 @@ impl Revalidator {
     /// a new one starts with every network looked at (a panic ends all re evaluation for the
     /// life of the node otherwise). The new one starts after a wait that doubles with each panic
     /// in a row, from [`RESTART_DELAY_INITIAL`] to [`RESTART_DELAY_MAX`], and starts over at the
-    /// first after a run that completed a pass ([`restart_delay`]); a bug that every pass hits
-    /// does not become a busy loop. Dropping or aborting this future stops the inner task too,
-    /// also during the wait.
+    /// first only after a run that judged every network it was due to judge after its restart,
+    /// not merely one that completed some pass ([`restart_delay`]): networks are judged in no
+    /// set order, so a bug in the pass of one network, next to another that completes, would
+    /// otherwise reset the wait about half the time and the node would restart several times a
+    /// second. A bug that every pass hits does not become a busy loop. Dropping or aborting
+    /// this future stops the inner task too, also during the wait.
     pub(crate) async fn run(self: Arc<Self>) {
         let (initial, max) = self.restart_delays;
         let mut everything = false;
         let mut previous: Option<Duration> = None;
         loop {
-            let completed_before = self.completed.load(Ordering::SeqCst);
+            self.restart_judged.store(false, Ordering::SeqCst);
             let inner = tokio::spawn(Arc::clone(&self).run_once(everything));
             let _stop = AbortOnDrop(inner.abort_handle());
             match inner.await {
                 Ok(()) => return,
                 Err(error) if error.is_panic() => {
-                    let progressed = self.completed.load(Ordering::SeqCst) > completed_before;
+                    let progressed = self.restart_judged.load(Ordering::SeqCst);
                     let wait = restart_delay(previous, progressed, initial, max);
                     previous = Some(wait);
                     tracing::error!(
@@ -555,7 +575,8 @@ impl Revalidator {
             let next = deadlines.values().min().copied();
             let mut due: HashSet<NetworkId> = HashSet::new();
             let mut all = false;
-            if std::mem::take(&mut first) {
+            let restart_pass = std::mem::take(&mut first);
+            if restart_pass {
                 all = true;
             } else {
                 tokio::select! {
@@ -609,6 +630,10 @@ impl Revalidator {
                         deadlines.remove(&network_id);
                     }
                 }
+            }
+            if restart_pass {
+                // Every network due after the restart was judged to the end.
+                self.restart_judged.store(true, Ordering::SeqCst);
             }
         }
     }
