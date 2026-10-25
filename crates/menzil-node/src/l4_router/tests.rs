@@ -2585,6 +2585,7 @@ fn serve(
         me,
         &Arc::new(crate::node::RefuseAll),
         gate,
+        None,
     );
 }
 
@@ -2916,3 +2917,6 @@ async fn a_forged_docs_only_init_does_not_abandon_our_own_initiation_to_that_pee
         .unwrap();
     assert!(outcome.is_ok(), "{:?}", outcome.err());
 }
+
+// The triggers of protocol.md 5.5 (TODO.md L4j S6), over these routers.
+mod sync;

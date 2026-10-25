@@ -585,6 +585,10 @@ fn explain(error: &NodeOpenError) -> String {
             "the other device refused the session: are both of you members of the network, with current documents?"
                 .to_string()
         }
+        NodeOpenError::Session(EnsureError::DocsOnly) => {
+            "the other device does not have this device's current documents yet (or its own have expired), so it only took them and no session was made: this device sent its documents, so try again in a moment; if it keeps happening, the other device needs a newer token (`menzil join`)"
+                .to_string()
+        }
         NodeOpenError::Open(OpenStreamError::Refused { code, msg }) => {
             format!("refused by the other end: {} ({msg})", code.name())
         }

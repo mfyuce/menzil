@@ -3,7 +3,7 @@
 //! agent and the commands that need a node (`reach`, `expose`, `stdio`)
 //! are built on this.
 //!
-//! [`Node::start`] spawns and owns three tasks:
+//! [`Node::start`] spawns and owns these tasks:
 //!
 //! * [`run_session`], the L3 session with the relay (protocol.md 3 and 4):
 //!   dialing, the handshake, reconnecting with backoff, and the SEND/RECV
@@ -16,7 +16,11 @@
 //!   peer may open streams over a session this node initiated as well as
 //!   over one it answered. Each inbound OPEN is authorized against the
 //!   Policy ([`PolicyAuthorizer`]) and, if allowed, handed to the node's
-//!   [`ServiceHandler`].
+//!   [`ServiceHandler`];
+//! * the document sync tasks (`docs_sync`, protocol.md 5.5 and 7.3): the watch
+//!   that fetches the Policy once the Roster is ahead of it, and one expiry
+//!   timer per claimed network. The comparison of seqs when a session comes up
+//!   runs in the server above, on the session's own task.
 //!
 //! **Asking for a stream** ([`Node::open_stream`]): the router finds or
 //! creates the L4 session to that peer in that network (concurrent callers
@@ -70,6 +74,7 @@ use tokio::task::JoinHandle;
 
 use crate::admission::PolicyAuthorizer;
 use crate::docs_access::{DocsGate, DocsLimits, SessionHandler};
+use crate::docs_sync::{DocsSync, PushReport, SyncConfig};
 use crate::l4_router::{
     EnsureError, RouterConfig, RouterHandle, RouterParts, SessionReady, new_router,
 };
@@ -160,6 +165,7 @@ pub struct Node {
     events: Option<mpsc::Receiver<SessionEvent>>,
     policies: Arc<PolicyStore>,
     rosters: Arc<RosterStore>,
+    sync: Arc<DocsSync>,
     /// Tells the relay session to write what it holds and close.
     stop_session: watch::Sender<bool>,
     /// Turns `true` when the relay session task has returned.
@@ -174,6 +180,20 @@ impl Node {
     /// runtime; returns at once, before the node is attached (see
     /// [`Self::wait_attached`]).
     pub fn start<H>(config: NodeConfig, handler: H) -> Result<Self, StartError>
+    where
+        H: ServiceHandler<Stream> + Send + Sync + 'static,
+        H::Handling: Send + 'static,
+    {
+        Self::start_with_sync(config, handler, SyncConfig::default())
+    }
+
+    /// [`Self::start`] with other timing for the document sync tasks (protocol.md 5.5, 7.3; see
+    /// [`SyncConfig`]).
+    pub fn start_with_sync<H>(
+        config: NodeConfig,
+        handler: H,
+        sync_config: SyncConfig,
+    ) -> Result<Self, StartError>
     where
         H: ServiceHandler<Stream> + Send + Sync + 'static,
         H::Handling: Send + 'static,
@@ -206,9 +226,17 @@ impl Node {
             task: router,
         } = new_router(router_config, outbound_tx, events_rx);
 
+        let sync = DocsSync::new(
+            handle.clone(),
+            rosters.clone(),
+            policies.clone(),
+            local_node_id,
+            sync_config,
+        );
+        let networks = session.networks.clone();
         let (stop_session, stop_rx) = watch::channel(false);
         let (ended_tx, session_ended) = watch::channel(false);
-        let tasks = vec![
+        let mut tasks = vec![
             tokio::spawn({
                 let rosters = rosters.clone();
                 async move {
@@ -224,8 +252,15 @@ impl Node {
                 local_node_id,
                 Arc::new(handler),
                 DocsGate::new(DocsLimits::default()),
+                Some(sync.clone()),
             )),
+            // A Roster newer than the Policy: fetch the Policy (protocol.md 5.5).
+            tokio::spawn(sync.clone().run_roster_watch(networks.clone())),
         ];
+        // Documents about to expire: ask for new ones (protocol.md 7.3).
+        for network_id in networks {
+            tasks.push(tokio::spawn(sync.clone().run_expiry(network_id)));
+        }
         Ok(Self {
             local_node_id,
             router: handle,
@@ -233,6 +268,7 @@ impl Node {
             events: Some(passthrough),
             policies,
             rosters,
+            sync,
             stop_session,
             session_ended,
             tasks,
@@ -252,6 +288,15 @@ impl Node {
     /// The Rosters this node holds, to seed or update.
     pub fn rosters(&self) -> &Arc<RosterStore> {
         &self.rosters
+    }
+
+    /// For a node that issued new documents (a steward node that renewed, a device where the
+    /// owner ran `admit`): pushes the held Roster and Policy to every unrevoked member of
+    /// `network_id`, eight at a time, retrying a member that does not answer after 1, 5 and 30
+    /// minutes and 2 hours (protocol.md 5.5). Takes as long as that schedule needs: spawn it.
+    /// The relay gets a newer Roster by itself, as soon as the store takes it.
+    pub async fn push_to_members(&self, network_id: NetworkId) -> PushReport {
+        self.sync.push_to_members(network_id).await
     }
 
     /// Waits up to `within` for the node to be attached to its relay and
@@ -367,12 +412,21 @@ async fn serve_sessions<H>(
     local_node_id: NodeId,
     handler: Arc<H>,
     gate: Arc<DocsGate>,
+    sync: Option<Arc<DocsSync>>,
 ) where
     H: ServiceHandler<Stream> + Send + Sync + 'static,
     H::Handling: Send + 'static,
 {
     while let Some(session) = ready.recv().await {
-        serve_session(session, &policies, &rosters, local_node_id, &handler, &gate);
+        serve_session(
+            session,
+            &policies,
+            &rosters,
+            local_node_id,
+            &handler,
+            &gate,
+            sync.as_ref(),
+        );
     }
 }
 
@@ -383,6 +437,12 @@ async fn serve_sessions<H>(
 /// session this node answered takes one `menzil:docs` push and nothing else, and
 /// is closed with CLOSE `docs_only` once that stream is over; one this node
 /// initiated (the peer admitted it docs only) takes no stream at all.
+///
+/// With `sync`, the document triggers of protocol.md 5.5 run as well: the session is
+/// noted as live for as long as its accept loop runs; as the initiator of an ordinary
+/// session this node compares the responder's seqs with its own and fetches and/or pushes
+/// ([`DocsSync::reconcile`]); as the initiator of a docs only session it pushes, and
+/// when that was adopted starts one new handshake ([`DocsSync::docs_only_push`]).
 pub(crate) fn serve_session<H>(
     session: SessionReady,
     policies: &Arc<PolicyStore>,
@@ -390,21 +450,30 @@ pub(crate) fn serve_session<H>(
     local_node_id: NodeId,
     handler: &Arc<H>,
     gate: &Arc<DocsGate>,
+    sync: Option<&Arc<DocsSync>>,
 ) where
     H: ServiceHandler<Stream> + Send + Sync + 'static,
     H::Handling: Send + 'static,
 {
     let SessionReady {
+        peer,
         network_id,
         mut acceptor,
         handle,
         role,
         docs_only,
+        peer_roster_seq,
+        peer_policy_seq,
         ..
     } = session;
     let authorizer =
         PolicyAuthorizer::new(policies.clone(), rosters.clone(), network_id, local_node_id);
     if docs_only && role == Role::Initiator {
+        if let Some(sync) = sync {
+            let sync = Arc::clone(sync);
+            let handle = handle.clone();
+            tokio::spawn(async move { sync.docs_only_push(handle).await });
+        }
         tokio::spawn(async move {
             accept_loop(&mut acceptor, DenyAll, RefuseAll).await;
         });
@@ -426,17 +495,32 @@ pub(crate) fn serve_session<H>(
             accept_loop(&mut acceptor, authorizer, handler).await;
         });
     } else {
-        // The handle is dropped here, with the rest of `session`: the
-        // router's table holds its own clone for as long as the session is
-        // the one in use.
+        // The router's table holds its own clone of the handle for as long as the
+        // session is the one in use.
         let handler = SessionHandler::full(
             Arc::clone(handler),
             gate.clone(),
             policies.clone(),
             rosters.clone(),
         );
+        let live = sync.map(|sync| {
+            let id = sync.register(peer, network_id, peer_roster_seq, peer_policy_seq);
+            (Arc::clone(sync), id)
+        });
+        if let Some((sync, _)) = &live
+            && role == Role::Initiator
+        {
+            let sync = Arc::clone(sync);
+            tokio::spawn(async move {
+                sync.reconcile(handle, peer_roster_seq, peer_policy_seq)
+                    .await;
+            });
+        }
         tokio::spawn(async move {
             accept_loop(&mut acceptor, authorizer, handler).await;
+            if let Some((sync, id)) = live {
+                sync.forget(peer, network_id, id);
+            }
         });
     }
 }

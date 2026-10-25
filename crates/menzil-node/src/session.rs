@@ -10,7 +10,10 @@
 //! (`Engine::accept_doc`); right after ATTACH, [`Session::connect`] pushes
 //! DOC(roster) for every network where this node's own store already
 //! holds something newer than WELCOME's `rosters` reported (protocol.md
-//! 4.3's literal node-to-relay rule, via `push_records_for_newer_rosters`).
+//! 4.3's literal node-to-relay rule, via `rosters_to_push`), and
+//! [`run_session`] does the same again whenever the store takes a newer Roster
+//! while attached (protocol.md 5.5; the relay's `seq` is tracked from WELCOME and
+//! from the Rosters it sends).
 //! `RosterStore` is owned by the caller and threaded through, not rebuilt
 //! per reconnect, so a node does not forget what it holds just because
 //! the link dropped.
@@ -104,6 +107,10 @@ struct Engine {
     /// checked before an inbound DOC(roster) is stored — see
     /// `Engine::accept_doc` for why.
     claimed_networks: Vec<NetworkId>,
+    /// The newest Roster `seq` this relay is known to hold, per network: what WELCOME reported,
+    /// raised by every Roster the relay sends that this node verified (protocol.md 4.3, 5.5). A
+    /// Roster newer than this is pushed to the relay on the live session, not only at attach.
+    relay_rosters: HashMap<NetworkId, u64>,
 }
 
 /// What [`Engine::on_message`] learned from one inbound ciphertext.
@@ -161,7 +168,25 @@ impl Engine {
             roster_store,
             doc_reassembler: DocReassembler::new(),
             claimed_networks,
+            relay_rosters: HashMap::new(),
         }
+    }
+
+    /// The DOC records that bring the relay up to this node's Rosters: for each claimed network
+    /// where the store holds a Roster newer than the relay is known to hold, the base first (a
+    /// steward signed Roster) and then the Roster. Remembers that the relay is current for those
+    /// networks, so that a second call with nothing new sends nothing.
+    fn catch_up_records(&mut self) -> Vec<Record> {
+        let mut records = Vec::new();
+        for (network_id, seq, network_records) in rosters_to_push(
+            &self.claimed_networks,
+            &self.roster_store,
+            &self.relay_rosters,
+        ) {
+            self.relay_rosters.insert(network_id, seq);
+            records.extend(network_records);
+        }
+        records
     }
 
     /// Decrypts one inbound message and classifies it, recording
@@ -244,8 +269,15 @@ impl Engine {
         // Owner signed Rosters only: a steward signed Roster arrives with its Policy, as a
         // pair, through `DocStore::adopt`, and the base the relay sends first
         // (`DocType::BaseRoster`) is not kept here.
-        if let Err(err) = self.roster_store.adopt_owner(&roster, unix_now()) {
-            tracing::warn!(error = %err, "reassembled DOC was not adopted as a Roster");
+        match self.roster_store.adopt_owner(&roster, unix_now()) {
+            // Adopted, or already held or older: either way the relay holds at least this one.
+            Ok(_) => {
+                let known = self.relay_rosters.entry(decoded.network_id).or_insert(0);
+                *known = (*known).max(decoded.seq);
+            }
+            Err(err) => {
+                tracing::warn!(error = %err, "reassembled DOC was not adopted as a Roster");
+            }
         }
     }
 
@@ -380,16 +412,21 @@ impl Session {
             welcome,
             tick: tokio::time::interval(TICK),
         };
+        session.engine.relay_rosters = session.welcome.rosters.clone();
         session.send(Record::Attach).await?;
-        let catch_up = push_records_for_newer_rosters(
-            &config.networks,
-            &roster_store,
-            &session.welcome.rosters,
-        );
-        for record in catch_up {
-            session.send(record).await?;
-        }
+        session.push_newer_rosters().await?;
         Ok(session)
+    }
+
+    /// Sends the relay every Roster this node holds that it is not known to hold (protocol.md
+    /// 4.3), the base first for a steward signed one. Run at attach, and again whenever the
+    /// store takes a newer Roster while attached (protocol.md 5.5: a node that adopts a
+    /// Roster newer than its relay's sends it on at once).
+    pub async fn push_newer_rosters(&mut self) -> Result<(), NodeError> {
+        for record in self.engine.catch_up_records() {
+            self.send(record).await?;
+        }
+        Ok(())
     }
 
     /// WELCOME as the relay sent it: session id, limits, and each claimed
@@ -497,12 +534,26 @@ impl Session {
 /// have `seq: 0` (protocol.md never forbids it), and folding "the relay
 /// has nothing at all for this network" into the same value as "the relay
 /// explicitly holds seq 0" would silently swallow exactly that push.
+#[cfg(test)]
 pub(crate) fn push_records_for_newer_rosters(
     networks: &[NetworkId],
     roster_store: &RosterStore,
     welcome_rosters: &HashMap<NetworkId, u64>,
 ) -> Vec<Record> {
-    let mut records = Vec::new();
+    rosters_to_push(networks, roster_store, welcome_rosters)
+        .into_iter()
+        .flat_map(|(_, _, records)| records)
+        .collect()
+}
+
+/// [`push_records_for_newer_rosters`], one entry per network pushed: the network, the `seq` of
+/// the Roster sent and its records.
+pub(crate) fn rosters_to_push(
+    networks: &[NetworkId],
+    roster_store: &RosterStore,
+    welcome_rosters: &HashMap<NetworkId, u64>,
+) -> Vec<(NetworkId, u64, Vec<Record>)> {
+    let mut out = Vec::new();
     for network_id in networks {
         let Some(seq) = roster_store.seq(network_id) else {
             continue;
@@ -522,6 +573,11 @@ pub(crate) fn push_records_for_newer_rosters(
         let Some((roster, base)) = roster_store.get_with_base(network_id) else {
             continue;
         };
+        // The seq sent is the one of the document read, which is what the relay will hold.
+        let Ok(sent_seq) = roster.decode().map(|body| body.seq) else {
+            continue;
+        };
+        let mut records = Vec::new();
         // A steward signed Roster goes with its base, sent first, as a relay does it
         // (protocol.md 4.3); without it every relay refuses the Roster (the sixth red-team
         // round, L2).
@@ -535,8 +591,9 @@ pub(crate) fn push_records_for_newer_rosters(
             DocType::Roster,
             &roster.encode(),
         ));
+        out.push((*network_id, sent_seq, records));
     }
-    records
+    out
 }
 
 /// Runs [`NodeHandshake`] to completion over `carrier` and verifies the
@@ -1027,6 +1084,10 @@ pub async fn run_session_until(
 ) {
     let mut backoff = Backoff::new();
     let mut epoch = Epoch::first();
+    // Subscribed for the life of the node, not of one attachment: a notice that comes while the
+    // node is reconnecting only makes the next check (which the attach itself also does) a
+    // second look.
+    let mut roster_changes = roster_store.subscribe();
     loop {
         let Some((mut session, waiting)) = connect_with_retry(
             &config,
@@ -1114,6 +1175,24 @@ pub async fn run_session_until(
                     // (TODO.md, found by L4h5's red-team review).
                     while let Ok(req) = outbound.try_recv() {
                         admit(req, epoch, &mut outbound_queue);
+                    }
+                }
+                // A newer Roster in the store (adopted from a peer, or installed from disk):
+                // the relay gets it now, not at the next attach (protocol.md 4.3, 5.5).
+                // Whatever the notice says (a lag included), the check is the same.
+                changed = roster_changes.recv() => {
+                    // `Closed` cannot happen: the store is held right here.
+                    let _ = changed;
+                    match tokio::time::timeout(SEND_TIMEOUT, session.push_newer_rosters()).await {
+                        Ok(Ok(())) => {}
+                        Ok(Err(err)) => {
+                            tracing::warn!(error = %err, "node session ended while pushing a Roster to the relay, reconnecting");
+                            break 'attached None;
+                        }
+                        Err(_elapsed) => {
+                            tracing::warn!("pushing a Roster to the relay stalled past the write timeout, reconnecting");
+                            break 'attached None;
+                        }
                     }
                 }
                 // A stop (see the check at the top of the loop for one that came during a write).
@@ -1446,6 +1525,122 @@ mod tests {
         }
         assert!(matches!(last_event, Some(EngineEvent::None)));
         assert_eq!(roster_store.seq(&network_id), Some(1));
+    }
+
+    /// Every Roster seq a batch of DOC records carries, in order.
+    fn roster_seqs_in(records: Vec<Record>) -> Vec<u64> {
+        let mut reassembler = menzil_proto::DocReassembler::new();
+        let mut seqs = Vec::new();
+        for record in records {
+            let Record::Doc(body) = record else {
+                panic!("only DOC records")
+            };
+            if let Some((DocType::Roster, bytes)) = reassembler.accept(&body).unwrap() {
+                seqs.push(Roster::decode_strict(&bytes).unwrap().decode().unwrap().seq);
+            }
+        }
+        seqs
+    }
+
+    #[test]
+    fn a_roster_stored_while_attached_is_sent_to_the_relay_once() {
+        let (node_transport, _relay_transport) = two_live_transports();
+        let roster_store = test_roster_store();
+        let owner = SigningKey::generate(&mut rand::rng());
+        let network_id = NetworkId::from(owner.verifying_key().to_bytes());
+        let mut engine = Engine::new(
+            node_transport,
+            Instant::now(),
+            Arc::clone(&roster_store),
+            vec![network_id],
+        );
+        // WELCOME said the relay holds seq 1; so does this node.
+        engine.relay_rosters.insert(network_id, 1);
+        roster_store
+            .set(&signed_roster(&owner, network_id, 1))
+            .unwrap();
+        assert!(engine.catch_up_records().is_empty(), "the relay is current");
+
+        // A newer one arrives from a peer: the relay gets it, and only once.
+        roster_store
+            .set(&signed_roster(&owner, network_id, 2))
+            .unwrap();
+        assert_eq!(roster_seqs_in(engine.catch_up_records()), vec![2]);
+        assert!(engine.catch_up_records().is_empty(), "already sent");
+
+        roster_store
+            .set(&signed_roster(&owner, network_id, 3))
+            .unwrap();
+        assert_eq!(roster_seqs_in(engine.catch_up_records()), vec![3]);
+    }
+
+    #[test]
+    fn a_roster_the_relay_sent_is_not_sent_back_but_a_newer_one_of_ours_is() {
+        let (node_transport, mut relay_transport) = two_live_transports();
+        let roster_store = test_roster_store();
+        let owner = SigningKey::generate(&mut rand::rng());
+        let network_id = NetworkId::from(owner.verifying_key().to_bytes());
+        let mut engine = Engine::new(
+            node_transport,
+            Instant::now(),
+            Arc::clone(&roster_store),
+            vec![network_id],
+        );
+        // The relay pushes seq 4: this node adopts it, and knows the relay holds it.
+        for record in menzil_proto::split_into_doc_records(
+            DocType::Roster,
+            &signed_roster(&owner, network_id, 4).encode(),
+        ) {
+            let ciphertext = relay_transport.encrypt_record(&record).unwrap();
+            engine.on_message(&ciphertext, Instant::now()).unwrap();
+        }
+        assert_eq!(roster_store.seq(&network_id), Some(4));
+        assert!(engine.catch_up_records().is_empty(), "no echo to the relay");
+
+        // The relay pushes an older one: ignored by the store, and the relay's seq stays 4.
+        for record in menzil_proto::split_into_doc_records(
+            DocType::Roster,
+            &signed_roster(&owner, network_id, 2).encode(),
+        ) {
+            let ciphertext = relay_transport.encrypt_record(&record).unwrap();
+            engine.on_message(&ciphertext, Instant::now()).unwrap();
+        }
+        assert!(engine.catch_up_records().is_empty());
+        assert_eq!(engine.relay_rosters.get(&network_id), Some(&4));
+
+        roster_store
+            .set(&signed_roster(&owner, network_id, 5))
+            .unwrap();
+        assert_eq!(roster_seqs_in(engine.catch_up_records()), vec![5]);
+    }
+
+    #[test]
+    fn a_roster_that_does_not_verify_does_not_raise_what_the_relay_is_known_to_hold() {
+        let (node_transport, mut relay_transport) = two_live_transports();
+        let roster_store = test_roster_store();
+        let owner = SigningKey::generate(&mut rand::rng());
+        let network_id = NetworkId::from(owner.verifying_key().to_bytes());
+        let mut engine = Engine::new(
+            node_transport,
+            Instant::now(),
+            Arc::clone(&roster_store),
+            vec![network_id],
+        );
+        roster_store
+            .set(&signed_roster(&owner, network_id, 1))
+            .unwrap();
+        // Signed by someone else under this network's id: refused, and the claim of a seq above
+        // ours must not make this node stop pushing its own.
+        let thief = SigningKey::generate(&mut rand::rng());
+        for record in menzil_proto::split_into_doc_records(
+            DocType::Roster,
+            &signed_roster(&thief, network_id, 9).encode(),
+        ) {
+            let ciphertext = relay_transport.encrypt_record(&record).unwrap();
+            engine.on_message(&ciphertext, Instant::now()).unwrap();
+        }
+        assert_eq!(roster_store.seq(&network_id), Some(1));
+        assert_eq!(roster_seqs_in(engine.catch_up_records()), vec![1]);
     }
 
     #[test]

@@ -95,6 +95,7 @@ impl<'a> DocStore<'a> {
         };
         if let Some(held) = roster {
             rosters.insert(network_id, held);
+            self.rosters.notify(network_id);
         }
         if let Some(held) = policy {
             policies.insert(network_id, held);
@@ -339,6 +340,24 @@ mod tests {
         assert_eq!(types, vec![DocType::BaseRoster, DocType::Roster]);
         assert_eq!(sent[0].1, net.base_roster.encode());
         assert_eq!(sent[1].1, rosters.get(&net.network_id).unwrap().encode());
+    }
+
+    #[test]
+    fn a_pair_adopted_is_announced_once_and_a_pair_held_is_not() {
+        let net = Net::new();
+        let rosters = RosterStore::new();
+        let policies = PolicyStore::new();
+        let mut changes = rosters.subscribe();
+        let docs = DocStore::new(&rosters, &policies);
+        docs.adopt(&net.base_bundle(), NOW).unwrap();
+        assert_eq!(changes.try_recv().unwrap(), net.network_id);
+        assert!(changes.try_recv().is_err());
+        docs.adopt(&net.base_bundle(), NOW).unwrap();
+        assert!(changes.try_recv().is_err(), "held: nothing to announce");
+        // A refused bundle announces nothing.
+        let thief = SigningKey::generate(&mut rand::rng());
+        assert!(docs.adopt(&net.renewal(&thief, 11, true), NOW).is_err());
+        assert!(changes.try_recv().is_err());
     }
 
     #[test]

@@ -14,6 +14,8 @@
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock, RwLockWriteGuard};
 
+use tokio::sync::broadcast;
+
 use ed25519_dalek::VerifyingKey;
 use menzil_proto::trust::{Bundle, HeldRoster, HeldView, Signer, Verdict, check_bundle};
 use menzil_proto::{NetworkId, ProtoError, Roster, RosterBody};
@@ -27,10 +29,25 @@ use crate::error::NodeError;
 /// of a near-[`menzil_proto::MAX_DOC_BYTES`] document at several
 /// milliseconds, a real cost once something calls this on every OPEN
 /// rather than only at the rate-limited L4 handshake.
-#[derive(Default)]
 pub struct RosterStore {
     by_network: RwLock<HashMap<NetworkId, Held>>,
+    /// Tells whoever subscribed ([`Self::subscribe`]) which network just got a newer Roster:
+    /// the triggers of protocol.md 5.5 (push to the relay, fetch the Policy) run on it.
+    changes: broadcast::Sender<NetworkId>,
 }
+
+impl Default for RosterStore {
+    fn default() -> Self {
+        Self {
+            by_network: RwLock::default(),
+            changes: broadcast::channel(CHANGE_BACKLOG).0,
+        }
+    }
+}
+
+/// How many change notices a slow subscriber may miss before it is told it lagged (it then
+/// looks at every network, which is all a notice ever asks for).
+const CHANGE_BACKLOG: usize = 64;
 
 /// One held Roster: the signed form, its decoded body, who signed it and, when a steward did,
 /// the owner signed base it was made from (a steward signed Roster is never held without it).
@@ -113,6 +130,7 @@ impl RosterStore {
             return Ok(false);
         }
         guard.insert(body.network_id, Held::new(roster, None, Signer::Owner)?);
+        self.notify(body.network_id);
         Ok(true)
     }
 
@@ -143,11 +161,25 @@ impl RosterStore {
         match check_bundle(&view, &bundle, now) {
             Verdict::Adopt(adoption) => {
                 guard.insert(network_id, Held::new(roster, None, adoption.signer)?);
+                self.notify(network_id);
                 Ok(true)
             }
             Verdict::Held => Ok(false),
             Verdict::Reject(reason) => Err(NodeError::DocumentRejected(reason)),
         }
+    }
+
+    /// Notices of a newer Roster stored here, one per store, carrying its network. Nobody
+    /// listening is no problem; a receiver that falls more than a few dozen notices behind gets
+    /// `Lagged` and should look at every network.
+    pub fn subscribe(&self) -> broadcast::Receiver<NetworkId> {
+        self.changes.subscribe()
+    }
+
+    /// Says a newer Roster of `network_id` is stored. Called with the store still locked by the
+    /// writer; a notice never waits for anyone.
+    pub(crate) fn notify(&self, network_id: NetworkId) {
+        let _ = self.changes.send(network_id);
     }
 
     /// The write guard, for [`crate::DocStore`].
@@ -289,6 +321,53 @@ mod tests {
         store.set(&signed_roster(&owner, network_id, 1)).unwrap();
         assert!(store.set(&signed_roster(&owner, network_id, 2)).unwrap());
         assert_eq!(store.seq(&network_id), Some(2));
+    }
+
+    #[test]
+    fn a_newer_roster_stored_is_announced_to_subscribers_and_a_refused_one_is_not() {
+        let owner = SigningKey::generate(&mut rand::rng());
+        let network_id = NetworkId::from(owner.verifying_key().to_bytes());
+        let store = RosterStore::new();
+        let mut changes = store.subscribe();
+        assert!(changes.try_recv().is_err(), "nothing yet");
+
+        store.set(&signed_roster(&owner, network_id, 2)).unwrap();
+        assert_eq!(changes.try_recv().unwrap(), network_id);
+        // Equal and lower seqs are not stored, so they announce nothing.
+        assert!(!store.set(&signed_roster(&owner, network_id, 2)).unwrap());
+        assert!(!store.set(&signed_roster(&owner, network_id, 1)).unwrap());
+        assert!(changes.try_recv().is_err());
+        // A Roster that fails verification is not announced either.
+        let thief = SigningKey::generate(&mut rand::rng());
+        assert!(store.set(&signed_roster(&thief, network_id, 9)).is_err());
+        assert!(changes.try_recv().is_err());
+    }
+
+    #[test]
+    fn a_roster_adopted_under_the_time_rules_is_announced() {
+        let owner = SigningKey::generate(&mut rand::rng());
+        let network_id = NetworkId::from(owner.verifying_key().to_bytes());
+        let now = 1_800_000_000;
+        let fresh = |seq| {
+            let body = RosterBody {
+                v: menzil_proto::PROTOCOL_VERSION,
+                network_id,
+                seq,
+                issued: now - 10,
+                expires: now + 86_400,
+                members: vec![],
+                revoked: vec![],
+                stewards: vec![],
+                labels: vec![],
+            };
+            Roster::sign(&owner, &body).unwrap()
+        };
+        let store = RosterStore::new();
+        let mut changes = store.subscribe();
+        assert!(store.adopt_owner(&fresh(3), now).unwrap());
+        assert_eq!(changes.try_recv().unwrap(), network_id);
+        assert!(!store.adopt_owner(&fresh(3), now).unwrap());
+        assert!(changes.try_recv().is_err(), "held: no announcement");
     }
 
     #[test]

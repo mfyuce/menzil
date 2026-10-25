@@ -187,7 +187,7 @@ Error codes are a registry in `menzil-proto`; version 1 defines at least `bad_ce
 
 ### 4.3 Documents
 
-A node sends DOC(roster) to a relay when it holds a newer Roster than the relay's WELCOME `rosters` shows; a relay sends DOC(roster) to attached members of that network when it receives a newer one. Policies travel only end to end (section 5.5). Relays keep the newest Roster per network they are configured to serve (by NetworkId) and refuse Rosters of other networks.
+A node sends DOC(roster) to a relay when it holds a newer Roster than the relay's WELCOME `rosters` shows, and again on the live session whenever it adopts a Roster newer than the newest the relay is known to hold; a relay sends DOC(roster) to attached members of that network when it receives a newer one. Policies travel only end to end (section 5.5). Relays keep the newest Roster per network they are configured to serve (by NetworkId) and refuse Rosters of other networks.
 
 ### 4.4 Advertising public names
 
@@ -258,7 +258,7 @@ A channel is opened by a yamux stream whose OPEN names a `udp:` service or `egre
 
 ### 5.5 Documents end to end
 
-Status: the node serves it (L4j slice S5): the framing, `serve`, `fetch`, `push` and the sinks, the OPEN checks, the rate limits and docs only sessions are built and tested. The triggers below (fetch and push when a session comes up, the issuer push, the catch up and expiry timers, the steward renew loop) and the new handshake after an adopted push are not built (slices S6 and S7).
+Status: the node serves it and asks for documents (L4j slices S5 and S6): the framing, `serve`, `fetch`, `push` and the sinks, the OPEN checks, the rate limits, docs only sessions, the comparison of seqs when a session comes up, the new handshake after an adopted docs only push, the Policy fetch after a newer Roster, the expiry timer, the Roster pushed to the relay on the live session, and the issuer push as a library function are built and tested. The command that calls the issuer push and the steward renew loop are not built (slice S7).
 
 `menzil:docs` is served by every node and named in no grant: any unrevoked member of the session's network, by the responder's Roster, may open it, checked again on every OPEN. It is never configured as a local service.
 
@@ -280,7 +280,7 @@ The receiver checks in this order and stops at the first failure: the frame leng
 
 The session initiator compares the responder's `roster_seq` and `policy_seq` with its own. If the responder holds a newer Roster or Policy, the initiator fetches; if an older one, it pushes; if each side is ahead in one, it pushes first and then fetches. This is how a revocation reaches peers even when a relay withholds it. A responder that answered `docs_only: true` (section 5.1) accepts one push and nothing else, sends no documents on that session, and ends it with CLOSE `docs_only` (26) once it has answered or after 30 seconds; when the push was adopted, the initiator starts a new handshake.
 
-A node that issues documents (a steward node, or the device where the owner or the steward ran a command) sends the Roster to its relay at once (section 4.3) and pushes both documents to every unrevoked member, at most eight at a time, retrying a member that does not answer after 1, 5 and 30 minutes and after 2 hours. A node that adopts a Roster newer than its Policy fetches the Policy from peers it has sessions with, then from up to three members of its Policy.
+A node that issues documents (a steward node, or the device where the owner or the steward ran a command) sends the Roster to its relay at once (section 4.3) and pushes both documents to every unrevoked member, at most eight at a time, retrying a member that does not answer after 1, 5 and 30 minutes and after 2 hours. A node that adopts a Roster newer than its Policy fetches the Policy, after a random wait of up to a minute, from the peers it has a session with that are known to hold a Policy at the Roster's `seq`, and when there are none from up to three members of its Policy.
 
 A node accepts at most one `menzil:docs` stream per peer at a time, four in all, six per peer per minute, and at most eight docs only sessions, one per peer; past a limit it answers OPEN_ACK `rate_limited`.
 

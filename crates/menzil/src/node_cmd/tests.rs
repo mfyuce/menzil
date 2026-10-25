@@ -196,6 +196,11 @@ fn what_a_person_is_told_about_a_failed_open_is_plain() {
     assert!(text.contains("not connected to the relay"), "{text}");
     let text = explain(&NodeOpenError::Session(EnsureError::Timeout));
     assert!(text.contains("did not answer"), "{text}");
+    let text = explain(&NodeOpenError::Session(EnsureError::DocsOnly));
+    assert!(
+        text.contains("only took them") && text.contains("try again"),
+        "{text}"
+    );
     // Anything else keeps the library's own words.
     assert_eq!(
         explain(&NodeOpenError::Session(EnsureError::SelfPeer)),

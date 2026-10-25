@@ -63,6 +63,7 @@ mod admission;
 pub mod docs;
 mod docs_access;
 mod docs_store;
+mod docs_sync;
 mod error;
 mod identity;
 mod l4_router;
@@ -82,6 +83,7 @@ pub use admission::{
 };
 pub use docs_access::{DocsGate, DocsLimits, DocsPermit, SessionHandler, SessionOpened};
 pub use docs_store::{Adopted, DocStore};
+pub use docs_sync::{POLICY_JITTER_MAX, PushReport, SyncConfig};
 pub use error::NodeError;
 pub use identity::LocalIdentity;
 pub use l4_router::{

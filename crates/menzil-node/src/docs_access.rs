@@ -95,6 +95,17 @@ impl DocsGate {
         })
     }
 
+    /// How many streams `peer` has started within the window (for tests).
+    #[cfg(test)]
+    pub(crate) fn started_by(&self, peer: &NodeId) -> usize {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .started
+            .get(peer)
+            .map_or(0, VecDeque::len)
+    }
+
     /// A place for one more stream of `peer`, or `None` when a limit says no. A refusal costs the
     /// peer nothing against the per minute count.
     pub fn try_acquire(self: &Arc<Self>, peer: NodeId) -> Option<DocsPermit> {
