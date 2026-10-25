@@ -20,7 +20,7 @@ use anyhow::{Context, Result};
 use menzil_admin::{Documents, StewardSecret};
 use menzil_node::{DocStore, Node, PolicyStore, RosterStore};
 use menzil_proto::trust::DOC_MAX_LIFETIME;
-use menzil_proto::{NetworkId, StewardKey};
+use menzil_proto::{NetworkId, Roster, StewardKey};
 use tokio::task::JoinHandle;
 
 use crate::home::Home;
@@ -66,7 +66,22 @@ impl Facts {
     /// The facts of `docs`: the entry is read from the owner signed Roster the pair stands on
     /// (its base when a steward signed it, itself otherwise).
     pub fn of(docs: &Documents) -> Result<Self> {
-        let owner_roster = docs.base().map_or(docs.roster(), |(roster, _)| roster);
+        Self::of_newest(docs, None)
+    }
+
+    /// Like [`Facts::of`], but the entry is read from the newest owner signed Roster the node
+    /// holds: the pair's own, or `stored` (the Roster in the stores with its base, as
+    /// `RosterStore::get_with_base` gives them) when that is newer. A Roster that came over the
+    /// relay without its Policy, such as the owner's removal of this steward, then stops the
+    /// steward before the Policy arrives (protocol.md 7.3; the ninth red-team round, L1).
+    pub fn of_newest(docs: &Documents, stored: Option<&(Roster, Option<Roster>)>) -> Result<Self> {
+        let mut owner_roster = docs.base().map_or(docs.roster(), |(roster, _)| roster);
+        if let Some((roster, base)) = stored {
+            let stored_owner = base.as_ref().unwrap_or(roster);
+            if stored_owner.decode()?.seq > owner_roster.decode()?.seq {
+                owner_roster = stored_owner;
+            }
+        }
         let entry = match owner_roster.decode()?.stewards.first() {
             Some(entry) => {
                 let body = entry.decode()?;
@@ -189,14 +204,17 @@ pub fn tick_due(last: Option<Tick>, now: u64, seq: u64) -> bool {
     match last {
         None => true,
         Some(last) => {
-            now.saturating_sub(last.at) >= TICK_SECS || last.seq.is_some_and(|seen| seen != seq)
+            // A `last.at` ahead of the clock (it was wrong once, then set right) is due, or the
+            // network would not be looked at until the clock caught up with it (the ninth
+            // red-team round, L2).
+            last.at > now || now - last.at >= TICK_SECS || last.seq.is_some_and(|seen| seen != seq)
         }
     }
 }
 
 /// Whether a warning is said now: not said yet, or [`WARN_EVERY_SECS`] since it was.
 pub fn warn_due(last: Option<u64>, now: u64) -> bool {
-    last.is_none_or(|at| now.saturating_sub(at) >= WARN_EVERY_SECS)
+    last.is_none_or(|at| at > now || now - at >= WARN_EVERY_SECS)
 }
 
 /// What the loop remembers of one network.
@@ -312,7 +330,8 @@ fn look(
     let Some(held) = held_documents(home, rosters, policies, network_id)? else {
         return Ok(Outcome::Idle);
     };
-    let facts = Facts::of(&held)?;
+    let stored = rosters.get_with_base(network_id);
+    let facts = Facts::of_newest(&held, stored.as_ref())?;
     let plan = decide(now, Some(key.public()), Some(&facts));
     if let Some(warning) = plan.warning
         && warn_due(state.last_warning, now)
@@ -322,7 +341,12 @@ fn look(
         tracing::warn!(network = %network_id, "{text}");
         eprintln!("warning: {text}");
     }
-    if !plan.renew {
+    // The stores hold a Roster above the pair this would renew from (one that came over the
+    // relay without its Policy): renewing from the older pair would sign over a newer network
+    // state and fail the pair rule on adoption. Wait for the Policy (the ninth red-team round,
+    // L1).
+    let roster_ahead = rosters.seq(network_id).is_some_and(|seq| seq > held.seq());
+    if !plan.renew || roster_ahead {
         return Ok(Outcome::Checked);
     }
     renew_and_adopt(home, rosters, policies, &key, &held, now, state)

@@ -340,6 +340,37 @@ mod tests {
         assert_eq!(rosters.get(&network_id).unwrap().seq, 1);
     }
 
+    /// Round 9, M2: a Roster that ran out on disk is held by the relay at start (judged at its
+    /// own `issued`), and then the current Roster a member pushes over DOC replaces it; a relay
+    /// that did not hold it answers every such DOC `NetworkNotServed`.
+    #[test]
+    fn a_held_expired_roster_is_replaced_by_a_newer_one_over_doc() {
+        let owner = SigningKey::generate(&mut rand::rng());
+        let network_id = NetworkId::from(owner.verifying_key().to_bytes());
+        let mut body = signed_roster(&owner, network_id, 5).decode().unwrap();
+        body.issued = NOW - 20 * DAY;
+        body.expires = NOW - 6 * DAY;
+        let expired = Roster::sign(&owner, &body).unwrap();
+        let fresh = signed_roster(&owner, network_id, 9);
+        let records = menzil_proto::split_into_doc_records(DocType::Roster, &fresh.encode());
+
+        // Not held: the network is not served and the newer Roster is refused.
+        let rosters = RosterStore::new();
+        assert!(rosters.adopt(&expired, None, NOW).is_err());
+        assert_eq!(
+            feed_all(&mut DocReassembler::new(), &records, &rosters),
+            AcceptOutcome::NetworkNotServed(network_id)
+        );
+
+        // Held, judged at its own `issued`: the newer one replaces it.
+        assert!(rosters.adopt(&expired, None, body.issued).unwrap());
+        assert_eq!(
+            feed_all(&mut DocReassembler::new(), &records, &rosters),
+            AcceptOutcome::NewRoster(network_id)
+        );
+        assert_eq!(rosters.get(&network_id).unwrap().seq, 9);
+    }
+
     #[test]
     fn a_roster_for_a_network_this_relay_does_not_already_serve_is_refused_not_inserted() {
         let owner = SigningKey::generate(&mut rand::rng());

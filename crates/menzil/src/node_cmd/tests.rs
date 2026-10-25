@@ -811,10 +811,13 @@ async fn a_socket_path_must_name_a_file() {
     assert!(!base.path().join("dirx").exists());
 }
 
-/// Round 6, M2: documents on disk that ran out hold back their own network, not the node: the
-/// stores load without it, and the other networks are held.
+/// Round 6, M2 and round 9, M1: documents on disk that ran out do not stop the node, and they
+/// are not left out of the stores either: they are held (judged at their own `issued`), so that
+/// the member can be admitted for documents only and dial for them after a restart. A pair
+/// issued more than 14 days ahead of the clock is a wrong clock on the signer's side and is not
+/// held; the node starts all the same.
 #[test]
-fn expired_documents_on_disk_do_not_stop_the_node() {
+fn expired_documents_on_disk_do_not_stop_the_node_and_are_held() {
     let dir = tempfile::tempdir().unwrap();
     let home = Home::new(dir.path().join("menzil"));
     let now = std::time::SystemTime::now()
@@ -825,13 +828,107 @@ fn expired_documents_on_disk_do_not_stop_the_node() {
     crate::local::init(&home, then).unwrap();
     let old = crate::local::network_create(&home, "laptop", then).unwrap();
     let fresh = crate::local::network_create(&home, "laptop", now).unwrap();
+    let soon = crate::local::network_create(&home, "laptop", now + 3 * 24 * 3600).unwrap();
+    let wrong_clock = crate::local::network_create(&home, "laptop", now + 20 * 24 * 3600).unwrap();
     let (policies, rosters, networks) =
         load_stores(&home).expect("expired documents of one network must not stop the node");
-    assert!(networks.contains(&old) && networks.contains(&fresh));
-    assert_eq!(rosters.seq(&old), None);
-    assert_eq!(policies.seq(&old), None);
-    assert!(rosters.seq(&fresh).is_some());
-    assert!(policies.seq(&fresh).is_some());
+    for id in [old, fresh, soon, wrong_clock] {
+        assert!(networks.contains(&id));
+    }
+    for held in [old, fresh, soon] {
+        assert!(rosters.seq(&held).is_some(), "{held}");
+        assert!(policies.seq(&held).is_some(), "{held}");
+    }
+    assert_eq!(rosters.seq(&wrong_clock), None);
+    assert_eq!(policies.seq(&wrong_clock), None);
+    // The ordinary adoption stays strict: the same pair at the real clock is refused.
+    let docs = crate::local::load_documents(&home, &old).unwrap();
+    let strict = DocStore::new(&RosterStore::new(), &PolicyStore::new()).adopt(&docs.bundle(), now);
+    assert!(matches!(
+        strict,
+        Err(NodeError::DocumentRejected(Reason::Expired))
+    ));
+}
+
+/// Round 9, M1: a member whose documents ran out while it was stopped is, after the restart,
+/// admitted for documents only when a steward dials it (`RosterExpired`), so the push can revive
+/// it; before the fix it answered `UnknownNetwork` to everyone.
+#[test]
+fn a_member_whose_disk_documents_expired_is_admitted_for_documents_only_after_a_restart() {
+    use menzil_node::{HandshakeAdmission, decide_responder_admission};
+    let past = clock() - 20 * 24 * 3600;
+    let owner_dir = tempfile::tempdir().unwrap();
+    let owner = Home::new(owner_dir.path());
+    init(&owner, past).unwrap();
+    let id = network_create(&owner, "laptop", past).unwrap();
+    let member_dir = tempfile::tempdir().unwrap();
+    let member = Home::new(member_dir.path());
+    let request = init(&member, past).unwrap().join_request;
+    let admitted = admit(&owner, None, &request, "member", &[], past).unwrap();
+    join(&member, &admitted.token, past).unwrap();
+    let (policies, rosters, _) = load_stores(&member).unwrap();
+    let docs = crate::local::load_documents(&owner, &id).unwrap();
+    let owner_node = docs.roster_body().members[0].node_id;
+    let member_node = docs.roster_body().members[1].node_id;
+    let serial = docs
+        .policy_body()
+        .certs
+        .iter()
+        .map(|c| c.decode().unwrap())
+        .find(|b| b.node_id == member_node)
+        .unwrap()
+        .serial;
+    let answer = decide_responder_admission(
+        &policies,
+        &rosters,
+        &id,
+        &owner_node,
+        &menzil_proto::X25519PublicKey::from([9u8; 32]),
+        &member_node,
+        serial,
+        clock(),
+    );
+    assert_eq!(
+        answer,
+        HandshakeAdmission::DocsOnly {
+            reason: menzil_proto::ErrorCode::RosterExpired
+        }
+    );
+    // The steward's renewed pair is then adopted through the ordinary, strict door.
+    let renewed = renew(&owner, None, clock()).unwrap();
+    let pair = crate::token::decode_documents(&renewed.token).unwrap();
+    let adopted = DocStore::new(&rosters, &policies)
+        .adopt(&pair.bundle(), clock())
+        .unwrap();
+    assert!(adopted.roster && adopted.policy);
+    assert_eq!(rosters.seq(&id), Some(renewed.seq));
+}
+
+/// Round 9, M1: only the start-up path relaxes the time rules. A reload while the node runs
+/// (a newer token that is already expired, written by `menzil join`) is still refused and the
+/// stores keep what they hold.
+#[test]
+fn the_reload_while_the_node_runs_stays_strict_about_time() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = Home::new(dir.path().join("menzil"));
+    let past = clock() - 20 * 24 * 3600;
+    crate::local::init(&home, past).unwrap();
+    let id = crate::local::network_create(&home, "laptop", past).unwrap();
+    let (policies, rosters, _) = load_stores(&home).unwrap();
+    let start = rosters.seq(&id).unwrap();
+    renew(&home, None, past + 60).unwrap();
+    let result = reload(
+        &home,
+        &policies,
+        &rosters,
+        &RwLock::new(Directory::default()),
+        &mut HashMap::new(),
+    );
+    assert!(
+        result.is_err(),
+        "an expired newer pair is not adopted at reload"
+    );
+    assert_eq!(rosters.seq(&id), Some(start));
 }
 
 /// Round 6, L1: a Roster that reached the node over L3 ahead of the docs token on disk is not a

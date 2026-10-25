@@ -391,19 +391,24 @@ async fn a_running_relay_picks_up_a_newer_roster_added_to_its_directory() {
     assert_eq!(running.roster_seq(&id), Some(2));
 }
 
-/// Round 6, M1: one network whose Roster on disk has expired (renewals travel by DOC, which the
-/// relay does not write back) holds back that network only; the relay starts and serves the
-/// others.
+/// Round 6, M1 and round 9, M2: one network whose Roster on disk has expired (renewals travel by
+/// DOC, which the relay does not write back) does not stop the relay and does not hold back the
+/// others. The expired Roster is held, so a member's newer Roster can replace it, but it
+/// forwards nothing; one issued more than 14 days ahead of the clock is not held.
 #[tokio::test]
-async fn an_expired_roster_on_disk_holds_back_its_network_only() {
+async fn an_expired_roster_on_disk_is_held_but_forwards_nothing() {
     let (_oa, owner_a) = home();
     init(&owner_a, clock() - 15 * DAY).unwrap();
     let id_a = network_create(&owner_a, "laptop", clock() - 15 * DAY).unwrap();
     let (_ob, owner_b, id_b, _) = token_of_a_network();
+    let (_oc, owner_c) = home();
+    init(&owner_c, clock() + 20 * DAY).unwrap();
+    let id_c = network_create(&owner_c, "laptop", clock() + 20 * DAY).unwrap();
     let (dir, relay_home) = home();
     init(&relay_home, clock()).unwrap();
     add_network(&relay_home, &relay_token(&owner_a), clock() - 15 * DAY + 60).unwrap();
     add_network(&relay_home, &relay_token(&owner_b), clock()).unwrap();
+    add_network(&relay_home, &relay_token(&owner_c), clock() + 20 * DAY).unwrap();
     let (cert, key) = pem_files(dir.path());
     let options = RunOptions {
         listen: "127.0.0.1:0".parse().unwrap(),
@@ -416,9 +421,25 @@ async fn an_expired_roster_on_disk_holds_back_its_network_only() {
     let running = start(&relay_home, &options)
         .await
         .expect("an expired Roster of one network must not stop the relay");
-    assert_eq!(running.networks, vec![id_b]);
+    assert!(running.networks.contains(&id_a) && running.networks.contains(&id_b));
+    assert!(!running.networks.contains(&id_c));
     assert!(running.roster_seq(&id_b).is_some());
-    assert_eq!(running.roster_seq(&id_a), None);
+    assert!(running.roster_seq(&id_a).is_some(), "held");
+    assert_eq!(running.roster_seq(&id_c), None);
+    // Held, not used: the owner is a member of its own network, and nothing is forwarded.
+    let owner_node = crate::local::load_documents(&owner_a, &id_a)
+        .unwrap()
+        .roster_body()
+        .members[0]
+        .node_id;
+    let rosters = running.relay.rosters();
+    assert!(!rosters.grants_forwarding(&owner_node, &[id_a], &owner_node, clock()));
+    // A newer Roster (what a member pushes over DOC) replaces it, and then forwards.
+    let renewed = crate::local::renew(&owner_a, None, clock()).unwrap();
+    let pair = crate::token::decode_documents(&renewed.token).unwrap();
+    assert!(rosters.adopt(pair.roster(), None, clock()).unwrap());
+    assert_eq!(running.roster_seq(&id_a), Some(renewed.seq));
+    assert!(rosters.grants_forwarding(&owner_node, &[id_a], &owner_node, clock()));
     running.stop();
 }
 

@@ -20,7 +20,7 @@ use menzil_node::{
     Adopted, DocStore, EnsureError, LocalIdentity, Node, NodeConfig, NodeError, NodeOpenError,
     OpenStreamError, PolicyStore, RosterStore, SessionConfig,
 };
-use menzil_proto::trust::Reason;
+use menzil_proto::trust::{DOC_MAX_LIFETIME, Reason};
 use menzil_proto::{NetworkId, NodeId, ServiceId, ServiceKind};
 use menzil_stream::Stream;
 use tokio::net::{UnixListener, UnixStream};
@@ -486,11 +486,16 @@ pub async fn bind_in_prepared_directory(path: &Path, kind: &SocketKind) -> Resul
 
 /// Loads every network's documents into the stores a node verifies against. A network whose
 /// documents cannot be read stops the node: running without it would look like a working
-/// network that rejects everyone. Documents that are expired or not valid yet do not: that
-/// network is warned about by name and left out of the stores (it refuses everyone, and says why
-/// in the log) while the others run, because a member whose documents ran out is revived by a
-/// steward's push, which needs the member running (protocol.md 7.3; the sixth red-team round,
-/// M2).
+/// network that rejects everyone. Documents that are expired or not valid yet do not: the pair
+/// is put into the stores anyway, judged at its own `issued` time (every other rule of
+/// protocol.md 2.3 still applies: signatures, steward rules, pair rules), and the network is
+/// warned about by name. Held that way it is not usable (admission already refuses a pair past
+/// its `expires`), but the member can be admitted for documents only and can dial for them, so a
+/// steward's push or the relay's catch-up revives it after a restart (protocol.md 7.3; the sixth
+/// red-team round, M2, and the ninth, M1). Only this start-up path relaxes the time rules; the
+/// reload while the node runs ([`reload_adopting`]) and every other adoption stay strict. A pair
+/// that is also bad for another reason, or whose `issued` is more than [`DOC_MAX_LIFETIME`]
+/// ahead of the clock, is warned about and left out of the stores like before.
 pub fn load_stores(home: &Home) -> Result<(Arc<PolicyStore>, Arc<RosterStore>, Vec<NetworkId>)> {
     let policies = Arc::new(PolicyStore::new());
     let rosters = Arc::new(RosterStore::new());
@@ -505,14 +510,28 @@ pub fn load_stores(home: &Home) -> Result<(Arc<PolicyStore>, Arc<RosterStore>, V
         match adopt_documents(&rosters, &policies, &docs) {
             Ok(_) => {}
             Err(NodeError::DocumentRejected(reason @ (Reason::Expired | Reason::NotYetValid))) => {
-                tracing::warn!(
-                    network = %network_id,
-                    ?reason,
-                    "the documents on disk for this network are not valid now: it stays unusable until valid ones arrive (`menzil join` with a newer token, or a push from a steward or the relay)"
-                );
-                eprintln!(
-                    "warning: network {network_id}: the documents on disk are not valid now ({reason:?}); it stays unusable until valid ones arrive"
-                );
+                match adopt_documents_as_issued(&rosters, &policies, &docs) {
+                    Ok(_) => {
+                        tracing::warn!(
+                            network = %network_id,
+                            ?reason,
+                            "the documents on disk for this network are not valid now: held for documents only, the network is unusable until valid ones arrive (`menzil join` with a newer token, or a push from a steward or the relay)"
+                        );
+                        eprintln!(
+                            "warning: network {network_id}: the documents on disk are not valid now ({reason:?}); held for documents only until valid ones arrive"
+                        );
+                    }
+                    Err(_) => {
+                        tracing::warn!(
+                            network = %network_id,
+                            ?reason,
+                            "the documents on disk for this network are not valid now and cannot be held: it stays unusable until valid ones arrive (`menzil join` with a newer token)"
+                        );
+                        eprintln!(
+                            "warning: network {network_id}: the documents on disk are not valid now ({reason:?}); it stays unusable until valid ones arrive"
+                        );
+                    }
+                }
             }
             Err(error) => {
                 return Err(anyhow::Error::new(error).context(format!(
@@ -557,6 +576,27 @@ fn adopt_documents(
     // pass it on with.
     let adopted = DocStore::new(rosters, policies).adopt(&docs.bundle(), now)?;
     Ok(Disk::Judged(adopted))
+}
+
+/// The start-up path of a pair that failed only on time (see [`load_stores`]): the same
+/// acceptance predicate, judged at the pair's own `issued` instead of the clock, so that its
+/// signatures, steward rules, pair rules and `seq` still count and only "has it run out" and
+/// "is it from the future" do not. `DocStore::adopt` already takes the time to judge at, so no
+/// other entry point is needed. A pair issued more than [`DOC_MAX_LIFETIME`] ahead of the clock
+/// is not held (that is a wrong clock on the signer's side, not a pair that ran out).
+fn adopt_documents_as_issued(
+    rosters: &RosterStore,
+    policies: &PolicyStore,
+    docs: &menzil_admin::Documents,
+) -> Result<Adopted, NodeError> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    let issued = docs.roster_body().issued.max(docs.policy_body().issued);
+    if issued > now.saturating_add(DOC_MAX_LIFETIME) {
+        return Err(NodeError::DocumentRejected(Reason::NotYetValid));
+    }
+    DocStore::new(rosters, policies).adopt(&docs.bundle(), issued)
 }
 
 /// Opens streams for the agent: resolves the name, then asks the node.

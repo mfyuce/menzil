@@ -138,8 +138,7 @@ fn a_network_is_looked_at_once_an_hour_or_when_its_seq_changes() {
     let failed = Some(Tick { at: NOW, seq: None });
     assert!(!tick_due(failed, NOW + 1, 6));
     assert!(tick_due(failed, NOW + TICK_SECS, 6));
-    // A clock that went back is not an hour.
-    assert!(!tick_due(seen, NOW - 10, 5));
+    // (round 9, L2: one that went back is due at once, see the test below.)
 }
 
 #[test]
@@ -148,7 +147,6 @@ fn a_warning_is_repeated_once_a_day() {
     assert!(!warn_due(Some(NOW), NOW));
     assert!(!warn_due(Some(NOW), NOW + DAY - 1));
     assert!(warn_due(Some(NOW), NOW + DAY));
-    assert!(!warn_due(Some(NOW), NOW - 10));
 }
 
 // ---- the wiring over real documents ----
@@ -534,4 +532,99 @@ fn the_renewal_waits_for_a_command_that_holds_the_network_lock() {
         "it signed while another command held the lock"
     );
     holder.join().unwrap();
+}
+
+/// Round 9, L2: a `last.at` ahead of the clock (the device booted with a clock a year ahead,
+/// looked once, then the clock was set right) is due, and a warning said then is due again.
+#[test]
+fn a_look_or_warning_stamped_in_the_future_is_due() {
+    let ahead = Tick {
+        at: NOW + 365 * DAY,
+        seq: Some(3),
+    };
+    for later in [NOW, NOW + DAY, NOW + 30 * DAY, NOW + 364 * DAY] {
+        assert!(tick_due(Some(ahead), later, 3), "+{}d", (later - NOW) / DAY);
+    }
+    assert!(warn_due(Some(NOW + 365 * DAY), NOW + 30 * DAY));
+    // The ordinary cases stay as they were: just stamped is not due, an hour later is.
+    assert!(!tick_due(
+        Some(Tick {
+            at: NOW,
+            seq: Some(3)
+        }),
+        NOW,
+        3
+    ));
+    assert!(!warn_due(Some(NOW), NOW));
+}
+
+/// Adopts the Roster alone of the pair in `token` (as the relay's DOC carries it: the Policy is
+/// still to be fetched from a peer) and returns its `seq`.
+fn adopt_roster_alone(token: &str, rosters: &RosterStore, policies: &PolicyStore, now: u64) -> u64 {
+    let pair = crate::token::decode_documents(token).unwrap();
+    let alone = menzil_proto::trust::Bundle {
+        roster: Some(pair.roster().clone()),
+        ..Default::default()
+    };
+    let adopted = DocStore::new(rosters, policies).adopt(&alone, now).unwrap();
+    assert!(adopted.roster && !adopted.policy);
+    pair.seq()
+}
+
+/// Round 9, L1: the owner's removal Roster held alone (its Policy still to come) stops the
+/// removed steward: no renewal from the older disk pair, the warning says it is not listed.
+#[test]
+fn a_removal_roster_held_alone_stops_the_removed_steward() {
+    let f = both();
+    let (policies, rosters, _) = load_stores(&f.steward).unwrap();
+    let removed = steward_remove(&f.owner, None, clock() + 1).unwrap();
+    let seq = adopt_roster_alone(&removed.token, &rosters, &policies, clock() + 1);
+    assert_eq!(
+        (rosters.seq(&f.id), policies.seq(&f.id)),
+        (Some(seq), Some(3))
+    );
+    let mut state = NetState::default();
+    let now = clock() + 8 * DAY;
+    let outcome = tick_network(&f.steward, &rosters, &policies, &f.id, now, &mut state).unwrap();
+    assert_eq!(outcome, Outcome::Checked);
+    let disk = crate::local::load_documents(&f.steward, &f.id).unwrap();
+    assert_eq!(disk.seq(), 3, "nothing was signed or written");
+    assert_eq!(rosters.seq(&f.id), Some(seq));
+    assert_eq!(
+        state.last_warning,
+        Some(now),
+        "it says the key is not listed"
+    );
+}
+
+/// Round 9, L1: a newer Roster held without its Policy makes the loop wait, even when it still
+/// lists the steward: renewing from the older pair would sign over it and fail on adoption.
+#[test]
+fn a_newer_roster_held_without_its_policy_makes_the_loop_wait() {
+    let f = both();
+    let (policies, rosters, _) = load_stores(&f.steward).unwrap();
+    let renewed = crate::local::renew(&f.owner, None, clock() + 1).unwrap();
+    let seq = adopt_roster_alone(&renewed.token, &rosters, &policies, clock() + 1);
+    let mut state = NetState::default();
+    let now = clock() + 8 * DAY;
+    let outcome = tick_network(&f.steward, &rosters, &policies, &f.id, now, &mut state).unwrap();
+    assert_eq!(outcome, Outcome::Checked);
+    let disk = crate::local::load_documents(&f.steward, &f.id).unwrap();
+    assert_eq!(disk.seq(), 3, "nothing was signed or written");
+    assert_eq!(rosters.seq(&f.id), Some(seq));
+    // With the Policy arrived the loop is back on the held pair and renews from it when due.
+    let pair = crate::token::decode_documents(&renewed.token).unwrap();
+    DocStore::new(&rosters, &policies)
+        .adopt(&pair.bundle(), clock() + 1)
+        .unwrap();
+    let later = tick_network(
+        &f.steward,
+        &rosters,
+        &policies,
+        &f.id,
+        now + TICK_SECS,
+        &mut state,
+    )
+    .unwrap();
+    assert_eq!(later, Outcome::Renewed { seq: seq + 1 });
 }

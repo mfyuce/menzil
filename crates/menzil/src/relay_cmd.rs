@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow, bail};
-use menzil_proto::trust::{HeldRoster, HeldView, Reason, Verdict, check_bundle};
+use menzil_proto::trust::{DOC_MAX_LIFETIME, HeldRoster, HeldView, Reason, Verdict, check_bundle};
 use menzil_proto::{Limits, NetworkId, Roster};
 use menzil_relay::{Listener, Relay, RelayError, RelayIdentity};
 use rustls::pki_types::pem::PemObject;
@@ -289,19 +289,40 @@ pub async fn start(home: &Home, options: &RunOptions) -> Result<RunningRelay> {
         {
             Ok(_) => networks.push(network_id),
             // A Roster that ran out on disk (the relay does not write the ones it takes over
-            // DOC, so the file is as old as the last `add-network`) or is not valid yet holds
-            // back its own network, not the others (the sixth red-team round, M1). The relay
-            // keeps looking at the file and takes a newer one when it appears; members push
-            // theirs when they attach.
+            // DOC, so the file is as old as the last `add-network`) or is not valid yet is
+            // still held, judged at its own `issued` (every other rule of protocol.md 2.3
+            // still applies), so that a member's newer Roster over DOC can replace it
+            // (`accept_roster_chunk` refuses a network the store does not hold). Holding it
+            // does not serve traffic: forwarding checks `expires` itself
+            // (`RosterStore::grants_forwarding`). One that cannot be held that way holds back
+            // its own network, not the others (the sixth red-team round, M1; the ninth, M2).
             Err(RelayError::DocumentRejected(reason @ (Reason::Expired | Reason::NotYetValid))) => {
-                tracing::warn!(
-                    network = %network_id,
-                    ?reason,
-                    "the Roster on disk for this network is not valid now: the network is not served until a valid one arrives (`menzil relay add-network` with a newer token)"
-                );
-                eprintln!(
-                    "warning: network {network_id}: the Roster on disk is not valid now ({reason:?}); not served until a valid one arrives"
-                );
+                let issued = stored.roster.decode()?.issued;
+                let held = issued <= unix_now().saturating_add(DOC_MAX_LIFETIME)
+                    && relay
+                        .rosters()
+                        .adopt(&stored.roster, stored.base.as_ref(), issued)
+                        .is_ok();
+                if held {
+                    networks.push(network_id);
+                    tracing::warn!(
+                        network = %network_id,
+                        ?reason,
+                        "the Roster on disk for this network is not valid now: held, but nothing is forwarded until a valid one arrives (a member's push, or `menzil relay add-network` with a newer token)"
+                    );
+                    eprintln!(
+                        "warning: network {network_id}: the Roster on disk is not valid now ({reason:?}); held, not forwarding until a valid one arrives"
+                    );
+                } else {
+                    tracing::warn!(
+                        network = %network_id,
+                        ?reason,
+                        "the Roster on disk for this network is not valid now and cannot be held: the network is not served until a valid one arrives (`menzil relay add-network` with a newer token)"
+                    );
+                    eprintln!(
+                        "warning: network {network_id}: the Roster on disk is not valid now ({reason:?}); not served until a valid one arrives"
+                    );
+                }
             }
             Err(error) => {
                 return Err(anyhow::Error::new(error)
