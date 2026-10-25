@@ -20,6 +20,7 @@ use ed25519_dalek::VerifyingKey;
 use menzil_proto::trust::{Bundle, HeldRoster, HeldView, Signer, Verdict, check_bundle};
 use menzil_proto::{NetworkId, ProtoError, Roster, RosterBody};
 
+use crate::docs_store::AdoptedHook;
 use crate::error::NodeError;
 
 /// This node's held Rosters, at most one per network. The decoded
@@ -34,6 +35,9 @@ pub struct RosterStore {
     /// Tells whoever subscribed ([`Self::subscribe`]) which network just got a newer Roster:
     /// the triggers of protocol.md 5.5 (push to the relay, fetch the Policy) run on it.
     changes: broadcast::Sender<NetworkId>,
+    /// Called after [`crate::DocStore::adopt`] has stored something (see
+    /// [`Self::set_on_adopted`]); how a caller keeps what arrives over the network on disk.
+    on_adopted: RwLock<Option<AdoptedHook>>,
 }
 
 impl Default for RosterStore {
@@ -41,6 +45,7 @@ impl Default for RosterStore {
         Self {
             by_network: RwLock::default(),
             changes: broadcast::channel(CHANGE_BACKLOG).0,
+            on_adopted: RwLock::default(),
         }
     }
 }
@@ -79,6 +84,11 @@ impl Held {
 
     pub(crate) fn seq(&self) -> u64 {
         self.body.seq
+    }
+
+    /// The signed Roster and its base.
+    pub(crate) fn signed_with_base(&self) -> (Roster, Option<Roster>) {
+        (self.signed.clone(), self.base.clone())
     }
 
     pub(crate) fn view(&self) -> &HeldRoster {
@@ -180,6 +190,19 @@ impl RosterStore {
     /// writer; a notice never waits for anyone.
     pub(crate) fn notify(&self, network_id: NetworkId) {
         let _ = self.changes.send(network_id);
+    }
+
+    /// Sets the function [`crate::DocStore::adopt`] calls, after its locks are released, each
+    /// time it has stored a Roster or a Policy (see [`crate::AdoptedDocs`]). The library keeps
+    /// no file paths: the caller decides where, and whether, an adopted pair is kept. One hook
+    /// per store; a second call replaces the first. [`Self::set`] and [`Self::adopt_owner`]
+    /// (fixtures, and a lone owner signed Roster that cannot form a pair) do not call it.
+    pub fn set_on_adopted(&self, hook: impl Fn(&crate::AdoptedDocs) + Send + Sync + 'static) {
+        *self.on_adopted.write().unwrap() = Some(std::sync::Arc::new(hook));
+    }
+
+    pub(crate) fn on_adopted(&self) -> Option<AdoptedHook> {
+        self.on_adopted.read().unwrap().clone()
     }
 
     /// The write guard, for [`crate::DocStore`].

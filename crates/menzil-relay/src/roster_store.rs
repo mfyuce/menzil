@@ -11,7 +11,7 @@
 //! (protocol.md 4.3) need against it.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::RwLock;
+use std::sync::{Arc, RwLock};
 
 use ed25519_dalek::VerifyingKey;
 use menzil_proto::trust::{Bundle, HeldRoster, HeldView, Reason, Verdict, check_bundle};
@@ -28,7 +28,13 @@ use crate::error::RelayError;
 #[derive(Default)]
 pub struct RosterStore {
     by_network: RwLock<HashMap<NetworkId, Held>>,
+    /// Called after [`Self::adopt`] has stored a Roster (see [`Self::set_on_adopted`]).
+    on_adopted: RwLock<Option<AdoptedHook>>,
 }
+
+/// The function a caller sets with [`RosterStore::set_on_adopted`]: the Roster just stored and,
+/// for a steward signed one, its base.
+type AdoptedHook = Arc<dyn Fn(&Roster, Option<&Roster>) + Send + Sync>;
 
 /// One held Roster. A Roster a steward signed is held together with the owner signed base it
 /// was made from, never without it: DOC propagation sends the base first (protocol.md 4.3),
@@ -97,6 +103,15 @@ impl RosterStore {
             },
         );
         Ok(true)
+    }
+
+    /// Sets the function [`Self::adopt`] calls, once the lock is released, each time it has
+    /// stored a Roster (arguments: the Roster and its base, a steward signed Roster's only).
+    /// The library keeps no file paths: the caller decides whether, and where, an adopted
+    /// Roster is kept, so that a restart does not roll the relay back to what it started with.
+    /// One hook; a second call replaces the first. [`Self::set`] (fixtures) does not call it.
+    pub fn set_on_adopted(&self, hook: impl Fn(&Roster, Option<&Roster>) + Send + Sync + 'static) {
+        *self.on_adopted.write().unwrap() = Some(Arc::new(hook));
     }
 
     /// Adopts `roster` if the acceptance predicate of protocol.md 2.3
@@ -171,6 +186,16 @@ impl RosterStore {
                 counted,
             },
         );
+        drop(guard);
+        // The Roster is held whatever the hook does: a panic in it is logged, never passed on
+        // to the adoption.
+        let hook = self.on_adopted.read().unwrap().clone();
+        if let Some(hook) = hook
+            && std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| hook(roster, base)))
+                .is_err()
+        {
+            tracing::warn!(%network_id, "the on adopted hook panicked; the Roster is held all the same");
+        }
         Ok(true)
     }
 
@@ -1017,5 +1042,63 @@ mod tests {
             refused(store.adopt(&renewal, None, NOW + 40 * crate::tests_support::DAY)),
             Reason::Expired
         );
+    }
+
+    type Seen = std::sync::Arc<std::sync::Mutex<Vec<(u64, Option<u64>)>>>;
+
+    /// A hook that records the `seq` of each Roster and of its base.
+    fn recording(store: &RosterStore) -> Seen {
+        let seen: Seen = Seen::default();
+        let sink = seen.clone();
+        store.set_on_adopted(move |roster, base| {
+            let base_seq = base.map(|b| b.decode().unwrap().seq);
+            sink.lock()
+                .unwrap()
+                .push((roster.decode().unwrap().seq, base_seq));
+        });
+        seen
+    }
+
+    #[test]
+    fn the_hook_hears_of_each_adopted_roster_with_its_base_and_of_nothing_else() {
+        let net = StewardNet::new(10, NOW, node(1));
+        let store = seeded(&net);
+        let seen = recording(&store);
+        // A steward signed Roster: the base goes with it.
+        let renewal = net.renewal(&net.steward, 11);
+        assert!(store.adopt(&renewal, Some(&net.base), NOW).unwrap());
+        assert_eq!(*seen.lock().unwrap(), vec![(11, Some(10))]);
+        // Held (nothing newer) and refused (a stranger's signature, no base) say nothing.
+        assert!(!store.adopt(&renewal, Some(&net.base), NOW).unwrap());
+        let stranger = SigningKey::generate(&mut rand::rng());
+        let forged = net.renewal(&stranger, 12);
+        assert!(store.adopt(&forged, Some(&net.base), NOW).is_err());
+        assert!(
+            store
+                .adopt(&net.renewal(&net.steward, 13), None, NOW)
+                .is_err()
+        );
+        assert_eq!(seen.lock().unwrap().len(), 1);
+        // An owner signed one comes with no base.
+        assert!(
+            store
+                .adopt(&net.renewal(&net.owner, 14), None, NOW)
+                .unwrap()
+        );
+        assert_eq!(seen.lock().unwrap()[1], (14, None));
+    }
+
+    #[test]
+    fn a_hook_that_panics_does_not_undo_the_adoption() {
+        let net = StewardNet::new(10, NOW, node(1));
+        let store = seeded(&net);
+        store.set_on_adopted(|_, _| panic!("the disk is on fire"));
+        assert!(
+            store
+                .adopt(&net.renewal(&net.steward, 11), Some(&net.base), NOW)
+                .unwrap()
+        );
+        assert_eq!(store.get(&net.network_id).unwrap().seq, 11);
+        assert!(store.base(&net.network_id).is_some());
     }
 }

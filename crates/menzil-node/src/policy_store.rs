@@ -106,6 +106,11 @@ impl Held {
     pub(crate) fn seq(&self) -> u64 {
         self.body.seq
     }
+
+    /// The signed Policy and its base.
+    pub(crate) fn signed_with_base(&self) -> (Policy, Option<Policy>) {
+        (self.signed.clone(), self.base.clone())
+    }
 }
 
 /// The map behind a [`PolicyStore`]; [`crate::DocStore`] takes its write guard second, after

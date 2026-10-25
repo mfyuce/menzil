@@ -606,6 +606,19 @@ pub fn join(home: &Home, token: &str, now: u64) -> Result<Joined> {
             })?;
         }
     }
+    keep_documents(home, &docs, now)
+}
+
+/// Keeps `docs` as this device's documents for their network if the acceptance predicate
+/// (protocol.md 2.3) takes them against what is held on disk at `now`, under the network lock:
+/// a lower or equal `seq` is left alone (never an older pair over a newer one), a steward may
+/// not build on a base older than the held one, and a file that exists but cannot be read is
+/// not written over. [`join`] after its own checks, and a running node for documents it
+/// adopted over the network. The caller has verified `docs` (they stand on the network's key
+/// or on a steward it lists); the device being a member is not asked here, since a pair that
+/// removes this device is exactly the one that must reach the disk.
+pub fn keep_documents(home: &Home, docs: &Documents, now: u64) -> Result<Joined> {
+    let network_id = docs.network_id();
     let _lock = home.lock_network(&network_id)?;
     match load_documents(home, &network_id) {
         Ok(held) => {
@@ -615,7 +628,7 @@ pub fn join(home: &Home, token: &str, now: u64) -> Result<Joined> {
                 Verdict::Adopt(adoption)
                     if adoption.roster.is_some() && adoption.policy.is_some() =>
                 {
-                    save_documents(home, &docs)?;
+                    save_documents(home, docs)?;
                     Ok(Joined::Updated {
                         network_id,
                         from_seq: held.seq(),
@@ -630,7 +643,7 @@ pub fn join(home: &Home, token: &str, now: u64) -> Result<Joined> {
             }
         }
         Err(_) if !home.documents_path(&network_id).exists() => {
-            save_documents(home, &docs)?;
+            save_documents(home, docs)?;
             Ok(Joined::New {
                 network_id,
                 seq: docs.seq(),

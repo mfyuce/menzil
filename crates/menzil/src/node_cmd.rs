@@ -17,8 +17,8 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow, bail};
 use menzil_carrier::DialConfig;
 use menzil_node::{
-    Adopted, DocStore, EnsureError, LocalIdentity, Node, NodeConfig, NodeError, NodeOpenError,
-    OpenStreamError, PolicyStore, RosterStore, SessionConfig,
+    Adopted, AdoptedDocs, DocStore, EnsureError, LocalIdentity, Node, NodeConfig, NodeError,
+    NodeOpenError, OpenStreamError, PolicyStore, RosterStore, SessionConfig,
 };
 use menzil_proto::trust::{DOC_MAX_LIFETIME, Reason};
 use menzil_proto::{NetworkId, NodeId, ServiceId, ServiceKind};
@@ -29,7 +29,8 @@ use tokio::task::JoinHandle;
 use crate::agent::{self, Opener};
 use crate::config::Config;
 use crate::home::{FileLock, Home};
-use crate::local::{load_documents, load_identity};
+use crate::local::{keep_documents, load_documents, load_identity};
+use crate::persist::Worker;
 use crate::steward_loop::{self, is_issuer, spawn_push};
 use crate::text;
 
@@ -668,8 +669,20 @@ pub struct RunningNode {
     /// The names this node can resolve.
     pub directory: Arc<RwLock<Directory>>,
     tasks: Vec<JoinHandle<()>>,
+    /// Writes the documents the node adopts over the network to disk (see
+    /// [`keep_adopted_documents`]).
+    keeper: Arc<Worker<AdoptedDocs>>,
     /// Held while this node runs: one node per identity.
     _instance: FileLock,
+}
+
+impl RunningNode {
+    /// Waits until every pair adopted so far has been written to (or refused by) the home
+    /// directory, at most `timeout`; whether it got there. A clean stop calls it, so that the
+    /// last adoption before a signal is not lost.
+    pub fn flush_documents(&self, timeout: Duration) -> bool {
+        self.keeper.flush(timeout)
+    }
 }
 
 impl Drop for RunningNode {
@@ -687,6 +700,7 @@ pub async fn start(home: &Home, config: &Config, socket: &Path) -> Result<Runnin
     let instance = home.lock_node()?;
     let (keys, cert) = load_identity(home)?;
     let (policies, rosters, networks) = load_stores(home)?;
+    let keeper = keep_adopted_documents(home, &rosters)?;
     let session = SessionConfig {
         dial: DialConfig {
             connection_info: config.connection_info()?,
@@ -765,6 +779,7 @@ pub async fn start(home: &Home, config: &Config, socket: &Path) -> Result<Runnin
         socket_identity,
         directory,
         tasks: vec![agent_task, reload_task, steward_task],
+        keeper,
         _instance: instance,
     })
 }
@@ -851,6 +866,62 @@ pub fn reload_adopting(
     }
 }
 
+/// Makes `rosters` (and with it the policies beside them, see [`DocStore::adopt`]) keep every
+/// pair the node adopts from now on in the home directory, as `menzil join` would: a restart
+/// then starts from it, not from the older pair on disk (a removed steward would otherwise
+/// renew from its stale disk pair again). Called after [`load_stores`], so that what was read
+/// from disk is not written back. The writing runs on a thread of its own (it takes the network
+/// lock, which the steward loop holds while it adopts what it has just signed); a pair that
+/// cannot be written is a warning and stays adopted in memory. Only a Roster and a Policy of
+/// one `seq` form a pair that can be kept: a Roster adopted alone waits for its Policy.
+pub fn keep_adopted_documents(
+    home: &Home,
+    rosters: &RosterStore,
+) -> Result<Arc<Worker<AdoptedDocs>>> {
+    let keeper = {
+        let home = home.clone();
+        Worker::spawn("menzil-docs-keep", move |adopted: AdoptedDocs| {
+            if let Err(error) = keep_adopted(&home, &adopted) {
+                tracing::warn!(network = %adopted.network_id, error = %format!("{error:#}"), "documents adopted over the network could not be kept on disk: a restart will start from the older pair");
+            }
+        })?
+    };
+    let hook = Arc::clone(&keeper);
+    rosters.set_on_adopted(move |adopted| hook.submit(adopted.clone()));
+    Ok(keeper)
+}
+
+/// Writes what `adopted` holds as the pair on disk, if it is a pair and newer than the disk's.
+/// The acceptance predicate has judged the documents once already (they are in the stores);
+/// [`keep_documents`] judges them again against the disk (not the clock), and a pair that does not stand on
+/// its signatures is never written.
+fn keep_adopted(home: &Home, adopted: &AdoptedDocs) -> Result<()> {
+    let (Some((roster, roster_base)), Some((policy, policy_base))) =
+        (adopted.roster.clone(), adopted.policy.clone())
+    else {
+        return Ok(());
+    };
+    let docs = match (roster_base, policy_base) {
+        (None, None) => menzil_admin::Documents::from_signed(roster, policy),
+        (Some(roster_base), Some(policy_base)) => {
+            menzil_admin::Documents::from_signed_with_base(roster, policy, roster_base, policy_base)
+        }
+        // A steward signed Roster beside an owner signed Policy (or the reverse): not a pair
+        // that is kept as one.
+        _ => return Ok(()),
+    };
+    // Documents of two `seq` are not a pair yet (the other half is on its way).
+    let Ok(docs) = docs else { return Ok(()) };
+    let docs = docs.into_verified().map_err(|e| anyhow!("{e}"))?;
+    // Judged at the pair's own `issued` time: the stores took it under the clock of the moment
+    // (the time rules were checked then), and a pair that ran out or was stamped ahead while
+    // it waited in the queue is still the newest the node holds. Signatures, steward rules and
+    // `seq` against the disk still count.
+    let at = docs.roster_body().issued.max(docs.policy_body().issued);
+    keep_documents(home, &docs, at)?;
+    Ok(())
+}
+
 /// `menzil node`: starts everything and runs until interrupted.
 pub async fn run(home: &Home) -> Result<()> {
     // Before anything that takes time (starting, then up to 60 s of waiting to attach): a signal
@@ -897,6 +968,17 @@ pub async fn run(home: &Home) -> Result<()> {
         eprintln!(
             "menzil: could not say goodbye to every peer in time; they will notice by the dead peer timeout"
         );
+    }
+    // The last pair adopted over the network is on disk before the process goes (bounded: a
+    // lock someone else holds is not waited for forever).
+    let flushed = {
+        let keeper = running.keeper.clone();
+        tokio::task::spawn_blocking(move || keeper.flush(STOP_GRACE))
+            .await
+            .unwrap_or(false)
+    };
+    if !flushed {
+        eprintln!("menzil: the documents adopted last may not have reached the disk");
     }
     drop(running);
     Ok(())

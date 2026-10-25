@@ -24,6 +24,7 @@ use tokio::task::JoinHandle;
 
 use crate::home::{Home, parse_hex32};
 use crate::local::load_identity;
+use crate::persist::Worker;
 use crate::token::{decode_roster, roster_from_bytes, roster_to_bytes};
 
 /// The WebSocket path nodes ask for unless the operator picks another (protocol.md 3.1).
@@ -61,9 +62,24 @@ pub struct StoredRoster {
 /// kept is left alone. Returns the network and the sequence number now kept.
 pub fn add_network(home: &Home, token: &str, now: u64) -> Result<(NetworkId, u64)> {
     let (roster, base) = decode_roster(token)?;
+    keep_roster(home, &roster, base.as_ref(), now)
+}
+
+/// Keeps `roster` (with its `base`, for a Roster a steward signed) as the Roster this relay
+/// starts from for its network, if the acceptance predicate of protocol.md 2.3 takes it against
+/// what is kept: [`add_network`] after decoding a token, and the relay itself for a Roster it
+/// adopted over DOC. A Roster no newer than the one kept is left alone, so an older one never
+/// replaces a newer one on disk, whoever hands it over and in whatever order. Returns the
+/// network and the sequence number now kept.
+fn keep_roster(
+    home: &Home,
+    roster: &Roster,
+    base: Option<&Roster>,
+    now: u64,
+) -> Result<(NetworkId, u64)> {
     let body = roster.decode()?;
     let bundle = menzil_proto::trust::Bundle {
-        base_roster: base.clone(),
+        base_roster: base.cloned(),
         roster: Some(roster.clone()),
         ..Default::default()
     };
@@ -103,7 +119,7 @@ pub fn add_network(home: &Home, token: &str, now: u64) -> Result<(NetworkId, u64
         menzil_proto::trust::Signer::Owner => None,
         menzil_proto::trust::Signer::Steward { .. } => base,
     };
-    home.write_public(&path, &roster_to_bytes(&roster, base.as_ref()))?;
+    home.write_public(&path, &roster_to_bytes(roster, base))?;
     Ok((body.network_id, body.seq))
 }
 
@@ -230,6 +246,7 @@ pub struct RunningRelay {
     relay: Relay,
     task: JoinHandle<()>,
     reload: JoinHandle<()>,
+    keeper: Arc<Worker<(Roster, Option<Roster>)>>,
 }
 
 impl RunningRelay {
@@ -241,6 +258,12 @@ impl RunningRelay {
     /// The sequence number of the Roster the relay holds for `network_id` now.
     pub fn roster_seq(&self, network_id: &NetworkId) -> Option<u64> {
         self.relay.rosters().get(network_id).map(|body| body.seq)
+    }
+
+    /// Waits until every Roster the relay adopted over DOC so far has been written to (or
+    /// refused by) the relay directory, at most `timeout`; whether it got there.
+    pub fn flush_rosters(&self, timeout: std::time::Duration) -> bool {
+        self.keeper.flush(timeout)
     }
 
     /// Stops the relay.
@@ -330,6 +353,34 @@ pub async fn start(home: &Home, options: &RunOptions) -> Result<RunningRelay> {
             }
         }
     }
+    // A Roster adopted from here on (a member's push over DOC, or a newer file `add-network`
+    // wrote) is kept in the relay directory too, through the same judgement `add-network`
+    // makes, so that a restart starts from it and not from the file the operator last wrote
+    // (TOBEDECIDED 19d). A thread does the writing: it takes a file lock, and it must not hold
+    // up the session that handed the Roster over. A write that fails is a warning; the Roster
+    // stays held in memory.
+    let keeper = {
+        let home = home.clone();
+        Worker::spawn(
+            "menzil-relay-keep",
+            move |(roster, base): (Roster, Option<Roster>)| {
+                let Ok(body) = roster.decode() else { return };
+                let network = Some(body.network_id);
+                // Judged at the Roster's own `issued` time, like the held-but-expired start: the
+                // time rules were checked when the store took it, and what is left to ask here is
+                // its signatures and `seq` against the file.
+                if let Err(error) = keep_roster(&home, &roster, base.as_ref(), body.issued) {
+                    tracing::warn!(?network, error = %format!("{error:#}"), "the Roster adopted over DOC could not be kept on disk: a restart will start from the older file");
+                }
+            },
+        )?
+    };
+    {
+        let keeper = Arc::clone(&keeper);
+        relay.rosters().set_on_adopted(move |roster, base| {
+            keeper.submit((roster.clone(), base.cloned()));
+        });
+    }
     let serving = relay.clone();
     let task = tokio::spawn(async move { serving.serve(&listener).await });
     // `add-network` with a newer token while the relay runs is picked up here; the store keeps
@@ -371,6 +422,7 @@ pub async fn start(home: &Home, options: &RunOptions) -> Result<RunningRelay> {
         relay,
         task,
         reload,
+        keeper,
     })
 }
 

@@ -628,3 +628,65 @@ fn a_newer_roster_held_without_its_policy_makes_the_loop_wait() {
     .unwrap();
     assert_eq!(later, Outcome::Renewed { seq: seq + 1 });
 }
+
+/// TOBEDECIDED 19d: the pair that removes a steward reaches the node over the network (never
+/// as a token), and is on disk by the time the node restarts, so the restarted steward does not
+/// renew from its stale disk pair again.
+#[test]
+fn a_removal_adopted_over_the_network_survives_a_restart_of_the_removed_steward() {
+    let f = both();
+    let (policies, rosters, _) = load_stores(&f.steward).unwrap();
+    let keeper = crate::node_cmd::keep_adopted_documents(&f.steward, &rosters).unwrap();
+    let removed = steward_remove(&f.owner, None, clock() + 1).unwrap();
+    let pair = crate::token::decode_documents(&removed.token).unwrap();
+    DocStore::new(&rosters, &policies)
+        .adopt(&pair.bundle(), clock() + 1)
+        .unwrap();
+    assert!(keeper.flush(std::time::Duration::from_secs(10)));
+    assert_eq!(
+        crate::local::load_documents(&f.steward, &f.id)
+            .unwrap()
+            .seq(),
+        removed.seq
+    );
+    // The restart: the stores are read from disk again.
+    let (policies, rosters, _) = load_stores(&f.steward).unwrap();
+    assert_eq!(rosters.seq(&f.id), Some(removed.seq));
+    let mut state = NetState::default();
+    let now = clock() + 8 * DAY;
+    let outcome = tick_network(&f.steward, &rosters, &policies, &f.id, now, &mut state).unwrap();
+    assert_eq!(outcome, Outcome::Checked, "nothing is renewed");
+    assert_eq!(rosters.seq(&f.id), Some(removed.seq));
+    assert_eq!(
+        state.last_warning,
+        Some(now),
+        "it warns that it is not listed"
+    );
+}
+
+/// A steward signed pair that a member adopts over the network is kept with its bases (it is
+/// never held, passed on or written without them).
+#[test]
+fn a_steward_signed_pair_adopted_over_the_network_is_kept_with_its_bases() {
+    let f = both();
+    let (policies, rosters, _) = load_stores(&f.steward).unwrap();
+    let now = clock() + 8 * DAY;
+    let mut state = NetState::default();
+    tick_network(&f.steward, &rosters, &policies, &f.id, now, &mut state).unwrap();
+    let steward_pair = crate::local::load_documents(&f.steward, &f.id).unwrap();
+    assert!(steward_pair.base().is_some());
+
+    // The owner's device stands in for a member that holds the owner signed pair.
+    let (member_policies, member_rosters, _) = load_stores(&f.owner).unwrap();
+    let keeper = crate::node_cmd::keep_adopted_documents(&f.owner, &member_rosters).unwrap();
+    DocStore::new(&member_rosters, &member_policies)
+        .adopt(&steward_pair.bundle(), now)
+        .unwrap();
+    assert!(keeper.flush(std::time::Duration::from_secs(10)));
+    let kept = crate::local::load_documents(&f.owner, &f.id).unwrap();
+    assert_eq!(kept.seq(), steward_pair.seq());
+    assert_eq!(
+        kept.base().unwrap().0.decode().unwrap().seq,
+        steward_pair.base().unwrap().0.decode().unwrap().seq
+    );
+}

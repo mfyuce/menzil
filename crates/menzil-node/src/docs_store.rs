@@ -17,8 +17,10 @@
 //! ([`menzil_proto::trust::HeldView`]) and what a relay or a member needs to be sent first when
 //! the document is passed on.
 
+use std::sync::Arc;
+
 use menzil_proto::trust::{Bundle, HeldView, Signer, Verdict, check_bundle};
-use menzil_proto::{MAX_DOC_BYTES, NetworkId};
+use menzil_proto::{MAX_DOC_BYTES, NetworkId, Policy, Roster};
 
 use crate::error::NodeError;
 use crate::policy_store::{self, PolicyStore};
@@ -32,6 +34,24 @@ pub struct Adopted {
     /// The offered Policy replaced the held one.
     pub policy: bool,
 }
+
+/// What the stores hold for one network right after [`DocStore::adopt`] stored something: the
+/// whole picture, not only the news, read under the adoption's own locks (so the Roster and the
+/// Policy are the ones that went in together, never halves of two adoptions).
+#[derive(Debug, Clone)]
+pub struct AdoptedDocs {
+    /// The network.
+    pub network_id: NetworkId,
+    /// What this adoption stored.
+    pub adopted: Adopted,
+    /// The held Roster with its base (steward signed Rosters only), if any is held.
+    pub roster: Option<(Roster, Option<Roster>)>,
+    /// The held Policy with its base (steward signed Policies only), if any is held.
+    pub policy: Option<(Policy, Option<Policy>)>,
+}
+
+/// The function a caller sets with [`RosterStore::set_on_adopted`].
+pub(crate) type AdoptedHook = Arc<dyn Fn(&AdoptedDocs) + Send + Sync>;
 
 /// The two document stores of a node, adopted into as one.
 #[derive(Clone, Copy)]
@@ -99,6 +119,28 @@ impl<'a> DocStore<'a> {
         }
         if let Some(held) = policy {
             policies.insert(network_id, held);
+        }
+        let hook = self.rosters.on_adopted();
+        let snapshot = hook.as_ref().map(|_| AdoptedDocs {
+            network_id,
+            adopted,
+            roster: rosters
+                .get(&network_id)
+                .map(roster_store::Held::signed_with_base),
+            policy: policies
+                .get(&network_id)
+                .map(policy_store::Held::signed_with_base),
+        });
+        // The locks go before the hook runs: it may take as long as it likes, and may read the
+        // stores.
+        drop(policies);
+        drop(rosters);
+        if let (Some(hook), Some(snapshot)) = (hook, snapshot) {
+            // The documents are adopted whatever the hook does: a panic in it is logged, never
+            // passed on to the adoption.
+            if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| hook(&snapshot))).is_err() {
+                tracing::warn!(network = %network_id, "the on adopted hook panicked; the documents are adopted all the same");
+            }
         }
         Ok(adopted)
     }
@@ -463,5 +505,86 @@ mod tests {
             Err(NodeError::DocumentRejected(Reason::Expired))
         ));
         assert_eq!(rosters.seq(&net.network_id), Some(10));
+    }
+
+    type Seen = std::sync::Arc<std::sync::Mutex<Vec<AdoptedDocs>>>;
+    type SeqPairs = std::sync::Arc<std::sync::Mutex<Vec<(Option<u64>, Option<u64>)>>>;
+
+    fn recording(rosters: &RosterStore) -> Seen {
+        let seen: Seen = Seen::default();
+        let sink = seen.clone();
+        rosters.set_on_adopted(move |docs| sink.lock().unwrap().push(docs.clone()));
+        seen
+    }
+
+    #[test]
+    fn the_hook_gets_the_pair_that_was_stored_with_its_bases_and_nothing_for_a_refusal() {
+        let net = Net::new();
+        let (rosters, policies) = stores_holding_base(&net);
+        let seen = recording(&rosters);
+        let docs = DocStore::new(&rosters, &policies);
+        let bundle = net.renewal(&net.steward, 11, true);
+        docs.adopt(&bundle, NOW).unwrap();
+        {
+            let seen = seen.lock().unwrap();
+            assert_eq!(seen.len(), 1);
+            let heard = &seen[0];
+            assert_eq!(heard.network_id, net.network_id);
+            assert_eq!(
+                heard.adopted,
+                Adopted {
+                    roster: true,
+                    policy: true
+                }
+            );
+            assert_eq!(
+                heard.roster,
+                Some((
+                    bundle.roster.clone().unwrap(),
+                    Some(net.base_roster.clone())
+                ))
+            );
+            assert_eq!(
+                heard.policy,
+                Some((
+                    bundle.policy.clone().unwrap(),
+                    Some(net.base_policy.clone())
+                ))
+            );
+        }
+        // Held, and refused: nothing to keep.
+        docs.adopt(&bundle, NOW).unwrap();
+        let thief = SigningKey::generate(&mut rand::rng());
+        assert!(docs.adopt(&net.renewal(&thief, 12, true), NOW).is_err());
+        assert_eq!(seen.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_hook_that_panics_does_not_undo_the_adoption() {
+        let net = Net::new();
+        let (rosters, policies) = stores_holding_base(&net);
+        rosters.set_on_adopted(|_| panic!("the disk is on fire"));
+        let adopted = DocStore::new(&rosters, &policies)
+            .adopt(&net.renewal(&net.steward, 11, true), NOW)
+            .unwrap();
+        assert!(adopted.roster && adopted.policy);
+        assert_eq!(rosters.seq(&net.network_id), Some(11));
+        assert_eq!(policies.seq(&net.network_id), Some(11));
+    }
+
+    #[test]
+    fn the_hook_may_read_the_stores_the_locks_are_released_first() {
+        let net = Net::new();
+        let rosters = std::sync::Arc::new(RosterStore::new());
+        let policies = std::sync::Arc::new(PolicyStore::new());
+        let (r, p) = (rosters.clone(), policies.clone());
+        let id = net.network_id;
+        let seen: SeqPairs = Default::default();
+        let sink = seen.clone();
+        rosters.set_on_adopted(move |_| sink.lock().unwrap().push((r.seq(&id), p.seq(&id))));
+        DocStore::new(&rosters, &policies)
+            .adopt(&net.base_bundle(), NOW)
+            .unwrap();
+        assert_eq!(*seen.lock().unwrap(), vec![(Some(10), Some(10))]);
     }
 }

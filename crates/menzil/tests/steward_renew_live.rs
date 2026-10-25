@@ -159,7 +159,23 @@ async fn a_steward_node_renews_by_itself_and_a_member_adopts_without_a_restart()
         phone.node.rosters().signer(&network_id),
         Some(Signer::Steward { .. })
     ));
-    // The relay has it too: a restarted phone would hear it in WELCOME (not checked here).
+    // What the phone adopted over the network is on its disk too (TOBEDECIDED 19d): a restarted
+    // phone starts from it. The steward signed it, so the base is kept with it.
+    until("the phone to keep the renewed pair on disk", || {
+        load_documents(&phone_home, &network_id)
+            .is_ok_and(|docs| docs.seq() == renewed && docs.base().is_some())
+    })
+    .await;
+    // So does the relay, which got the Roster from the steward's push over DOC.
+    until("the relay to keep the renewed Roster on disk", || {
+        relay_cmd::load_rosters(&relay_home).is_ok_and(|kept| {
+            kept.iter().any(|stored| {
+                stored.roster.decode().is_ok_and(|body| body.seq == renewed)
+                    && stored.base.is_some()
+            })
+        })
+    })
+    .await;
 
     // Then the steward admits a device from the command line while its node runs: the node
     // picks the file up on its reload, and, being the issuer, pushes it to the phone.

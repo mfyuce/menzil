@@ -1049,3 +1049,181 @@ fn a_node_loads_and_reloads_documents_a_steward_signed() {
     std::fs::write(&docs_path, bare).unwrap();
     assert!(load_stores(&steward).is_err());
 }
+
+// ---- documents adopted over the network are kept (TOBEDECIDED 19d) ----
+
+/// An owner, and a member device that holds the owner's first pair and runs the stores a
+/// node runs (with the keeper installed).
+struct Member {
+    _dirs: Vec<tempfile::TempDir>,
+    owner: Home,
+    member: Home,
+    id: NetworkId,
+    policies: Arc<PolicyStore>,
+    rosters: Arc<RosterStore>,
+    keeper: Arc<Worker<AdoptedDocs>>,
+}
+
+fn running_member() -> Member {
+    let owner_dir = tempfile::tempdir().unwrap();
+    let owner = Home::new(owner_dir.path());
+    init(&owner, clock()).unwrap();
+    let id = network_create(&owner, "laptop", clock()).unwrap();
+    let member_dir = tempfile::tempdir().unwrap();
+    let member = Home::new(member_dir.path());
+    let request = init(&member, clock()).unwrap().join_request;
+    let admitted = admit(&owner, None, &request, "phone", &[], clock()).unwrap();
+    join(&member, &admitted.token, clock()).unwrap();
+    let (policies, rosters, _) = load_stores(&member).unwrap();
+    let keeper = keep_adopted_documents(&member, &rosters).unwrap();
+    Member {
+        _dirs: vec![owner_dir, member_dir],
+        owner,
+        member,
+        id,
+        policies,
+        rosters,
+        keeper,
+    }
+}
+
+const FLUSH: Duration = Duration::from_secs(10);
+
+/// The pair adopted from the network is on disk when the keeper is done, and the next start
+/// of the node holds it: the removed steward's problem, in its simplest form.
+#[test]
+fn a_pair_adopted_over_the_network_is_on_disk_and_the_next_start_holds_it() {
+    let m = running_member();
+    let before = crate::local::load_documents(&m.member, &m.id)
+        .unwrap()
+        .seq();
+    let renewed = renew(&m.owner, None, clock() + 60).unwrap();
+    assert!(renewed.seq > before);
+    let pair = crate::token::decode_documents(&renewed.token).unwrap();
+    let adopted = DocStore::new(&m.rosters, &m.policies)
+        .adopt(&pair.bundle(), clock() + 60)
+        .unwrap();
+    assert!(adopted.roster && adopted.policy);
+    assert!(m.keeper.flush(FLUSH));
+    assert_eq!(
+        crate::local::load_documents(&m.member, &m.id)
+            .unwrap()
+            .seq(),
+        renewed.seq
+    );
+    let (policies, rosters, _) = load_stores(&m.member).unwrap();
+    assert_eq!(rosters.seq(&m.id), Some(renewed.seq));
+    assert_eq!(policies.seq(&m.id), Some(renewed.seq));
+}
+
+/// Protocol.md 2.3: never a lower `seq`, on disk either. The disk got a newer pair (a token
+/// installed while the node ran) than the one that arrives over the network afterwards.
+#[test]
+fn an_older_pair_adopted_over_the_network_does_not_replace_a_newer_one_on_disk() {
+    let m = running_member();
+    let second = renew(&m.owner, None, clock() + 60).unwrap();
+    let third = renew(&m.owner, None, clock() + 120).unwrap();
+    join(&m.member, &third.token, clock() + 120).unwrap();
+    let pair = crate::token::decode_documents(&second.token).unwrap();
+    let adopted = DocStore::new(&m.rosters, &m.policies)
+        .adopt(&pair.bundle(), clock() + 120)
+        .unwrap();
+    assert!(adopted.roster && adopted.policy, "the stores were behind");
+    assert!(m.keeper.flush(FLUSH));
+    assert_eq!(
+        crate::local::load_documents(&m.member, &m.id)
+            .unwrap()
+            .seq(),
+        third.seq
+    );
+}
+
+/// A write that fails is a warning: the pair stays adopted in memory, the damaged file is not
+/// written over, and the keeper goes on to the next pair.
+#[test]
+fn a_pair_that_cannot_be_written_stays_adopted_and_the_keeper_goes_on() {
+    let m = running_member();
+    let path = m.member.documents_path(&m.id);
+    let good = fs::read(&path).unwrap();
+    fs::write(&path, b"damaged").unwrap();
+    let second = renew(&m.owner, None, clock() + 60).unwrap();
+    let pair = crate::token::decode_documents(&second.token).unwrap();
+    let adopted = DocStore::new(&m.rosters, &m.policies)
+        .adopt(&pair.bundle(), clock() + 60)
+        .unwrap();
+    assert!(adopted.roster && adopted.policy);
+    assert!(m.keeper.flush(FLUSH));
+    assert_eq!(m.rosters.seq(&m.id), Some(second.seq));
+    assert_eq!(m.policies.seq(&m.id), Some(second.seq));
+    assert_eq!(fs::read(&path).unwrap(), b"damaged");
+    // Once the file is readable again the next pair is kept.
+    fs::write(&path, good).unwrap();
+    let third = renew(&m.owner, None, clock() + 120).unwrap();
+    let pair = crate::token::decode_documents(&third.token).unwrap();
+    DocStore::new(&m.rosters, &m.policies)
+        .adopt(&pair.bundle(), clock() + 120)
+        .unwrap();
+    assert!(m.keeper.flush(FLUSH));
+    assert_eq!(
+        crate::local::load_documents(&m.member, &m.id)
+            .unwrap()
+            .seq(),
+        third.seq
+    );
+}
+
+/// A refused bundle reaches neither the stores nor the disk, and a Roster adopted without its
+/// Policy is not a pair: the disk keeps the pair it has until the Policy arrives.
+#[test]
+fn only_a_pair_the_stores_adopted_is_written() {
+    let m = running_member();
+    let start = crate::local::load_documents(&m.member, &m.id)
+        .unwrap()
+        .seq();
+    let second = renew(&m.owner, None, clock() + 60).unwrap();
+    let pair = crate::token::decode_documents(&second.token).unwrap();
+    // A forged Roster: the stranger's signature does not stand on the network's key.
+    let stranger = menzil_admin::OwnerKey::generate();
+    let mut forged = pair.roster().decode().unwrap();
+    forged.seq += 5;
+    let bundle = menzil_proto::trust::Bundle {
+        roster: Some(menzil_proto::Roster::sign(stranger.signing_key(), &forged).unwrap()),
+        ..Default::default()
+    };
+    assert!(
+        DocStore::new(&m.rosters, &m.policies)
+            .adopt(&bundle, clock() + 60)
+            .is_err()
+    );
+    // The genuine Roster alone.
+    let roster_only = menzil_proto::trust::Bundle {
+        roster: Some(pair.roster().clone()),
+        ..Default::default()
+    };
+    let adopted = DocStore::new(&m.rosters, &m.policies)
+        .adopt(&roster_only, clock() + 60)
+        .unwrap();
+    assert!(adopted.roster && !adopted.policy);
+    assert!(m.keeper.flush(FLUSH));
+    assert_eq!(
+        crate::local::load_documents(&m.member, &m.id)
+            .unwrap()
+            .seq(),
+        start
+    );
+    // Its Policy completes the pair.
+    let policy_only = menzil_proto::trust::Bundle {
+        policy: Some(pair.policy().clone()),
+        ..Default::default()
+    };
+    DocStore::new(&m.rosters, &m.policies)
+        .adopt(&policy_only, clock() + 60)
+        .unwrap();
+    assert!(m.keeper.flush(FLUSH));
+    assert_eq!(
+        crate::local::load_documents(&m.member, &m.id)
+            .unwrap()
+            .seq(),
+        second.seq
+    );
+}

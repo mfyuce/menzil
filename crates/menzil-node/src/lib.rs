@@ -82,7 +82,7 @@ pub use admission::{
     resolve_dial_cert,
 };
 pub use docs_access::{DocsGate, DocsLimits, DocsPermit, SessionHandler, SessionOpened};
-pub use docs_store::{Adopted, DocStore};
+pub use docs_store::{Adopted, AdoptedDocs, DocStore};
 pub use docs_sync::{POLICY_JITTER_MAX, PushReport, SyncConfig};
 pub use error::NodeError;
 pub use identity::LocalIdentity;

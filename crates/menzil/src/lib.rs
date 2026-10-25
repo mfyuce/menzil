@@ -15,6 +15,7 @@ pub mod config;
 pub mod home;
 pub mod local;
 pub mod node_cmd;
+pub mod persist;
 pub mod reach;
 pub mod relay_cmd;
 pub mod signals;

@@ -624,3 +624,154 @@ async fn a_relay_starts_and_reloads_with_a_steward_signed_roster() {
     assert_eq!(running.roster_seq(&id), Some(4));
     running.stop();
 }
+
+// ---- Rosters adopted over DOC are kept (TOBEDECIDED 19d) ----
+
+fn run_options(dir: &Path) -> RunOptions {
+    let (cert, key) = pem_files(dir);
+    RunOptions {
+        listen: "127.0.0.1:0".parse().unwrap(),
+        tls_cert: cert,
+        tls_key: key,
+        path: DEFAULT_PATH.to_string(),
+        host: None,
+        reload_every: Duration::from_secs(3600),
+    }
+}
+
+const FLUSH: Duration = Duration::from_secs(10);
+
+/// A Roster a member pushed over DOC is on disk once the keeper is done, and a relay started
+/// after a restart holds it instead of the file the operator last wrote.
+#[tokio::test]
+async fn a_roster_adopted_over_doc_is_on_disk_and_the_next_start_holds_it() {
+    let (_o, owner, id, _) = token_of_a_network();
+    let (dir, relay_home) = home();
+    init(&relay_home, clock()).unwrap();
+    add_network(&relay_home, &relay_token(&owner), clock()).unwrap();
+    let options = run_options(dir.path());
+    let running = start(&relay_home, &options).await.unwrap();
+    assert_eq!(running.roster_seq(&id), Some(1));
+
+    let renewed = crate::local::renew(&owner, None, clock() + 60).unwrap();
+    let pair = crate::token::decode_documents(&renewed.token).unwrap();
+    assert!(
+        running
+            .relay
+            .rosters()
+            .adopt(pair.roster(), None, clock() + 60)
+            .unwrap()
+    );
+    assert!(running.flush_rosters(FLUSH));
+    let stored = load_rosters(&relay_home).unwrap();
+    assert_eq!(stored.len(), 1);
+    assert_eq!(stored[0].roster.decode().unwrap().seq, renewed.seq);
+    running.stop();
+
+    let restarted = start(&relay_home, &options).await.unwrap();
+    assert_eq!(restarted.roster_seq(&id), Some(renewed.seq));
+    restarted.stop();
+}
+
+/// A steward signed Roster adopted over DOC is kept with its base, in the file layout the
+/// loader reads.
+#[tokio::test]
+async fn a_steward_signed_roster_adopted_over_doc_is_kept_with_its_base() {
+    let (_o, owner, _s, steward, id) = steward_renewed_network();
+    let (dir, relay_home) = home();
+    init(&relay_home, clock()).unwrap();
+    add_network(&relay_home, &relay_token(&owner), clock() + 61).unwrap();
+    let options = run_options(dir.path());
+    let running = start(&relay_home, &options).await.unwrap();
+    let seeded = running.roster_seq(&id).unwrap();
+
+    let (roster, base) = crate::token::decode_roster(&relay_token(&steward)).unwrap();
+    assert!(base.is_some());
+    assert!(
+        running
+            .relay
+            .rosters()
+            .adopt(&roster, base.as_ref(), clock() + 61)
+            .unwrap()
+    );
+    assert!(running.flush_rosters(FLUSH));
+    let stored = load_rosters(&relay_home).unwrap();
+    assert_eq!(stored.len(), 1);
+    let seq = roster.decode().unwrap().seq;
+    assert!(seq > seeded);
+    assert_eq!(stored[0].roster.decode().unwrap().seq, seq);
+    assert_eq!(
+        stored[0].base.as_ref().unwrap().decode().unwrap().seq,
+        base.unwrap().decode().unwrap().seq
+    );
+    running.stop();
+}
+
+/// A Roster that cannot be written stays adopted in memory (the relay keeps serving it), the
+/// damaged path is not replaced, and the next Roster is kept once the path is fine again.
+#[tokio::test]
+async fn a_roster_that_cannot_be_written_stays_adopted_and_the_keeper_goes_on() {
+    let (_o, owner, id, _) = token_of_a_network();
+    let (dir, relay_home) = home();
+    init(&relay_home, clock()).unwrap();
+    add_network(&relay_home, &relay_token(&owner), clock()).unwrap();
+    let running = start(&relay_home, &run_options(dir.path())).await.unwrap();
+    let path = roster_path(&relay_home, &id);
+    let good = fs::read(&path).unwrap();
+    // A directory where the file goes: the atomic rename onto it fails.
+    fs::remove_file(&path).unwrap();
+    fs::create_dir(&path).unwrap();
+
+    let second = crate::local::renew(&owner, None, clock() + 60).unwrap();
+    let pair = crate::token::decode_documents(&second.token).unwrap();
+    let rosters = running.relay.rosters();
+    assert!(rosters.adopt(pair.roster(), None, clock() + 60).unwrap());
+    assert!(running.flush_rosters(FLUSH));
+    assert_eq!(running.roster_seq(&id), Some(second.seq));
+    assert!(path.is_dir());
+
+    fs::remove_dir(&path).unwrap();
+    fs::write(&path, good).unwrap();
+    let third = crate::local::renew(&owner, None, clock() + 120).unwrap();
+    let pair = crate::token::decode_documents(&third.token).unwrap();
+    assert!(rosters.adopt(pair.roster(), None, clock() + 120).unwrap());
+    assert!(running.flush_rosters(FLUSH));
+    let stored = load_rosters(&relay_home).unwrap();
+    assert_eq!(stored[0].roster.decode().unwrap().seq, third.seq);
+    running.stop();
+}
+
+/// Never a lower `seq` on disk: a newer file the operator wrote while the relay ran is not
+/// replaced by an older Roster that arrives over DOC afterwards.
+#[tokio::test]
+async fn a_roster_adopted_over_doc_does_not_replace_a_newer_file() {
+    let (_o, owner, id, _) = token_of_a_network();
+    let (dir, relay_home) = home();
+    init(&relay_home, clock()).unwrap();
+    add_network(&relay_home, &relay_token(&owner), clock()).unwrap();
+    let running = start(&relay_home, &run_options(dir.path())).await.unwrap();
+    let second = crate::local::renew(&owner, None, clock() + 60).unwrap();
+    let third = crate::local::renew(&owner, None, clock() + 120).unwrap();
+    // The operator installs the third while the relay holds the first (the reload is an hour
+    // away); the second then arrives over DOC.
+    add_network(&relay_home, &relay_token(&owner), clock() + 120).unwrap();
+    let pair = crate::token::decode_documents(&second.token).unwrap();
+    assert!(
+        running
+            .relay
+            .rosters()
+            .adopt(pair.roster(), None, clock() + 120)
+            .unwrap()
+    );
+    assert!(running.flush_rosters(FLUSH));
+    assert_eq!(
+        load_rosters(&relay_home).unwrap()[0]
+            .roster
+            .decode()
+            .unwrap()
+            .seq,
+        third.seq
+    );
+    assert_eq!(running.roster_seq(&id), Some(second.seq));
+    running.stop();
+}
