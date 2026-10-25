@@ -108,7 +108,9 @@
 //! is the end-to-end probe of a hostile burst; the tests that fail
 //! without the pause semantics are in `menzil-stream`'s
 //! `tests/backpressure.rs`.
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use menzil_proto::{ErrorCode, OpenBody, OpenMeta, OpenTarget, ServiceId, ServiceKind};
@@ -301,6 +303,124 @@ impl<S, H: ServiceHandler<S> + Sync> ServiceHandler<S> for MemberServiceHandler<
     }
 }
 
+/// The streams one node has accepted and is still serving (protocol.md 5.3, L4k): each entry
+/// is the scrubbed [`OpenRequest`] it was authorized for and the handle that stops its task.
+/// Dropping a served stream's task resets both ends (`Pipe` and `menzil_stream::Stream` reset
+/// on drop), so [`Self::recheck`] needs nothing else to take a stream away.
+///
+/// Cheap to clone; every clone is the same registry. One registry may serve several sessions
+/// (a stream id is unique across all of them).
+#[derive(Clone, Default)]
+pub struct AcceptedStreams {
+    inner: Arc<StreamsInner>,
+}
+
+#[derive(Default)]
+struct StreamsInner {
+    entries: Mutex<HashMap<u64, Entry>>,
+    next_id: AtomicU64,
+    /// Bumped by every [`AcceptedStreams::recheck`] before it reads the map; an OPEN that began
+    /// authorization at an older value may have been authorized under documents a recheck has
+    /// already replaced, and is authorized once more when it registers.
+    generation: AtomicU64,
+}
+
+struct Entry {
+    request: OpenRequest,
+    abort: tokio::task::AbortHandle,
+}
+
+impl AcceptedStreams {
+    /// An empty registry.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// How many accepted streams are still being served.
+    pub fn len(&self) -> usize {
+        self.entries().len()
+    }
+
+    /// Whether no accepted stream is being served.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    fn entries(&self) -> MutexGuard<'_, HashMap<u64, Entry>> {
+        self.inner
+            .entries
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn generation(&self) -> u64 {
+        self.inner.generation.load(Ordering::SeqCst)
+    }
+
+    /// Asks `authorizer` about every served stream again and stops each one it denies: the
+    /// task is aborted, so the peer reads a reset and the local target gets an RST. A stream
+    /// it allows is left alone. Returns how many were stopped.
+    ///
+    /// The generation is bumped before the map is read, and a stream registers before it
+    /// compares generations (see [`accept_loop_tracked`]): whichever of the two runs second
+    /// covers the stream, so none is missed. `authorizer` runs with no lock held.
+    pub fn recheck(&self, authorizer: &dyn Authorizer) -> usize {
+        self.inner.generation.fetch_add(1, Ordering::SeqCst);
+        let snapshot: Vec<(OpenRequest, tokio::task::AbortHandle)> = self
+            .entries()
+            .values()
+            .map(|entry| (entry.request.clone(), entry.abort.clone()))
+            .collect();
+        let mut stopped = 0;
+        for (request, abort) in snapshot {
+            if let OpenDecision::Deny(_) = authorizer.authorize(&as_member_request(&request)) {
+                abort.abort();
+                stopped += 1;
+            }
+        }
+        stopped
+    }
+}
+
+impl std::fmt::Debug for AcceptedStreams {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AcceptedStreams")
+            .field("len", &self.len())
+            .finish()
+    }
+}
+
+/// Removes its entry when the served task ends, however it ends (finished, aborted, dropped
+/// unpolled).
+struct EntryGuard {
+    streams: AcceptedStreams,
+    id: u64,
+}
+
+impl Drop for EntryGuard {
+    fn drop(&mut self) {
+        self.streams.entries().remove(&self.id);
+    }
+}
+
+/// Wraps the (already scrubbed) authorizer for one inbound OPEN and remembers what it saw: the
+/// request, and the registry's generation read before the decision was made.
+struct TrackingAuthorizer<'a, A> {
+    inner: &'a MemberAuthorizer<A>,
+    streams: &'a AcceptedStreams,
+    seen: Mutex<Option<(u64, OpenRequest)>>,
+}
+
+impl<A: Authorizer> Authorizer for TrackingAuthorizer<'_, A> {
+    fn authorize(&self, request: &OpenRequest) -> OpenDecision {
+        let generation = self.streams.generation();
+        let decision = self.inner.authorize(request);
+        *self.seen.lock().unwrap_or_else(PoisonError::into_inner) =
+            Some((generation, as_member_request(request)));
+        decision
+    }
+}
+
 /// Runs the responder side of every OPEN a peer sends on `acceptor`,
 /// until its session ends (`acceptor.accept()` returns `None`). Each
 /// inbound stream runs `menzil_stream::respond_to_open` against
@@ -321,8 +441,33 @@ impl<S, H: ServiceHandler<S> + Sync> ServiceHandler<S> for MemberServiceHandler<
 ///
 /// Takes the unique [`L4SessionAcceptor`] half of a session, not the
 /// cloneable [`L4SessionHandle`] — see this module's own doc comment.
+///
+/// Keeps no handle to the streams it accepts; [`accept_loop_tracked`] is the same loop with a
+/// registry a caller can re-check.
 pub async fn accept_loop<A, H>(acceptor: &mut L4SessionAcceptor, authorizer: A, handler: H)
 where
+    A: Authorizer + Send + Sync + 'static,
+    H: ServiceHandler<Stream> + Send + Sync + 'static,
+    H::Handling: Send + 'static,
+{
+    accept_loop_tracked(acceptor, authorizer, handler, AcceptedStreams::new()).await;
+}
+
+/// [`accept_loop`], registering every accepted stream in `streams` until it ends, so that
+/// [`AcceptedStreams::recheck`] can reset the ones whose grant is gone (protocol.md 5.3).
+///
+/// A stream registers after its OPEN_ACK went out, which can be well after the authorizer
+/// decided (`ServiceHandler::open` awaits a local connect). The registry's generation is read
+/// before the authorizer runs; once the stream is registered, a generation that has moved means
+/// a recheck may have walked the map without it, and the stream is authorized once more and
+/// stopped on a denial. The order (register, then compare) is what makes the two interleave
+/// safely.
+pub async fn accept_loop_tracked<A, H>(
+    acceptor: &mut L4SessionAcceptor,
+    authorizer: A,
+    handler: H,
+    streams: AcceptedStreams,
+) where
     A: Authorizer + Send + Sync + 'static,
     H: ServiceHandler<Stream> + Send + Sync + 'static,
     H::Handling: Send + 'static,
@@ -351,16 +496,33 @@ where
         };
         let authorizer = Arc::clone(&authorizer);
         let handler = Arc::clone(&handler);
+        let streams = streams.clone();
         tokio::spawn(async move {
             let _permit = permit;
+            let tracking = TrackingAuthorizer {
+                inner: &authorizer,
+                streams: &streams,
+                seen: Mutex::new(None),
+            };
             let outcome = tokio::time::timeout(
                 OPEN_TIMEOUT,
-                respond_to_open(stream, network_id, peer, &*authorizer, &*handler),
+                respond_to_open(stream, network_id, peer, &tracking, &*handler),
             )
             .await;
             match outcome {
                 Ok(Ok(Responded::Accepted(handling))) => {
-                    tokio::spawn(handling);
+                    let seen = tracking
+                        .seen
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .take();
+                    let Some((generation, request)) = seen else {
+                        // An accepted exchange always went through the authorizer; fail
+                        // closed (dropping `handling` resets the stream) if that ever changes.
+                        tracing::warn!(peer = %peer, "accepted OPEN without an authorization");
+                        return;
+                    };
+                    register(&streams, &*authorizer, generation, request, handling);
                 }
                 Ok(Ok(Responded::Refused(refusal))) => {
                     tracing::debug!(peer = %peer, code = ?refusal.code, "inbound OPEN refused");
@@ -373,6 +535,47 @@ where
                 }
             }
         });
+    }
+}
+
+/// Spawns `handling`, enters it in `streams`, then compares generations (see
+/// [`accept_loop_tracked`]).
+fn register<H>(
+    streams: &AcceptedStreams,
+    authorizer: &dyn Authorizer,
+    generation: u64,
+    request: OpenRequest,
+    handling: H,
+) where
+    H: std::future::Future<Output = ()> + Send + 'static,
+{
+    let id = streams.inner.next_id.fetch_add(1, Ordering::Relaxed);
+    let guard = EntryGuard {
+        streams: streams.clone(),
+        id,
+    };
+    let abort = {
+        // Spawned under the lock: a task that ends at once drops its guard, which waits here
+        // until the entry exists, so the entry cannot outlive the task.
+        let mut entries = streams.entries();
+        let join = tokio::spawn(async move {
+            let _guard = guard;
+            handling.await;
+        });
+        let abort = join.abort_handle();
+        entries.insert(
+            id,
+            Entry {
+                request: request.clone(),
+                abort: abort.clone(),
+            },
+        );
+        abort
+    };
+    if streams.generation() != generation
+        && let OpenDecision::Deny(_) = authorizer.authorize(&request)
+    {
+        abort.abort();
     }
 }
 
@@ -1290,5 +1493,449 @@ mod tests {
              open()'s own bound, got {result:?}"
         );
         drop(held);
+    }
+
+    // ---- K3: the registry of accepted streams (L4k, protocol.md 5.3) ----
+
+    /// An [`Authorizer`] that allows every service not on its deny list, and counts its calls.
+    /// The test flips the list to model a grant removal.
+    #[derive(Clone, Default)]
+    struct Switchable {
+        denied: Arc<std::sync::Mutex<Vec<ServiceId>>>,
+        calls: Arc<AtomicUsize>,
+        gate: Arc<std::sync::Mutex<Option<AuthGate>>>,
+    }
+
+    /// Held by the next `authorize` call, after it has decided and before it returns: it
+    /// signals `entered`, then blocks until `release` is sent to.
+    struct AuthGate {
+        entered: std::sync::mpsc::Sender<()>,
+        release: std::sync::mpsc::Receiver<()>,
+    }
+
+    impl Switchable {
+        fn deny(&self, service: ServiceId) {
+            self.denied.lock().unwrap().push(service);
+        }
+
+        fn calls(&self) -> usize {
+            self.calls.load(Ordering::SeqCst)
+        }
+
+        /// Gates the next `authorize` call only; returns the receiver that fires once it has
+        /// decided and the sender that lets it return.
+        fn gate_next(&self) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+            let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            *self.gate.lock().unwrap() = Some(AuthGate {
+                entered: entered_tx,
+                release: release_rx,
+            });
+            (entered_rx, release_tx)
+        }
+    }
+
+    impl Authorizer for Switchable {
+        fn authorize(&self, request: &OpenRequest) -> OpenDecision {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let decision = if self.denied.lock().unwrap().contains(&request.service) {
+                OpenDecision::Deny(OpenRefusal {
+                    code: ErrorCode::GrantRemoved,
+                    msg: "grant removed".to_string(),
+                })
+            } else {
+                OpenDecision::Allow
+            };
+            let gate = self.gate.lock().unwrap().take();
+            if let Some(gate) = gate {
+                gate.entered.send(()).unwrap();
+                gate.release.recv().unwrap();
+            }
+            decision
+        }
+    }
+
+    /// A [`ServiceHandler`] whose stream echoes every byte back until it ends, and whose
+    /// `open` can be held up: it signals `entered` and then waits for `release` if `gated`.
+    #[derive(Clone, Default)]
+    struct EchoHandler {
+        gated: bool,
+        entered: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    }
+
+    impl ServiceHandler<Stream> for EchoHandler {
+        type Opened = ();
+        type Handling = std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>;
+
+        async fn open(&self, _request: &OpenRequest) -> Result<(), OpenRefusal> {
+            if self.gated {
+                self.entered.notify_one();
+                self.release.notified().await;
+            }
+            Ok(())
+        }
+
+        fn handle(&self, mut stream: Stream, _request: OpenRequest, _opened: ()) -> Self::Handling {
+            Box::pin(async move {
+                let mut buf = [0u8; 64];
+                loop {
+                    match stream.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            if stream.write_all(&buf[..n]).await.is_err()
+                                || stream.flush().await.is_err()
+                            {
+                                break;
+                            }
+                        }
+                    }
+                }
+            })
+        }
+    }
+
+    const STEP: Duration = Duration::from_secs(5);
+
+    async fn wait_for_len(streams: &AcceptedStreams, len: usize) {
+        tokio::time::timeout(STEP, async {
+            while streams.len() != len {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("registry length never reached {len}, is {}", streams.len()));
+    }
+
+    /// A stream read that must end in a reset (not a clean end of file, not a hang).
+    async fn expect_reset(stream: &mut Stream) {
+        let mut buf = Vec::new();
+        let error = tokio::time::timeout(STEP, stream.read_to_end(&mut buf))
+            .await
+            .expect("the stream was left running")
+            .expect_err("a reset is not a clean end of file");
+        assert_eq!(error.kind(), std::io::ErrorKind::ConnectionReset);
+    }
+
+    #[tokio::test]
+    async fn recheck_resets_the_stream_whose_grant_is_gone_and_leaves_the_others() {
+        use crate::serve::{LocalServices, LocalTarget};
+
+        let TwoSessions {
+            a,
+            a_acceptor: _a_acceptor,
+            mut b,
+            b_handle: _b_handle,
+            _pump_a_to_b,
+            _pump_b_to_a,
+            _task_a,
+            _task_b,
+            _a_epoch_ended_tx,
+            _b_epoch_ended_tx,
+        } = two_sessions();
+        let ssh_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let web_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let web = ServiceId::new(ServiceKind::Tcp, "web");
+        let services = LocalServices::new()
+            .serve(
+                ssh(),
+                LocalTarget::new("127.0.0.1", ssh_listener.local_addr().unwrap().port()),
+            )
+            .unwrap()
+            .serve(
+                web.clone(),
+                LocalTarget::new("127.0.0.1", web_listener.local_addr().unwrap().port()),
+            )
+            .unwrap();
+        let switch = Switchable::default();
+        let streams = AcceptedStreams::new();
+        let accept_task = {
+            let (switch, streams) = (switch.clone(), streams.clone());
+            tokio::spawn(async move {
+                accept_loop_tracked(&mut b, switch, services, streams).await;
+            })
+        };
+
+        let mut ssh_stream = open(&a, ssh(), None).await.unwrap();
+        let mut web_stream = open(&a, web.clone(), None).await.unwrap();
+        let (mut ssh_target, _) = tokio::time::timeout(STEP, ssh_listener.accept())
+            .await
+            .unwrap()
+            .unwrap();
+        let (mut web_target, _) = tokio::time::timeout(STEP, web_listener.accept())
+            .await
+            .unwrap()
+            .unwrap();
+        wait_for_len(&streams, 2).await;
+        // One authorization per OPEN and no more: nothing re-authorizes a stream that no recheck
+        // can have missed.
+        assert_eq!(switch.calls(), 2);
+
+        // Nothing changed: a recheck stops nothing.
+        assert_eq!(streams.recheck(&switch), 0);
+        assert_eq!(streams.len(), 2);
+
+        switch.deny(ssh());
+        assert_eq!(streams.recheck(&switch), 1);
+
+        expect_reset(&mut ssh_stream).await;
+        let mut byte = [0u8; 1];
+        let error = tokio::time::timeout(
+            STEP,
+            tokio::io::AsyncReadExt::read(&mut ssh_target, &mut byte),
+        )
+        .await
+        .expect("the local target was left connected")
+        .expect_err("the local target must see a reset, not a clean end");
+        assert!(
+            matches!(
+                error.kind(),
+                std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted
+            ),
+            "the local target saw {error:?}"
+        );
+        wait_for_len(&streams, 1).await;
+
+        // The other service's stream still carries data both ways.
+        web_stream.write_all(b"x").await.unwrap();
+        web_stream.flush().await.unwrap();
+        tokio::time::timeout(
+            STEP,
+            tokio::io::AsyncReadExt::read_exact(&mut web_target, &mut byte),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(&byte, b"x");
+        tokio::io::AsyncWriteExt::write_all(&mut web_target, b"y")
+            .await
+            .unwrap();
+        tokio::time::timeout(STEP, web_stream.read_exact(&mut byte))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&byte, b"y");
+        assert_eq!(streams.len(), 1);
+        accept_task.abort();
+    }
+
+    #[tokio::test]
+    async fn a_stream_that_ends_cleanly_leaves_the_registry() {
+        let TwoSessions {
+            a,
+            a_acceptor: _a_acceptor,
+            mut b,
+            b_handle: _b_handle,
+            _pump_a_to_b,
+            _pump_b_to_a,
+            _task_a,
+            _task_b,
+            _a_epoch_ended_tx,
+            _b_epoch_ended_tx,
+        } = two_sessions();
+        let handler = CountingHandler::default();
+        let accepted = Arc::clone(&handler.accepted);
+        let streams = AcceptedStreams::new();
+        assert!(streams.is_empty());
+        let accept_task = {
+            let streams = streams.clone();
+            tokio::spawn(async move {
+                accept_loop_tracked(&mut b, AllowAll, handler, streams).await;
+            })
+        };
+
+        let mut stream = open(&a, ssh(), None).await.unwrap();
+        wait_for_len(&streams, 1).await;
+        // `CountingHandler` ends after one byte.
+        stream.write_all(b"x").await.unwrap();
+        stream.flush().await.unwrap();
+        wait_for_len(&streams, 0).await;
+        assert_eq!(accepted.load(Ordering::SeqCst), 1);
+        assert!(streams.is_empty());
+        accept_task.abort();
+    }
+
+    #[tokio::test]
+    async fn a_stream_aborted_by_a_recheck_leaves_the_registry() {
+        let TwoSessions {
+            a,
+            a_acceptor: _a_acceptor,
+            mut b,
+            b_handle: _b_handle,
+            _pump_a_to_b,
+            _pump_b_to_a,
+            _task_a,
+            _task_b,
+            _a_epoch_ended_tx,
+            _b_epoch_ended_tx,
+        } = two_sessions();
+        let switch = Switchable::default();
+        let streams = AcceptedStreams::new();
+        let accept_task = {
+            let (switch, streams) = (switch.clone(), streams.clone());
+            tokio::spawn(async move {
+                accept_loop_tracked(&mut b, switch, EchoHandler::default(), streams).await;
+            })
+        };
+        let mut stream = open(&a, ssh(), None).await.unwrap();
+        wait_for_len(&streams, 1).await;
+        switch.deny(ssh());
+        assert_eq!(streams.recheck(&switch), 1);
+        expect_reset(&mut stream).await;
+        wait_for_len(&streams, 0).await;
+        accept_task.abort();
+    }
+
+    /// The documents change and a recheck runs while an OPEN already authorized under the old
+    /// ones is still waiting in `ServiceHandler::open`; the recheck finds nothing to stop, and
+    /// the stream is reset right after it is accepted.
+    #[tokio::test]
+    async fn an_open_in_flight_during_a_recheck_is_reset_once_accepted() {
+        let TwoSessions {
+            a,
+            a_acceptor: _a_acceptor,
+            mut b,
+            b_handle: _b_handle,
+            _pump_a_to_b,
+            _pump_b_to_a,
+            _task_a,
+            _task_b,
+            _a_epoch_ended_tx,
+            _b_epoch_ended_tx,
+        } = two_sessions();
+        let switch = Switchable::default();
+        let streams = AcceptedStreams::new();
+        let handler = EchoHandler {
+            gated: true,
+            ..EchoHandler::default()
+        };
+        let (entered, release) = (Arc::clone(&handler.entered), Arc::clone(&handler.release));
+        let accept_task = {
+            let (switch, streams) = (switch.clone(), streams.clone());
+            tokio::spawn(async move {
+                accept_loop_tracked(&mut b, switch, handler, streams).await;
+            })
+        };
+        let opener = {
+            let a = a.clone();
+            tokio::spawn(async move { open(&a, ssh(), None).await })
+        };
+        // Authorized (allowed), now held in `open`.
+        tokio::time::timeout(STEP, entered.notified())
+            .await
+            .unwrap();
+        assert_eq!(switch.calls(), 1);
+
+        switch.deny(ssh());
+        assert_eq!(streams.recheck(&switch), 0, "nothing is registered yet");
+        assert!(streams.is_empty());
+
+        release.notify_one();
+        let mut stream = tokio::time::timeout(STEP, opener)
+            .await
+            .unwrap()
+            .unwrap()
+            .expect("the OPEN was acknowledged: it was authorized before the change");
+        expect_reset(&mut stream).await;
+        wait_for_len(&streams, 0).await;
+        // The OPEN authorized it once, the registration once more.
+        assert_eq!(switch.calls(), 2);
+        accept_task.abort();
+    }
+
+    /// The same race, with the delay inside the authorizer: it has decided `Allow` under the
+    /// old documents, and the change and the recheck both happen before it returns. The
+    /// generation must therefore be read before the authorizer runs, not after.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_recheck_during_the_authorization_is_not_missed() {
+        let TwoSessions {
+            a,
+            a_acceptor: _a_acceptor,
+            mut b,
+            b_handle: _b_handle,
+            _pump_a_to_b,
+            _pump_b_to_a,
+            _task_a,
+            _task_b,
+            _a_epoch_ended_tx,
+            _b_epoch_ended_tx,
+        } = two_sessions();
+        let switch = Switchable::default();
+        let (entered, release) = switch.gate_next();
+        let streams = AcceptedStreams::new();
+        let accept_task = {
+            let (switch, streams) = (switch.clone(), streams.clone());
+            tokio::spawn(async move {
+                accept_loop_tracked(&mut b, switch, EchoHandler::default(), streams).await;
+            })
+        };
+        let opener = {
+            let a = a.clone();
+            tokio::spawn(async move { open(&a, ssh(), None).await })
+        };
+        // The authorizer has decided `Allow` and is parked.
+        tokio::task::spawn_blocking(move || entered.recv_timeout(STEP))
+            .await
+            .unwrap()
+            .unwrap();
+
+        switch.deny(ssh());
+        assert_eq!(streams.recheck(&switch), 0, "nothing is registered yet");
+        release.send(()).unwrap();
+
+        let mut stream = tokio::time::timeout(STEP, opener)
+            .await
+            .unwrap()
+            .unwrap()
+            .expect("the OPEN was allowed under the documents of its time");
+        expect_reset(&mut stream).await;
+        wait_for_len(&streams, 0).await;
+        accept_task.abort();
+    }
+
+    /// The documents stream passes the same authorizer as any other and is reset only if that
+    /// says no: a grant removal for another service leaves it running.
+    #[tokio::test]
+    async fn a_docs_stream_survives_a_grant_removal() {
+        let TwoSessions {
+            a,
+            a_acceptor: _a_acceptor,
+            mut b,
+            b_handle: _b_handle,
+            _pump_a_to_b,
+            _pump_b_to_a,
+            _task_a,
+            _task_b,
+            _a_epoch_ended_tx,
+            _b_epoch_ended_tx,
+        } = two_sessions();
+        let switch = Switchable::default();
+        let streams = AcceptedStreams::new();
+        let accept_task = {
+            let (switch, streams) = (switch.clone(), streams.clone());
+            tokio::spawn(async move {
+                accept_loop_tracked(&mut b, switch, EchoHandler::default(), streams).await;
+            })
+        };
+        let mut docs = open(&a, crate::admission::docs_service(), None)
+            .await
+            .unwrap();
+        let mut granted = open(&a, ssh(), None).await.unwrap();
+        wait_for_len(&streams, 2).await;
+
+        switch.deny(ssh());
+        assert_eq!(streams.recheck(&switch), 1);
+        expect_reset(&mut granted).await;
+        wait_for_len(&streams, 1).await;
+
+        docs.write_all(b"hi").await.unwrap();
+        docs.flush().await.unwrap();
+        let mut got = [0u8; 2];
+        tokio::time::timeout(STEP, docs.read_exact(&mut got))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&got, b"hi");
+        accept_task.abort();
     }
 }

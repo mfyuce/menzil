@@ -95,7 +95,9 @@ pub use l4_session::{
     CloseReason, EndReason, InboundOverflow, L4_INBOUND_BUDGET_PER_SESSION, L4SessionAcceptor,
     L4SessionConfig, L4SessionHandle, SessionNotice, SessionObserver,
 };
-pub use l5_stream::{OpenStreamError, accept_loop, open as open_stream};
+pub use l5_stream::{
+    AcceptedStreams, OpenStreamError, accept_loop, accept_loop_tracked, open as open_stream,
+};
 pub use node::{Node, NodeConfig, NodeOpenError, RefuseAll, StartError};
 pub use outbound::{
     EnqueueOutcome, Epoch, OutboundQueue, OutboundSend, SendBudget, SendBudgets, SendPermit,
