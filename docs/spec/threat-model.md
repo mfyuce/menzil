@@ -38,7 +38,7 @@ Can: open L4 sessions to members of the same network and attempt any stream; sen
 
 ### 2.5 Stolen node key
 
-The holder is that node until revoked. Mitigations: key files restricted to the user (mode 0600, Windows ACL), revocation through Roster and Policy applied by relays and peers on receipt, `min_serial` raising so stale NodeCerts die immediately, document expiry of 14 days as the upper bound for a relay that withholds updates, one attached session per NodeId so the legitimate node notices displacement. Not in phase 1: hardware backed keys, device attestation.
+The holder is that node until revoked. Mitigations: key files restricted to the user (mode 0600, Windows ACL), revocation through Roster and Policy applied by relays and peers on receipt, `min_serial` raising so stale NodeCerts die immediately, document expiry of 14 days as the upper bound for a relay that withholds updates from a verifier that holds no steward signed renewal (a steward renews from the base it holds, so a revocation that never reaches the steward lasts until the steward's `not_after`, at most 90 days), one attached session per NodeId so the legitimate node notices displacement. Not in phase 1: hardware backed keys, device attestation.
 
 ### 2.6 Stolen owner key
 

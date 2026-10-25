@@ -148,7 +148,7 @@ In IK the node's payload rides message 1 and the relay's rides message 2; in XX 
 
 `caps` is a list of capability strings from the registry in `menzil-proto`; version 1 defines `dgram` (the node accepts datagram channels), `docs` (the node serves `menzil:docs`), `share-blind` and `share-terminated` (the node can host shares of that mode). Unknown strings are ignored.
 
-The relay verifies the NodeCert and rejects a serial lower than the highest it has seen or lower than any Roster's `min_serial` for that node, rejects a `timestamp` not greater than the last accepted for that NodeId, and checks each claimed network against its Rosters: unknown network, unlisted node or revoked node fails with ERROR. A node may claim no network; it may then only redeem an invite. A node does not claim a network whose Roster it holds revokes it.
+The relay verifies the NodeCert and rejects a serial lower than the highest it has seen or lower than the `min_serial` for that node in a Roster of a network the HELLO claims, rejects a `timestamp` not greater than the last accepted for that NodeId, and checks each claimed network against its Rosters: unknown network, unlisted node or revoked node fails with ERROR. A node may claim no network; it may then only redeem an invite. A node does not claim a network whose Roster it holds revokes it.
 
 After WELCOME all records are Noise transport messages. The new session is not routable and does not supersede an existing one until the node's first transport record, ATTACH, is decrypted. Then the previous session for that NodeId receives GOAWAY `superseded`. Noise `Rekey()` runs in both directions on REKEY (section 4.2) every hour; there is no forced daily reconnect.
 
@@ -177,7 +177,7 @@ u8 type | body
 | 0x0e | ERROR | both | CBOR `{ code: u16, msg: str }` |
 | 0x0f | GOAWAY | relay to node | CBOR `{ reason: str, retry_after_ms: u32 }` |
 
-GOAWAY `reason` is `superseded` (4.1) or `revoked` (7.3).
+GOAWAY `reason` is `superseded` (4.1) or `revoked` (7.3); `revoked` also ends a session whose node a Roster of a claimed network no longer lists or whose `min_serial` it now exceeds, the ERROR before it says which (`revoked`, `not_member` or `stale_serial`). Before that ERROR the relay sends the node the Roster of the network concerned, so that the node can leave the network out of its next HELLO.
 
 `e2e_proto`: `0x01` menzil Noise (section 5), `0x02` reserved for QUIC. Others are rejected with ERROR `unknown_e2e`. `flags` bit 0 = droppable (datagram class). SEND payload is at most 65,535 minus 35 bytes.
 
