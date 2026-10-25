@@ -16,8 +16,12 @@ use std::sync::{Arc, RwLock};
 use ed25519_dalek::VerifyingKey;
 use menzil_proto::trust::{Bundle, HeldRoster, HeldView, Reason, Verdict, check_bundle};
 use menzil_proto::{NetworkId, NodeId, Roster, RosterBody};
+use tokio::sync::broadcast;
 
 use crate::error::RelayError;
+
+/// How many change notices a subscriber may fall behind by before it gets `Lagged`.
+const CHANGE_BACKLOG: usize = 64;
 
 /// The relay's held Rosters, at most one per network. Each is verified
 /// against its own claimed `network_id` (protocol.md 2.3: `NetworkId`
@@ -25,11 +29,22 @@ use crate::error::RelayError;
 /// The signed `Roster` itself is kept, not just its decoded body: DOC
 /// propagation (protocol.md 4.3) forwards the signed bytes verbatim
 /// (protocol.md 2.1), never re-encoding them.
-#[derive(Default)]
 pub struct RosterStore {
     by_network: RwLock<HashMap<NetworkId, Held>>,
     /// Called after [`Self::adopt`] has stored a Roster (see [`Self::set_on_adopted`]).
     on_adopted: RwLock<Option<AdoptedHook>>,
+    /// Says which network got a newer Roster (see [`Self::subscribe`]).
+    changes: broadcast::Sender<NetworkId>,
+}
+
+impl Default for RosterStore {
+    fn default() -> Self {
+        Self {
+            by_network: RwLock::default(),
+            on_adopted: RwLock::default(),
+            changes: broadcast::channel(CHANGE_BACKLOG).0,
+        }
+    }
 }
 
 /// The function a caller sets with [`RosterStore::set_on_adopted`]: the Roster just stored and,
@@ -56,6 +71,15 @@ impl RosterStore {
     /// An empty store, serving no networks yet.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Notices of a newer Roster stored here, one per store, carrying its network (from
+    /// [`Self::set`] and [`Self::adopt`], whichever stored it). A session that claimed a network
+    /// listens to judge itself again (protocol.md 4.1, 7.3). Nobody listening is no problem; a
+    /// receiver that falls more than a few dozen notices behind gets `Lagged` and should look at
+    /// every network it claimed.
+    pub fn subscribe(&self) -> broadcast::Receiver<NetworkId> {
+        self.changes.subscribe()
     }
 
     /// Verifies `roster`'s signature against its own claimed
@@ -85,6 +109,7 @@ impl RosterStore {
             });
         }
 
+        let network_id = body.network_id;
         let mut guard = self.by_network.write().unwrap();
         if let Some(existing) = guard.get(&body.network_id)
             && body.seq <= existing.body.seq
@@ -102,6 +127,8 @@ impl RosterStore {
                 view,
             },
         );
+        drop(guard);
+        let _ = self.changes.send(network_id);
         Ok(true)
     }
 
@@ -187,6 +214,8 @@ impl RosterStore {
             },
         );
         drop(guard);
+        // Before the hook, which may be slow: whoever hears this reads the new Roster.
+        let _ = self.changes.send(network_id);
         // The Roster is held whatever the hook does: a panic in it is logged, never passed on
         // to the adoption.
         let hook = self.on_adopted.read().unwrap().clone();
@@ -469,6 +498,41 @@ mod tests {
         assert!(store.set(&signed_roster(&owner, network_id, 1)).unwrap());
         let body = store.get(&network_id).unwrap();
         assert_eq!(body.seq, 1);
+    }
+
+    #[test]
+    fn a_newer_roster_stored_by_set_or_adopt_is_announced_with_its_network_and_a_stale_one_is_not()
+    {
+        let owner = SigningKey::generate(&mut rand::rng());
+        let network_id = NetworkId::from(owner.verifying_key().to_bytes());
+        let store = RosterStore::new();
+        let mut changes = store.subscribe();
+        let fresh = |seq: u64| {
+            let body = RosterBody {
+                v: menzil_proto::PROTOCOL_VERSION,
+                network_id,
+                seq,
+                issued: NOW - 10,
+                expires: NOW + 1000,
+                members: vec![],
+                revoked: vec![],
+                stewards: vec![],
+                labels: vec![],
+            };
+            Roster::sign(&owner, &body).unwrap()
+        };
+
+        assert!(store.set(&fresh(1)).unwrap());
+        assert_eq!(changes.try_recv().unwrap(), network_id);
+        assert!(!store.set(&fresh(1)).unwrap());
+        assert!(!store.adopt(&fresh(1), None, NOW).unwrap());
+        assert!(
+            changes.try_recv().is_err(),
+            "a Roster that was not stored is not announced"
+        );
+        assert!(store.adopt(&fresh(2), None, NOW).unwrap());
+        assert_eq!(changes.try_recv().unwrap(), network_id);
+        assert!(changes.try_recv().is_err());
     }
 
     #[test]

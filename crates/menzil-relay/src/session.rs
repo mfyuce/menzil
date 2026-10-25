@@ -29,6 +29,14 @@
 //! separate from DOC/ADVERTISE_ACK's own for the reasons `crate::registry`'s
 //! module doc comment gives.
 //!
+//! A session also ends when a Roster the relay adopts later puts its node out of standing in a
+//! network it claimed (protocol.md 7.3; TODO.md L4k K5): revoked, no longer listed, or a
+//! `min_serial` raised above the serial of the NodeCert it presented in HELLO. The node gets
+//! ERROR (`revoked`, `not_member` or `stale_serial`) and GOAWAY `revoked`, and the session
+//! detaches. Every session judges itself (it listens to `RosterStore::subscribe`), attached or
+//! not yet, by the rule HELLO applied (`crate::hello::roster_standing`), so a node of another
+//! network is never looked at.
+//!
 //! Everything else this build doesn't yet act on (PEER_STATE, ADMIT_*,
 //! and an ADVERTISE_ACK, CREDIT, or GOAWAY received from a node, all
 //! protocol violations since those records are relay-to-node only — not
@@ -46,12 +54,13 @@ use menzil_session::{
     HandshakePattern, Liveness, RekeySchedule, RelayHandshake, RelayHandshakeStep, Transport,
     prologue,
 };
+use tokio::sync::broadcast;
 
 use crate::connection::InboundConnection;
 use crate::doc::{self, AcceptOutcome, PendingBases};
 use crate::error::RelayError;
 use crate::forward::{ForwardItem, ForwardOutcome};
-use crate::hello::check_hello;
+use crate::hello::{HelloRejection, check_hello, roster_standing};
 use crate::relay::Relay;
 
 /// The exact byte length of a Noise `Xx` pattern's message 1: just the
@@ -365,6 +374,82 @@ async fn dispatch(
     }
 }
 
+/// What a session hears of Roster changes (`RosterStore::subscribe`), to judge itself again when
+/// a network it claimed has a newer Roster.
+pub(crate) struct StandingWatch {
+    changes: broadcast::Receiver<NetworkId>,
+    /// False once the store is gone, which cannot happen while the `Relay` is held; then nothing
+    /// more is heard (and the arm must not spin on an always ready `Closed`).
+    open: bool,
+}
+
+impl StandingWatch {
+    /// Listening starts now, so a Roster adopted from here on is not missed; a check right after
+    /// closes the gap since HELLO was judged.
+    pub(crate) fn new(relay: &Relay) -> Self {
+        Self {
+            changes: relay.rosters.subscribe(),
+            open: true,
+        }
+    }
+
+    /// Resolves when a Roster of one of `claimed` was stored, or when notices were missed (then
+    /// any network may have changed). A Roster of any other network is none of this session's
+    /// business and is skipped.
+    pub(crate) async fn changed(&mut self, claimed: &[NetworkId]) {
+        loop {
+            if !self.open {
+                std::future::pending::<()>().await;
+            }
+            match self.changes.recv().await {
+                Ok(network_id) if claimed.contains(&network_id) => return,
+                Ok(_) => {}
+                Err(broadcast::error::RecvError::Lagged(_)) => return,
+                Err(broadcast::error::RecvError::Closed) => self.open = false,
+            }
+        }
+    }
+}
+
+/// Why `node_id` must no longer be served in the networks it claimed, if the Rosters held now say
+/// so: the rule HELLO applied, against what is held at this moment.
+fn out_of_standing(
+    relay: &Relay,
+    node_id: &NodeId,
+    cert_serial: u32,
+    claimed_networks: &[NetworkId],
+) -> Option<HelloRejection> {
+    roster_standing(node_id, cert_serial, claimed_networks, &relay.rosters).err()
+}
+
+/// Tells a node it is out: ERROR with the reason, then GOAWAY `revoked` (protocol.md 4.2, 7.3), best
+/// effort. The caller ends the session.
+async fn send_eviction(
+    conn: &mut InboundConnection,
+    transport: &mut Transport,
+    rejection: HelloRejection,
+    session_id: u32,
+    node_id: &NodeId,
+) {
+    tracing::info!(
+        session_id,
+        node_id = %node_id,
+        code = ?rejection.code,
+        reason = %rejection.message,
+        "relay session ended, the node is out of standing in a claimed network"
+    );
+    let error = Record::Error(ErrorBody {
+        code: rejection.code,
+        msg: rejection.message,
+    });
+    let _ = send_record(conn, transport, error).await;
+    let goaway = Record::Goaway(GoawayBody {
+        reason: "revoked".to_string(),
+        retry_after_ms: 0,
+    });
+    let _ = send_record(conn, transport, goaway).await;
+}
+
 #[derive(Debug, PartialEq, Eq)]
 enum TickOutcome {
     Continue,
@@ -410,15 +495,24 @@ const TICK: Duration = Duration::from_secs(1);
 /// `their_roster_seq` are this node's own HELLO `networks`/`roster_seq`
 /// (protocol.md 4.1), used for DOC propagation targeting and the
 /// attach-time catch-up (protocol.md 4.3; `crate::doc`).
+#[allow(clippy::too_many_arguments)]
 async fn run_attached_loop(
     mut conn: InboundConnection,
     mut transport: Transport,
     node_id: NodeId,
+    cert_serial: u32,
     session_id: u32,
     relay: &Relay,
     claimed_networks: Vec<NetworkId>,
     their_roster_seq: HashMap<NetworkId, u64>,
 ) {
+    // Listening before judging, so a Roster adopted between the two is heard; HELLO was judged
+    // against whatever was held then.
+    let mut watch = StandingWatch::new(relay);
+    if let Some(rejection) = out_of_standing(relay, &node_id, cert_serial, &claimed_networks) {
+        send_eviction(&mut conn, &mut transport, rejection, session_id, &node_id).await;
+        return;
+    }
     let mut liveness = Liveness::new(Instant::now());
     let mut rekey = RekeySchedule::new(Instant::now());
     let mut tick = tokio::time::interval(TICK);
@@ -445,6 +539,12 @@ async fn run_attached_loop(
             }
             _ = tick.tick() => {
                 if on_tick(&mut conn, &mut transport, &liveness, &mut rekey).await == TickOutcome::Dead {
+                    return;
+                }
+            }
+            () = watch.changed(&claimed_networks) => {
+                if let Some(rejection) = out_of_standing(relay, &node_id, cert_serial, &claimed_networks) {
+                    send_eviction(&mut conn, &mut transport, rejection, session_id, &node_id).await;
                     return;
                 }
             }
@@ -505,6 +605,12 @@ async fn run_attached_loop(
                 let _ = send_record(&mut conn, &mut transport, goaway).await;
                 tracing::info!(session_id, node_id = %node_id, "relay session superseded");
                 break;
+            }
+            () = watch.changed(&claimed_networks) => {
+                if let Some(rejection) = out_of_standing(relay, &node_id, cert_serial, &claimed_networks) {
+                    send_eviction(&mut conn, &mut transport, rejection, session_id, &node_id).await;
+                    break;
+                }
             }
             Some(record) = outbound_rx.recv() => {
                 let _ = send_record(&mut conn, &mut transport, record).await;
@@ -599,10 +705,19 @@ fn dedup_networks(networks: Vec<NetworkId>) -> Vec<NetworkId> {
 pub(crate) async fn handle_connection(conn: InboundConnection, relay: Relay, session_id: u32) {
     match run_handshake_and_validate(conn, &relay, session_id).await {
         Ok((conn, transport, node_id, hello)) => {
+            // The NodeCert was verified by `check_hello`; this reads the serial it judged.
+            let Ok(cert) = hello.node_cert.decode() else {
+                tracing::warn!(
+                    session_id,
+                    "relay session dropped, its verified NodeCert did not decode"
+                );
+                return;
+            };
             run_attached_loop(
                 conn,
                 transport,
                 node_id,
+                cert.serial,
                 session_id,
                 &relay,
                 dedup_networks(hello.networks),

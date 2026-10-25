@@ -438,16 +438,14 @@ impl Session {
         env: &HashMap<String, String>,
         roster_store: Arc<RosterStore>,
     ) -> Result<Self, NodeError> {
+        // Decided at every connect, from what the store holds now (protocol.md 4.1).
+        let claims = claimable_networks(config, &roster_store);
         let mut carrier = Carrier::dial(&config.dial, env).await?;
-        let (transport, welcome) = run_handshake(&mut carrier, config, &roster_store).await?;
+        let (transport, welcome) =
+            run_handshake(&mut carrier, config, &claims, &roster_store).await?;
         let mut session = Self {
             carrier,
-            engine: Engine::new(
-                transport,
-                Instant::now(),
-                Arc::clone(&roster_store),
-                config.networks.clone(),
-            ),
+            engine: Engine::new(transport, Instant::now(), Arc::clone(&roster_store), claims),
             welcome,
             tick: tokio::time::interval(TICK),
         };
@@ -635,11 +633,46 @@ pub(crate) fn rosters_to_push(
     out
 }
 
+/// The networks this node puts in HELLO: `config.networks` less every network whose Roster this
+/// node holds and that lists the node as revoked (protocol.md 4.1, "a node does not claim a
+/// network whose Roster it holds revokes it"). A relay refuses a HELLO that claims a network
+/// revoking the node as a whole, so without this one revocation would take all of the node's
+/// networks off the relay at its next reconnect. A network whose Roster is not held is claimed as
+/// before (nothing says it revokes the node), and so is every network when the node's own
+/// certificate does not decode (the relay answers that with `bad_cert`). One warning per network
+/// left out.
+fn claimable_networks(config: &SessionConfig, roster_store: &RosterStore) -> Vec<NetworkId> {
+    let Ok(cert) = config.identity.node_cert.decode() else {
+        return config.networks.clone();
+    };
+    config
+        .networks
+        .iter()
+        .copied()
+        .filter(|network_id| {
+            let revoked = roster_store.body(network_id).is_some_and(|roster| {
+                roster
+                    .revoked
+                    .iter()
+                    .any(|revoked| revoked.node_id == cert.node_id)
+            });
+            if revoked {
+                tracing::warn!(
+                    %network_id,
+                    "this node is revoked in the Roster it holds for the network, so it does not claim it"
+                );
+            }
+            !revoked
+        })
+        .collect()
+}
+
 /// Runs [`NodeHandshake`] to completion over `carrier` and verifies the
 /// result (protocol.md 4.1).
 async fn run_handshake(
     carrier: &mut Carrier,
     config: &SessionConfig,
+    claims: &[NetworkId],
     roster_store: &RosterStore,
 ) -> Result<(Transport, WelcomeBody), NodeError> {
     let info = &config.dial.connection_info;
@@ -663,15 +696,14 @@ async fn run_handshake(
             })?;
     let prologue_bytes = prologue(&carrier.offered_subprotocol, &selected, pattern);
 
-    let roster_seq = config
-        .networks
+    let roster_seq = claims
         .iter()
         .filter_map(|network_id| roster_store.seq(network_id).map(|seq| (*network_id, seq)))
         .collect();
     let hello = HelloBody {
         v: PROTOCOL_VERSION,
         node_cert: config.identity.node_cert.clone(),
-        networks: config.networks.clone(),
+        networks: claims.to_vec(),
         timestamp: tai64n_now(),
         roster_seq,
         caps: config.caps.clone(),
@@ -1323,6 +1355,7 @@ pub async fn run_session_until(
 mod tests {
     use super::*;
     use ed25519_dalek::SigningKey;
+    use menzil_carrier::{ConnectionInfo, DialConfig};
     use menzil_proto::{Limits, NodeCert, NodeCertBody, NodeId, RosterBody, RosterMember};
 
     #[test]
@@ -1351,6 +1384,97 @@ mod tests {
             not_after: 1_000_000_000,
         };
         NodeCert::sign(&key, &body).unwrap()
+    }
+
+    fn config_claiming(networks: Vec<NetworkId>, cert: NodeCert) -> SessionConfig {
+        SessionConfig {
+            dial: DialConfig {
+                connection_info: ConnectionInfo {
+                    host: "localhost".to_string(),
+                    port: 1,
+                    path: "/_menzil/v1".to_string(),
+                    relay_node_id: NodeId::from([200u8; 32]),
+                    relay_x25519: None,
+                },
+                proxy_override: None,
+            },
+            identity: LocalIdentity {
+                node_cert: cert,
+                x25519_private: [0u8; 32],
+            },
+            networks,
+            caps: vec![],
+            e2e_protos: vec![0x01],
+        }
+    }
+
+    /// A Roster of a fresh network listing `members` and revoking `revoked`, stored in `store`.
+    fn hold_roster(store: &RosterStore, members: &[u8], revoked: &[u8]) -> NetworkId {
+        let owner = SigningKey::generate(&mut rand::rng());
+        let network_id = NetworkId::from(owner.verifying_key().to_bytes());
+        let body = RosterBody {
+            v: PROTOCOL_VERSION,
+            network_id,
+            seq: 1,
+            issued: unix_now() - 60,
+            expires: unix_now() + 7 * 86_400,
+            members: members
+                .iter()
+                .map(|&seed| RosterMember {
+                    node_id: NodeId::from([seed; 32]),
+                    min_serial: 1,
+                })
+                .collect(),
+            revoked: revoked
+                .iter()
+                .map(|&seed| menzil_proto::RevokedMember {
+                    node_id: NodeId::from([seed; 32]),
+                    since: 1,
+                })
+                .collect(),
+            stewards: vec![],
+            labels: vec![],
+        };
+        store.set(&Roster::sign(&owner, &body).unwrap()).unwrap();
+        network_id
+    }
+
+    #[test]
+    fn hello_claims_leave_out_a_network_whose_held_roster_revokes_this_node() {
+        let store = RosterStore::new();
+        let revoking = hold_roster(&store, &[8], &[7]);
+        let listing = hold_roster(&store, &[7, 8], &[]);
+        let revoking_someone_else = hold_roster(&store, &[7], &[8]);
+        let not_held = NetworkId::from([99u8; 32]);
+        // Not listed there and not revoked either: the relay judges that, not the node.
+        let unlisting = hold_roster(&store, &[8], &[]);
+
+        let config = config_claiming(
+            vec![
+                revoking,
+                listing,
+                revoking_someone_else,
+                not_held,
+                unlisting,
+            ],
+            node_cert(7),
+        );
+        assert_eq!(
+            claimable_networks(&config, &store),
+            vec![listing, revoking_someone_else, not_held, unlisting],
+            "only the network whose held Roster revokes this node is left out, order kept"
+        );
+    }
+
+    #[test]
+    fn hello_claims_are_every_configured_network_when_none_revokes_this_node() {
+        let store = RosterStore::new();
+        let a = hold_roster(&store, &[7], &[]);
+        let b = hold_roster(&store, &[7, 8], &[]);
+        let config = config_claiming(vec![a, b], node_cert(7));
+        assert_eq!(claimable_networks(&config, &store), vec![a, b]);
+        let none = config_claiming(vec![], node_cert(7));
+        assert!(claimable_networks(&none, &store).is_empty());
     }
 
     fn test_roster_store() -> Arc<RosterStore> {

@@ -1472,3 +1472,336 @@ async fn max_peers_has_no_spec_default_and_is_always_the_caller_choice() {
     let limits = test_limits();
     assert_eq!(limits.max_peers, 10);
 }
+
+// --- Eviction when an adopted Roster takes a node out of standing (protocol.md 7.3; L4k K5) ---
+
+use crate::session::StandingWatch;
+use menzil_proto::RevokedMember;
+
+/// A Roster of `network_id` signed by `owner` that the relay will adopt now: `members` as
+/// `(node, min_serial)` and `revoked` nodes.
+fn evict_roster(
+    owner: &SigningKey,
+    network_id: NetworkId,
+    seq: u64,
+    members: &[(NodeId, u32)],
+    revoked: &[NodeId],
+) -> Roster {
+    let body = RosterBody {
+        v: PROTOCOL_VERSION,
+        network_id,
+        seq,
+        issued: real_now(),
+        expires: real_now() + 7 * DAY,
+        members: members
+            .iter()
+            .map(|&(node_id, min_serial)| RosterMember {
+                node_id,
+                min_serial,
+            })
+            .collect(),
+        revoked: revoked
+            .iter()
+            .map(|&node_id| RevokedMember {
+                node_id,
+                since: real_now(),
+            })
+            .collect(),
+        stewards: vec![],
+        labels: vec![],
+    };
+    Roster::sign(owner, &body).unwrap()
+}
+
+/// What a node out of standing was sent, the relay's state afterwards, and that others were
+/// left alone.
+struct Eviction {
+    /// Everything `x` received from the Roster push on, until its connection ended.
+    x_records: Vec<Record>,
+    relay: Relay,
+}
+
+/// Network A has `x` (serial 1) and `y`; network B, another owner's, has `z`. Everyone connects
+/// (`x` attaches only when `attach_x`), then `y` pushes the Roster `next` builds (seq 2, from the
+/// owner of A, with `x` and `y` as arguments) over DOC. Reads `x` to the end of its connection,
+/// then checks that `y` and `z` are still attached and answer, and that `x` is not attached.
+async fn eviction_scenario(
+    attach_x: bool,
+    next: impl FnOnce(&SigningKey, NetworkId, NodeId, NodeId) -> Roster,
+) -> Eviction {
+    let (relay, listener, cert, relay_x25519) = bind_test_relay().await;
+    let addr = listener.local_addr().unwrap();
+    let (x, y, z) = (
+        generate_identity(),
+        generate_identity(),
+        generate_identity(),
+    );
+    let owner_a = SigningKey::generate(&mut rand::rng());
+    let network_a = NetworkId::from(owner_a.verifying_key().to_bytes());
+    let owner_b = SigningKey::generate(&mut rand::rng());
+    let network_b = NetworkId::from(owner_b.verifying_key().to_bytes());
+    relay
+        .rosters()
+        .set(&evict_roster(
+            &owner_a,
+            network_a,
+            1,
+            &[(x.node_id, 1), (y.node_id, 1)],
+            &[],
+        ))
+        .unwrap();
+    relay
+        .rosters()
+        .set(&evict_roster(
+            &owner_b,
+            network_b,
+            1,
+            &[(z.node_id, 1)],
+            &[],
+        ))
+        .unwrap();
+    let serve_relay = relay.clone();
+    tokio::spawn(async move { serve_relay.serve(&listener).await });
+
+    let seen = |network_id| HashMap::from([(network_id, 1u64)]);
+    let (mut client_x, _) = TestClient::connect(
+        addr,
+        cert.clone(),
+        &x,
+        relay_x25519,
+        vec![network_a],
+        seen(network_a),
+        1,
+        10,
+    )
+    .await;
+    let (mut client_y, _) = TestClient::connect(
+        addr,
+        cert.clone(),
+        &y,
+        relay_x25519,
+        vec![network_a],
+        seen(network_a),
+        1,
+        10,
+    )
+    .await;
+    let (mut client_z, _) = TestClient::connect(
+        addr,
+        cert,
+        &z,
+        relay_x25519,
+        vec![network_b],
+        seen(network_b),
+        1,
+        10,
+    )
+    .await;
+    if attach_x {
+        client_x.send(Record::Attach).await;
+    }
+    client_y.send(Record::Attach).await;
+    client_z.send(Record::Attach).await;
+    ping_pong(&mut client_x, [1; 8]).await;
+    ping_pong(&mut client_y, [2; 8]).await;
+    ping_pong(&mut client_z, [3; 8]).await;
+    assert_eq!(relay.registry.is_attached(&x.node_id), attach_x);
+    assert!(relay.registry.is_attached(&y.node_id));
+    assert!(relay.registry.is_attached(&z.node_id));
+
+    let next_roster = next(&owner_a, network_a, x.node_id, y.node_id);
+    for record in menzil_proto::split_into_doc_records(DocType::Roster, &next_roster.encode()) {
+        client_y.send(record).await;
+    }
+
+    let mut x_records = Vec::new();
+    while let Some(record) =
+        tokio::time::timeout(std::time::Duration::from_secs(10), client_x.recv())
+            .await
+            .expect("x's connection must end")
+    {
+        x_records.push(record);
+    }
+
+    assert!(
+        !relay.registry.is_attached(&x.node_id),
+        "the evicted node is detached once its connection has ended"
+    );
+    ping_pong(&mut client_y, [4; 8]).await;
+    ping_pong(&mut client_z, [5; 8]).await;
+    assert!(relay.registry.is_attached(&y.node_id));
+    assert!(
+        relay.registry.is_attached(&z.node_id),
+        "a node of another network is not touched"
+    );
+    Eviction { x_records, relay }
+}
+
+/// The ERROR code and GOAWAY of an eviction: the ERROR first, the GOAWAY last, `revoked`.
+fn assert_told_out(eviction: &Eviction, code: ErrorCode) {
+    let records = &eviction.x_records;
+    let error_at = records
+        .iter()
+        .position(|record| matches!(record, Record::Error(body) if body.code == code))
+        .unwrap_or_else(|| panic!("expected ERROR {code:?} among {records:?}"));
+    match records.last() {
+        Some(Record::Goaway(body)) => {
+            assert_eq!(body.reason, "revoked");
+            assert_eq!(body.retry_after_ms, 0);
+        }
+        other => panic!("expected GOAWAY as the last record, got {other:?}"),
+    }
+    assert_eq!(
+        records
+            .iter()
+            .filter(|r| matches!(r, Record::Goaway(_)))
+            .count(),
+        1
+    );
+    assert!(
+        error_at < records.len() - 1,
+        "the ERROR comes before the GOAWAY"
+    );
+}
+
+#[tokio::test]
+async fn an_attached_node_that_an_adopted_roster_revokes_is_told_and_detached() {
+    let eviction = eviction_scenario(true, |owner, network, x, y| {
+        evict_roster(owner, network, 2, &[(y, 1)], &[x])
+    })
+    .await;
+    assert_told_out(&eviction, ErrorCode::Revoked);
+    // The relay now holds the revoking Roster, and refuses the node's HELLO.
+    assert_eq!(eviction.relay.rosters().seqs().values().max(), Some(&2));
+}
+
+#[tokio::test]
+async fn a_node_the_adopted_roster_no_longer_lists_is_told_not_member() {
+    let eviction = eviction_scenario(true, |owner, network, _x, y| {
+        evict_roster(owner, network, 2, &[(y, 1)], &[])
+    })
+    .await;
+    assert_told_out(&eviction, ErrorCode::NotMember);
+}
+
+#[tokio::test]
+async fn a_min_serial_raised_above_the_hello_serial_evicts_a_still_listed_node() {
+    let eviction = eviction_scenario(true, |owner, network, x, y| {
+        evict_roster(owner, network, 2, &[(x, 2), (y, 1)], &[])
+    })
+    .await;
+    assert_told_out(&eviction, ErrorCode::StaleSerial);
+}
+
+#[tokio::test]
+async fn a_session_that_has_not_attached_yet_is_evicted_too() {
+    let eviction = eviction_scenario(false, |owner, network, x, y| {
+        evict_roster(owner, network, 2, &[(y, 1)], &[x])
+    })
+    .await;
+    assert_told_out(&eviction, ErrorCode::Revoked);
+}
+
+#[tokio::test]
+async fn a_roster_that_leaves_a_node_in_standing_ends_nothing() {
+    // `min_serial` raised to exactly the serial the node presented is no eviction.
+    let (relay, listener, cert, relay_x25519) = bind_test_relay().await;
+    let addr = listener.local_addr().unwrap();
+    let (x, y) = (generate_identity(), generate_identity());
+    let owner = SigningKey::generate(&mut rand::rng());
+    let network = NetworkId::from(owner.verifying_key().to_bytes());
+    relay
+        .rosters()
+        .set(&evict_roster(
+            &owner,
+            network,
+            1,
+            &[(x.node_id, 1), (y.node_id, 1)],
+            &[],
+        ))
+        .unwrap();
+    let serve_relay = relay.clone();
+    tokio::spawn(async move { serve_relay.serve(&listener).await });
+    let seen = HashMap::from([(network, 1u64)]);
+    let (mut client_x, _) = TestClient::connect(
+        addr,
+        cert.clone(),
+        &x,
+        relay_x25519,
+        vec![network],
+        seen.clone(),
+        3,
+        10,
+    )
+    .await;
+    let (mut client_y, _) =
+        TestClient::connect(addr, cert, &y, relay_x25519, vec![network], seen, 1, 10).await;
+    client_x.send(Record::Attach).await;
+    client_y.send(Record::Attach).await;
+    ping_pong(&mut client_x, [1; 8]).await;
+    ping_pong(&mut client_y, [2; 8]).await;
+
+    let next = evict_roster(&owner, network, 2, &[(x.node_id, 3), (y.node_id, 1)], &[]);
+    for record in menzil_proto::split_into_doc_records(DocType::Roster, &next.encode()) {
+        client_y.send(record).await;
+    }
+    // x hears the fan-out of the new Roster, and nothing else.
+    assert_eq!(client_x.recv_roster_doc().await.decode().unwrap().seq, 2);
+    ping_pong(&mut client_x, [3; 8]).await;
+    assert!(relay.registry.is_attached(&x.node_id));
+}
+
+#[tokio::test]
+async fn a_standing_watch_wakes_only_for_a_claimed_network_or_missed_notices() {
+    let (relay, _listener, _cert, _x25519) = bind_test_relay().await;
+    let owner_a = SigningKey::generate(&mut rand::rng());
+    let network_a = NetworkId::from(owner_a.verifying_key().to_bytes());
+    let owner_b = SigningKey::generate(&mut rand::rng());
+    let network_b = NetworkId::from(owner_b.verifying_key().to_bytes());
+    let node = NodeId::from([5u8; 32]);
+    for (owner, network) in [(&owner_a, network_a), (&owner_b, network_b)] {
+        relay
+            .rosters()
+            .set(&evict_roster(owner, network, 1, &[(node, 1)], &[]))
+            .unwrap();
+    }
+    let short = std::time::Duration::from_millis(200);
+    let long = std::time::Duration::from_secs(5);
+    let mut watch = StandingWatch::new(&relay);
+
+    // A newer Roster of a network not claimed wakes nobody.
+    relay
+        .rosters()
+        .set(&evict_roster(&owner_b, network_b, 2, &[(node, 1)], &[]))
+        .unwrap();
+    assert!(
+        tokio::time::timeout(short, watch.changed(&[network_a]))
+            .await
+            .is_err(),
+        "another network's Roster is none of this session's business"
+    );
+    // One of the claimed network does.
+    relay
+        .rosters()
+        .set(&evict_roster(&owner_a, network_a, 2, &[(node, 1)], &[]))
+        .unwrap();
+    assert!(
+        tokio::time::timeout(long, watch.changed(&[network_a]))
+            .await
+            .is_ok()
+    );
+
+    // Missed notices (more than the backlog) wake it whatever the networks were.
+    for seq in 3..120 {
+        relay
+            .rosters()
+            .set(&evict_roster(&owner_b, network_b, seq, &[(node, 1)], &[]))
+            .unwrap();
+    }
+    assert!(
+        tokio::time::timeout(long, watch.changed(&[network_a]))
+            .await
+            .is_ok(),
+        "a lagged watch looks at every claimed network"
+    );
+}

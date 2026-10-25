@@ -20,7 +20,7 @@
 //! `NodeHistory` already do internally (a brief, non-blocking lock).
 
 use ed25519_dalek::VerifyingKey;
-use menzil_proto::{ErrorCode, HelloBody, NodeCertBody, NodeId, X25519PublicKey};
+use menzil_proto::{ErrorCode, HelloBody, NetworkId, NodeCertBody, NodeId, X25519PublicKey};
 
 use crate::node_history::{HistoryViolation, NodeHistory};
 use crate::roster_store::RosterStore;
@@ -82,6 +82,63 @@ fn verify_node_cert(
     Ok(body)
 }
 
+/// The Roster side of HELLO validation, for `node_id` holding a NodeCert of `cert_serial` and
+/// claiming `networks`: a serial below any held Roster's `min_serial` for the node, then for each
+/// claimed network, unknown, revoked there (checked before membership, and independently of
+/// it: a Roster may or may not still carry a revoked node in `members` alongside `revoked`
+/// (protocol.md 2.3 doesn't say which), and a revoked node should get the more specific
+/// `Revoked` either way, not `NotMember`), or not listed there.
+///
+/// Pure and read only. The one rule both of its callers apply: [`check_hello`] when a session
+/// starts, and `crate::session` again whenever a Roster of a network the session claimed is
+/// adopted (protocol.md 7.3, "relays end the session of a node that a Roster they adopt
+/// revokes"), so that a session is ended exactly when the same HELLO would now be refused.
+pub(crate) fn roster_standing(
+    node_id: &NodeId,
+    cert_serial: u32,
+    networks: &[NetworkId],
+    rosters: &RosterStore,
+) -> Result<(), HelloRejection> {
+    if let Some(min_serial) = rosters.min_serial_for(node_id)
+        && cert_serial < min_serial
+    {
+        return Err(reject(
+            ErrorCode::StaleSerial,
+            format!("serial {cert_serial} is below this node's Roster min_serial {min_serial}"),
+        ));
+    }
+
+    for network_id in networks {
+        let Some(roster) = rosters.get(network_id) else {
+            return Err(reject(
+                ErrorCode::UnknownNetwork,
+                format!("no Roster held for network {network_id}"),
+            ));
+        };
+        if roster
+            .revoked
+            .iter()
+            .any(|revoked| &revoked.node_id == node_id)
+        {
+            return Err(reject(
+                ErrorCode::Revoked,
+                format!("node is revoked from network {network_id}"),
+            ));
+        }
+        if !roster
+            .members
+            .iter()
+            .any(|member| &member.node_id == node_id)
+        {
+            return Err(reject(
+                ErrorCode::NotMember,
+                format!("node is not a member of network {network_id}"),
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Serial, timestamp, and per-claimed-network checks against `node_id`
 /// (already proven to own `cert_serial`'s NodeCert by
 /// [`verify_node_cert`]).
@@ -104,48 +161,7 @@ fn validate_against_rosters(
     rosters: &RosterStore,
     history: &NodeHistory,
 ) -> Result<(), HelloRejection> {
-    if let Some(min_serial) = rosters.min_serial_for(&node_id)
-        && cert_serial < min_serial
-    {
-        return Err(reject(
-            ErrorCode::StaleSerial,
-            format!("serial {cert_serial} is below this node's Roster min_serial {min_serial}"),
-        ));
-    }
-
-    for network_id in &hello.networks {
-        let Some(roster) = rosters.get(network_id) else {
-            return Err(reject(
-                ErrorCode::UnknownNetwork,
-                format!("no Roster held for network {network_id}"),
-            ));
-        };
-        // Checked before membership, and independently of it: a Roster
-        // may or may not still carry a revoked node in `members`
-        // alongside `revoked` (protocol.md 2.3 doesn't say which), and
-        // a revoked node should get the more specific `Revoked` either
-        // way, not `NotMember`.
-        if roster
-            .revoked
-            .iter()
-            .any(|revoked| revoked.node_id == node_id)
-        {
-            return Err(reject(
-                ErrorCode::Revoked,
-                format!("node is revoked from network {network_id}"),
-            ));
-        }
-        if !roster
-            .members
-            .iter()
-            .any(|member| member.node_id == node_id)
-        {
-            return Err(reject(
-                ErrorCode::NotMember,
-                format!("node is not a member of network {network_id}"),
-            ));
-        }
-    }
+    roster_standing(&node_id, cert_serial, &hello.networks, rosters)?;
 
     history
         .check_and_record(node_id, cert_serial, hello.timestamp)
