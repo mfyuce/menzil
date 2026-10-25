@@ -29,17 +29,24 @@
 //!   routes). Then the cheap decision ([`SessionTable::on_inbound_init`]:
 //!   self, the rate limit, the simultaneous-open tie-break, the table
 //!   being full), then, only if we hold the network's documents, the
-//!   responder handshake, then L4h2's checks ([`decide_responder_admission`]),
-//!   then a reserved index, `resp`, and a session actor installed as a
-//!   *candidate*. A failed check answers nothing at all (L4h2's judgment
-//!   call 1); a member with no grant gets the handshake and then CLOSE
-//!   `no_grant` (protocol.md 5.1) from an actor that is never installed,
-//!   so it cannot displace a session or abandon an initiation of ours. An
-//!   `init` claiming to come from the attached relay's own NodeId is
-//!   refused outright, and so is asking for a session with it: the relay
-//!   principal (protocol.md 6.1) has no network, no Policy and no
-//!   certificate to check it against, and what an `expose` session with it
-//!   will be is TOBEDECIDED item 8.
+//!   check that the RECV `src` is an unrevoked member in our Roster (before
+//!   any Diffie Hellman: a stranger or a revoked member gets silence and
+//!   costs nothing), then the responder handshake, then L4h2's checks
+//!   ([`decide_responder_admission`]). A failed check answers nothing at
+//!   all (L4h2's judgment call 1). A member with no grant gets a normal
+//!   session (what it may open is decided per stream, protocol.md 5.3). A
+//!   member the Roster lists but the Policy cannot vouch for (no cert for
+//!   its key, not listed, or our documents have expired) completes the
+//!   handshake with `docs_only: true` and gets a *docs only* session:
+//!   installed under [`docs_only_slot`] so it can displace nothing, at most
+//!   [`MAX_DOCS_ONLY_SESSIONS`] of them and one per peer, announced on
+//!   [`RouterParts::ready`] with [`SessionReady::docs_only`], and ended with
+//!   CLOSE `docs_only` after [`DOCS_ONLY_LIFETIME`] (or sooner by whoever
+//!   serves its one push). An `init` claiming to come from the attached
+//!   relay's own NodeId is refused outright, and so is asking for a session
+//!   with it: the relay principal (protocol.md 6.1) has no network, no
+//!   Policy and no certificate to check it against, and what an `expose`
+//!   session with it will be is TOBEDECIDED item 8.
 //! * `resp`: matched to our pending initiation by the echoed index and the
 //!   RECV source, then the initiator handshake, L4h2's checks
 //!   ([`decide_initiator_admission`]) and a check that the responder
@@ -121,7 +128,7 @@ use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::admission::{
     HandshakeAdmission, InitiatorAdmission, decide_initiator_admission, decide_responder_admission,
-    resolve_dial_cert,
+    is_unrevoked_roster_member, resolve_dial_cert,
 };
 use crate::identity::LocalIdentity;
 use crate::l4_session::{
@@ -141,6 +148,27 @@ pub const HANDSHAKE_ATTEMPTS: u32 = 3;
 /// How often the router checks the table's timeouts. The shortest of them
 /// is 10 s, so this granularity costs nothing observable.
 const TICK: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// How many docs only sessions this node answers at once, one per peer at most
+/// (protocol.md 5.5). An `init` that would be the ninth is not answered.
+pub const MAX_DOCS_ONLY_SESSIONS: usize = 8;
+
+/// How long a docs only session may live (protocol.md 5.1): the responder ends it
+/// with CLOSE `docs_only` after this, if the push has not ended it sooner. The
+/// initiator side keeps the same limit on its end, so that a responder that never
+/// closes cannot keep an actor of ours alive.
+pub const DOCS_ONLY_LIFETIME: Duration = Duration::from_secs(30);
+
+/// The table slot docs only sessions live in. A docs only session is installed
+/// under this network instead of the real one, so that it can neither become the
+/// `current` or `candidate` session of the peer's real slot (a relay can forge the
+/// `src` of any Roster member, and its `init` would then displace that member's
+/// real session) nor abandon an initiation of ours to that peer. All bytes `0xff`
+/// is not the encoding of any owner key (a NetworkId is a canonical Ed25519 public
+/// key), so no real network shares it.
+fn docs_only_slot() -> NetworkId {
+    NetworkId::from([0xff; 32])
+}
 
 /// How many non-L4 events may wait for [`RouterParts::passthrough`]'s
 /// reader before further ones are dropped.
@@ -224,6 +252,14 @@ pub enum EnsureError {
     /// call 1.
     #[error("the handshake was refused")]
     Refused,
+    /// The peer completed the handshake but admitted this node for a
+    /// `menzil:docs` push only (`docs_only` in its handshake payload, protocol.md
+    /// 5.1): it holds no certificate for this node's key, does not list it in its
+    /// Policy, or its documents have expired. No session for streams exists; the
+    /// docs only session itself is announced on [`RouterParts::ready`] with
+    /// [`SessionReady::docs_only`] set, for whoever pushes (TODO.md L4j S6).
+    #[error("the peer admitted this node for a documents push only")]
+    DocsOnly,
     /// The L3 attachment ended while the caller waited.
     #[error("the relay session ended while waiting")]
     Detached,
@@ -263,6 +299,12 @@ pub struct SessionReady {
     pub peer_roster_seq: Option<u64>,
     /// As [`Self::peer_roster_seq`], for the Policy.
     pub peer_policy_seq: Option<u64>,
+    /// A docs only session (protocol.md 5.1): the responder admitted the initiator
+    /// for one `menzil:docs` push only. Such a session is never handed to
+    /// [`RouterHandle::ensure_session`] callers, is not in the peer's real slot and
+    /// ends at [`DOCS_ONLY_LIFETIME`] at the latest. Serve it with the docs only
+    /// rules (the responder), or push on it (the initiator).
+    pub docs_only: bool,
 }
 
 impl std::fmt::Debug for SessionReady {
@@ -274,6 +316,7 @@ impl std::fmt::Debug for SessionReady {
             .field("epoch", &self.epoch)
             .field("peer_roster_seq", &self.peer_roster_seq)
             .field("peer_policy_seq", &self.peer_policy_seq)
+            .field("docs_only", &self.docs_only)
             .finish_non_exhaustive()
     }
 }
@@ -523,6 +566,9 @@ struct Entry {
     /// `sender_index` and Noise message, to tell a repeat of it from a new
     /// one (see [`Engine::is_repeated_init`]). `None` for one we initiated.
     init: Option<(u32, Vec<u8>)>,
+    /// A docs only session: installed under [`docs_only_slot`], tracked in
+    /// [`Engine::docs_only`], never offered for sending or promoted.
+    docs_only: bool,
     /// Dropped with the entry, which is what ends the actor as
     /// `EpochEnded` (the actor treats a closed sender like a message).
     _epoch_ended: oneshot::Sender<()>,
@@ -580,6 +626,20 @@ struct Engine {
     /// The tags of the sessions [`Self::on_stop`] closed whose actors have
     /// not reported their end yet.
     closing: HashSet<u64>,
+    /// The docs only sessions in the table, by index.
+    docs_only: HashMap<SessionIndex, DocsOnly>,
+    /// How many responder handshakes got as far as the Noise work (the Diffie
+    /// Hellmans), for the test that pins that a stranger costs none.
+    #[cfg(test)]
+    handshakes_started: usize,
+}
+
+/// What the engine keeps about a docs only session beside its table entry.
+struct DocsOnly {
+    role: Role,
+    peer: NodeId,
+    /// When the session is ended with CLOSE `docs_only`.
+    deadline: Instant,
 }
 
 impl Engine {
@@ -623,6 +683,9 @@ impl Engine {
             next_generation: 1,
             stopping: false,
             closing: HashSet::new(),
+            docs_only: HashMap::new(),
+            #[cfg(test)]
+            handshakes_started: 0,
         }
     }
 
@@ -648,7 +711,9 @@ impl Engine {
         // Dropping each entry drops its `epoch_ended` sender, which ends
         // the actor as `EpochEnded`; no CLOSE is worth trying over a dead
         // L3 session.
-        drop(self.table.remove_where(|entry| entry.epoch == epoch));
+        for (index, _) in self.table.remove_where(|entry| entry.epoch == epoch) {
+            self.docs_only.remove(&index);
+        }
         drop(
             self.table
                 .remove_pending_where(|pending| pending.epoch == epoch),
@@ -740,6 +805,7 @@ impl Engine {
             return;
         };
         let (peer, network) = (handle.peer, handle.network);
+        let was_docs_only = self.docs_only.remove(&index).is_some();
         if let Some(held_back) = self.overflow_log.allow(now.instant) {
             // The records are charged before they are decrypted, so what
             // piled up may be junk a relay forwarded under this peer's name:
@@ -756,7 +822,9 @@ impl Engine {
             code: ErrorCode::RateLimited,
             msg: "unread inbound data passed the session budget".to_string(),
         }));
-        self.fail_orphans(&(peer, network));
+        if !was_docs_only {
+            self.fail_orphans(&(peer, network));
+        }
     }
 
     // ------------------------------------------------------------------
@@ -805,12 +873,25 @@ impl Engine {
             tracing::debug!(%src, "ignored an L4 init for a network we hold no documents for");
             return;
         };
+        // Before any Diffie Hellman (protocol.md 5.1): the RECV `src` must be an
+        // unrevoked member in the Roster we hold, expired or not. A stranger and a
+        // revoked member alike get silence and cost nothing but their entry in the
+        // table's rate limit. What an unrevoked member may then do is decided
+        // below, and per stream later.
+        if !is_unrevoked_roster_member(&self.rosters, &network_id, &src) {
+            tracing::debug!(%src, "ignored an L4 init from a node that is not an unrevoked Roster member");
+            return;
+        }
         let msg1_copy = noise_msg1.clone();
         let init = E2eFrame::Init {
             sender_index,
             network_id,
             noise_msg1,
         };
+        #[cfg(test)]
+        {
+            self.handshakes_started += 1;
+        }
         let Ok(hs) = E2eResponderHandshake::start(
             &self.identity.x25519_private,
             src,
@@ -820,7 +901,7 @@ impl Engine {
             tracing::debug!(%src, "ignored an L4 init that did not decrypt");
             return;
         };
-        let no_grant = match decide_responder_admission(
+        let docs_only = match decide_responder_admission(
             &self.policies,
             &self.rosters,
             &network_id,
@@ -830,8 +911,11 @@ impl Engine {
             self.local_cert_serial,
             now.unix,
         ) {
-            HandshakeAdmission::Allow => false,
-            HandshakeAdmission::AllowNoGrant => true,
+            HandshakeAdmission::Allow | HandshakeAdmission::AllowNoGrant => false,
+            HandshakeAdmission::DocsOnly { reason } => {
+                tracing::debug!(%src, ?reason, "answering an L4 init docs only");
+                true
+            }
             HandshakeAdmission::Refuse { reason } => {
                 // Local logs only; nothing goes on the wire (L4h2, judgment
                 // call 1).
@@ -839,6 +923,10 @@ impl Engine {
                 return;
             }
         };
+        if docs_only {
+            self.answer_docs_only(attached, src, network_id, sender_index, msg1_copy, hs, now);
+            return;
+        }
         let Ok(index) = self.table.reserve_index(now.instant) else {
             return;
         };
@@ -854,36 +942,9 @@ impl Engine {
             return;
         };
 
-        if no_grant {
-            // protocol.md 5.1: a member with no grant gets the handshake
-            // and then CLOSE `no_grant`, and learns nothing further. That
-            // session exists only to say so, so it is never installed:
-            // installed, it would become the slot's candidate, abandon an
-            // initiation of our own that the peer's `init` beat in the
-            // tie-break, and answer the callers waiting on it with a
-            // session that is closed at once. The index stays reserved
-            // until the table takes it back, so no live session is given
-            // it meanwhile and the peer's frames for it find nothing.
-            let (entry, _acceptor, task) = self.make_session(
-                index,
-                src,
-                network_id,
-                Origin::Answered {
-                    sender_index,
-                    noise_msg1: msg1_copy,
-                },
-                transport,
-                attached,
-            );
-            self.send(src, attached.epoch, resp.encode());
-            tokio::spawn(task);
-            entry.handle.close(Some(CloseReason {
-                code: ErrorCode::NoGrant,
-                msg: "no grant".to_string(),
-            }));
-            return;
-        }
-
+        // A member with no grant is admitted like any other (protocol.md 5.1):
+        // what it may open is decided per stream, and `menzil:docs` needs no
+        // grant at all.
         let (entry, acceptor, task) = self.make_session(
             index,
             src,
@@ -894,6 +955,7 @@ impl Engine {
             },
             transport,
             attached,
+            false,
         );
         let handle = entry.handle.clone();
         match self.table.install_session(
@@ -930,6 +992,111 @@ impl Engine {
             acceptor,
             peer_roster_seq: None,
             peer_policy_seq: None,
+            docs_only: false,
+        });
+    }
+
+    /// Completes the handshake of an `init` that [`decide_responder_admission`]
+    /// admitted docs only (protocol.md 5.1, 5.5), `docs_only: true` in the payload.
+    /// The session is installed under [`docs_only_slot`], at most
+    /// [`MAX_DOCS_ONLY_SESSIONS`] of them and one per peer (a new `init` of a peer
+    /// replaces its earlier docs only session), and is ended with CLOSE
+    /// `docs_only` at [`DOCS_ONLY_LIFETIME`] (or sooner by whoever serves the
+    /// push). Past the cap the `init` is not answered.
+    #[allow(clippy::too_many_arguments)]
+    fn answer_docs_only(
+        &mut self,
+        attached: Attached,
+        src: NodeId,
+        network_id: NetworkId,
+        sender_index: u32,
+        noise_msg1: Vec<u8>,
+        hs: E2eResponderHandshake,
+        now: Now,
+    ) {
+        let (Some(roster_seq), Some(policy_seq)) = (
+            self.rosters.seq(&network_id),
+            self.policies.seq(&network_id),
+        ) else {
+            return;
+        };
+        let others = self
+            .docs_only
+            .values()
+            .filter(|docs| docs.role == Role::Responder && docs.peer != src)
+            .count();
+        if others >= MAX_DOCS_ONLY_SESSIONS {
+            if let Some(held_back) = self.refused_log.allow(now.instant) {
+                tracing::warn!(%src, held_back, "ignored an L4 init: the docs only sessions are full");
+            }
+            return;
+        }
+        let Ok(index) = self.table.reserve_index(now.instant) else {
+            return;
+        };
+        let Ok((transport, resp)) = hs.finish_docs_only(
+            self.identity.node_cert.clone(),
+            roster_seq,
+            policy_seq,
+            vec![E2E_PROTO_TAG],
+            index,
+            attached.limits.max_record,
+        ) else {
+            self.table.release_index(index);
+            return;
+        };
+        let (entry, acceptor, task) = self.make_session(
+            index,
+            src,
+            network_id,
+            Origin::Answered {
+                sender_index,
+                noise_msg1,
+            },
+            transport,
+            attached,
+            true,
+        );
+        let handle = entry.handle.clone();
+        match self.table.install_session(
+            index,
+            src,
+            docs_only_slot(),
+            Role::Responder,
+            entry,
+            now.instant,
+        ) {
+            Ok(installed) => {
+                if let Some((old, superseded)) = installed.superseded_candidate {
+                    self.docs_only.remove(&old);
+                    superseded.handle.close(None);
+                }
+            }
+            Err((error, _)) => {
+                tracing::warn!(%src, ?error, "could not install a docs only session");
+                return;
+            }
+        }
+        self.docs_only.insert(
+            index,
+            DocsOnly {
+                role: Role::Responder,
+                peer: src,
+                deadline: now.instant + DOCS_ONLY_LIFETIME,
+            },
+        );
+        self.send(src, attached.epoch, resp.encode());
+        tokio::spawn(task);
+        let _ = self.ready.send(SessionReady {
+            peer: src,
+            network_id,
+            role: Role::Responder,
+            epoch: attached.epoch,
+            handle,
+            acceptor,
+            peer_roster_seq: None,
+            peer_policy_seq: None,
+            docs_only: true,
         });
     }
 
@@ -948,8 +1115,9 @@ impl Engine {
         sender_index: u32,
         noise_msg1: &[u8],
     ) -> bool {
-        let slot = self.table.slot(src, network);
-        [slot.candidate, slot.current]
+        let real = self.table.slot(src, network);
+        let aside = self.table.slot(src, &docs_only_slot());
+        [real.candidate, real.current, aside.candidate]
             .into_iter()
             .flatten()
             .filter_map(|index| self.table.get(index))
@@ -1129,8 +1297,31 @@ impl Engine {
             self.fail_waiters(&key, EnsureError::Refused);
             return;
         }
-        let (entry, acceptor, task) =
-            self.make_session(index, peer, network, Origin::Initiated, transport, attached);
+        if payload.docs_only {
+            // The peer will take a push and nothing else. The session is no use
+            // to the callers waiting for one, so they are told so, and it is kept
+            // aside (protocol.md 5.1, 5.5) for whoever pushes on it.
+            self.keep_docs_only_initiator(
+                attached,
+                index,
+                peer,
+                network,
+                transport,
+                (payload.roster_seq, payload.policy_seq),
+                now,
+            );
+            self.fail_waiters(&key, EnsureError::DocsOnly);
+            return;
+        }
+        let (entry, acceptor, task) = self.make_session(
+            index,
+            peer,
+            network,
+            Origin::Initiated,
+            transport,
+            attached,
+            false,
+        );
         let handle = entry.handle.clone();
         match self
             .table
@@ -1157,8 +1348,73 @@ impl Engine {
             acceptor,
             peer_roster_seq: Some(payload.roster_seq),
             peer_policy_seq: Some(payload.policy_seq),
+            docs_only: false,
         });
         self.resolve_waiters(&key, &handle);
+    }
+
+    /// Installs the initiator side of a docs only session under
+    /// [`docs_only_slot`] and announces it on `ready` with `docs_only` set.
+    #[allow(clippy::too_many_arguments)]
+    fn keep_docs_only_initiator(
+        &mut self,
+        attached: Attached,
+        index: SessionIndex,
+        peer: NodeId,
+        network: NetworkId,
+        transport: menzil_e2e::E2eTransport,
+        peer_seqs: (u64, u64),
+        now: Now,
+    ) {
+        let (entry, acceptor, task) = self.make_session(
+            index,
+            peer,
+            network,
+            Origin::Initiated,
+            transport,
+            attached,
+            true,
+        );
+        let handle = entry.handle.clone();
+        match self.table.install_session(
+            index,
+            peer,
+            docs_only_slot(),
+            Role::Initiator,
+            entry,
+            now.instant,
+        ) {
+            Ok(installed) => {
+                if let Some((old, replaced)) = installed.replaced {
+                    self.docs_only.remove(&old);
+                    replaced.handle.close(None);
+                }
+            }
+            Err((error, _)) => {
+                tracing::warn!(%peer, ?error, "could not install a docs only session");
+                return;
+            }
+        }
+        self.docs_only.insert(
+            index,
+            DocsOnly {
+                role: Role::Initiator,
+                peer,
+                deadline: now.instant + DOCS_ONLY_LIFETIME,
+            },
+        );
+        tokio::spawn(task);
+        let _ = self.ready.send(SessionReady {
+            peer,
+            network_id: network,
+            role: Role::Initiator,
+            epoch: attached.epoch,
+            handle,
+            acceptor,
+            peer_roster_seq: Some(peer_seqs.0),
+            peer_policy_seq: Some(peer_seqs.1),
+            docs_only: true,
+        });
     }
 
     // ------------------------------------------------------------------
@@ -1178,6 +1434,7 @@ impl Engine {
         }
         drop(self.table.remove_pending_where(|_| true));
         self.unsent.clear();
+        self.docs_only.clear();
         for (index, entry) in self.table.remove_where(|_| true) {
             self.closing.insert(tag_of(entry.generation, index));
             entry.handle.close(Some(reason.clone()));
@@ -1202,6 +1459,14 @@ impl Engine {
             return;
         }
         let key = (entry.peer, entry.network);
+        if entry.docs_only {
+            // Never promoted, and nobody waits on it: only its end matters.
+            if matches!(notice, SessionNotice::Ended) {
+                self.docs_only.remove(&index);
+                self.table.remove(index);
+            }
+            return;
+        }
         match notice {
             SessionNotice::FirstRecord => {
                 let handle = entry.handle.clone();
@@ -1222,6 +1487,7 @@ impl Engine {
 
     fn on_tick(&mut self, now: Now) {
         self.flush_unsent();
+        self.end_docs_only_sessions(now.instant);
         let expired = self.table.expire(now.instant);
         for (_, pending) in expired.pending {
             let key = (pending.peer, pending.network);
@@ -1254,8 +1520,12 @@ impl Engine {
             }
             self.fail_waiters(&key, EnsureError::Timeout);
         }
-        for (_, candidate) in expired.candidates {
+        for (index, candidate) in expired.candidates {
             let key = (candidate.peer, candidate.network);
+            if self.docs_only.remove(&index).is_some() {
+                candidate.handle.close(Some(docs_only_close()));
+                continue;
+            }
             candidate.handle.close(None);
             self.fail_orphans(&key);
         }
@@ -1264,12 +1534,31 @@ impl Engine {
         self.expire_waiters(now.instant);
     }
 
+    /// Ends the docs only sessions whose time is up with CLOSE `docs_only`
+    /// (protocol.md 5.1).
+    fn end_docs_only_sessions(&mut self, now: Instant) {
+        let due: Vec<SessionIndex> = self
+            .docs_only
+            .iter()
+            .filter(|(_, docs)| now >= docs.deadline)
+            .map(|(&index, _)| index)
+            .collect();
+        for index in due {
+            self.docs_only.remove(&index);
+            if let Some(Removed::Session { handle, .. }) = self.table.remove(index) {
+                handle.handle.close(Some(docs_only_close()));
+            }
+        }
+    }
+
     // ------------------------------------------------------------------
     // Helpers
     // ------------------------------------------------------------------
 
     /// Builds the actor for an established handshake. The caller installs
     /// the returned entry in the table and spawns the task.
+    // The flag is one more independent input of a session's construction.
+    #[allow(clippy::too_many_arguments)]
     fn make_session(
         &mut self,
         index: SessionIndex,
@@ -1278,6 +1567,7 @@ impl Engine {
         origin: Origin,
         transport: menzil_e2e::E2eTransport,
         attached: Attached,
+        docs_only: bool,
     ) -> (Entry, L4SessionAcceptor, SessionTask) {
         let (mode, init) = match origin {
             Origin::Initiated => (Mode::Client, None),
@@ -1315,6 +1605,7 @@ impl Engine {
                 epoch: attached.epoch,
                 generation,
                 init,
+                docs_only,
                 _epoch_ended: epoch_ended_tx,
             },
             acceptor,
@@ -1499,6 +1790,14 @@ async fn run_router(
         if !events_open && !commands_open {
             break;
         }
+    }
+}
+
+/// The CLOSE that ends a docs only session (protocol.md 5.1).
+fn docs_only_close() -> CloseReason {
+    CloseReason {
+        code: ErrorCode::DocsOnly,
+        msg: "docs only session over".to_string(),
     }
 }
 

@@ -389,6 +389,11 @@ impl TestNode {
 /// A router for `party` over `stores`, attached to `net` at the first
 /// epoch.
 async fn node(net: &Net, party: &Party, stores: &Stores) -> TestNode {
+    node_with(net, party, stores, TableConfig::default()).await
+}
+
+/// [`node`], with another session table configuration.
+async fn node_with(net: &Net, party: &Party, stores: &Stores, table: TableConfig) -> TestNode {
     let (events_tx, events_rx) = mpsc::channel(1024);
     let (outbound_tx, mut outbound_rx) = mpsc::channel::<OutboundSend>(1024);
     net.inner.lock().unwrap().links.insert(
@@ -406,7 +411,8 @@ async fn node(net: &Net, party: &Party, stores: &Stores) -> TestNode {
         stores.rosters.clone(),
         SendBudgets::new(),
     )
-    .unwrap();
+    .unwrap()
+    .with_table_config(table);
     let parts = new_router(config, outbound_tx, events_rx);
     let task = tokio::spawn(parts.task);
 
@@ -519,6 +525,17 @@ impl Manual {
                 && let Ok(frame) = E2eFrame::decode(&payload)
             {
                 return (src, frame);
+            }
+        }
+    }
+
+    /// The next `resp` a router sent this party (the data records a session
+    /// sends right after it are skipped).
+    async fn next_resp(&mut self) -> E2eFrame {
+        loop {
+            let (_, frame) = self.next_frame().await;
+            if matches!(frame, E2eFrame::Resp { .. }) {
+                return frame;
             }
         }
     }
@@ -679,10 +696,11 @@ async fn a_peer_with_no_cert_in_our_policy_cannot_be_dialed() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn a_member_with_no_grant_gets_the_handshake_and_then_close_no_grant() {
+async fn a_member_with_no_grant_gets_a_normal_session() {
     let w = world();
     let (a, b) = (party(), party());
-    // Both are members; nobody has a grant.
+    // Both are members; nobody has a grant. What the peer may open is decided per stream
+    // (protocol.md 5.3), so the handshake is not the place that says no.
     let stores = w.stores(&[&a, &b], vec![]);
     let net = Net::new();
     let mut na = node(&net, &a, &stores).await;
@@ -690,27 +708,25 @@ async fn a_member_with_no_grant_gets_the_handshake_and_then_close_no_grant() {
 
     ensure(&na, b.id, w.network)
         .await
-        .expect("the handshake itself succeeds");
+        .expect("the handshake succeeds and the session is handed out");
     let mut ready_a = na.next_ready().await;
-    let reason = timeout(Duration::from_secs(5), ready_a.acceptor.closed())
-        .await
-        .expect("the session must end");
-    assert!(
-        matches!(
-            reason.as_ref(),
-            EndReason::PeerClosed {
-                code: ErrorCode::NoGrant,
-                ..
-            }
-        ),
-        "{reason:?}"
-    );
-    // B reports no session to serve.
-    assert!(
-        timeout(Duration::from_millis(200), nb.ready.recv())
-            .await
-            .is_err()
-    );
+    let mut ready_b = nb.next_ready().await;
+    assert!(!ready_a.docs_only && !ready_b.docs_only);
+    assert_eq!(ready_b.role, Role::Responder);
+    exchange_bytes(
+        &ready_a.handle,
+        &mut ready_a.acceptor,
+        &mut ready_b.acceptor,
+    )
+    .await;
+    // It stays up: nothing closes it `no_grant`.
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    exchange_bytes(
+        &ready_a.handle,
+        &mut ready_a.acceptor,
+        &mut ready_b.acceptor,
+    )
+    .await;
 }
 
 #[tokio::test(start_paused = true)]
@@ -1550,11 +1566,11 @@ async fn replaying_the_init_of_a_live_session_brings_up_nothing() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn a_no_grant_init_does_not_abandon_our_own_valid_initiation() {
-    // Both dial at once and only the higher node has a grant (on the
-    // lower). The lower node's `init` wins the tie-break at the higher
-    // one, which answers it no-grant. That answer must not cost the higher
-    // node its own initiation: its grant was never the problem.
+async fn a_member_with_no_grant_that_wins_the_tie_break_shares_its_session_with_both_callers() {
+    // Both dial at once and only the higher node has a grant (on the lower). The lower node's
+    // `init` wins the tie-break at the higher one. A member with no grant is admitted like any
+    // other now, so the higher node answers it with a normal session, abandons its own
+    // initiation, and both callers get that one session.
     let w = world();
     let (p, q) = (party(), party());
     let (low, high) = if p.id.as_ref() < q.id.as_ref() {
@@ -1583,44 +1599,32 @@ async fn a_no_grant_init_does_not_abandon_our_own_valid_initiation() {
     }
     net.release();
 
-    // The lower node's own call completes (it won the tie-break, got the
-    // handshake) and its session is then closed `no_grant`.
     let low_outcome = timeout(Duration::from_secs(60), from_low)
         .await
         .unwrap()
         .unwrap();
     assert!(low_outcome.is_ok(), "{:?}", low_outcome.err());
-    let mut ready_low = n_low.next_ready().await;
-    let reason = timeout(Duration::from_secs(5), ready_low.acceptor.closed())
-        .await
-        .unwrap();
-    assert!(
-        matches!(
-            reason.as_ref(),
-            EndReason::PeerClosed {
-                code: ErrorCode::NoGrant,
-                ..
-            }
-        ),
-        "{reason:?}"
-    );
-
-    // The higher node's call is not told its session ended: its `init` was
-    // ignored by the lower node (which kept its own), so it is retried, and
-    // the retry is answered.
     let high_outcome = timeout(Duration::from_secs(120), from_high)
         .await
         .unwrap()
         .unwrap();
     assert!(high_outcome.is_ok(), "{:?}", high_outcome.err());
-    let mut at_high = n_high.next_ready().await;
     let mut at_low = n_low.next_ready().await;
+    let mut at_high = n_high.next_ready().await;
+    assert_eq!(at_low.role, Role::Initiator);
+    assert_eq!(at_high.role, Role::Responder);
     exchange_bytes(
         &high_outcome.unwrap(),
         &mut at_high.acceptor,
         &mut at_low.acceptor,
     )
     .await;
+    assert!(
+        timeout(Duration::from_millis(300), n_high.ready.recv())
+            .await
+            .is_err(),
+        "no second session"
+    );
 }
 
 #[tokio::test(start_paused = true)]
@@ -2122,4 +2126,793 @@ async fn sessions_get_the_default_inbound_budget_unless_the_router_is_told_other
         session.handle.inbound_budget(),
         crate::l4_session::L4_INBOUND_BUDGET_PER_SESSION
     );
+}
+
+// ----------------------------------------------------------------------
+// Docs only admission (protocol.md 5.1, 5.5; TODO.md L4j S5)
+// ----------------------------------------------------------------------
+
+impl World {
+    /// The Roster of `members` at seq 1, changed by `edit`.
+    fn roster_edit(&self, members: &[&Party], edit: impl FnOnce(&mut RosterBody)) -> Roster {
+        let mut body = self.roster(members).decode().unwrap();
+        edit(&mut body);
+        Roster::sign(&self.owner, &body).unwrap()
+    }
+
+    /// Stores holding the Roster of `roster_members` and a Policy that lists
+    /// `policy_members` and carries the certs of `certs_of`.
+    fn split_stores(
+        &self,
+        roster_members: &[&Party],
+        policy_members: &[&Party],
+        certs_of: &[&Party],
+    ) -> Stores {
+        let rosters = RosterStore::new();
+        rosters.set(&self.roster(roster_members)).unwrap();
+        let policies = PolicyStore::new();
+        policies
+            .set(&self.policy(policy_members, certs_of, vec![]))
+            .unwrap();
+        Stores {
+            policies: Arc::new(policies),
+            rosters: Arc::new(rosters),
+        }
+    }
+}
+
+/// [`Manual::finish`], keeping the responder's handshake payload too.
+fn finish_with_payload(
+    hs: E2eInitiatorHandshake,
+    resp: &E2eFrame,
+) -> (E2eTransport, u32, menzil_proto::E2eHandshakePayload) {
+    let E2eFrame::Resp { sender_index, .. } = resp else {
+        panic!("not a resp: {resp:?}");
+    };
+    let (transport, payload, _static) = hs.finish(resp, 65_535).unwrap();
+    (transport, *sender_index, payload)
+}
+
+/// Every record the router has sent `manual` within `within`, decrypted with
+/// `transport`, oldest first.
+async fn drain_records(
+    manual: &mut Manual,
+    transport: &mut E2eTransport,
+    within: Duration,
+) -> Vec<E2eDataBody> {
+    let mut bodies = Vec::new();
+    let end = tokio::time::Instant::now() + within;
+    while let Ok(Some(event)) = tokio::time::timeout_at(end, manual.mailbox.recv()).await {
+        if let SessionEvent::Record { record, .. } = event
+            && let Record::Recv { payload, .. } = *record
+            && let Ok(E2eFrame::Data {
+                counter,
+                ciphertext,
+                ..
+            }) = E2eFrame::decode(&payload)
+        {
+            bodies.push(transport.decrypt_data(counter, &ciphertext).unwrap());
+        }
+    }
+    bodies
+}
+
+fn is_docs_only_close(body: &E2eDataBody) -> bool {
+    matches!(
+        body,
+        E2eDataBody::Close {
+            code: ErrorCode::DocsOnly,
+            ..
+        }
+    )
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_stranger_or_a_revoked_member_costs_no_handshake_work_and_gets_no_answer() {
+    let w = world();
+    let (b, member, revoked, stranger) = (party(), party(), party(), party());
+    let rosters = RosterStore::new();
+    rosters
+        .set(&w.roster_edit(&[&b, &member, &revoked], |body| {
+            body.revoked = vec![menzil_proto::RevokedMember {
+                node_id: revoked.id,
+                since: 0,
+            }];
+        }))
+        .unwrap();
+    // The Policy knows all of them, certs included: only the Roster says no.
+    let policies = PolicyStore::new();
+    policies
+        .set(&w.policy(&[&b, &member, &revoked], &[&b, &member, &revoked], vec![]))
+        .unwrap();
+    let stores = Stores {
+        policies: Arc::new(policies),
+        rosters: Arc::new(rosters),
+    };
+    let mut d = driven(&b, &stores, NodeId::from([0xAA; 32]), 7);
+    d.engine.on_attached(Epoch::first(), LIMITS);
+    let net = Net::new();
+    let send_init = |d: &mut Driven, from: &Party| {
+        let manual = Manual::new(&net, from.clone_for_test());
+        let (_hs, init) = manual.init(&b, w.network, 1);
+        let record = Record::Recv {
+            src: from.id,
+            e2e_proto: E2E_PROTO_TAG,
+            flags: 0,
+            payload: init.encode(),
+        };
+        assert!(
+            d.engine
+                .on_record(Epoch::first(), record, Now::capture())
+                .is_none()
+        );
+    };
+
+    send_init(&mut d, &stranger);
+    send_init(&mut d, &revoked);
+    assert_eq!(
+        d.engine.handshakes_started, 0,
+        "neither of them may cost a Diffie Hellman"
+    );
+    assert!(d.outbound.try_recv().is_err(), "and neither gets a frame");
+
+    // The control: a listed, unrevoked member does start one and is answered.
+    send_init(&mut d, &member);
+    assert_eq!(d.engine.handshakes_started, 1);
+    assert!(d.outbound.try_recv().is_ok());
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_member_the_policy_cannot_vouch_for_is_answered_docs_only_and_the_others_are_not() {
+    let w = world();
+    let (r, m, known) = (party(), party(), party());
+    // R's Roster lists M, but its (older) Policy has no cert for M.
+    let stores = w.split_stores(&[&r, &m, &known], &[&r, &m, &known], &[&r, &known]);
+    let net = Net::new();
+    let mut nr = node(&net, &r, &stores).await;
+    let mut m = Manual::new(&net, m);
+    let mut known = Manual::new(&net, known);
+
+    let (hs, init) = m.init(&r, w.network, 1);
+    net.inject(m.party.id, r.id, &init);
+    let (_, resp) = m.next_frame().await;
+    let (_, _, payload) = finish_with_payload(hs, &resp);
+    assert!(payload.docs_only, "no cert for M's key: docs only");
+    let at_r = nr.next_ready().await;
+    assert!(at_r.docs_only);
+    assert_eq!(at_r.role, Role::Responder);
+    assert_eq!(at_r.peer, m.party.id);
+
+    let (hs, init) = known.init(&r, w.network, 2);
+    net.inject(known.party.id, r.id, &init);
+    let (_, resp) = known.next_frame().await;
+    let (_, _, payload) = finish_with_payload(hs, &resp);
+    assert!(!payload.docs_only, "a member the Policy vouches for");
+    assert!(!nr.next_ready().await.docs_only);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_node_with_expired_documents_answers_its_members_docs_only() {
+    let w = world();
+    let (r, m) = (party(), party());
+    let rosters = RosterStore::new();
+    rosters
+        .set(&w.roster_edit(&[&r, &m], |body| body.expires = 1))
+        .unwrap();
+    let policies = PolicyStore::new();
+    policies
+        .set(&w.policy(&[&r, &m], &[&r, &m], vec![]))
+        .unwrap();
+    let stores = Stores {
+        policies: Arc::new(policies),
+        rosters: Arc::new(rosters),
+    };
+    let net = Net::new();
+    let mut nr = node(&net, &r, &stores).await;
+    let mut m = Manual::new(&net, m);
+
+    let (hs, init) = m.init(&r, w.network, 1);
+    net.inject(m.party.id, r.id, &init);
+    let (_, resp) = m.next_frame().await;
+    let (_, _, payload) = finish_with_payload(hs, &resp);
+    assert!(payload.docs_only);
+    assert!(nr.next_ready().await.docs_only);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_docs_only_session_is_ended_with_close_docs_only_after_thirty_seconds() {
+    let w = world();
+    let (r, m) = (party(), party());
+    let stores = w.split_stores(&[&r, &m], &[&r, &m], &[&r]);
+    let net = Net::new();
+    // The table's own timeout for a session that never sees a record is also thirty seconds;
+    // make it long, so that it is the docs only deadline that ends this one.
+    let long = TableConfig {
+        candidate_timeout: Duration::from_secs(600),
+        ..TableConfig::default()
+    };
+    let mut nr = node_with(&net, &r, &stores, long).await;
+    let mut m = Manual::new(&net, m);
+
+    let (hs, init) = m.init(&r, w.network, 1);
+    net.inject(m.party.id, r.id, &init);
+    let (_, resp) = m.next_frame().await;
+    let (mut transport, _, payload) = finish_with_payload(hs, &resp);
+    assert!(payload.docs_only);
+    let mut at_r = nr.next_ready().await;
+
+    let early = drain_records(&mut m, &mut transport, Duration::from_secs(29)).await;
+    assert!(
+        !early.iter().any(is_docs_only_close),
+        "not before its time: {early:?}"
+    );
+    let late = drain_records(&mut m, &mut transport, Duration::from_secs(3)).await;
+    assert!(
+        late.iter().any(is_docs_only_close),
+        "CLOSE docs_only at thirty seconds: {late:?}"
+    );
+    let reason = timeout(Duration::from_secs(5), at_r.acceptor.closed())
+        .await
+        .expect("the session is over");
+    assert!(
+        matches!(
+            reason.as_ref(),
+            EndReason::ClosedLocally(Some(CloseReason {
+                code: ErrorCode::DocsOnly,
+                ..
+            }))
+        ),
+        "{reason:?}"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn at_most_eight_docs_only_sessions_and_one_per_peer() {
+    let w = world();
+    let r = party();
+    let peers: Vec<Party> = (0..9).map(|_| party()).collect();
+    let mut roster_members: Vec<&Party> = vec![&r];
+    roster_members.extend(peers.iter());
+    let stores = w.split_stores(&roster_members, &roster_members, &[&r]);
+    let net = Net::new();
+    let mut nr = node(&net, &r, &stores).await;
+    let mut manuals: Vec<Manual> = peers
+        .iter()
+        .map(|p| Manual::new(&net, p.clone_for_test()))
+        .collect();
+
+    for (n, manual) in manuals.iter_mut().take(8).enumerate() {
+        let (_hs, init) = manual.init(&r, w.network, n as u32 + 1);
+        net.inject(manual.party.id, r.id, &init);
+        let resp = manual.next_resp().await;
+        assert!(matches!(resp, E2eFrame::Resp { .. }));
+    }
+    assert_eq!(net.count_from(&r.id, "resp"), 8);
+
+    // The ninth peer is not answered.
+    let (_hs, init) = manuals[8].init(&r, w.network, 90);
+    net.inject(manuals[8].party.id, r.id, &init);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(net.count_from(&r.id, "resp"), 8, "the ninth gets silence");
+
+    // A peer that already has one replaces it (one per peer), full table or not.
+    let mut first_ready = nr.next_ready().await;
+    let (_hs, init) = manuals[0].init(&r, w.network, 91);
+    net.inject(manuals[0].party.id, r.id, &init);
+    let resp = manuals[0].next_resp().await;
+    assert!(matches!(resp, E2eFrame::Resp { .. }));
+    let reason = timeout(Duration::from_secs(5), first_ready.acceptor.closed())
+        .await
+        .expect("its first docs only session was replaced");
+    assert!(
+        matches!(reason.as_ref(), EndReason::ClosedLocally(None)),
+        "{reason:?}"
+    );
+
+    // Once the thirty seconds are over the room is back.
+    tokio::time::sleep(Duration::from_secs(35)).await;
+    let (_hs, init) = manuals[8].init(&r, w.network, 92);
+    net.inject(manuals[8].party.id, r.id, &init);
+    let resp = manuals[8].next_resp().await;
+    assert!(matches!(resp, E2eFrame::Resp { .. }));
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_forged_docs_only_session_cannot_displace_the_members_real_one() {
+    // A relay can put any Roster member's NodeId on an `init`. Its handshake can only end docs
+    // only (the member's cert does not match its own key), and that session must not become the
+    // member's real session, not even once the forger's first record has authenticated.
+    let w = world();
+    let (a, b) = (party(), party());
+    let stores = w.stores(&[&a, &b], vec![w.grant(&a, &b)]);
+    let net = Net::new();
+    let mut na = node(&net, &a, &stores).await;
+    let mut nb = node(&net, &b, &stores).await;
+
+    let handle = ensure(&na, b.id, w.network).await.unwrap();
+    let mut at_a = na.next_ready().await;
+    let mut at_b = nb.next_ready().await;
+    exchange_bytes(&handle, &mut at_a.acceptor, &mut at_b.acceptor).await;
+
+    let params: snow::params::NoiseParams = "Noise_IK_25519_ChaChaPoly_BLAKE2s".parse().unwrap();
+    let forger_key = snow::Builder::new(params).generate_keypair().unwrap();
+    let forger_private = <[u8; 32]>::try_from(forger_key.private).unwrap();
+    let (hs, init) = E2eInitiatorHandshake::start(
+        &forger_private,
+        &b.x25519_public,
+        w.network,
+        a.id, // forged
+        b.id,
+        4_000_000,
+    )
+    .unwrap();
+    net.inject(a.id, b.id, &init);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let resp = net
+        .frames("resp")
+        .into_iter()
+        .rev()
+        .find(|f| f.src == b.id && f.dst == a.id)
+        .map(|f| E2eFrame::decode(&f.payload).unwrap())
+        .unwrap();
+    let (mut transport, b_index, payload) = finish_with_payload(hs, &resp);
+    assert!(payload.docs_only);
+    let forged = nb.next_ready().await;
+    assert!(forged.docs_only);
+
+    // The forger's first record authenticates.
+    let first = data_frame(&mut transport, b_index, &E2eDataBody::Keep);
+    net.inject(a.id, b.id, &first);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // The real session is the one B still sends on and receives on.
+    let again = nb.handle.ensure_session(a.id, w.network).await.unwrap();
+    assert_eq!(net.count_from(&b.id, "init"), 0);
+    let mut opened = again.open_stream().await.unwrap();
+    opened.write_all(b"ping").await.unwrap();
+    let mut accepted = timeout(Duration::from_secs(5), at_a.acceptor.accept())
+        .await
+        .expect("A's real session still takes B's stream")
+        .unwrap();
+    let mut buf = [0u8; 4];
+    accepted.read_exact(&mut buf).await.unwrap();
+    exchange_bytes(&handle, &mut at_a.acceptor, &mut at_b.acceptor).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_initiator_admitted_docs_only_is_told_so_and_never_handed_the_session() {
+    let w = world();
+    let (r, m) = (party(), party());
+    // M knows R completely; R's older Policy has no cert for M.
+    let m_stores = w.stores(&[&r, &m], vec![]);
+    let r_stores = w.split_stores(&[&r, &m], &[&r, &m], &[&r]);
+    let net = Net::new();
+    let mut nm = node(&net, &m, &m_stores).await;
+    let mut nr = node(&net, &r, &r_stores).await;
+
+    assert_eq!(
+        ensure(&nm, r.id, w.network).await.err(),
+        Some(EnsureError::DocsOnly)
+    );
+    let mut at_m = nm.next_ready().await;
+    let at_r = nr.next_ready().await;
+    assert!(at_m.docs_only && at_r.docs_only);
+    assert_eq!(at_m.role, Role::Initiator);
+    assert_eq!(at_m.peer_roster_seq, Some(1));
+
+    // It is not in the peer's real slot: the next request dials afresh.
+    assert_eq!(
+        ensure(&nm, r.id, w.network).await.err(),
+        Some(EnsureError::DocsOnly)
+    );
+    assert_eq!(net.count_from(&m.id, "init"), 2);
+
+    // And it ends within its thirty seconds, with no one to end it for us.
+    timeout(Duration::from_secs(40), at_m.acceptor.closed())
+        .await
+        .expect("a docs only session does not live forever");
+}
+
+// ----------------------------------------------------------------------
+// The wiring of sessions to menzil:docs, over routers
+// ----------------------------------------------------------------------
+
+impl World {
+    /// A Roster and a Policy of `seq` that a node holding older ones accepts: fresh dates, the
+    /// owner's signature.
+    fn fresh_pair(
+        &self,
+        seq: u64,
+        roster_members: &[&Party],
+        policy_members: &[&Party],
+        certs_of: &[&Party],
+    ) -> (Roster, Policy) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let mut roster = self.roster(roster_members).decode().unwrap();
+        roster.seq = seq;
+        roster.issued = now - 1_000;
+        roster.expires = now + 10 * 86_400;
+        let mut policy = self
+            .policy(policy_members, certs_of, vec![])
+            .decode()
+            .unwrap();
+        policy.seq = seq;
+        policy.issued = now - 1_000;
+        policy.expires = now + 10 * 86_400;
+        (
+            Roster::sign(&self.owner, &roster).unwrap(),
+            Policy::sign(&self.owner, &policy).unwrap(),
+        )
+    }
+}
+
+fn stores_from(roster: &Roster, policy: &Policy) -> Stores {
+    let rosters = RosterStore::new();
+    rosters.set(roster).unwrap();
+    let policies = PolicyStore::new();
+    policies.set(policy).unwrap();
+    Stores {
+        policies: Arc::new(policies),
+        rosters: Arc::new(rosters),
+    }
+}
+
+fn docs_params(network: NetworkId) -> crate::docs::DocsParams {
+    crate::docs::DocsParams {
+        network_id: network,
+        now: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs(),
+        deadline: crate::docs::STREAM_DEADLINE,
+    }
+}
+
+/// Serves `ready` the way a running node does.
+fn serve(
+    ready: SessionReady,
+    stores: &Stores,
+    me: NodeId,
+    gate: &Arc<crate::docs_access::DocsGate>,
+) {
+    crate::node::serve_session(
+        ready,
+        &stores.policies,
+        &stores.rosters,
+        me,
+        &Arc::new(crate::node::RefuseAll),
+        gate,
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_member_with_no_grant_fetches_documents_over_its_session_and_nothing_else_is_served() {
+    let w = world();
+    let (a, b) = (party(), party());
+    // Nobody has a grant. B holds seq 2, A seq 1.
+    let (r1, p1) = w.fresh_pair(1, &[&a, &b], &[&a, &b], &[&a, &b]);
+    let (r2, p2) = w.fresh_pair(2, &[&a, &b], &[&a, &b], &[&a, &b]);
+    let (stores_a, stores_b) = (stores_from(&r1, &p1), stores_from(&r2, &p2));
+    let net = Net::new();
+    let mut na = node(&net, &a, &stores_a).await;
+    let mut nb = node(&net, &b, &stores_b).await;
+    let gate = crate::docs_access::DocsGate::new(Default::default());
+
+    let handle = ensure(&na, b.id, w.network).await.unwrap();
+    serve(na.next_ready().await, &stores_a, a.id, &gate);
+    serve(nb.next_ready().await, &stores_b, b.id, &gate);
+
+    let mut docs = crate::l5_stream::open(&handle, crate::docs_service(), None)
+        .await
+        .expect("menzil:docs needs no grant");
+    let sink = crate::docs::StoreDocs::new(&stores_a.rosters, &stores_a.policies, w.network);
+    let report = crate::docs::fetch(&mut docs, sink, &docs_params(w.network))
+        .await
+        .unwrap();
+    assert!(report.adopted.roster && report.adopted.policy);
+    assert_eq!(stores_a.rosters.seq(&w.network), Some(2));
+
+    match crate::l5_stream::open(&handle, "tcp:ssh".parse().unwrap(), None).await {
+        Err(crate::l5_stream::OpenStreamError::Refused { code, .. }) => {
+            assert_eq!(code, ErrorCode::NoGrant);
+        }
+        other => panic!("expected no_grant, got {:?}", other.map(|_| ())),
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_docs_only_push_is_adopted_then_the_session_ends_and_the_next_one_is_a_full_session() {
+    let w = world();
+    let (r, m) = (party(), party());
+    // R is behind: its Policy has no cert for M. M holds seq 2, which has.
+    let (r1, _) = w.fresh_pair(1, &[&r, &m], &[&r, &m], &[&r]);
+    let p1 = w.policy(&[&r, &m], &[&r], vec![]);
+    let (r2, p2) = w.fresh_pair(2, &[&r, &m], &[&r, &m], &[&r, &m]);
+    let (stores_r, stores_m) = (stores_from(&r1, &p1), stores_from(&r2, &p2));
+    let net = Net::new();
+    let mut nr = node(&net, &r, &stores_r).await;
+    let mut nm = node(&net, &m, &stores_m).await;
+    let gate = crate::docs_access::DocsGate::new(Default::default());
+
+    assert_eq!(
+        ensure(&nm, r.id, w.network).await.err(),
+        Some(EnsureError::DocsOnly)
+    );
+    let mut at_m = nm.next_ready().await;
+    let at_r = nr.next_ready().await;
+    assert!(at_m.docs_only && at_r.docs_only);
+    let handle = at_m.handle.clone();
+    let mut closed = std::pin::pin!(at_m.acceptor.closed());
+    // (the acceptor is polled below, so that the CLOSE is read)
+    serve(at_r, &stores_r, r.id, &gate);
+
+    let source = crate::docs::StoreDocs::new(&stores_m.rosters, &stores_m.policies, w.network);
+    let bundle = crate::docs::bundle_to_push(&source, docs_params(w.network).now);
+    let mut docs = crate::l5_stream::open(&handle, crate::docs_service(), None)
+        .await
+        .expect("a member may push on a docs only session");
+    let result = crate::docs::push(&mut docs, &bundle, &docs_params(w.network))
+        .await
+        .unwrap();
+    assert_eq!(result.roster, menzil_proto::docs::Outcome::Adopted);
+    assert_eq!(result.policy, menzil_proto::docs::Outcome::Adopted);
+    assert_eq!(stores_r.rosters.seq(&w.network), Some(2));
+    docs.close().await.unwrap();
+
+    // R ends the session once it has answered, well before the thirty seconds.
+    let reason = timeout(Duration::from_secs(5), &mut closed)
+        .await
+        .expect("the session ends with the push");
+    assert!(
+        matches!(
+            reason.as_ref(),
+            EndReason::PeerClosed {
+                code: ErrorCode::DocsOnly,
+                ..
+            }
+        ),
+        "{reason:?}"
+    );
+
+    // R's Policy now vouches for M: the next handshake is an ordinary one.
+    assert!(ensure(&nm, r.id, w.network).await.is_ok());
+    assert!(!nr.next_ready().await.docs_only);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_docs_only_session_serves_no_fetch_and_no_other_stream() {
+    let w = world();
+    let (r, m) = (party(), party());
+    // R holds seq 2 (so a fetch would have something to send) but cannot vouch for M's key.
+    let (r2, _) = w.fresh_pair(2, &[&r, &m], &[&r, &m], &[&r]);
+    let mut p2 = w
+        .fresh_pair(2, &[&r, &m], &[&r, &m], &[&r])
+        .1
+        .decode()
+        .unwrap();
+    // M even holds a grant on R, which a full session would honour.
+    p2.grants = vec![w.grant(&m, &r)];
+    let p2 = Policy::sign(&w.owner, &p2).unwrap();
+    let stores_r = stores_from(&r2, &p2);
+    let (r1, p1) = w.fresh_pair(1, &[&r, &m], &[&r, &m], &[&r, &m]);
+    let stores_m = stores_from(&r1, &p1);
+    let net = Net::new();
+    let mut nr = node(&net, &r, &stores_r).await;
+    let mut nm = node(&net, &m, &stores_m).await;
+    let gate = crate::docs_access::DocsGate::new(Default::default());
+
+    assert_eq!(
+        ensure(&nm, r.id, w.network).await.err(),
+        Some(EnsureError::DocsOnly)
+    );
+    let at_m = nm.next_ready().await;
+    let handle = at_m.handle.clone();
+    serve(nr.next_ready().await, &stores_r, r.id, &gate);
+
+    // Another service: refused, whatever the Policy grants.
+    match crate::l5_stream::open(&handle, "tcp:ssh".parse().unwrap(), None).await {
+        Err(crate::l5_stream::OpenStreamError::Refused { code, .. }) => {
+            assert_eq!(code, ErrorCode::NoGrant);
+        }
+        other => panic!("expected no_grant, got {:?}", other.map(|_| ())),
+    }
+    // A fetch: no document comes back.
+    let mut docs = crate::l5_stream::open(&handle, crate::docs_service(), None)
+        .await
+        .unwrap();
+    let sink = crate::docs::StoreDocs::new(&stores_m.rosters, &stores_m.policies, w.network);
+    let fetched = crate::docs::fetch(&mut docs, sink, &docs_params(w.network)).await;
+    assert!(fetched.is_err(), "{fetched:?}");
+    assert_eq!(stores_m.rosters.seq(&w.network), Some(1));
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_init_the_relay_delivers_twice_is_answered_once_on_a_docs_only_session_too() {
+    let w = world();
+    let (r, m) = (party(), party());
+    let stores = w.split_stores(&[&r, &m], &[&r, &m], &[&r]);
+    let net = Net::new();
+    let mut nr = node(&net, &r, &stores).await;
+    let m = Manual::new(&net, m);
+
+    let (_hs, init) = m.init(&r, w.network, 1);
+    net.inject(m.party.id, r.id, &init);
+    net.inject(m.party.id, r.id, &init); // the same bytes again
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(net.count_from(&r.id, "resp"), 1, "the copy got no answer");
+    assert!(nr.next_ready().await.docs_only);
+    assert!(nr.ready.try_recv().is_err(), "and no second session");
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_engine_keeps_one_entry_per_docs_only_peer_and_forgets_them_with_their_sessions() {
+    let w = world();
+    let (r, m) = (party(), party());
+    let stores = w.split_stores(&[&r, &m], &[&r, &m], &[&r]);
+    let mut counter = 100;
+    let mut d = driven_with(&r, &stores, NodeId::from([0xAA; 32]), 1024, move || {
+        counter += 1;
+        counter
+    });
+    d.engine.on_attached(Epoch::first(), LIMITS);
+    let manual = Manual::new(&Net::new(), m);
+    for n in 1..=3 {
+        let (_hs, init) = manual.init(&r, w.network, n);
+        let record = Record::Recv {
+            src: manual.party.id,
+            e2e_proto: E2E_PROTO_TAG,
+            flags: 0,
+            payload: init.encode(),
+        };
+        assert!(
+            d.engine
+                .on_record(Epoch::first(), record, Now::capture())
+                .is_none()
+        );
+    }
+    assert_eq!(
+        d.engine.docs_only.len(),
+        1,
+        "a new init replaces the peer's docs only session, entry and all"
+    );
+
+    // A session that ends by itself leaves its entry behind no longer than the session.
+    let (&index, _) = d.engine.docs_only.iter().next().unwrap();
+    let generation = d.engine.table.get(index).unwrap().generation;
+    d.engine
+        .on_notice(tag_of(generation, index), SessionNotice::Ended);
+    assert!(d.engine.docs_only.is_empty());
+    assert!(d.engine.table.is_empty());
+
+    // And one that is still there when its time is up is ended by the clock.
+    let (_hs, init) = manual.init(&r, w.network, 9);
+    let record = Record::Recv {
+        src: manual.party.id,
+        e2e_proto: E2E_PROTO_TAG,
+        flags: 0,
+        payload: init.encode(),
+    };
+    d.engine.on_record(Epoch::first(), record, Now::capture());
+    assert_eq!(d.engine.docs_only.len(), 1);
+    let late = Now {
+        instant: Now::capture().instant + DOCS_ONLY_LIFETIME + Duration::from_secs(1),
+        unix: Now::capture().unix,
+    };
+    d.engine.on_tick(late);
+    assert!(d.engine.docs_only.is_empty());
+    assert!(d.engine.table.is_empty());
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_initiator_side_of_a_docs_only_session_takes_no_stream_from_the_responder() {
+    let w = world();
+    let (r, m) = (party(), party());
+    let m_stores = w.stores(&[&r, &m], vec![]);
+    let r_stores = w.split_stores(&[&r, &m], &[&r, &m], &[&r]);
+    let net = Net::new();
+    let mut nm = node(&net, &m, &m_stores).await;
+    let mut nr = node(&net, &r, &r_stores).await;
+    let gate = crate::docs_access::DocsGate::new(Default::default());
+
+    assert_eq!(
+        ensure(&nm, r.id, w.network).await.err(),
+        Some(EnsureError::DocsOnly)
+    );
+    let at_r = nr.next_ready().await;
+    let r_handle = at_r.handle.clone();
+    serve(nm.next_ready().await, &m_stores, m.id, &gate);
+    // R is the one that serves the push; here it plays a responder that opens a stream anyway.
+    match crate::l5_stream::open(&r_handle, crate::docs_service(), None).await {
+        Err(crate::l5_stream::OpenStreamError::Refused { code, .. }) => {
+            assert_eq!(code, ErrorCode::NoGrant);
+        }
+        other => panic!("expected no_grant, got {:?}", other.map(|_| ())),
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_initiator_ends_its_docs_only_session_itself_when_the_responder_never_does() {
+    let w = world();
+    let (r, m) = (party(), party());
+    let m_stores = w.stores(&[&r, &m], vec![]);
+    let r_stores = w.split_stores(&[&r, &m], &[&r, &m], &[&r]);
+    let net = Net::new();
+    let mut nm = node(&net, &m, &m_stores).await;
+    let _nr = node(&net, &r, &r_stores).await;
+
+    assert_eq!(
+        ensure(&nm, r.id, w.network).await.err(),
+        Some(EnsureError::DocsOnly)
+    );
+    let mut at_m = nm.next_ready().await;
+    // R goes silent: its CLOSE docs_only, and everything else, never arrives.
+    net.set_up(&m.id, false);
+    let reason = timeout(Duration::from_secs(35), at_m.acceptor.closed())
+        .await
+        .expect("ended by its own deadline, not by the dead peer timer");
+    assert!(
+        matches!(
+            reason.as_ref(),
+            EndReason::ClosedLocally(Some(CloseReason {
+                code: ErrorCode::DocsOnly,
+                ..
+            }))
+        ),
+        "{reason:?}"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_forged_docs_only_init_does_not_abandon_our_own_initiation_to_that_peer() {
+    // The higher node dials the lower one, which stays silent for now. Someone puts the lower
+    // node's NodeId on an `init` with a key of its own: it is answered docs only, and that must
+    // not cost the higher node the initiation it has out.
+    let w = world();
+    let (p, q) = (party(), party());
+    let (low, high) = if p.id.as_ref() < q.id.as_ref() {
+        (p, q)
+    } else {
+        (q, p)
+    };
+    let stores = w.stores(&[&low, &high], vec![w.grant(&high, &low)]);
+    let net = Net::new();
+    let nh = node(&net, &high, &stores).await;
+    let mut manual_low = Manual::new(&net, low.clone_for_test());
+
+    let asking = {
+        let handle = nh.handle.clone();
+        let (peer, network) = (low.id, w.network);
+        tokio::spawn(async move { handle.ensure_session(peer, network).await })
+    };
+    let (_, own_init) = manual_low.next_frame().await;
+
+    let params: snow::params::NoiseParams = "Noise_IK_25519_ChaChaPoly_BLAKE2s".parse().unwrap();
+    let forger_key = snow::Builder::new(params).generate_keypair().unwrap();
+    let (_hs, forged) = E2eInitiatorHandshake::start(
+        &<[u8; 32]>::try_from(forger_key.private).unwrap(),
+        &high.x25519_public,
+        w.network,
+        low.id, // forged
+        high.id,
+        4_000_000,
+    )
+    .unwrap();
+    net.inject(low.id, high.id, &forged);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(net.count_from(&high.id, "resp"), 1, "answered docs only");
+
+    // The real low node now answers the real initiation.
+    let hs = E2eResponderHandshake::start(&low.x25519_private, high.id, low.id, &own_init).unwrap();
+    let (_transport, resp) = hs
+        .finish(low.cert.clone(), 1, 1, vec![E2E_PROTO_TAG], 4242, 65_535)
+        .unwrap();
+    net.inject(low.id, high.id, &resp);
+    let outcome = timeout(Duration::from_secs(5), asking)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(outcome.is_ok(), "{:?}", outcome.err());
 }

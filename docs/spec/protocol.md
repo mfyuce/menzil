@@ -258,7 +258,7 @@ A channel is opened by a yamux stream whose OPEN names a `udp:` service or `egre
 
 ### 5.5 Documents end to end
 
-Status: the library is built and tested (framing, `serve`, `fetch`, `push`, the sinks; L4j slice S4). It is not yet wired into the node: the OPEN checks, the rate limits, docs only sessions and the triggers below are not built, and TOBEDECIDED 18 (b) and (c) are still open.
+Status: the node serves it (L4j slice S5): the framing, `serve`, `fetch`, `push` and the sinks, the OPEN checks, the rate limits and docs only sessions are built and tested. The triggers below (fetch and push when a session comes up, the issuer push, the catch up and expiry timers, the steward renew loop) and the new handshake after an adopted push are not built (slices S6 and S7).
 
 `menzil:docs` is served by every node and named in no grant: any unrevoked member of the session's network, by the responder's Roster, may open it, checked again on every OPEN. It is never configured as a local service.
 

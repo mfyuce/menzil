@@ -341,11 +341,56 @@ impl E2eResponderHandshake {
     /// see its own `encrypt_data` docs for why this crate enforces one
     /// at all.
     pub fn finish(
+        self,
+        responder_node_cert: NodeCert,
+        roster_seq: u64,
+        policy_seq: u64,
+        e2e_protos: Vec<u8>,
+        own_index: u32,
+        max_record: u32,
+    ) -> Result<(E2eTransport, E2eFrame), E2eError> {
+        self.finish_with(
+            responder_node_cert,
+            roster_seq,
+            policy_seq,
+            e2e_protos,
+            false,
+            own_index,
+            max_record,
+        )
+    }
+
+    /// As [`Self::finish`], with `docs_only: true` in the payload (protocol.md
+    /// 5.1: the responder admitted the initiator for a `menzil:docs` push
+    /// only).
+    pub fn finish_docs_only(
+        self,
+        responder_node_cert: NodeCert,
+        roster_seq: u64,
+        policy_seq: u64,
+        e2e_protos: Vec<u8>,
+        own_index: u32,
+        max_record: u32,
+    ) -> Result<(E2eTransport, E2eFrame), E2eError> {
+        self.finish_with(
+            responder_node_cert,
+            roster_seq,
+            policy_seq,
+            e2e_protos,
+            true,
+            own_index,
+            max_record,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn finish_with(
         mut self,
         responder_node_cert: NodeCert,
         roster_seq: u64,
         policy_seq: u64,
         e2e_protos: Vec<u8>,
+        docs_only: bool,
         own_index: u32,
         max_record: u32,
     ) -> Result<(E2eTransport, E2eFrame), E2eError> {
@@ -355,6 +400,7 @@ impl E2eResponderHandshake {
             roster_seq,
             policy_seq,
             e2e_protos,
+            docs_only,
         };
         let noise_msg2 = write(&mut self.hs, &payload.encode()?)?;
         let frame = E2eFrame::Resp {

@@ -62,12 +62,14 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+use menzil_e2e::Role;
 use menzil_proto::{ErrorCode, NetworkId, NodeId, OpenTarget, ProtoError, ServiceId};
-use menzil_stream::{OpenRefusal, OpenRequest, ServiceHandler, Stream};
+use menzil_stream::{Authorizer, OpenDecision, OpenRefusal, OpenRequest, ServiceHandler, Stream};
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 
 use crate::admission::PolicyAuthorizer;
+use crate::docs_access::{DocsGate, DocsLimits, SessionHandler};
 use crate::l4_router::{
     EnsureError, RouterConfig, RouterHandle, RouterParts, SessionReady, new_router,
 };
@@ -221,6 +223,7 @@ impl Node {
                 rosters.clone(),
                 local_node_id,
                 Arc::new(handler),
+                DocsGate::new(DocsLimits::default()),
             )),
         ];
         Ok(Self {
@@ -343,22 +346,15 @@ impl Drop for Node {
     }
 }
 
-/// [`ServiceHandler`] over a handler shared by every session's accept loop.
-struct SharedHandler<H>(Arc<H>);
+/// Refuses every OPEN, for a session on which the peer has no business opening anything.
+struct DenyAll;
 
-impl<H: ServiceHandler<Stream> + Sync> ServiceHandler<Stream> for SharedHandler<H> {
-    type Opened = H::Opened;
-    type Handling = H::Handling;
-
-    fn open(
-        &self,
-        request: &OpenRequest,
-    ) -> impl std::future::Future<Output = Result<Self::Opened, OpenRefusal>> + Send {
-        self.0.open(request)
-    }
-
-    fn handle(&self, stream: Stream, request: OpenRequest, opened: Self::Opened) -> Self::Handling {
-        self.0.handle(stream, request, opened)
+impl Authorizer for DenyAll {
+    fn authorize(&self, _request: &OpenRequest) -> OpenDecision {
+        OpenDecision::Deny(OpenRefusal {
+            code: ErrorCode::NoGrant,
+            msg: "no grant".to_string(),
+        })
     }
 }
 
@@ -370,22 +366,75 @@ async fn serve_sessions<H>(
     rosters: Arc<RosterStore>,
     local_node_id: NodeId,
     handler: Arc<H>,
+    gate: Arc<DocsGate>,
 ) where
     H: ServiceHandler<Stream> + Send + Sync + 'static,
     H::Handling: Send + 'static,
 {
     while let Some(session) = ready.recv().await {
+        serve_session(session, &policies, &rosters, local_node_id, &handler, &gate);
+    }
+}
+
+/// Starts the accept loop of one session.
+///
+/// An ordinary session is authorized against the Policy plus the `menzil:docs`
+/// exemption and served by [`SessionHandler`] in front of `handler`. A docs only
+/// session this node answered takes one `menzil:docs` push and nothing else, and
+/// is closed with CLOSE `docs_only` once that stream is over; one this node
+/// initiated (the peer admitted it docs only) takes no stream at all.
+pub(crate) fn serve_session<H>(
+    session: SessionReady,
+    policies: &Arc<PolicyStore>,
+    rosters: &Arc<RosterStore>,
+    local_node_id: NodeId,
+    handler: &Arc<H>,
+    gate: &Arc<DocsGate>,
+) where
+    H: ServiceHandler<Stream> + Send + Sync + 'static,
+    H::Handling: Send + 'static,
+{
+    let SessionReady {
+        network_id,
+        mut acceptor,
+        handle,
+        role,
+        docs_only,
+        ..
+    } = session;
+    let authorizer =
+        PolicyAuthorizer::new(policies.clone(), rosters.clone(), network_id, local_node_id);
+    if docs_only && role == Role::Initiator {
+        tokio::spawn(async move {
+            accept_loop(&mut acceptor, DenyAll, RefuseAll).await;
+        });
+    } else if docs_only {
+        let handler = SessionHandler::docs_only(
+            Arc::clone(handler),
+            gate.clone(),
+            policies.clone(),
+            rosters.clone(),
+            move || {
+                handle.close(Some(CloseReason {
+                    code: ErrorCode::DocsOnly,
+                    msg: "docs only session over".to_string(),
+                }));
+            },
+        );
+        let authorizer = authorizer.docs_only();
+        tokio::spawn(async move {
+            accept_loop(&mut acceptor, authorizer, handler).await;
+        });
+    } else {
         // The handle is dropped here, with the rest of `session`: the
         // router's table holds its own clone for as long as the session is
         // the one in use.
-        let SessionReady {
-            network_id,
-            mut acceptor,
-            ..
-        } = session;
-        let authorizer =
-            PolicyAuthorizer::new(policies.clone(), rosters.clone(), network_id, local_node_id);
-        let handler = SharedHandler(Arc::clone(&handler));
+        let handler = SessionHandler::full(
+            Arc::clone(handler),
+            gate.clone(),
+            policies.clone(),
+            rosters.clone(),
+        );
         tokio::spawn(async move {
             accept_loop(&mut acceptor, authorizer, handler).await;
         });

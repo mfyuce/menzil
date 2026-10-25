@@ -233,7 +233,7 @@ fn decode_body<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T, ProtoE
 }
 
 /// `CBOR{ v: 1, node_cert: NodeCert, roster_seq: u64, policy_seq: u64,
-/// e2e_protos: [u8] }` (protocol.md 5.1). See this module's doc comment:
+/// e2e_protos: [u8], docs_only: bool }` (protocol.md 5.1; `docs_only` optional). See this module's doc comment:
 /// carried in `resp` only, not `init`. Unsigned (not a
 /// [`crate::signed::Signed`] body — its authenticity comes from the
 /// Noise transcript, not a CBOR-level signature) and, like
@@ -255,6 +255,15 @@ pub struct E2eHandshakePayload {
     pub policy_seq: u64,
     /// `e2e_proto` tags the responder supports (protocol.md 5.1).
     pub e2e_protos: Vec<u8>,
+    /// Set by a responder that completed the handshake but admitted the
+    /// initiator for a `menzil:docs` push only (protocol.md 5.1, 5.5). Optional
+    /// on the wire: absent means `false`, and `false` is never written.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub docs_only: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 impl E2eHandshakePayload {
@@ -608,9 +617,28 @@ mod tests {
             roster_seq: 3,
             policy_seq: 7,
             e2e_protos: vec![0x01],
+            docs_only: false,
         };
         let encoded = payload.encode().unwrap();
         assert_eq!(E2eHandshakePayload::decode(&encoded).unwrap(), payload);
+    }
+
+    #[test]
+    fn handshake_payload_docs_only_round_trips_and_false_is_not_written() {
+        let mut payload = E2eHandshakePayload {
+            v: crate::PROTOCOL_VERSION,
+            node_cert: sample_cert(),
+            roster_seq: 3,
+            policy_seq: 7,
+            e2e_protos: vec![0x01],
+            docs_only: false,
+        };
+        let plain = payload.encode().unwrap();
+        payload.docs_only = true;
+        let flagged = payload.encode().unwrap();
+        assert!(flagged.len() > plain.len(), "false must be left out");
+        assert!(E2eHandshakePayload::decode(&flagged).unwrap().docs_only);
+        assert!(!E2eHandshakePayload::decode(&plain).unwrap().docs_only);
     }
 
     #[test]

@@ -418,7 +418,7 @@ impl PolicyStore {
 /// there, not fixed as part of this item since it is a different crate's
 /// already-shipped code) would silently honor whichever entry happens to
 /// come first, which could be the stale, lower one.
-fn roster_standing(roster: &RosterBody, node_id: &NodeId) -> Result<u32, ErrorCode> {
+pub(crate) fn roster_standing(roster: &RosterBody, node_id: &NodeId) -> Result<u32, ErrorCode> {
     if roster.revoked.iter().any(|r| &r.node_id == node_id) {
         return Err(ErrorCode::Revoked);
     }

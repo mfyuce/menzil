@@ -48,9 +48,12 @@
 //!    not a dependency here) already exposes the initiator's static key
 //!    before `resp` is written precisely so a caller can refuse before
 //!    paying to complete the handshake for a peer with no real standing.
-//!    The already-mandated grant-check answer stays the one case that
-//!    gets an explicit wire reply, reusing it rather than inventing a
-//!    parallel "membership failed" code.
+//!    The one exception is the `docs_only: true` handshake (TODO.md L4j
+//!    S5): a peer the Roster lists as an unrevoked member but the Policy
+//!    cannot vouch for completes the handshake and may push documents on
+//!    it ([`HandshakeAdmission::DocsOnly`]). The old handshake-time CLOSE
+//!    `no_grant` is gone: a member with no grant gets a normal session and
+//!    is refused per stream.
 //! 2. **Whether the initiator also checks the responder's own standing**
 //!    (5.1's "both... are unrevoked members" is stated as the
 //!    responder's check on the initiator; nothing symmetric is stated for
@@ -133,11 +136,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use ed25519_dalek::VerifyingKey;
 use menzil_proto::{
     E2eHandshakePayload, ErrorCode, NetworkId, NodeCert, NodeCertBody, NodeId, ProtoError,
-    X25519PublicKey,
+    ServiceId, ServiceKind, X25519PublicKey,
 };
 use menzil_stream::{Authorizer, OpenDecision, OpenRefusal, OpenRequest};
 
-use crate::policy_store::PolicyStore;
+use crate::policy_store::{PolicyStore, roster_standing};
 use crate::roster_store::RosterStore;
 
 /// Verifies `cert`'s self-signature against its own claimed `node_id`
@@ -257,30 +260,51 @@ pub fn resolve_dial_cert(
         .max_by_key(|body| body.serial)
 }
 
-/// What protocol.md 5.1's responder-side checks, plus its handshake-time
-/// grant gate (`PolicyStore::has_grant` with `service: None`), decide
-/// about one just-read `init` — before `resp` is ever written. See this
-/// module's own doc comment, point 1, for why a failed check answers
-/// silently rather than on the wire.
+/// What protocol.md 5.1's responder-side checks decide about one just-read
+/// `init`, before `resp` is written. See this module's own doc comment, point
+/// 1, for why a failed check answers silently rather than on the wire.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HandshakeAdmission {
     /// Every check passed and a grant exists: complete the handshake
     /// (write `resp`) and proceed normally.
     Allow,
     /// Every check passed but no grant exists for this initiator on this
-    /// node (protocol.md 5.1): complete the handshake, then immediately
-    /// answer with a `data` record of kind CLOSE `no_grant` — the one
-    /// case protocol.md gives an explicit wire answer for.
+    /// node (protocol.md 5.1): complete the handshake and install a normal
+    /// session. What the peer may open is decided per stream (5.3): every
+    /// OPEN but `menzil:docs` is refused `no_grant`.
     AllowNoGrant,
-    /// A cert, membership, or serial check failed, for either side — see
-    /// this module's doc comment on checking "both" sides' standing.
-    /// Never write `resp`. `reason` is for this caller's own local logs
-    /// only — see this module's own doc comment, point 1; it must never
-    /// reach the wire.
+    /// The initiator is an unrevoked member in the held Roster but cannot be
+    /// admitted: no certificate in the Policy matches the handshake key, it
+    /// is not in the Policy, or the held documents have expired. Complete the
+    /// handshake with `docs_only: true` and accept one `menzil:docs` push
+    /// (protocol.md 5.1, 5.5). `reason` is for local logs only.
+    DocsOnly {
+        /// Why the initiator could not be admitted, for local diagnostics.
+        reason: ErrorCode,
+    },
+    /// A revocation, a serial below the floor, or this node's own standing
+    /// failed. Never write `resp`. `reason` is for this caller's own local
+    /// logs only; it must never reach the wire.
     Refuse {
         /// Why, for local diagnostics only.
         reason: ErrorCode,
     },
+}
+
+/// Whether `node_id` is listed in the held Roster of `network_id` and not
+/// revoked there, expired or not. This is the cheap check the responder makes
+/// on the RECV `src` before any Diffie Hellman (protocol.md 5.1), and the one
+/// `menzil:docs` repeats on every OPEN (5.5). Expiry is deliberately not part
+/// of it: a member of an expired Roster is exactly who a docs only push is
+/// for.
+pub fn is_unrevoked_roster_member(
+    rosters: &RosterStore,
+    network_id: &NetworkId,
+    node_id: &NodeId,
+) -> bool {
+    rosters
+        .body(network_id)
+        .is_some_and(|roster| roster_standing(&roster, node_id).is_ok())
 }
 
 /// Decides [`HandshakeAdmission`] for an `init` whose Noise message 1 has
@@ -296,6 +320,13 @@ pub enum HandshakeAdmission {
 /// cert serial (from its own [`crate::LocalIdentity`]) — this module's
 /// doc comment explains why the responder's own standing is checked here
 /// too, not only the initiator's.
+///
+/// The order, cheap and decisive first: the initiator's Roster standing (not
+/// listed or revoked: refuse); this node's own standing (revoked, not listed
+/// or a stale serial: refuse); a resolvable cert below `min_serial` (refuse);
+/// then the cases that only cost the initiator a push: expired documents, no
+/// cert for the negotiated key, either side missing from the Policy (docs only); then the grant
+/// (allow, or allow with no grant).
 // 8 genuinely independent scalar inputs (shared context plus both sides' own
 // identity) — a struct bundling two of them purely to dodge this count would be
 // ceremony this crate otherwise avoids, not a real grouping.
@@ -310,32 +341,71 @@ pub fn decide_responder_admission(
     responder_cert_serial: u32,
     now: u64,
 ) -> HandshakeAdmission {
-    let Some(cert) = resolve_member_cert(
+    let (Some(roster), Some(policy)) = (rosters.body(network_id), policies.body(network_id)) else {
+        return HandshakeAdmission::Refuse {
+            reason: ErrorCode::UnknownNetwork,
+        };
+    };
+
+    let initiator_min_serial = match roster_standing(&roster, initiator_node_id) {
+        Ok(min_serial) => min_serial,
+        Err(reason) => return HandshakeAdmission::Refuse { reason },
+    };
+
+    match roster_standing(&roster, responder_node_id) {
+        Ok(min_serial) if responder_cert_serial >= min_serial => {}
+        Ok(_) => {
+            return HandshakeAdmission::Refuse {
+                reason: ErrorCode::StaleSerial,
+            };
+        }
+        Err(reason) => return HandshakeAdmission::Refuse { reason },
+    }
+
+    let cert = resolve_member_cert(
         policies,
         network_id,
         initiator_node_id,
         initiator_static,
         now,
-    ) else {
-        return HandshakeAdmission::Refuse {
-            reason: ErrorCode::BadCert,
-        };
-    };
-
-    if let Err(reason) =
-        policies.check_membership(rosters, network_id, initiator_node_id, cert.serial, now)
+    );
+    if let Some(cert) = &cert
+        && cert.serial < initiator_min_serial
     {
-        return HandshakeAdmission::Refuse { reason };
+        return HandshakeAdmission::Refuse {
+            reason: ErrorCode::StaleSerial,
+        };
     }
 
-    if let Err(reason) = policies.check_membership(
-        rosters,
-        network_id,
-        responder_node_id,
-        responder_cert_serial,
-        now,
-    ) {
-        return HandshakeAdmission::Refuse { reason };
+    if roster.expires <= now || policy.expires <= now {
+        return HandshakeAdmission::DocsOnly {
+            reason: ErrorCode::RosterExpired,
+        };
+    }
+    if cert.is_none() {
+        return HandshakeAdmission::DocsOnly {
+            reason: ErrorCode::BadCert,
+        };
+    }
+    if !policy
+        .members
+        .iter()
+        .any(|member| &member.node_id == initiator_node_id)
+    {
+        return HandshakeAdmission::DocsOnly {
+            reason: ErrorCode::NotMember,
+        };
+    }
+    // A node the Roster lists but its own (older) Policy does not yet: it is
+    // the one that needs a push, so it takes one.
+    if !policy
+        .members
+        .iter()
+        .any(|member| &member.node_id == responder_node_id)
+    {
+        return HandshakeAdmission::DocsOnly {
+            reason: ErrorCode::NotMember,
+        };
     }
 
     if policies.has_grant(
@@ -423,6 +493,17 @@ pub fn decide_initiator_admission(
     }
 }
 
+/// The service id of the documents service (protocol.md 5.5): served by every
+/// node, named in no grant.
+pub fn docs_service() -> ServiceId {
+    ServiceId::new(ServiceKind::Menzil, "docs")
+}
+
+/// Whether `service` is `menzil:docs`.
+pub fn is_docs_service(service: &ServiceId) -> bool {
+    service.kind == ServiceKind::Menzil && service.label == "docs"
+}
+
 /// Implements [`menzil_stream::Authorizer`] (protocol.md 5.3's per-OPEN
 /// grant check) against this node's held [`PolicyStore`]/[`RosterStore`]
 /// — the per-OPEN counterpart to [`decide_responder_admission`]'s
@@ -431,12 +512,19 @@ pub fn decide_initiator_admission(
 /// session's own fixed identity (the same two values
 /// [`decide_responder_admission`] used to admit it), supplied once at
 /// construction: an `Authorizer` is per-session, not global.
+///
+/// `menzil:docs` is the exception (protocol.md 5.5): it needs no grant, only
+/// that the peer is an unrevoked member of the session's network in the held
+/// Roster, looked up again on every OPEN so a revocation that arrives
+/// mid session stops the next one. On a docs only session
+/// ([`Self::docs_only`]) nothing else is allowed at all.
 #[derive(Clone)]
 pub struct PolicyAuthorizer {
     policies: Arc<PolicyStore>,
     rosters: Arc<RosterStore>,
     network_id: NetworkId,
     to_node: NodeId,
+    docs_only: bool,
 }
 
 impl PolicyAuthorizer {
@@ -453,7 +541,22 @@ impl PolicyAuthorizer {
             rosters,
             network_id,
             to_node,
+            docs_only: false,
         }
+    }
+
+    /// Narrows this authorizer to a docs only session (protocol.md 5.1):
+    /// `menzil:docs` for a Roster member, and every other service refused.
+    pub fn docs_only(mut self) -> Self {
+        self.docs_only = true;
+        self
+    }
+
+    fn no_grant() -> OpenDecision {
+        OpenDecision::Deny(OpenRefusal {
+            code: ErrorCode::NoGrant,
+            msg: "no grant".to_string(),
+        })
     }
 }
 
@@ -466,10 +569,21 @@ impl Authorizer for PolicyAuthorizer {
         // would be worse than refusing outright — a red-team review
         // found this was previously unchecked.
         if request.network_id != self.network_id {
-            return OpenDecision::Deny(OpenRefusal {
-                code: ErrorCode::NoGrant,
-                msg: "no grant".to_string(),
-            });
+            return Self::no_grant();
+        }
+        if is_docs_service(&request.service) {
+            return if is_unrevoked_roster_member(
+                &self.rosters,
+                &self.network_id,
+                &request.initiator,
+            ) {
+                OpenDecision::Allow
+            } else {
+                Self::no_grant()
+            };
+        }
+        if self.docs_only {
+            return Self::no_grant();
         }
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -485,10 +599,7 @@ impl Authorizer for PolicyAuthorizer {
         ) {
             OpenDecision::Allow
         } else {
-            OpenDecision::Deny(OpenRefusal {
-                code: ErrorCode::NoGrant,
-                msg: "no grant".to_string(),
-            })
+            Self::no_grant()
         }
     }
 }
@@ -691,7 +802,7 @@ mod tests {
     }
 
     #[test]
-    fn responder_allows_but_closes_a_member_with_no_grant() {
+    fn responder_admits_a_member_with_no_grant_as_a_normal_session() {
         let f = fixture(vec![]);
         assert_eq!(
             decide_responder_admission(
@@ -709,7 +820,7 @@ mod tests {
     }
 
     #[test]
-    fn responder_refuses_silently_when_no_cert_matches_the_negotiated_key() {
+    fn responder_answers_docs_only_when_no_cert_matches_the_negotiated_key() {
         let f = fixture(vec![]);
         let wrong_key = X25519PublicKey::from([0x55u8; 32]);
         assert_eq!(
@@ -723,14 +834,14 @@ mod tests {
                 f.ids.responder_cert_serial,
                 1_000,
             ),
-            HandshakeAdmission::Refuse {
+            HandshakeAdmission::DocsOnly {
                 reason: ErrorCode::BadCert
             }
         );
     }
 
     #[test]
-    fn responder_refuses_silently_when_only_a_different_members_cert_matches_the_key() {
+    fn responder_answers_docs_only_when_only_a_different_members_cert_matches_the_key() {
         // A cert exists for some *other* node (`mallory`) at the same
         // negotiated key as `initiator_static`, with a serial that would
         // satisfy `initiator`'s own `min_serial` if it were wrongly
@@ -771,7 +882,7 @@ mod tests {
                 f.ids.responder_cert_serial,
                 1_000,
             ),
-            HandshakeAdmission::Refuse {
+            HandshakeAdmission::DocsOnly {
                 reason: ErrorCode::BadCert
             },
             "mallory's cert matches the key but not initiator_node_id; it must not be used"
@@ -779,7 +890,7 @@ mod tests {
     }
 
     #[test]
-    fn responder_refuses_silently_when_the_cert_self_signature_is_forged() {
+    fn responder_answers_docs_only_when_the_cert_self_signature_is_forged() {
         let ids = fresh_ids();
         let rosters = RosterStore::new();
         rosters.set(&signed_roster(&ids, 1)).unwrap();
@@ -814,14 +925,14 @@ mod tests {
                 ids.responder_cert_serial,
                 1_000,
             ),
-            HandshakeAdmission::Refuse {
+            HandshakeAdmission::DocsOnly {
                 reason: ErrorCode::BadCert
             }
         );
     }
 
     #[test]
-    fn responder_refuses_silently_when_the_matching_cert_has_expired() {
+    fn responder_answers_docs_only_when_the_matching_cert_has_expired() {
         let f = fixture(vec![]);
         // Replace the fixture's far-future cert with one that already
         // expired, at a higher seq so it actually replaces it.
@@ -845,7 +956,7 @@ mod tests {
                 f.ids.responder_cert_serial,
                 1_000,
             ),
-            HandshakeAdmission::Refuse {
+            HandshakeAdmission::DocsOnly {
                 reason: ErrorCode::BadCert
             }
         );
@@ -985,6 +1096,7 @@ mod tests {
             roster_seq: 1,
             policy_seq: 1,
             e2e_protos: vec![0x01],
+            docs_only: false,
         }
     }
 
@@ -1070,6 +1182,7 @@ mod tests {
             roster_seq: 1,
             policy_seq: 1,
             e2e_protos: vec![],
+            docs_only: false,
         };
         assert_eq!(
             decide_initiator_admission(
@@ -1110,6 +1223,7 @@ mod tests {
             roster_seq: 1,
             policy_seq: 1,
             e2e_protos: vec![],
+            docs_only: false,
         };
 
         // Past the Roster/Policy's own `expires` (4_000_000_000, see
@@ -1169,6 +1283,7 @@ mod tests {
             roster_seq: 1,
             policy_seq: 1,
             e2e_protos: vec![],
+            docs_only: false,
         };
 
         match decide_initiator_admission(
@@ -1276,6 +1391,352 @@ mod tests {
             OpenDecision::Allow => panic!("must not evaluate grants for a different network"),
         }
     }
+    // --- docs only admission, the docs exemption (protocol.md 5.1, 5.5) ----
+
+    /// Replaces the fixture's Roster by `edit` of it at the next seq.
+    fn edit_roster(f: &Fixture, edit: impl FnOnce(&mut menzil_proto::RosterBody)) {
+        let mut body = f.rosters.body(&f.ids.network_id).unwrap().as_ref().clone();
+        body.seq += 1;
+        edit(&mut body);
+        assert!(
+            f.rosters
+                .set(&Roster::sign(&f.ids.owner, &body).unwrap())
+                .unwrap()
+        );
+    }
+
+    /// Replaces the fixture's Policy by `edit` of it at the next seq.
+    fn edit_policy(f: &Fixture, edit: impl FnOnce(&mut menzil_proto::PolicyBody)) {
+        let mut body = f.policies.body(&f.ids.network_id).unwrap().as_ref().clone();
+        body.seq += 1;
+        edit(&mut body);
+        assert!(
+            f.policies
+                .set(&Policy::sign(&f.ids.owner, &body).unwrap())
+                .unwrap()
+        );
+    }
+
+    fn admit(f: &Fixture, now: u64) -> HandshakeAdmission {
+        decide_responder_admission(
+            &f.policies,
+            &f.rosters,
+            &f.ids.network_id,
+            &f.ids.initiator_node_id,
+            &f.ids.initiator_x25519,
+            &f.ids.responder_node_id,
+            f.ids.responder_cert_serial,
+            now,
+        )
+    }
+
+    #[test]
+    fn responder_refuses_a_revoked_initiator_even_with_a_cert_and_a_grant() {
+        let f = fixture(vec![]);
+        let grant = allowing_grant(&f.ids);
+        edit_policy(&f, |body| body.grants = vec![grant]);
+        edit_roster(&f, |body| {
+            body.revoked = vec![menzil_proto::RevokedMember {
+                node_id: f.ids.initiator_node_id,
+                since: 0,
+            }];
+        });
+        assert_eq!(
+            admit(&f, 1_000),
+            HandshakeAdmission::Refuse {
+                reason: ErrorCode::Revoked
+            }
+        );
+    }
+
+    #[test]
+    fn responder_refuses_an_initiator_the_roster_does_not_list() {
+        let f = fixture(vec![]);
+        edit_roster(&f, |body| {
+            body.members
+                .retain(|member| member.node_id != f.ids.initiator_node_id);
+        });
+        assert_eq!(
+            admit(&f, 1_000),
+            HandshakeAdmission::Refuse {
+                reason: ErrorCode::NotMember
+            }
+        );
+    }
+
+    #[test]
+    fn responder_answers_docs_only_when_the_policy_does_not_list_the_initiator() {
+        let f = fixture(vec![]);
+        edit_policy(&f, |body| {
+            body.members
+                .retain(|member| member.node_id != f.ids.initiator_node_id);
+        });
+        assert_eq!(
+            admit(&f, 1_000),
+            HandshakeAdmission::DocsOnly {
+                reason: ErrorCode::NotMember
+            }
+        );
+    }
+
+    #[test]
+    fn responder_answers_docs_only_when_the_policy_does_not_list_itself() {
+        let f = fixture(vec![]);
+        edit_policy(&f, |body| {
+            body.members
+                .retain(|member| member.node_id != f.ids.responder_node_id);
+        });
+        assert_eq!(
+            admit(&f, 1_000),
+            HandshakeAdmission::DocsOnly {
+                reason: ErrorCode::NotMember
+            }
+        );
+    }
+
+    #[test]
+    fn responder_answers_docs_only_once_its_documents_have_expired() {
+        let f = fixture(vec![]);
+        // A cert that outlives the documents, so that expiry is the only thing wrong.
+        let cert = signed_cert(&f.ids, f.ids.initiator_x25519, 0, u64::MAX);
+        edit_policy(&f, |body| body.certs = vec![cert]);
+        assert_eq!(admit(&f, 3_999_999_999), HandshakeAdmission::AllowNoGrant);
+        assert_eq!(
+            admit(&f, 4_000_000_000),
+            HandshakeAdmission::DocsOnly {
+                reason: ErrorCode::RosterExpired
+            }
+        );
+    }
+
+    #[test]
+    fn responder_answers_docs_only_when_only_the_roster_has_expired() {
+        let f = fixture(vec![]);
+        let cert = signed_cert(&f.ids, f.ids.initiator_x25519, 0, u64::MAX);
+        edit_policy(&f, |body| {
+            body.certs = vec![cert];
+            body.expires = 9_000_000_000;
+        });
+        assert_eq!(
+            admit(&f, 4_000_000_001),
+            HandshakeAdmission::DocsOnly {
+                reason: ErrorCode::RosterExpired
+            }
+        );
+    }
+
+    #[test]
+    fn responder_answers_docs_only_when_only_the_policy_has_expired() {
+        let f = fixture(vec![]);
+        let cert = signed_cert(&f.ids, f.ids.initiator_x25519, 0, u64::MAX);
+        edit_roster(&f, |body| body.expires = 9_000_000_000);
+        edit_policy(&f, |body| body.certs = vec![cert]);
+        assert_eq!(
+            admit(&f, 4_000_000_001),
+            HandshakeAdmission::DocsOnly {
+                reason: ErrorCode::RosterExpired
+            }
+        );
+    }
+
+    #[test]
+    fn responder_still_refuses_a_stale_serial_or_a_revoked_self_when_the_documents_expired() {
+        let f = fixture(vec![]);
+        let cert = signed_cert(&f.ids, f.ids.initiator_x25519, 0, u64::MAX);
+        edit_policy(&f, |body| body.certs = vec![cert]);
+        edit_roster(&f, |body| {
+            for member in &mut body.members {
+                if member.node_id == f.ids.initiator_node_id {
+                    member.min_serial = 100;
+                }
+            }
+        });
+        assert_eq!(
+            admit(&f, 5_000_000_000),
+            HandshakeAdmission::Refuse {
+                reason: ErrorCode::StaleSerial
+            },
+            "a certificate below the floor is refused whether or not the documents expired"
+        );
+        edit_roster(&f, |body| {
+            for member in &mut body.members {
+                member.min_serial = 1;
+            }
+            body.revoked = vec![menzil_proto::RevokedMember {
+                node_id: f.ids.responder_node_id,
+                since: 0,
+            }];
+        });
+        assert_eq!(
+            admit(&f, 5_000_000_000),
+            HandshakeAdmission::Refuse {
+                reason: ErrorCode::Revoked
+            },
+            "a node that was revoked itself serves nobody, expired documents or not"
+        );
+    }
+
+    #[test]
+    fn responder_refuses_when_its_own_cert_serial_is_below_the_floor() {
+        let f = fixture(vec![]);
+        edit_roster(&f, |body| {
+            for member in &mut body.members {
+                if member.node_id == f.ids.responder_node_id {
+                    member.min_serial = f.ids.responder_cert_serial + 1;
+                }
+            }
+        });
+        assert_eq!(
+            admit(&f, 1_000),
+            HandshakeAdmission::Refuse {
+                reason: ErrorCode::StaleSerial
+            }
+        );
+    }
+
+    #[test]
+    fn the_roster_member_check_ignores_expiry_and_refuses_revoked_and_unlisted() {
+        let f = fixture(vec![]);
+        let network = f.ids.network_id;
+        assert!(is_unrevoked_roster_member(
+            &f.rosters,
+            &network,
+            &f.ids.initiator_node_id
+        ));
+        assert!(!is_unrevoked_roster_member(
+            &f.rosters,
+            &network,
+            &NodeId::from([0x77; 32])
+        ));
+        assert!(!is_unrevoked_roster_member(
+            &f.rosters,
+            &NetworkId::from([0x11; 32]),
+            &f.ids.initiator_node_id
+        ));
+        edit_roster(&f, |body| {
+            body.expires = 1;
+            body.revoked = vec![menzil_proto::RevokedMember {
+                node_id: f.ids.responder_node_id,
+                since: 0,
+            }];
+        });
+        assert!(
+            is_unrevoked_roster_member(&f.rosters, &network, &f.ids.initiator_node_id),
+            "an expired Roster still lists its unrevoked members"
+        );
+        assert!(!is_unrevoked_roster_member(
+            &f.rosters,
+            &network,
+            &f.ids.responder_node_id
+        ));
+    }
+
+    fn docs_request(ids: &Ids) -> OpenRequest {
+        OpenRequest {
+            service: docs_service(),
+            ..open_request(ids)
+        }
+    }
+
+    fn authorizer_of(f: &Fixture) -> (PolicyAuthorizer, Arc<RosterStore>, Arc<PolicyStore>) {
+        let rosters = Arc::new(RosterStore::new());
+        rosters.set(&signed_roster(&f.ids, 1)).unwrap();
+        let policies = Arc::new(PolicyStore::new());
+        policies
+            .set(&f.policies.get(&f.ids.network_id).unwrap())
+            .unwrap();
+        (
+            PolicyAuthorizer::new(
+                policies.clone(),
+                rosters.clone(),
+                f.ids.network_id,
+                f.ids.responder_node_id,
+            ),
+            rosters,
+            policies,
+        )
+    }
+
+    #[test]
+    fn docs_needs_no_grant_only_an_unrevoked_roster_member() {
+        let f = fixture(vec![]);
+        let (authorizer, rosters, _) = authorizer_of(&f);
+        // No grant at all, so tcp:ssh is refused and menzil:docs is not.
+        assert!(matches!(
+            authorizer.authorize(&open_request(&f.ids)),
+            OpenDecision::Deny(_)
+        ));
+        assert!(matches!(
+            authorizer.authorize(&docs_request(&f.ids)),
+            OpenDecision::Allow
+        ));
+        // Revoked in a Roster that arrives mid session: the next OPEN is refused.
+        let mut body = rosters.body(&f.ids.network_id).unwrap().as_ref().clone();
+        body.seq += 1;
+        body.revoked = vec![menzil_proto::RevokedMember {
+            node_id: f.ids.initiator_node_id,
+            since: 0,
+        }];
+        rosters
+            .set(&Roster::sign(&f.ids.owner, &body).unwrap())
+            .unwrap();
+        match authorizer.authorize(&docs_request(&f.ids)) {
+            OpenDecision::Deny(refusal) => assert_eq!(refusal.code, ErrorCode::NoGrant),
+            OpenDecision::Allow => panic!("a peer revoked mid session must be refused"),
+        }
+    }
+
+    #[test]
+    fn docs_is_refused_to_a_peer_the_roster_does_not_list() {
+        let f = fixture(vec![]);
+        let (authorizer, _, _) = authorizer_of(&f);
+        let mut request = docs_request(&f.ids);
+        request.initiator = NodeId::from([0x77; 32]);
+        assert!(matches!(
+            authorizer.authorize(&request),
+            OpenDecision::Deny(_)
+        ));
+    }
+
+    #[test]
+    fn docs_is_served_from_an_expired_roster_to_its_unrevoked_members() {
+        // The check is about standing, not freshness: a docs only push into an expired node is
+        // what revives a network.
+        let f = fixture(vec![]);
+        let (authorizer, rosters, _) = authorizer_of(&f);
+        let mut body = rosters.body(&f.ids.network_id).unwrap().as_ref().clone();
+        body.seq += 1;
+        body.expires = 1;
+        rosters
+            .set(&Roster::sign(&f.ids.owner, &body).unwrap())
+            .unwrap();
+        assert!(matches!(
+            authorizer.authorize(&docs_request(&f.ids)),
+            OpenDecision::Allow
+        ));
+    }
+
+    #[test]
+    fn a_docs_only_authorizer_serves_docs_and_nothing_a_grant_would_allow() {
+        let f = fixture(vec![]);
+        let grant = allowing_grant(&f.ids);
+        edit_policy(&f, |body| body.grants = vec![grant]);
+        let (full, _, _) = authorizer_of(&f);
+        assert!(matches!(
+            full.authorize(&open_request(&f.ids)),
+            OpenDecision::Allow
+        ));
+        let narrowed = full.docs_only();
+        match narrowed.authorize(&open_request(&f.ids)) {
+            OpenDecision::Deny(refusal) => assert_eq!(refusal.code, ErrorCode::NoGrant),
+            OpenDecision::Allow => panic!("a docs only session serves nothing but menzil:docs"),
+        }
+        assert!(matches!(
+            narrowed.authorize(&docs_request(&f.ids)),
+            OpenDecision::Allow
+        ));
+    }
+
     // --- resolve_dial_cert ---------------------------------------------
 
     fn cert_with(ids: &Ids, serial: u32, not_before: u64, not_after: u64) -> NodeCert {
