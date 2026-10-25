@@ -1805,3 +1805,325 @@ async fn a_standing_watch_wakes_only_for_a_claimed_network_or_missed_notices() {
         "a lagged watch looks at every claimed network"
     );
 }
+
+// --- Round 12: standing is judged per claimed network, and an evicted node hears the Roster ---
+
+/// Reads `client` until its connection ends, giving up after ten seconds.
+async fn read_to_end(client: &mut TestClient) -> Vec<Record> {
+    let mut records = Vec::new();
+    while let Some(record) = tokio::time::timeout(std::time::Duration::from_secs(10), client.recv())
+        .await
+        .expect("the connection must end")
+    {
+        records.push(record);
+    }
+    records
+}
+
+/// Round 12, N1: a node evicted by a Roster that only the store hears of (no DOC fan-out, so the
+/// eviction path is the only way the node can learn it) gets that Roster first, then the ERROR,
+/// then the GOAWAY.
+async fn evicted_node_hears_the_roster(
+    expected: ErrorCode,
+    next: impl FnOnce(&SigningKey, NetworkId, NodeId, NodeId) -> Roster,
+) {
+    let (relay, listener, cert, relay_x25519) = bind_test_relay().await;
+    let addr = listener.local_addr().unwrap();
+    let (x, y) = (generate_identity(), generate_identity());
+    let owner = SigningKey::generate(&mut rand::rng());
+    let network = NetworkId::from(owner.verifying_key().to_bytes());
+    relay
+        .rosters()
+        .set(&evict_roster(
+            &owner,
+            network,
+            1,
+            &[(x.node_id, 1), (y.node_id, 1)],
+            &[],
+        ))
+        .unwrap();
+    let serve_relay = relay.clone();
+    tokio::spawn(async move { serve_relay.serve(&listener).await });
+    let (mut client_x, _) = TestClient::connect(
+        addr,
+        cert,
+        &x,
+        relay_x25519,
+        vec![network],
+        HashMap::from([(network, 1u64)]),
+        1,
+        10,
+    )
+    .await;
+    client_x.send(Record::Attach).await;
+    ping_pong(&mut client_x, [1; 8]).await;
+
+    let next = next(&owner, network, x.node_id, y.node_id);
+    relay.rosters().set(&next).unwrap();
+
+    let mut reassembler = DocReassembler::new();
+    let mut heard = None;
+    let mut kinds = Vec::new();
+    for record in read_to_end(&mut client_x).await {
+        match record {
+            Record::Doc(body) => {
+                assert!(
+                    kinds.is_empty(),
+                    "the DOC comes before the ERROR and the GOAWAY: {kinds:?}"
+                );
+                if let Some((doc_type, bytes)) = reassembler.accept(&body).unwrap() {
+                    assert_eq!(doc_type, DocType::Roster);
+                    heard = Some(Roster::decode_strict(&bytes).unwrap());
+                }
+            }
+            Record::Error(body) => kinds.push(format!("ERROR {:?}", body.code)),
+            Record::Goaway(_) => kinds.push("GOAWAY".to_string()),
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+    assert_eq!(
+        kinds,
+        vec![format!("ERROR {expected:?}"), "GOAWAY".to_string()]
+    );
+    assert_eq!(heard.expect("the Roster was sent").decode().unwrap().seq, 2);
+}
+
+#[tokio::test]
+async fn a_revoked_node_is_sent_the_revoking_roster_before_the_error() {
+    evicted_node_hears_the_roster(ErrorCode::Revoked, |owner, network, x, y| {
+        evict_roster(owner, network, 2, &[(y, 1)], &[x])
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_dropped_node_is_sent_the_dropping_roster_before_the_error() {
+    evicted_node_hears_the_roster(ErrorCode::NotMember, |owner, network, _x, y| {
+        evict_roster(owner, network, 2, &[(y, 1)], &[])
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_node_below_a_raised_min_serial_is_sent_that_roster_before_the_error() {
+    evicted_node_hears_the_roster(ErrorCode::StaleSerial, |owner, network, x, y| {
+        evict_roster(owner, network, 2, &[(x, 2), (y, 1)], &[])
+    })
+    .await;
+}
+
+/// Round 12, M1 setup: network A (the attacker's) and B (the victim `z`'s, with `w`). The
+/// attacker is a member of A only and claims nothing.
+struct SharedRelay {
+    relay: Relay,
+    addr: SocketAddr,
+    cert: CertificateDer<'static>,
+    relay_x25519: X25519PublicKey,
+    owner_a: SigningKey,
+    network_a: NetworkId,
+    owner_b: SigningKey,
+    network_b: NetworkId,
+    attacker: TestIdentity,
+    z: TestIdentity,
+    w: TestIdentity,
+}
+
+async fn shared_relay() -> SharedRelay {
+    let (relay, listener, cert, relay_x25519) = bind_test_relay().await;
+    let addr = listener.local_addr().unwrap();
+    let (attacker, z, w) = (
+        generate_identity(),
+        generate_identity(),
+        generate_identity(),
+    );
+    let owner_a = SigningKey::generate(&mut rand::rng());
+    let network_a = NetworkId::from(owner_a.verifying_key().to_bytes());
+    let owner_b = SigningKey::generate(&mut rand::rng());
+    let network_b = NetworkId::from(owner_b.verifying_key().to_bytes());
+    relay
+        .rosters()
+        .set(&evict_roster(
+            &owner_a,
+            network_a,
+            1,
+            &[(attacker.node_id, 1)],
+            &[],
+        ))
+        .unwrap();
+    relay
+        .rosters()
+        .set(&evict_roster(
+            &owner_b,
+            network_b,
+            1,
+            &[(z.node_id, 1), (w.node_id, 1)],
+            &[],
+        ))
+        .unwrap();
+    let serve_relay = relay.clone();
+    tokio::spawn(async move { serve_relay.serve(&listener).await });
+    SharedRelay {
+        relay,
+        addr,
+        cert,
+        relay_x25519,
+        owner_a,
+        network_a,
+        owner_b,
+        network_b,
+        attacker,
+        z,
+        w,
+    }
+}
+
+impl SharedRelay {
+    async fn connect(
+        &self,
+        who: &TestIdentity,
+        networks: Vec<NetworkId>,
+        seq: u64,
+        ts: u8,
+    ) -> TestClient {
+        let seen = networks.iter().map(|n| (*n, seq)).collect();
+        TestClient::connect(
+            self.addr,
+            self.cert.clone(),
+            who,
+            self.relay_x25519,
+            networks,
+            seen,
+            1,
+            ts,
+        )
+        .await
+        .0
+    }
+
+    /// The attacker pushes a Roster of A that lists `z` with `min_serial` u32::MAX.
+    fn poison(&self, seq: u64) -> Vec<Record> {
+        let roster = evict_roster(
+            &self.owner_a,
+            self.network_a,
+            seq,
+            &[(self.attacker.node_id, 1), (self.z.node_id, u32::MAX)],
+            &[],
+        );
+        menzil_proto::split_into_doc_records(DocType::Roster, &roster.encode())
+    }
+}
+
+/// Round 12, M1: the owner of network A lists a node of network B (never admitted to A) with a
+/// huge `min_serial`. The node, which claims only B, is neither refused at HELLO nor evicted when
+/// B's own Roster is renewed.
+#[tokio::test]
+async fn another_networks_min_serial_neither_evicts_nor_locks_out_a_node() {
+    let shared = shared_relay().await;
+    let mut client_z = shared
+        .connect(&shared.z, vec![shared.network_b], 1, 10)
+        .await;
+    let mut client_w = shared
+        .connect(&shared.w, vec![shared.network_b], 1, 10)
+        .await;
+    client_z.send(Record::Attach).await;
+    client_w.send(Record::Attach).await;
+    ping_pong(&mut client_z, [1; 8]).await;
+    ping_pong(&mut client_w, [2; 8]).await;
+
+    let mut attacker = shared.connect(&shared.attacker, vec![], 1, 10).await;
+    for record in shared.poison(2) {
+        attacker.send(record).await;
+    }
+    ping_pong(&mut attacker, [3; 8]).await;
+    assert_eq!(
+        shared.relay.rosters().seqs().get(&shared.network_a),
+        Some(&2)
+    );
+
+    // B's owner renews, nothing about z changes: the eviction judge looks at B only.
+    let renewal = evict_roster(
+        &shared.owner_b,
+        shared.network_b,
+        2,
+        &[(shared.z.node_id, 1), (shared.w.node_id, 1)],
+        &[],
+    );
+    for record in menzil_proto::split_into_doc_records(DocType::Roster, &renewal.encode()) {
+        client_w.send(record).await;
+    }
+    assert_eq!(client_z.recv_roster_doc().await.decode().unwrap().seq, 2);
+    ping_pong(&mut client_z, [4; 8]).await;
+    assert!(shared.relay.registry.is_attached(&shared.z.node_id));
+
+    // A fresh HELLO claiming B is accepted too.
+    let mut again = shared
+        .connect(&shared.z, vec![shared.network_b], 2, 20)
+        .await;
+    again.send(Record::Attach).await;
+    ping_pong(&mut again, [5; 8]).await;
+}
+
+/// Round 12, M1 and the lagged watch: a burst of the attacker's Rosters makes the victim's
+/// watch miss notices, which re-judges it; it is in standing in the one network it claimed and
+/// stays.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_burst_of_other_networks_rosters_does_not_evict_an_honest_node() {
+    let shared = shared_relay().await;
+    let mut client_z = shared
+        .connect(&shared.z, vec![shared.network_b], 1, 10)
+        .await;
+    client_z.send(Record::Attach).await;
+    ping_pong(&mut client_z, [1; 8]).await;
+    let mut attacker = shared.connect(&shared.attacker, vec![], 1, 10).await;
+    let mut all = Vec::new();
+    for seq in 2..200u64 {
+        all.extend(shared.poison(seq));
+    }
+    for record in all {
+        attacker.send(record).await;
+    }
+    ping_pong(&mut attacker, [3; 8]).await;
+    assert_eq!(
+        shared.relay.rosters().seqs().get(&shared.network_a),
+        Some(&199)
+    );
+    // Give z's task the time to wake on the lag and judge itself.
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    ping_pong(&mut client_z, [2; 8]).await;
+    assert!(shared.relay.registry.is_attached(&shared.z.node_id));
+}
+
+/// Round 12, M1: a node that does claim the network whose Roster holds the high `min_serial` is
+/// still judged by it (the owner of A decides about A).
+#[tokio::test]
+async fn a_claimed_networks_own_min_serial_still_evicts() {
+    let shared = shared_relay().await;
+    // z is a member of A now, at serial 1; it claims A and B.
+    let admit = evict_roster(
+        &shared.owner_a,
+        shared.network_a,
+        2,
+        &[(shared.attacker.node_id, 1), (shared.z.node_id, 1)],
+        &[],
+    );
+    shared.relay.rosters().set(&admit).unwrap();
+    let mut client_z = shared
+        .connect(&shared.z, vec![shared.network_a, shared.network_b], 2, 10)
+        .await;
+    client_z.send(Record::Attach).await;
+    ping_pong(&mut client_z, [1; 8]).await;
+    let poison = evict_roster(
+        &shared.owner_a,
+        shared.network_a,
+        3,
+        &[(shared.attacker.node_id, 1), (shared.z.node_id, 5)],
+        &[],
+    );
+    shared.relay.rosters().set(&poison).unwrap();
+    let records = read_to_end(&mut client_z).await;
+    assert!(
+        records
+            .iter()
+            .any(|r| matches!(r, Record::Error(body) if body.code == ErrorCode::StaleSerial))
+    );
+}

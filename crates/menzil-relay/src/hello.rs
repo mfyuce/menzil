@@ -1,6 +1,7 @@
 //! HELLO validation against a held Roster (protocol.md 4.1): "The relay
 //! verifies the NodeCert and rejects a serial lower than the highest it
-//! has seen or lower than any Roster's `min_serial` for that node,
+//! has seen or lower than the `min_serial` for that node in a Roster of a
+//! claimed network,
 //! rejects a `timestamp` not greater than the last accepted for that
 //! NodeId, and checks each claimed network against its Rosters: unknown
 //! network, unlisted node or revoked node fails with ERROR. A node may
@@ -33,12 +34,24 @@ pub struct HelloRejection {
     pub code: ErrorCode,
     /// Free-text detail.
     pub message: String,
+    /// The claimed network whose Roster caused this rejection (revoked, not a member, or the
+    /// `min_serial` that is too high), when one did: the Roster a relay sends an evicted node
+    /// before the ERROR (protocol.md 4.2).
+    pub network: Option<NetworkId>,
 }
 
 fn reject(code: ErrorCode, message: impl Into<String>) -> HelloRejection {
     HelloRejection {
         code,
         message: message.into(),
+        network: None,
+    }
+}
+
+fn reject_in(code: ErrorCode, message: impl Into<String>, network: NetworkId) -> HelloRejection {
+    HelloRejection {
+        network: Some(network),
+        ..reject(code, message)
     }
 }
 
@@ -83,8 +96,9 @@ fn verify_node_cert(
 }
 
 /// The Roster side of HELLO validation, for `node_id` holding a NodeCert of `cert_serial` and
-/// claiming `networks`: a serial below any held Roster's `min_serial` for the node, then for each
-/// claimed network, unknown, revoked there (checked before membership, and independently of
+/// claiming `networks`: a serial below the `min_serial` for the node in a Roster of a claimed
+/// network (one network's owner has no say over the node's standing in another's, the twelfth
+/// red-team round, M1), then for each claimed network, unknown, revoked there (checked before membership, and independently of
 /// it: a Roster may or may not still carry a revoked node in `members` alongside `revoked`
 /// (protocol.md 2.3 doesn't say which), and a revoked node should get the more specific
 /// `Revoked` either way, not `NotMember`), or not listed there.
@@ -99,12 +113,13 @@ pub(crate) fn roster_standing(
     networks: &[NetworkId],
     rosters: &RosterStore,
 ) -> Result<(), HelloRejection> {
-    if let Some(min_serial) = rosters.min_serial_for(node_id)
+    if let Some((network_id, min_serial)) = rosters.min_serial_in(node_id, networks)
         && cert_serial < min_serial
     {
-        return Err(reject(
+        return Err(reject_in(
             ErrorCode::StaleSerial,
             format!("serial {cert_serial} is below this node's Roster min_serial {min_serial}"),
+            network_id,
         ));
     }
 
@@ -120,9 +135,10 @@ pub(crate) fn roster_standing(
             .iter()
             .any(|revoked| &revoked.node_id == node_id)
         {
-            return Err(reject(
+            return Err(reject_in(
                 ErrorCode::Revoked,
                 format!("node is revoked from network {network_id}"),
+                *network_id,
             ));
         }
         if !roster
@@ -130,9 +146,10 @@ pub(crate) fn roster_standing(
             .iter()
             .any(|member| &member.node_id == node_id)
         {
-            return Err(reject(
+            return Err(reject_in(
                 ErrorCode::NotMember,
                 format!("node is not a member of network {network_id}"),
+                *network_id,
             ));
         }
     }
@@ -377,11 +394,57 @@ mod tests {
         rosters.set(&Roster::sign(&owner, &body).unwrap()).unwrap();
         let history = NodeHistory::new();
 
-        // Claims no network at all: min_serial_for scans every held
-        // Roster regardless of what's claimed (see this module's docs).
-        let hello = hello_with(&fixture, vec![], 4, 10);
+        // Claims the network that set the floor: refused, naming that network.
+        let hello = hello_with(&fixture, vec![network_id], 4, 10);
         let err = check_hello(&hello, &fixture.x25519_static, &rosters, &history, 500).unwrap_err();
         assert_eq!(err.code, ErrorCode::StaleSerial);
+        assert_eq!(err.network, Some(network_id));
+
+        // Claims no network: no Roster applies, so the floor does not either (round 12, M1:
+        // the floor is judged per claimed network).
+        let hello = hello_with(&fixture, vec![], 4, 11);
+        assert!(check_hello(&hello, &fixture.x25519_static, &rosters, &history, 500).is_ok());
+    }
+
+    /// Round 12, M1: another network's Roster listing the node with a huge `min_serial` does
+    /// not refuse a HELLO that claims only the node's own network.
+    #[test]
+    fn another_networks_min_serial_does_not_refuse_a_hello_that_does_not_claim_it() {
+        let fixture = fixture();
+        let (owner_a, owner_b) = (
+            SigningKey::generate(&mut rand::rng()),
+            SigningKey::generate(&mut rand::rng()),
+        );
+        let network_a = NetworkId::from(owner_a.verifying_key().to_bytes());
+        let network_b = NetworkId::from(owner_b.verifying_key().to_bytes());
+        let roster = |owner: &SigningKey, network_id, min_serial| {
+            let body = RosterBody {
+                v: menzil_proto::PROTOCOL_VERSION,
+                network_id,
+                seq: 1,
+                issued: 0,
+                expires: 1_000_000_000,
+                members: vec![RosterMember {
+                    node_id: fixture.node_id,
+                    min_serial,
+                }],
+                revoked: vec![],
+                stewards: vec![],
+                labels: vec![],
+            };
+            Roster::sign(owner, &body).unwrap()
+        };
+        let rosters = RosterStore::new();
+        rosters.set(&roster(&owner_a, network_a, u32::MAX)).unwrap();
+        rosters.set(&roster(&owner_b, network_b, 1)).unwrap();
+        let history = NodeHistory::new();
+        let hello = hello_with(&fixture, vec![network_b], 1, 10);
+        assert!(check_hello(&hello, &fixture.x25519_static, &rosters, &history, 500).is_ok());
+        // Claiming A as well is the node's own choice and A's floor applies.
+        let hello = hello_with(&fixture, vec![network_a, network_b], 1, 11);
+        let err = check_hello(&hello, &fixture.x25519_static, &rosters, &history, 500).unwrap_err();
+        assert_eq!(err.code, ErrorCode::StaleSerial);
+        assert_eq!(err.network, Some(network_a));
     }
 
     #[test]

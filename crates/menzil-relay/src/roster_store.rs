@@ -279,14 +279,15 @@ impl RosterStore {
             .collect()
     }
 
-    /// The strictest `min_serial` this NodeId is subject to, across
-    /// every network's Roster this relay holds where it is listed as a
-    /// member (protocol.md 4.1: "rejects a serial lower than... any
-    /// Roster's `min_serial` for that node" — read as every held
-    /// Roster, not only whichever networks a given HELLO happens to
-    /// claim: a stale, compromised NodeCert should not become usable
-    /// again just by a HELLO that omits the network where it was
-    /// flagged).
+    /// The strictest `min_serial` this NodeId is subject to in the Rosters of `networks` (the
+    /// networks a HELLO claims) that this relay holds and lists it in, with the network that sets
+    /// it (protocol.md 4.1: "lower than the `min_serial` for that node in a Roster of a network
+    /// the HELLO claims"). A network the HELLO does not claim does not count: the owner of any
+    /// network on a shared relay could otherwise list a stranger's NodeId with a huge
+    /// `min_serial` and lock it out of every other network (the twelfth red-team round, M1).
+    /// The cost is that a node which claims none of the networks that flagged its stale
+    /// NodeCert is not stopped by them, which is those owners' decision to make about their
+    /// own network only.
     ///
     /// Within one Roster a NodeId listed more than once counts at its
     /// highest `min_serial`, not at whichever entry comes first: nothing
@@ -295,12 +296,16 @@ impl RosterStore {
     /// defeated by a stale, lower entry that happens to be listed ahead of
     /// the raised one (TODO.md, found by L4c's red-team review; the
     /// node-side `PolicyStore` already did this).
-    pub fn min_serial_for(&self, node_id: &NodeId) -> Option<u32> {
-        self.by_network
-            .read()
-            .unwrap()
-            .values()
-            .filter_map(|held| {
+    pub fn min_serial_in(
+        &self,
+        node_id: &NodeId,
+        networks: &[NetworkId],
+    ) -> Option<(NetworkId, u32)> {
+        let guard = self.by_network.read().unwrap();
+        networks
+            .iter()
+            .filter_map(|network_id| {
+                let held = guard.get(network_id)?;
                 held.body
                     .members
                     .iter()
@@ -308,15 +313,16 @@ impl RosterStore {
                     .filter(|member| &member.node_id == node_id)
                     .map(|member| member.min_serial)
                     .max()
+                    .map(|min_serial| (*network_id, min_serial))
             })
-            .max()
+            .max_by_key(|&(_, min_serial)| min_serial)
     }
 
     /// Every name granted to `node_id` in the Roster of any of
     /// `networks` this relay holds (protocol.md 4.4: "the Roster of one
     /// of the node's networks lists that name for this NodeId in
     /// labels" — read as one of the networks *this node itself claimed*,
-    /// the same restriction `min_serial_for`'s own doc comment discusses
+    /// the same restriction `min_serial_in`'s own doc comment discusses
     /// for a different check: a relay may happen to serve a network this
     /// node never claimed in HELLO, and that network's Roster granting
     /// the name to this NodeId must not let it claim the name through a
@@ -576,7 +582,7 @@ mod tests {
     }
 
     #[test]
-    fn min_serial_for_finds_the_strictest_across_networks() {
+    fn min_serial_in_finds_the_strictest_across_the_claimed_networks_only() {
         let owner_a = SigningKey::generate(&mut rand::rng());
         let owner_b = SigningKey::generate(&mut rand::rng());
         let network_a = NetworkId::from(owner_a.verifying_key().to_bytes());
@@ -619,12 +625,27 @@ mod tests {
             .set(&Roster::sign(&owner_b, &body_b).unwrap())
             .unwrap();
 
-        assert_eq!(store.min_serial_for(&node_id), Some(7));
-        assert_eq!(store.min_serial_for(&NodeId::from([1u8; 32])), None);
+        let both = [network_a, network_b];
+        assert_eq!(store.min_serial_in(&node_id, &both), Some((network_b, 7)));
+        assert_eq!(
+            store.min_serial_in(&node_id, &[network_a]),
+            Some((network_a, 2))
+        );
+        assert_eq!(
+            store.min_serial_in(&node_id, &[network_b]),
+            Some((network_b, 7))
+        );
+        // Claiming no network, or one that does not list it: no floor (round 12, M1).
+        assert_eq!(store.min_serial_in(&node_id, &[]), None);
+        assert_eq!(
+            store.min_serial_in(&node_id, &[NetworkId::from([5u8; 32])]),
+            None
+        );
+        assert_eq!(store.min_serial_in(&NodeId::from([1u8; 32]), &both), None);
     }
 
     #[test]
-    fn min_serial_for_takes_the_highest_of_duplicate_entries_within_one_roster() {
+    fn min_serial_in_takes_the_highest_of_duplicate_entries_within_one_roster() {
         // protocol.md 7.3's compromise response is "min_serial raised". A
         // Roster listing the same NodeId twice (nothing in this crate or
         // `menzil-proto` rejects that) must not let a stale, lower entry
@@ -659,8 +680,16 @@ mod tests {
             };
             let store = RosterStore::new();
             store.set(&Roster::sign(&owner, &body).unwrap()).unwrap();
-            assert_eq!(store.min_serial_for(&node_id), Some(9), "{members:?}");
-            assert_eq!(store.min_serial_for(&other), Some(1), "{members:?}");
+            assert_eq!(
+                store.min_serial_in(&node_id, &[network_id]),
+                Some((network_id, 9)),
+                "{members:?}"
+            );
+            assert_eq!(
+                store.min_serial_in(&other, &[network_id]),
+                Some((network_id, 1)),
+                "{members:?}"
+            );
         }
     }
 
@@ -1039,7 +1068,7 @@ mod tests {
     }
 
     /// Round 6, M4: a steward of network A appends a member of network B with the highest
-    /// `min_serial`; the relay, which scans every held Roster for `min_serial`, must not then
+    /// `min_serial`; the relay must not then
     /// refuse that node's HELLO. What a steward appends does not count.
     #[test]
     fn a_steward_cannot_lock_a_node_of_another_network_out_with_a_min_serial() {
@@ -1051,7 +1080,8 @@ mod tests {
         let store = RosterStore::new();
         store.adopt(&a.base, None, now).unwrap();
         store.adopt(&b.base, None, now).unwrap();
-        assert_eq!(store.min_serial_for(&victim), Some(1));
+        let both = [a.network_id, b.network_id];
+        assert_eq!(store.min_serial_in(&victim, &both), Some((b.network_id, 1)));
         let mut body = a.base.decode().unwrap();
         body.seq = 11;
         body.issued = now;
@@ -1062,9 +1092,12 @@ mod tests {
         });
         let steward_roster = Roster::sign(&a.steward, &body).unwrap();
         assert!(store.adopt(&steward_roster, Some(&a.base), now).unwrap());
-        assert_eq!(store.min_serial_for(&victim), Some(1));
+        assert_eq!(store.min_serial_in(&victim, &both), Some((b.network_id, 1)));
         // The base members of a steward signed Roster still count.
-        assert_eq!(store.min_serial_for(&node(1)), Some(1));
+        assert_eq!(
+            store.min_serial_in(&node(1), &both),
+            Some((a.network_id, 1))
+        );
     }
 
     #[test]

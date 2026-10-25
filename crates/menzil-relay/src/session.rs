@@ -32,8 +32,8 @@
 //! A session also ends when a Roster the relay adopts later puts its node out of standing in a
 //! network it claimed (protocol.md 7.3; TODO.md L4k K5): revoked, no longer listed, or a
 //! `min_serial` raised above the serial of the NodeCert it presented in HELLO. The node gets
-//! ERROR (`revoked`, `not_member` or `stale_serial`) and GOAWAY `revoked`, and the session
-//! detaches. Every session judges itself (it listens to `RosterStore::subscribe`), attached or
+//! the Roster of that network (DOC), then ERROR (`revoked`, `not_member` or `stale_serial`) and
+//! GOAWAY `revoked`, and the session detaches. Every session judges itself (it listens to `RosterStore::subscribe`), attached or
 //! not yet, by the rule HELLO applied (`crate::hello::roster_standing`), so a node of another
 //! network is never looked at.
 //!
@@ -422,11 +422,15 @@ fn out_of_standing(
     roster_standing(node_id, cert_serial, claimed_networks, &relay.rosters).err()
 }
 
-/// Tells a node it is out: ERROR with the reason, then GOAWAY `revoked` (protocol.md 4.2, 7.3), best
-/// effort. The caller ends the session.
+/// Tells a node it is out: first the Roster of the network concerned (DOC records, base first
+/// for a steward signed one), so that the node learns why even when the fan-out of that Roster
+/// lost the race to this eviction and can leave the network out of its next HELLO (protocol.md
+/// 4.2, the twelfth red-team round, N1); then ERROR with the reason, then GOAWAY `revoked`
+/// (protocol.md 4.2, 7.3), all best effort. The caller ends the session.
 async fn send_eviction(
     conn: &mut InboundConnection,
     transport: &mut Transport,
+    relay: &Relay,
     rejection: HelloRejection,
     session_id: u32,
     node_id: &NodeId,
@@ -438,6 +442,11 @@ async fn send_eviction(
         reason = %rejection.message,
         "relay session ended, the node is out of standing in a claimed network"
     );
+    if let Some(network_id) = rejection.network
+        && let Some(records) = doc::roster_doc_records(&relay.rosters, &network_id)
+    {
+        send_all(conn, transport, records).await;
+    }
     let error = Record::Error(ErrorBody {
         code: rejection.code,
         msg: rejection.message,
@@ -510,7 +519,15 @@ async fn run_attached_loop(
     // against whatever was held then.
     let mut watch = StandingWatch::new(relay);
     if let Some(rejection) = out_of_standing(relay, &node_id, cert_serial, &claimed_networks) {
-        send_eviction(&mut conn, &mut transport, rejection, session_id, &node_id).await;
+        send_eviction(
+            &mut conn,
+            &mut transport,
+            relay,
+            rejection,
+            session_id,
+            &node_id,
+        )
+        .await;
         return;
     }
     let mut liveness = Liveness::new(Instant::now());
@@ -544,7 +561,7 @@ async fn run_attached_loop(
             }
             () = watch.changed(&claimed_networks) => {
                 if let Some(rejection) = out_of_standing(relay, &node_id, cert_serial, &claimed_networks) {
-                    send_eviction(&mut conn, &mut transport, rejection, session_id, &node_id).await;
+                    send_eviction(&mut conn, &mut transport, relay, rejection, session_id, &node_id).await;
                     return;
                 }
             }
@@ -608,7 +625,7 @@ async fn run_attached_loop(
             }
             () = watch.changed(&claimed_networks) => {
                 if let Some(rejection) = out_of_standing(relay, &node_id, cert_serial, &claimed_networks) {
-                    send_eviction(&mut conn, &mut transport, rejection, session_id, &node_id).await;
+                    send_eviction(&mut conn, &mut transport, relay, rejection, session_id, &node_id).await;
                     break;
                 }
             }

@@ -634,13 +634,15 @@ pub(crate) fn rosters_to_push(
 }
 
 /// The networks this node puts in HELLO: `config.networks` less every network whose Roster this
-/// node holds and that lists the node as revoked (protocol.md 4.1, "a node does not claim a
-/// network whose Roster it holds revokes it"). A relay refuses a HELLO that claims a network
-/// revoking the node as a whole, so without this one revocation would take all of the node's
-/// networks off the relay at its next reconnect. A network whose Roster is not held is claimed as
-/// before (nothing says it revokes the node), and so is every network when the node's own
-/// certificate does not decode (the relay answers that with `bad_cert`). One warning per network
-/// left out.
+/// node holds and in which it is not an unrevoked member in good standing: the Roster revokes
+/// it, no longer lists it, or has a `min_serial` for it above the serial of its own certificate
+/// (protocol.md 4.1, "a node does not claim a network whose Roster it holds revokes it", and the
+/// same for the other two reasons a relay ends a session, 4.2; the twelfth red-team round, L1).
+/// A relay refuses a HELLO as a whole when one claimed network fails, so without this one
+/// revocation, one removal or one raised `min_serial` would take all of the node's networks off
+/// the relay at its next reconnect. A network whose Roster is not held is claimed as before
+/// (nothing says it excludes the node), and so is every network when the node's own certificate
+/// does not decode (the relay answers that with `bad_cert`). One warning per network left out.
 fn claimable_networks(config: &SessionConfig, roster_store: &RosterStore) -> Vec<NetworkId> {
     let Ok(cert) = config.identity.node_cert.decode() else {
         return config.networks.clone();
@@ -650,19 +652,35 @@ fn claimable_networks(config: &SessionConfig, roster_store: &RosterStore) -> Vec
         .iter()
         .copied()
         .filter(|network_id| {
-            let revoked = roster_store.body(network_id).is_some_and(|roster| {
-                roster
-                    .revoked
-                    .iter()
-                    .any(|revoked| revoked.node_id == cert.node_id)
-            });
-            if revoked {
-                tracing::warn!(
-                    %network_id,
-                    "this node is revoked in the Roster it holds for the network, so it does not claim it"
-                );
+            let Some(roster) = roster_store.body(network_id) else {
+                return true;
+            };
+            match crate::policy_store::roster_standing(&roster, &cert.node_id) {
+                Err(menzil_proto::ErrorCode::Revoked) => {
+                    tracing::warn!(
+                        %network_id,
+                        "this node is revoked in the Roster it holds for the network, so it does not claim it"
+                    );
+                    false
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        %network_id,
+                        "the Roster this node holds for the network does not list it, so it does not claim it"
+                    );
+                    false
+                }
+                Ok(min_serial) if cert.serial < min_serial => {
+                    tracing::warn!(
+                        %network_id,
+                        serial = cert.serial,
+                        min_serial,
+                        "the Roster this node holds for the network requires a newer certificate than this node's, so it does not claim it"
+                    );
+                    false
+                }
+                Ok(_) => true,
             }
-            !revoked
         })
         .collect()
 }
@@ -1410,6 +1428,16 @@ mod tests {
 
     /// A Roster of a fresh network listing `members` and revoking `revoked`, stored in `store`.
     fn hold_roster(store: &RosterStore, members: &[u8], revoked: &[u8]) -> NetworkId {
+        hold_roster_with_min_serial(store, members, revoked, 1)
+    }
+
+    /// As [`hold_roster`], every member with `min_serial`.
+    fn hold_roster_with_min_serial(
+        store: &RosterStore,
+        members: &[u8],
+        revoked: &[u8],
+        min_serial: u32,
+    ) -> NetworkId {
         let owner = SigningKey::generate(&mut rand::rng());
         let network_id = NetworkId::from(owner.verifying_key().to_bytes());
         let body = RosterBody {
@@ -1422,7 +1450,7 @@ mod tests {
                 .iter()
                 .map(|&seed| RosterMember {
                     node_id: NodeId::from([seed; 32]),
-                    min_serial: 1,
+                    min_serial,
                 })
                 .collect(),
             revoked: revoked
@@ -1446,24 +1474,38 @@ mod tests {
         let listing = hold_roster(&store, &[7, 8], &[]);
         let revoking_someone_else = hold_roster(&store, &[7], &[8]);
         let not_held = NetworkId::from([99u8; 32]);
-        // Not listed there and not revoked either: the relay judges that, not the node.
-        let unlisting = hold_roster(&store, &[8], &[]);
 
         let config = config_claiming(
-            vec![
-                revoking,
-                listing,
-                revoking_someone_else,
-                not_held,
-                unlisting,
-            ],
+            vec![revoking, listing, revoking_someone_else, not_held],
             node_cert(7),
         );
         assert_eq!(
             claimable_networks(&config, &store),
-            vec![listing, revoking_someone_else, not_held, unlisting],
+            vec![listing, revoking_someone_else, not_held],
             "only the network whose held Roster revokes this node is left out, order kept"
         );
+    }
+
+    /// Round 12, L1: a Roster that drops the node without revoking it, or that raises its
+    /// `min_serial` above the node's certificate serial (1 here), explains an eviction the same
+    /// way, so the node leaves the network out as well and keeps its others on the relay.
+    #[test]
+    fn hello_claims_leave_out_a_network_that_dropped_this_node_or_raised_its_min_serial() {
+        let store = RosterStore::new();
+        let listing = hold_roster(&store, &[7, 8], &[]);
+        let unlisting = hold_roster(&store, &[8], &[]);
+        let raised = hold_roster_with_min_serial(&store, &[7, 8], &[], 2);
+        let not_held = NetworkId::from([99u8; 32]);
+        let config = config_claiming(vec![unlisting, listing, raised, not_held], node_cert(7));
+        assert_eq!(
+            claimable_networks(&config, &store),
+            vec![listing, not_held],
+            "dropped and min_serial raised are left out, order kept"
+        );
+        // A min_serial equal to the certificate's serial is in good standing.
+        let equal = hold_roster_with_min_serial(&store, &[7], &[], 1);
+        let config = config_claiming(vec![equal], node_cert(7));
+        assert_eq!(claimable_networks(&config, &store), vec![equal]);
     }
 
     #[test]

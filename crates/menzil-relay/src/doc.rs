@@ -120,10 +120,10 @@ pub(crate) enum AcceptOutcome {
 /// real standing on this relay — could get an arbitrary number of
 /// invented networks stored and served: directly violating protocol.md
 /// 4.3 ("refuse Rosters of other networks"), and, via
-/// `RosterStore::min_serial_for` (which scans every held Roster) and
+/// the standing checks over held Rosters and
 /// WELCOME's `rosters` field (which lists every held network's seq,
 /// `crate::session::build_welcome`), turning into a cheap way to either
-/// lock a chosen real NodeId out with a forged `min_serial`, or push
+/// plant a forged Roster to lock a chosen real NodeId out, or push
 /// WELCOME's own payload size past the Noise transport message limit for
 /// every node on this relay. protocol.md 4.3's "networks they are
 /// configured to serve" is exactly this: the very first Roster for a
