@@ -463,7 +463,29 @@ async fn ungrant_and_revoke_cut_a_running_phone_off_and_the_status_goes_on_worki
         );
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
-    // The phone cannot reach the laptop again.
+    // The phone's node remembers why, and `menzil status` on the phone (which asks the running
+    // node) and a refused `stdio` say it in words, not only as a list of possible causes.
+    let until = Instant::now();
+    loop {
+        let status = menzil(phone_home.root(), &["status"]).await;
+        assert!(status.ok, "{}", status.stderr);
+        if status.stdout.contains("the relay turned this device away")
+            && status.stdout.contains("this device is revoked")
+            && status.stdout.contains("GOAWAY revoked")
+        {
+            assert!(status.stdout.contains("relay: "), "{}", status.stdout);
+            break;
+        }
+        assert!(
+            until.elapsed() < WAIT,
+            "the phone's status never gave the relay's reason: {}",
+            status.stdout
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    // The phone cannot reach the laptop again. (Whether its node still counts itself as not
+    // attached, or has reattached without the network and fails its own standing check, depends
+    // on how long ago the relay ended its session; both say why.)
     let mut retry = MemberStdio::spawn(phone_home.root(), "laptop/echo");
     let (status, message) = retry
         .ends(Duration::from_secs(120))
@@ -472,7 +494,9 @@ async fn ungrant_and_revoke_cut_a_running_phone_off_and_the_status_goes_on_worki
     assert_eq!(status.code(), Some(1), "{message}");
     assert!(
         message.starts_with("menzil: ")
-            && message.contains("not connected to the relay")
+            && (message.contains("not connected to the relay")
+                || message.contains("not a member in good standing"))
+            && message.contains("the relay turned this device away")
             && message.contains("revoked"),
         "{message}"
     );

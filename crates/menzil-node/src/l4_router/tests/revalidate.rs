@@ -812,6 +812,96 @@ async fn a_panic_in_the_revalidator_restarts_it_with_every_network_looked_at() {
     task.abort();
 }
 
+const T_INITIAL: Duration = Duration::from_millis(40);
+const T_MAX: Duration = Duration::from_millis(160);
+
+/// The same revalidator with short restart waits, serving B's end.
+fn timed(live: &mut Live) {
+    live.reval = Revalidator::with_timing(
+        live.stores_b.policies.clone(),
+        live.stores_b.rosters.clone(),
+        live.b.id,
+        1,
+        live.b.x25519_public,
+        Duration::from_secs(300),
+        (T_INITIAL, T_MAX),
+    );
+    live.serve_b();
+}
+
+/// The wait before a restart: the first is `initial`, a panic in a row doubles it, the longest
+/// is `max`, and a run that completed a pass starts over at `initial`.
+#[test]
+fn the_restart_wait_doubles_is_capped_and_resets_after_progress() {
+    use crate::revalidate::restart_delay;
+    let (i, m) = (Duration::from_millis(100), Duration::from_secs(30));
+    assert_eq!(restart_delay(None, false, i, m), i, "the first panic");
+    assert_eq!(restart_delay(None, true, i, m), i);
+    assert_eq!(restart_delay(Some(i), false, i, m), 2 * i, "doubles");
+    assert_eq!(restart_delay(Some(4 * i), false, i, m), 8 * i);
+    assert_eq!(restart_delay(Some(m), false, i, m), m, "capped");
+    assert_eq!(restart_delay(Some(Duration::from_secs(20)), false, i, m), m);
+    assert_eq!(restart_delay(Some(8 * i), true, i, m), i, "progress resets");
+    assert_eq!(restart_delay(Some(m), true, i, m), i);
+    // Neither overflows nor passes the maximum when the maximum is the smaller.
+    assert_eq!(restart_delay(Some(Duration::MAX), false, i, m), m);
+    assert_eq!(restart_delay(None, false, m, i), i);
+}
+
+/// A panic that every pass hits does not make a busy loop: the waits between restarts double up
+/// to the maximum, and each restart really waits that long.
+#[tokio::test]
+async fn a_persistent_panic_restarts_with_growing_waits() {
+    let mut live = live(|w, a, b| vec![grant_for(w, a, b, &["tcp:ssh"])]).await;
+    timed(&mut live);
+    live.reval
+        .panic_passes_left
+        .store(u32::MAX, Ordering::SeqCst);
+    let task = tokio::spawn(live.reval.clone().run());
+    wait_for(|| live.reval.restart_waits.lock().unwrap().len() >= 6).await;
+    task.abort();
+    let waits = live.reval.restart_waits.lock().unwrap().clone();
+    let ms = |n: u64| Duration::from_millis(n);
+    assert_eq!(
+        waits[..6],
+        [ms(40), ms(80), ms(160), ms(160), ms(160), ms(160)],
+        "doubling, then the cap"
+    );
+    // Each pass began no sooner than the wait after the one before it.
+    let starts = live.reval.pass_starts.lock().unwrap().clone();
+    assert!(starts.len() >= 6, "{} passes", starts.len());
+    for (n, wait) in waits.iter().take(starts.len() - 1).enumerate() {
+        let gap = starts[n + 1] - starts[n];
+        assert!(
+            gap + Duration::from_millis(2) >= *wait,
+            "restart {n} came after {gap:?}, the wait was {wait:?}"
+        );
+    }
+}
+
+/// A run that completed a pass before it panicked again starts the waits over.
+#[tokio::test]
+async fn a_pass_that_completes_resets_the_restart_wait() {
+    let mut live = live(|w, a, b| vec![grant_for(w, a, b, &["tcp:ssh"])]).await;
+    timed(&mut live);
+    // Two panics in a row (waits of 40 and 80 ms), then a pass that completes.
+    live.reval.panic_passes_left.store(2, Ordering::SeqCst);
+    let task = tokio::spawn(live.reval.clone().run());
+    wait_for(|| live.reval.completed_passes() >= 1).await;
+    // A pass that follows panics for a new reason.
+    live.reval.panic_next_pass.store(true, Ordering::SeqCst);
+    revoke_in(&live.w, &live.stores_b, live.a.id);
+    wait_for(|| live.reval.restart_waits.lock().unwrap().len() >= 3).await;
+    task.abort();
+    let waits = live.reval.restart_waits.lock().unwrap().clone();
+    assert_eq!(waits[0], T_INITIAL);
+    assert_eq!(waits[1], 2 * T_INITIAL);
+    assert_eq!(
+        waits[2], T_INITIAL,
+        "a completed pass starts the waits over"
+    );
+}
+
 /// Dropping the supervisor drops the work: the node aborts the one task it holds, and the task
 /// it supervises goes with it (each holds an `Arc` of the revalidator).
 #[tokio::test]

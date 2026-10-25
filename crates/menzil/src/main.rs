@@ -508,7 +508,18 @@ async fn run(cli: Cli) -> Result<()> {
                 }
             );
         }
-        Command::Status => print!("{}", local::status(&home()?)?.render(now())),
+        Command::Status => {
+            let home = home()?;
+            print!("{}", local::status(&home)?.render(now()));
+            // A running node knows what the files do not: whether the relay has it attached,
+            // and why it turned it away. No node, or one that says nothing, adds nothing.
+            if let Ok(config) = Config::load(&home) {
+                let socket = node_cmd::agent_socket_path(&home, &config);
+                if let Ok(relay) = agent::query_status(&socket).await {
+                    print!("{}", relay.render(now()));
+                }
+            }
+        }
         Command::Relay {
             command: RelayCommand::AddNetwork { token },
         } => {

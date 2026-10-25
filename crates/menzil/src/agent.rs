@@ -15,6 +15,22 @@
 //!                   kind 2 reset: the sender aborts, payload is a reason
 //! ```
 //!
+//! The other request asks how the node stands with its relay (`menzil status` uses it) and gets
+//! text lines, not frames:
+//!
+//! ```text
+//! client -> agent   status\n
+//! agent  -> client  lines "<key> <text>\n", then the connection ends. Keys:
+//!                     attached yes|no
+//!                     rejected_at <Unix seconds>      the relay's last rejection (below)
+//!                     rejected_code <name>            the ERROR code, e.g. revoked
+//!                     rejected_message <text>         the ERROR text
+//!                     rejected_goaway <text>          the GOAWAY reason
+//!                   A client skips a key it does not know, so a field can be added; an agent
+//!                   that predates the request answers `error ...`, which a client takes as
+//!                   "no word from the node".
+//! ```
+//!
 //! Both directions are framed because a clean end and an abnormal one must stay apart all the
 //! way to the program that uses the stream (protocol.md 5.2, "never with a clean end of
 //! file"), and a Unix socket cannot say it: closing it looks the same whether the program
@@ -68,6 +84,115 @@ const MAX_CONNECTIONS: usize = 256;
 pub trait Opener: Send + Sync + 'static {
     /// Opens a stream to `target`, which is `<who>/<service>` as the user typed it.
     fn open(&self, target: &str) -> impl Future<Output = Result<Stream, String>> + Send;
+
+    /// How the node stands with its relay, for the `status` request. An opener that knows
+    /// nothing says nothing.
+    fn status(&self) -> impl Future<Output = RelayStatus> + Send {
+        async { RelayStatus::default() }
+    }
+}
+
+/// What the node knows about its relay, as the `status` request carries it. Every part is
+/// optional: an agent says what it knows.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RelayStatus {
+    /// Whether the node is attached to its relay right now.
+    pub attached: Option<bool>,
+    /// The last time the relay turned the node away, if it has not been cleared by a good
+    /// attachment since.
+    pub rejected: Option<Rejected>,
+}
+
+/// The relay's last rejection of the node: an ERROR (`revoked`, `not_member`, `stale_serial`,
+/// ...) and/or the GOAWAY after it, and when.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Rejected {
+    /// When it came, Unix seconds; 0 when the agent did not say.
+    pub at: u64,
+    /// The ERROR code's name, if an ERROR came.
+    pub code: Option<String>,
+    /// The ERROR's own text.
+    pub message: String,
+    /// The GOAWAY reason, if one came.
+    pub goaway: Option<String>,
+}
+
+impl RelayStatus {
+    /// The reply to a `status` request: one `key text` line per known part.
+    fn to_lines(&self) -> String {
+        let mut out = String::new();
+        if let Some(attached) = self.attached {
+            out.push_str(if attached {
+                "attached yes\n"
+            } else {
+                "attached no\n"
+            });
+        }
+        if let Some(rejected) = &self.rejected {
+            out.push_str(&format!("rejected_at {}\n", rejected.at));
+            if let Some(code) = &rejected.code {
+                out.push_str(&format!("rejected_code {}\n", one_line(code)));
+            }
+            if !rejected.message.is_empty() {
+                out.push_str(&format!(
+                    "rejected_message {}\n",
+                    one_line(&rejected.message)
+                ));
+            }
+            if let Some(goaway) = &rejected.goaway {
+                out.push_str(&format!("rejected_goaway {}\n", one_line(goaway)));
+            }
+        }
+        out
+    }
+
+    /// Reads the lines of a reply. A key this client does not know is skipped; a value is made
+    /// printable here too, whatever the agent sent.
+    fn from_lines(lines: &[String]) -> Self {
+        let mut status = Self::default();
+        let mut rejected = Rejected::default();
+        let mut any = false;
+        for line in lines {
+            let (key, value) = line.split_once(' ').unwrap_or((line.as_str(), ""));
+            let value = one_line(value);
+            match key {
+                "attached" => status.attached = Some(value == "yes"),
+                "rejected_at" => {
+                    rejected.at = value.trim().parse().unwrap_or(0);
+                }
+                "rejected_code" => {
+                    rejected.code = Some(value);
+                    any = true;
+                }
+                "rejected_message" => rejected.message = value,
+                "rejected_goaway" => {
+                    rejected.goaway = Some(value);
+                    any = true;
+                }
+                _ => {}
+            }
+        }
+        if any {
+            status.rejected = Some(rejected);
+        }
+        status
+    }
+
+    /// What `menzil status` adds about the relay, as text (empty when the agent said nothing),
+    /// with times relative to `now`.
+    pub fn render(&self, now: u64) -> String {
+        let mut out = String::new();
+        match (self.attached, &self.rejected) {
+            (Some(true), None) => out.push_str("relay: attached\n"),
+            (Some(true), Some(_)) => out.push_str("relay: attached, but see below\n"),
+            (Some(false), _) => out.push_str("relay: not attached\n"),
+            (None, _) => {}
+        }
+        if let Some(rejected) = &self.rejected {
+            out.push_str(&format!("  {}\n", text::turned_away(rejected, now)));
+        }
+        out
+    }
 }
 
 /// How a stream ended, as the client learns it.
@@ -230,6 +355,12 @@ async fn handle<O: Opener>(connection: UnixStream, opener: &O) -> Result<()> {
         .await
         .context("the request did not arrive in time")??
         .ok_or_else(|| anyhow!("the client sent nothing"))?;
+    if line.trim_end_matches(['\r', '\n']) == "status" {
+        write
+            .write_all(opener.status().await.to_lines().as_bytes())
+            .await?;
+        return Ok(());
+    }
     let target = match parse_request(&line) {
         Ok(target) => target,
         Err(message) => {
@@ -450,6 +581,64 @@ where
             return Ok(End::Clean);
         }
     }
+}
+
+/// How long [`query_status`] waits for the agent to answer.
+const STATUS_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// The most lines of a `status` reply a client reads.
+const MAX_STATUS_LINES: usize = 32;
+
+/// Asks the agent at `socket` how the node stands with its relay. An error means there is no
+/// agent to ask (none is listening, another user serves the socket, it did not answer, or it
+/// predates the request), which a caller takes as "no word from the node".
+pub async fn query_status(socket: &Path) -> Result<RelayStatus> {
+    let uid = current_uid()
+        .await
+        .context("finding out which user this is")?;
+    query_status_as(socket, uid).await
+}
+
+/// [`query_status`] for a client that expects the agent to run as `uid`.
+async fn query_status_as(socket: &Path, uid: u32) -> Result<RelayStatus> {
+    crate::node_cmd::check_socket_path_length(socket)?;
+    timeout(STATUS_TIMEOUT, async {
+        let connection = UnixStream::connect(socket)
+            .await
+            .with_context(|| format!("no agent is listening at {}", socket.display()))?;
+        let served_by = connection
+            .peer_cred()
+            .context("asking who runs the agent")?
+            .uid();
+        if served_by != uid {
+            bail!(
+                "the socket {} is served by another user; nothing was sent to it",
+                socket.display()
+            );
+        }
+        let (read, mut write) = connection.into_split();
+        let mut read = BufReader::new(read);
+        write.write_all(b"status\n").await?;
+        let mut lines = Vec::new();
+        while let Some(line) = read_line(&mut read, MAX_REPLY_BYTES).await? {
+            let line = line.trim_end_matches(['\r', '\n']).to_string();
+            if lines.is_empty()
+                && let Some(message) = line.strip_prefix("error ")
+            {
+                bail!(
+                    "the agent does not report its status: {}",
+                    one_line(message)
+                );
+            }
+            lines.push(line);
+            if lines.len() >= MAX_STATUS_LINES {
+                break;
+            }
+        }
+        Ok(RelayStatus::from_lines(&lines))
+    })
+    .await
+    .context("the agent did not answer in time")?
 }
 
 /// How the input side of [`connect_and_bridge`] ended.

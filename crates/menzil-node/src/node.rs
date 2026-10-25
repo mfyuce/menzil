@@ -88,9 +88,10 @@ use crate::l4_session::{CloseReason, E2E_PROTO_TAG, L4SessionHandle};
 use crate::l5_stream::{AcceptedStreams, OpenStreamError, accept_loop, accept_loop_tracked, open};
 use crate::outbound::{Epoch, SendBudgets};
 use crate::policy_store::PolicyStore;
+use crate::relay_notes::{RelayError, RelayNotes};
 use crate::revalidate::{Kind, Revalidator};
 use crate::roster_store::RosterStore;
-use crate::session::{SessionConfig, SessionEvent, run_session_until};
+use crate::session::{SessionConfig, SessionEvent, run_session_observed};
 
 /// Capacity of each of the two channels between [`run_session`] and the
 /// router. Any size works (`run_session` is written not to deadlock on a
@@ -173,6 +174,8 @@ pub struct Node {
     policies: Arc<PolicyStore>,
     rosters: Arc<RosterStore>,
     sync: Arc<DocsSync>,
+    /// What the relay last said when it turned this node away.
+    relay_notes: RelayNotes,
     /// Tells the relay session to write what it holds and close.
     stop_session: watch::Sender<bool>,
     /// Turns `true` when the relay session task has returned.
@@ -252,11 +255,22 @@ impl Node {
         );
         let (stop_session, stop_rx) = watch::channel(false);
         let (ended_tx, session_ended) = watch::channel(false);
+        let relay_notes = RelayNotes::new();
         let mut tasks = vec![
             tokio::spawn({
                 let rosters = rosters.clone();
+                let notes = relay_notes.clone();
                 async move {
-                    run_session_until(session, env, events_tx, outbound_rx, rosters, stop_rx).await;
+                    run_session_observed(
+                        session,
+                        env,
+                        events_tx,
+                        outbound_rx,
+                        rosters,
+                        stop_rx,
+                        notes,
+                    )
+                    .await;
                     let _ = ended_tx.send(true);
                 }
             }),
@@ -290,10 +304,27 @@ impl Node {
             policies,
             rosters,
             sync,
+            relay_notes,
             stop_session,
             session_ended,
             tasks,
         })
+    }
+
+    /// What the relay last said when it turned this node away (an ERROR such as `revoked`,
+    /// `not_member` or `stale_serial`) or ended its session (GOAWAY), with the time; `None` when
+    /// it has not, or when an attachment since has lasted without being turned away (see
+    /// [`RelayNotes`]). A revoked or evicted device learns here why it is not attached, where
+    /// the log alone said.
+    pub fn last_relay_error(&self) -> Option<RelayError> {
+        self.relay_notes.last_error()
+    }
+
+    /// Whether the node is attached to its relay right now. A relay that is about to turn the
+    /// node away has attached it first (WELCOME comes before HELLO is judged): see
+    /// [`Self::last_relay_error`] for that.
+    pub fn is_attached(&self) -> bool {
+        self.attachment.borrow().is_some()
     }
 
     /// This node's own NodeId.

@@ -726,3 +726,262 @@ async fn what_an_agent_sends_never_reaches_the_terminal_unescaped() {
     }
     server.abort();
 }
+
+// ---- the `status` request (the relay's last rejection reaches `menzil status`) ----
+
+struct Reports(RelayStatus);
+
+impl Opener for Reports {
+    async fn open(&self, _target: &str) -> Result<Stream, String> {
+        Err("no streams here".to_string())
+    }
+    async fn status(&self) -> RelayStatus {
+        self.0.clone()
+    }
+}
+
+fn rejected(code: &str) -> Rejected {
+    Rejected {
+        at: 1_700_000_000,
+        code: Some(code.to_string()),
+        message: "node is revoked in network x".to_string(),
+        goaway: Some("revoked".to_string()),
+    }
+}
+
+async fn ask(status: RelayStatus) -> Result<RelayStatus> {
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("agent.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let uid = current_uid().await.unwrap();
+    let agent = tokio::spawn(serve_user(listener, Arc::new(Reports(status)), uid));
+    let got = timeout(WAIT, query_status_as(&socket, uid)).await.unwrap();
+    agent.abort();
+    got
+}
+
+#[tokio::test]
+async fn the_status_request_carries_the_rejection_and_whether_the_node_is_attached() {
+    let sent = RelayStatus {
+        attached: Some(false),
+        rejected: Some(rejected("revoked")),
+    };
+    assert_eq!(ask(sent.clone()).await.unwrap(), sent);
+    // Every part is optional: attached with nothing held against it, an ERROR without text, a
+    // GOAWAY alone.
+    let attached = RelayStatus {
+        attached: Some(true),
+        rejected: None,
+    };
+    assert_eq!(ask(attached.clone()).await.unwrap(), attached);
+    let bare = RelayStatus {
+        attached: None,
+        rejected: Some(Rejected {
+            at: 5,
+            code: Some("not_member".to_string()),
+            message: String::new(),
+            goaway: None,
+        }),
+    };
+    assert_eq!(ask(bare.clone()).await.unwrap(), bare);
+    let goaway_only = RelayStatus {
+        attached: Some(true),
+        rejected: Some(Rejected {
+            at: 6,
+            code: None,
+            message: String::new(),
+            goaway: Some("superseded".to_string()),
+        }),
+    };
+    assert_eq!(ask(goaway_only.clone()).await.unwrap(), goaway_only);
+    // An opener that knows nothing says nothing.
+    assert_eq!(
+        ask(RelayStatus::default()).await.unwrap(),
+        RelayStatus::default()
+    );
+}
+
+#[tokio::test]
+async fn the_default_opener_answers_status_with_nothing() {
+    struct Plain;
+    impl Opener for Plain {
+        async fn open(&self, _target: &str) -> Result<Stream, String> {
+            Err("no".to_string())
+        }
+    }
+    assert_eq!(Plain.status().await, RelayStatus::default());
+}
+
+#[tokio::test]
+async fn what_the_agent_says_in_a_status_reply_never_reaches_the_terminal_unescaped() {
+    let sent = RelayStatus {
+        attached: Some(false),
+        rejected: Some(Rejected {
+            at: 1,
+            code: Some("revoked\u{1b}[2J".to_string()),
+            message: "line one\nrejected_code forged\u{202e}".to_string(),
+            goaway: Some("a\u{7}b".to_string()),
+        }),
+    };
+    let got = ask(sent).await.unwrap();
+    let rejected = got.rejected.unwrap();
+    let all = format!(
+        "{:?} {} {:?}",
+        rejected.code, rejected.message, rejected.goaway
+    );
+    assert!(
+        !all.contains('\u{1b}') && !all.contains('\u{202e}') && !all.contains('\u{7}'),
+        "{all:?}"
+    );
+    assert_eq!(rejected.code.as_deref(), Some("revoked [2J"));
+    // The newline in the text did not start a line of its own that forges a key.
+    assert_eq!(rejected.message, "line one rejected_code forged ");
+}
+
+#[test]
+fn a_client_skips_keys_it_does_not_know_and_ignores_a_reply_with_no_rejection() {
+    let lines: Vec<String> = [
+        "attached no",
+        "future_field something new",
+        "rejected_at 42",
+        "rejected_code stale_serial",
+        "rejected_extra x",
+    ]
+    .iter()
+    .map(|l| l.to_string())
+    .collect();
+    let status = RelayStatus::from_lines(&lines);
+    assert_eq!(status.attached, Some(false));
+    let rejected = status.rejected.unwrap();
+    assert_eq!(
+        (rejected.at, rejected.code.as_deref()),
+        (42, Some("stale_serial"))
+    );
+    // A time with nothing it is the time of is not a rejection.
+    let only_time = RelayStatus::from_lines(&["rejected_at 42".to_string()]);
+    assert_eq!(only_time.rejected, None);
+    // A time that does not parse is 0 ("unknown").
+    let odd = RelayStatus::from_lines(&[
+        "rejected_at soon".to_string(),
+        "rejected_code revoked".to_string(),
+    ]);
+    assert_eq!(odd.rejected.unwrap().at, 0);
+}
+
+/// An agent from before the request answers `error ...`: the client reports that, and does not
+/// make a status of it.
+#[tokio::test]
+async fn an_agent_that_does_not_know_the_request_gives_no_status() {
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("old.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let uid = current_uid().await.unwrap();
+    let old = tokio::spawn(async move {
+        let (mut connection, _) = listener.accept().await.unwrap();
+        let mut request = [0u8; 64];
+        let _ = connection.read(&mut request).await;
+        connection
+            .write_all(b"error the request must be `open <who>/<service>`\n")
+            .await
+            .unwrap();
+    });
+    let error = timeout(WAIT, query_status_as(&socket, uid))
+        .await
+        .unwrap()
+        .unwrap_err();
+    assert!(
+        format!("{error:#}").contains("does not report its status"),
+        "{error:#}"
+    );
+    old.await.unwrap();
+    // And with no agent at all, it says how to start one.
+    let error = query_status_as(&dir.path().join("none.sock"), uid)
+        .await
+        .unwrap_err();
+    assert!(
+        format!("{error:#}").contains("no agent is listening"),
+        "{error:#}"
+    );
+}
+
+#[tokio::test]
+async fn the_status_client_refuses_a_socket_that_another_user_serves() {
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("agent.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let uid = current_uid().await.unwrap();
+    let agent = tokio::spawn(serve_user(
+        listener,
+        Arc::new(Reports(RelayStatus::default())),
+        uid,
+    ));
+    let error = query_status_as(&socket, uid + 1).await.unwrap_err();
+    assert!(
+        format!("{error:#}").contains("served by another user"),
+        "{error:#}"
+    );
+    agent.abort();
+}
+
+#[test]
+fn status_is_rendered_with_the_reason_in_words() {
+    let now = 1_700_000_000 + 7 * 60;
+    let text = RelayStatus {
+        attached: Some(false),
+        rejected: Some(rejected("revoked")),
+    }
+    .render(now);
+    assert!(text.starts_with("relay: not attached\n"), "{text}");
+    assert!(
+        text.contains("the relay turned this device away")
+            && text.contains("revoked")
+            && text.contains("7 minutes ago")
+            && text.contains("node is revoked in network x")
+            && text.contains("GOAWAY revoked"),
+        "{text}"
+    );
+    assert_eq!(text.lines().count(), 2, "{text}");
+    let text = RelayStatus {
+        attached: Some(true),
+        rejected: None,
+    }
+    .render(now);
+    assert_eq!(text, "relay: attached\n");
+    assert_eq!(RelayStatus::default().render(now), "");
+}
+
+/// Each side makes the text printable on its own: the agent before it sends, the client when it
+/// reads, whatever the other side did.
+#[test]
+fn the_agent_and_the_client_each_make_the_status_text_printable() {
+    let dirty = RelayStatus {
+        attached: Some(false),
+        rejected: Some(Rejected {
+            at: 1,
+            code: Some("re\u{1b}[2Jvoked\nattached yes".to_string()),
+            message: "a\nb\u{202e}".to_string(),
+            goaway: Some("g\u{7}".to_string()),
+        }),
+    };
+    // What the agent writes has one line per key and nothing that acts.
+    let sent = dirty.to_lines();
+    assert_eq!(sent.lines().count(), 5, "{sent:?}");
+    assert!(
+        !sent.contains('\u{1b}') && !sent.contains('\u{202e}') && !sent.contains('\u{7}'),
+        "{sent:?}"
+    );
+    // What the client reads is cleaned even when the agent did not.
+    let lines: Vec<String> = [
+        "rejected_at 1",
+        "rejected_code re\u{1b}[2Jvoked",
+        "rejected_message a\u{202e}b",
+        "rejected_goaway g\u{7}",
+    ]
+    .iter()
+    .map(|l| l.to_string())
+    .collect();
+    let rejected = RelayStatus::from_lines(&lines).rejected.unwrap();
+    assert_eq!(rejected.code.as_deref(), Some("re [2Jvoked"));
+    assert_eq!(rejected.message, "a b");
+    assert_eq!(rejected.goaway.as_deref(), Some("g "));
+}

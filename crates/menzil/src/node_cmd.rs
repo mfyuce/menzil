@@ -18,7 +18,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use menzil_carrier::DialConfig;
 use menzil_node::{
     Adopted, AdoptedDocs, DocStore, EnsureError, LocalIdentity, Node, NodeConfig, NodeError,
-    NodeOpenError, OpenStreamError, PolicyStore, RosterStore, SessionConfig,
+    NodeOpenError, OpenStreamError, PolicyStore, RelayError, RosterStore, SessionConfig,
 };
 use menzil_proto::trust::{DOC_MAX_LIFETIME, Reason};
 use menzil_proto::{ErrorCode, NetworkId, NodeId, ServiceId, ServiceKind};
@@ -613,9 +613,33 @@ impl NodeOpener {
     }
 }
 
+/// The relay's last rejection as the agent socket carries it.
+fn rejected_of(error: RelayError) -> agent::Rejected {
+    agent::Rejected {
+        at: error.at,
+        code: error.code.map(|code| code.name().to_string()),
+        message: error.message,
+        goaway: error.goaway,
+    }
+}
+
 /// What a person is told about a failed open.
+#[cfg(test)]
 fn explain(error: &NodeOpenError) -> String {
+    explain_with(error, None, 0)
+}
+
+/// [`explain`] for a node that knows why its relay turned it away, if it does (`rejected`, judged
+/// at `now`): then the reason is stated, not only listed among the possible causes.
+fn explain_with(error: &NodeOpenError, rejected: Option<&agent::Rejected>, now: u64) -> String {
     match error {
+        NodeOpenError::Session(EnsureError::NotAttached) if rejected.is_some() => {
+            let rejected = rejected.expect("guarded by is_some");
+            format!(
+                "this node is not connected to the relay. {}",
+                text::turned_away(rejected, now)
+            )
+        }
         NodeOpenError::Session(EnsureError::NotAttached) => {
             "this node is not connected to the relay (yet): check `relay` in config.toml and the network; a device that was revoked is turned away by the relay too, and `menzil status` on the owner's device shows the revoked"
                 .to_string()
@@ -629,8 +653,14 @@ fn explain(error: &NodeOpenError) -> String {
                 .to_string()
         }
         NodeOpenError::Session(EnsureError::NotAMember) => {
-            "this device is not a member in good standing of that network any more: its documents may have expired (`menzil renew`), or it was revoked or removed by the owner"
-                .to_string()
+            let mut told = "this device is not a member in good standing of that network any more: its documents may have expired (`menzil renew`), or it was revoked or removed by the owner"
+                .to_string();
+            // The relay may have said which.
+            if let Some(rejected) = rejected {
+                told.push_str(". ");
+                told.push_str(&text::turned_away(rejected, now));
+            }
+            told
         }
         NodeOpenError::Session(EnsureError::UnknownPeer) => {
             "this device holds no valid certificate for that member in that network: the member may have been revoked, or these documents are older than its admission (`menzil join` a current token)"
@@ -667,8 +697,25 @@ impl Opener for NodeOpener {
         self.node
             .open_stream(peer, network_id, service, None)
             .await
-            .map_err(|error| explain(&error))
+            .map_err(|error| {
+                let rejected = self.node.last_relay_error().map(rejected_of);
+                explain_with(&error, rejected.as_ref(), unix_now())
+            })
     }
+
+    async fn status(&self) -> agent::RelayStatus {
+        agent::RelayStatus {
+            attached: Some(self.node.is_attached()),
+            rejected: self.node.last_relay_error().map(rejected_of),
+        }
+    }
+}
+
+/// The clock in Unix seconds.
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
 }
 
 /// A node that is running.

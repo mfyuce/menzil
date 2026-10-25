@@ -73,6 +73,7 @@ mod l5_stream;
 mod node;
 mod outbound;
 mod policy_store;
+mod relay_notes;
 mod revalidate;
 mod roster_store;
 mod serve;
@@ -105,10 +106,13 @@ pub use outbound::{
     EnqueueOutcome, Epoch, OutboundQueue, OutboundSend, SendBudget, SendBudgets, SendPermit,
 };
 pub use policy_store::PolicyStore;
+pub use relay_notes::{ATTACH_SETTLED, RelayError, RelayNotes};
 pub use roster_store::RosterStore;
 pub use serve::{
     DEFAULT_CONNECT_TIMEOUT, DEFAULT_MAX_CONNECTIONS, DEFAULT_MAX_CONNECTIONS_PER_PEER,
     DEFAULT_SOCKET_BUFFER, LocalServices, LocalTarget, MAX_CONNECT_TIMEOUT, OpenedTarget,
     ServeConfigError, ServeLimits,
 };
-pub use session::{Session, SessionConfig, SessionEvent, run_session, run_session_until};
+pub use session::{
+    Session, SessionConfig, SessionEvent, run_session, run_session_observed, run_session_until,
+};

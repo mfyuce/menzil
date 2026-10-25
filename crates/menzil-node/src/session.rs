@@ -73,6 +73,7 @@ use menzil_session::{
 use crate::error::NodeError;
 use crate::identity::LocalIdentity;
 use crate::outbound::{EnqueueOutcome, Epoch, MAX_QUEUED_BYTES, OutboundQueue, OutboundSend};
+use crate::relay_notes::RelayNotes;
 use crate::roster_store::RosterStore;
 
 /// Everything [`Session::connect`] needs beyond what
@@ -464,6 +465,13 @@ impl Session {
             self.send(record).await?;
         }
         Ok(())
+    }
+
+    /// The networks this session put in HELLO: the configured ones less those this node left out
+    /// because the Roster it holds says it is not in good standing there (see
+    /// [`claimable_networks`]).
+    pub fn claimed_networks(&self) -> &[NetworkId] {
+        &self.engine.claimed_networks
     }
 
     /// WELCOME as the relay sent it: session id, limits, and each claimed
@@ -1167,9 +1175,36 @@ pub async fn run_session_until(
     config: SessionConfig,
     env: HashMap<String, String>,
     events: mpsc::Sender<SessionEvent>,
+    outbound: mpsc::Receiver<OutboundSend>,
+    roster_store: Arc<RosterStore>,
+    stop: watch::Receiver<bool>,
+) {
+    run_session_observed(
+        config,
+        env,
+        events,
+        outbound,
+        roster_store,
+        stop,
+        RelayNotes::new(),
+    )
+    .await;
+}
+
+/// [`run_session_until`] that also keeps, in `notes`, what the relay last said when it turned
+/// this node away (an ERROR such as `revoked`, `not_member` or `stale_serial`) or ended the
+/// session (GOAWAY), with the time. An attachment that lasts [`RelayNotes::settle_after`]
+/// without being turned away, and claimed every configured network, clears what an earlier one
+/// recorded: WELCOME comes before the relay looks at HELLO, so the attach itself proves nothing
+/// (see [`RelayNotes`]).
+pub async fn run_session_observed(
+    config: SessionConfig,
+    env: HashMap<String, String>,
+    events: mpsc::Sender<SessionEvent>,
     mut outbound: mpsc::Receiver<OutboundSend>,
     roster_store: Arc<RosterStore>,
     mut stop: watch::Receiver<bool>,
+    notes: RelayNotes,
 ) {
     let mut backoff = Backoff::new();
     let mut epoch = Epoch::first();
@@ -1196,6 +1231,12 @@ pub async fn run_session_until(
         };
         tracing::info!(?epoch, "node session attached");
         let attached_at = Instant::now();
+        notes.begin_attachment();
+        // Whether this attachment claimed every network the node is configured for.
+        let complete = session.claimed_networks().len() == config.networks.len();
+        let settle = tokio::time::sleep(notes.settle_after());
+        tokio::pin!(settle);
+        let mut settled = false;
         let limits = sane_limits(session.welcome().limits);
         let mut outbound_queue = OutboundQueue::new(limits.credit, limits.max_record);
         for req in waiting {
@@ -1225,12 +1266,16 @@ pub async fn run_session_until(
                             outbound_queue.note_credit(body.peer, body.bytes);
                         }
                         Ok(record) => {
+                            if let Record::Error(body) = &record {
+                                notes.note_error(body, unix_now());
+                            }
                             pending.push_back(SessionEvent::Record {
                                 epoch,
                                 record: Box::new(record),
                             });
                         }
                         Err(NodeError::Goaway { reason, retry_after_ms }) => {
+                            notes.note_goaway(&reason, unix_now());
                             tracing::info!(reason, retry_after_ms, "relay sent GOAWAY, reconnecting");
                             break 'attached Some(retry_after_ms);
                         }
@@ -1239,6 +1284,11 @@ pub async fn run_session_until(
                             break 'attached None;
                         }
                     }
+                }
+                // Lasted long enough without being turned away: a good attachment.
+                () = &mut settle, if !settled => {
+                    settled = true;
+                    notes.settle(complete);
                 }
                 permit = events.reserve(), if !pending.is_empty() => {
                     match permit {

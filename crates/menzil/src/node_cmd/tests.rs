@@ -190,6 +190,65 @@ async fn a_stale_socket_is_replaced_and_a_live_one_is_not() {
     }
 }
 
+/// A node that knows why its relay turned it away says so instead of listing the causes.
+#[test]
+fn a_failed_open_states_the_relays_reason_when_it_is_known() {
+    let rejected = crate::agent::Rejected {
+        at: 1_000,
+        code: Some("revoked".to_string()),
+        message: "node is revoked".to_string(),
+        goaway: Some("revoked".to_string()),
+    };
+    let not_attached = NodeOpenError::Session(EnsureError::NotAttached);
+    let told = explain_with(&not_attached, Some(&rejected), 1_000 + 120);
+    assert!(
+        told.starts_with(
+            "this node is not connected to the relay. the relay turned this device away: "
+        ) && told.contains("(revoked, 2 minutes ago")
+            && told.contains("GOAWAY revoked"),
+        "{told}"
+    );
+    assert!(
+        !told.contains("(yet)") && !told.contains("check `relay` in config.toml and the network"),
+        "the reason replaces the list of causes: {told}"
+    );
+    // Unknown: the list of possible causes, as before.
+    assert_eq!(explain_with(&not_attached, None, 5), explain(&not_attached));
+    // A device that holds the Roster revoking it fails the local check first; the relay's
+    // reason is added to that.
+    let not_a_member = NodeOpenError::Session(EnsureError::NotAMember);
+    let told = explain_with(&not_a_member, Some(&rejected), 1_000 + 120);
+    assert!(
+        told.starts_with(&explain(&not_a_member))
+            && told.contains(". the relay turned this device away: ")
+            && told.contains("(revoked, 2 minutes ago"),
+        "{told}"
+    );
+    assert_eq!(explain_with(&not_a_member, None, 5), explain(&not_a_member));
+    // Other failures are not rewritten by a rejection that is on record.
+    let timeout = NodeOpenError::Session(EnsureError::Timeout);
+    assert_eq!(
+        explain_with(&timeout, Some(&rejected), 5),
+        explain(&timeout)
+    );
+    // The node's own record converts as the socket carries it.
+    let from_node = rejected_of(menzil_node::RelayError {
+        code: Some(ErrorCode::NotMember),
+        message: "gone".to_string(),
+        goaway: None,
+        at: 9,
+    });
+    assert_eq!(
+        from_node,
+        crate::agent::Rejected {
+            at: 9,
+            code: Some("not_member".to_string()),
+            message: "gone".to_string(),
+            goaway: None,
+        }
+    );
+}
+
 #[test]
 fn what_a_person_is_told_about_a_failed_open_is_plain() {
     let text = explain(&NodeOpenError::Session(EnsureError::NotAttached));

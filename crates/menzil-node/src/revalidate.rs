@@ -56,6 +56,28 @@ pub(crate) const SWEEP_INTERVAL: Duration = Duration::from_secs(300);
 /// Added to a wait for a deadline so that the wall clock has surely reached it on waking.
 const WAKE_MARGIN: Duration = Duration::from_millis(50);
 
+/// The wait before the first restart after a panic.
+pub(crate) const RESTART_DELAY_INITIAL: Duration = Duration::from_millis(100);
+
+/// The longest wait before a restart, however many panics in a row.
+pub(crate) const RESTART_DELAY_MAX: Duration = Duration::from_secs(30);
+
+/// The wait before the restart that follows a panic: `initial` after a run that completed at
+/// least one pass (or the first panic), else twice the previous wait, never more than `max`.
+/// A panic that repeats at once, a bug that every pass hits, then costs a few restarts a minute
+/// and not a busy loop that fills the log.
+pub(crate) fn restart_delay(
+    previous: Option<Duration>,
+    progressed: bool,
+    initial: Duration,
+    max: Duration,
+) -> Duration {
+    match previous {
+        Some(previous) if !progressed => previous.saturating_mul(2).min(max),
+        _ => initial.min(max),
+    }
+}
+
 /// What kind of session is registered, and what the revalidator needs for it.
 pub(crate) enum Kind {
     /// An ordinary session: judged by [`session_standing`], its served streams asked again
@@ -102,12 +124,25 @@ pub(crate) struct Revalidator {
     /// This node's own static key, for its certificate in the Policy (round 11 N1).
     local_static: X25519PublicKey,
     sweep: Duration,
+    /// The first and the longest wait before a restart after a panic.
+    restart_delays: (Duration, Duration),
     state: Mutex<State>,
     wake: Notify,
     passes: AtomicU64,
+    /// Passes that ran to their end (the supervisor resets its backoff when one did).
+    completed: AtomicU64,
     /// Test hook: the next pass panics (the supervision test).
     #[cfg(test)]
     pub(crate) panic_next_pass: std::sync::atomic::AtomicBool,
+    /// Test hook: how many of the next passes panic.
+    #[cfg(test)]
+    pub(crate) panic_passes_left: std::sync::atomic::AtomicU32,
+    /// Test hook: the wait the supervisor chose before each restart.
+    #[cfg(test)]
+    pub(crate) restart_waits: Mutex<Vec<Duration>>,
+    /// Test hook: when each pass began.
+    #[cfg(test)]
+    pub(crate) pass_starts: Mutex<Vec<std::time::Instant>>,
     /// Test hook: the thread the last pass ran on.
     #[cfg(test)]
     pub(crate) last_pass_thread: Mutex<Option<std::thread::ThreadId>>,
@@ -143,6 +178,28 @@ impl Revalidator {
         local_static: X25519PublicKey,
         sweep: Duration,
     ) -> Arc<Self> {
+        Self::with_timing(
+            policies,
+            rosters,
+            local,
+            local_serial,
+            local_static,
+            sweep,
+            (RESTART_DELAY_INITIAL, RESTART_DELAY_MAX),
+        )
+    }
+
+    /// [`Self::with_sweep`] with other waits before a restart after a panic: the first and the
+    /// longest (tests shorten them).
+    pub(crate) fn with_timing(
+        policies: Arc<PolicyStore>,
+        rosters: Arc<RosterStore>,
+        local: NodeId,
+        local_serial: u32,
+        local_static: X25519PublicKey,
+        sweep: Duration,
+        restart_delays: (Duration, Duration),
+    ) -> Arc<Self> {
         Arc::new(Self {
             policies,
             rosters,
@@ -150,11 +207,19 @@ impl Revalidator {
             local_serial,
             local_static,
             sweep,
+            restart_delays,
             state: Mutex::new(State::default()),
             wake: Notify::new(),
             passes: AtomicU64::new(0),
+            completed: AtomicU64::new(0),
             #[cfg(test)]
             panic_next_pass: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            panic_passes_left: std::sync::atomic::AtomicU32::new(0),
+            #[cfg(test)]
+            restart_waits: Mutex::new(Vec::new()),
+            #[cfg(test)]
+            pass_starts: Mutex::new(Vec::new()),
             #[cfg(test)]
             last_pass_thread: Mutex::new(None),
             #[cfg(test)]
@@ -213,6 +278,12 @@ impl Revalidator {
     #[cfg(test)]
     pub(crate) fn state_is_free(&self) -> bool {
         self.state.try_lock().is_ok()
+    }
+
+    /// How many network passes ran to their end, for tests.
+    #[cfg(test)]
+    pub(crate) fn completed_passes(&self) -> u64 {
+        self.completed.load(Ordering::SeqCst)
     }
 
     /// How many network passes have run, for tests.
@@ -406,7 +477,17 @@ impl Revalidator {
                 .last_pass_thread
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner) = Some(std::thread::current().id());
-            if self.panic_next_pass.swap(false, Ordering::SeqCst) {
+            self.pass_starts
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(std::time::Instant::now());
+            let counted = self
+                .panic_passes_left
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+                    left.checked_sub(1)
+                })
+                .is_ok();
+            if counted || self.panic_next_pass.swap(false, Ordering::SeqCst) {
                 panic!("test: a pass panics");
             }
         }
@@ -414,24 +495,43 @@ impl Revalidator {
         let plan = self.plan(network_id, now);
         self.apply(&plan);
         let horizon = now.saturating_add(self.sweep.as_secs());
-        self.deadline(network_id, now).filter(|at| *at <= horizon)
+        let deadline = self.deadline(network_id, now).filter(|at| *at <= horizon);
+        self.completed.fetch_add(1, Ordering::SeqCst);
+        deadline
     }
 
     /// Runs until the task is dropped, and keeps running after a panic: the work is done by
     /// [`Self::run_once`] in a task of its own, and when that one panics the panic is logged and
     /// a new one starts with every network looked at (a panic ends all re evaluation for the
-    /// life of the node otherwise). Dropping or aborting this future stops the inner task too.
+    /// life of the node otherwise). The new one starts after a wait that doubles with each panic
+    /// in a row, from [`RESTART_DELAY_INITIAL`] to [`RESTART_DELAY_MAX`], and starts over at the
+    /// first after a run that completed a pass ([`restart_delay`]); a bug that every pass hits
+    /// does not become a busy loop. Dropping or aborting this future stops the inner task too,
+    /// also during the wait.
     pub(crate) async fn run(self: Arc<Self>) {
+        let (initial, max) = self.restart_delays;
         let mut everything = false;
+        let mut previous: Option<Duration> = None;
         loop {
+            let completed_before = self.completed.load(Ordering::SeqCst);
             let inner = tokio::spawn(Arc::clone(&self).run_once(everything));
             let _stop = AbortOnDrop(inner.abort_handle());
             match inner.await {
                 Ok(()) => return,
                 Err(error) if error.is_panic() => {
+                    let progressed = self.completed.load(Ordering::SeqCst) > completed_before;
+                    let wait = restart_delay(previous, progressed, initial, max);
+                    previous = Some(wait);
                     tracing::error!(
-                        "the revalidator panicked; it is restarted and every network looked at"
+                        wait_ms = wait.as_millis() as u64,
+                        "the revalidator panicked; it is restarted after the wait and every network looked at"
                     );
+                    #[cfg(test)]
+                    self.restart_waits
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .push(wait);
+                    tokio::time::sleep(wait).await;
                     everything = true;
                 }
                 // Cancelled from outside: nothing more to watch.
