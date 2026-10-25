@@ -17,6 +17,10 @@
 //!   over one it answered. Each inbound OPEN is authorized against the
 //!   Policy ([`PolicyAuthorizer`]) and, if allowed, handed to the node's
 //!   [`ServiceHandler`];
+//! * the revalidator (`revalidate`, protocol.md 5.3, L4k): one task that asks again, whenever
+//!   the Roster or the Policy changes and whenever a grant, the documents or a certificate
+//!   expire, whether each session may go on (else CLOSE `grant_removed`) and whether each
+//!   served stream still has its grant (else it is reset);
 //! * the document sync tasks (`docs_sync`, protocol.md 5.5 and 7.3): the watch
 //!   that fetches the Policy once the Roster is ahead of it, and one expiry
 //!   timer per claimed network. The comparison of seqs when a session comes up
@@ -78,10 +82,11 @@ use crate::docs_sync::{DocsSync, PushReport, SyncConfig};
 use crate::l4_router::{
     EnsureError, RouterConfig, RouterHandle, RouterParts, SessionReady, new_router,
 };
-use crate::l4_session::{CloseReason, E2E_PROTO_TAG};
-use crate::l5_stream::{OpenStreamError, accept_loop, open};
+use crate::l4_session::{CloseReason, E2E_PROTO_TAG, L4SessionHandle};
+use crate::l5_stream::{AcceptedStreams, OpenStreamError, accept_loop, accept_loop_tracked, open};
 use crate::outbound::{Epoch, SendBudgets};
 use crate::policy_store::PolicyStore;
+use crate::revalidate::{Kind, Revalidator};
 use crate::roster_store::RosterStore;
 use crate::session::{SessionConfig, SessionEvent, run_session_until};
 
@@ -235,6 +240,12 @@ impl Node {
             sync_config,
         );
         let networks = session.networks.clone();
+        let revalidator = Revalidator::new(
+            policies.clone(),
+            rosters.clone(),
+            local_node_id,
+            local_serial,
+        );
         let (stop_session, stop_rx) = watch::channel(false);
         let (ended_tx, session_ended) = watch::channel(false);
         let mut tasks = vec![
@@ -255,7 +266,10 @@ impl Node {
                 Arc::new(handler),
                 DocsGate::new(DocsLimits::default()),
                 Some(sync.clone()),
+                Some(revalidator.clone()),
             )),
+            // Grants, sessions and served streams, asked again on every change (protocol.md 5.3).
+            tokio::spawn(revalidator.run()),
             // A Roster newer than the Policy: fetch the Policy (protocol.md 5.5).
             tokio::spawn(sync.clone().run_roster_watch(networks.clone())),
         ];
@@ -418,6 +432,7 @@ async fn serve_sessions<H>(
     handler: Arc<H>,
     gate: Arc<DocsGate>,
     sync: Option<Arc<DocsSync>>,
+    revalidator: Option<Arc<Revalidator>>,
 ) where
     H: ServiceHandler<Stream> + Send + Sync + 'static,
     H::Handling: Send + 'static,
@@ -432,7 +447,20 @@ async fn serve_sessions<H>(
             &handler,
             &gate,
             sync.as_ref(),
+            revalidator.as_ref(),
         );
+    }
+}
+
+/// Takes a session out of the revalidator's registry when dropped, so the handle and the
+/// stream registry it holds go with the session however its accept loop ends.
+struct Forget(Option<(Arc<Revalidator>, u64)>);
+
+impl Drop for Forget {
+    fn drop(&mut self) {
+        if let Some((revalidator, id)) = self.0.take() {
+            revalidator.forget(id);
+        }
     }
 }
 
@@ -449,6 +477,10 @@ async fn serve_sessions<H>(
 /// session this node compares the responder's seqs with its own and fetches and/or pushes
 /// ([`DocsSync::reconcile`]); as the initiator of a docs only session it pushes, and
 /// when that was adopted starts one new handshake ([`DocsSync::docs_only_push`]).
+///
+/// With `revalidator`, every kind of session is registered with it before its accept loop
+/// starts and forgotten when the loop ends (protocol.md 5.3, L4k); an ordinary session's accept
+/// loop keeps a registry of the streams it serves for the revalidator to ask again.
 // One more independent input of the node's own identity (its cert serial).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn serve_session<H>(
@@ -460,6 +492,7 @@ pub(crate) fn serve_session<H>(
     handler: &Arc<H>,
     gate: &Arc<DocsGate>,
     sync: Option<&Arc<DocsSync>>,
+    revalidator: Option<&Arc<Revalidator>>,
 ) where
     H: ServiceHandler<Stream> + Send + Sync + 'static,
     H::Handling: Send + 'static,
@@ -467,6 +500,7 @@ pub(crate) fn serve_session<H>(
     let SessionReady {
         peer,
         network_id,
+        peer_static,
         mut acceptor,
         handle,
         role,
@@ -482,7 +516,17 @@ pub(crate) fn serve_session<H>(
         local_node_id,
         local_serial,
     );
+    // Registered before the accept loop starts, so no OPEN is served unwatched; the
+    // registration also has the network looked at once, for documents that changed since the
+    // router decided to hand this session out.
+    let register = |handle: &L4SessionHandle, kind: Kind| {
+        Forget(revalidator.map(|revalidator| {
+            let id = revalidator.register(peer, network_id, peer_static, handle.clone(), kind);
+            (Arc::clone(revalidator), id)
+        }))
+    };
     if docs_only && role == Role::Initiator {
+        let forget = register(&handle, Kind::DocsOnly);
         if let Some(sync) = sync {
             let sync = Arc::clone(sync);
             let handle = handle.clone();
@@ -490,8 +534,10 @@ pub(crate) fn serve_session<H>(
         }
         tokio::spawn(async move {
             accept_loop(&mut acceptor, DenyAll, RefuseAll).await;
+            drop(forget);
         });
     } else if docs_only {
+        let forget = register(&handle, Kind::DocsOnly);
         let handler = SessionHandler::docs_only(
             Arc::clone(handler),
             gate.clone(),
@@ -507,8 +553,17 @@ pub(crate) fn serve_session<H>(
         let authorizer = authorizer.docs_only();
         tokio::spawn(async move {
             accept_loop(&mut acceptor, authorizer, handler).await;
+            drop(forget);
         });
     } else {
+        let streams = AcceptedStreams::new();
+        let forget = register(
+            &handle,
+            Kind::Full {
+                streams: streams.clone(),
+                authorizer: authorizer.clone(),
+            },
+        );
         // The router's table holds its own clone of the handle for as long as the
         // session is the one in use.
         let handler = SessionHandler::full(
@@ -537,7 +592,8 @@ pub(crate) fn serve_session<H>(
             });
         }
         tokio::spawn(async move {
-            accept_loop(&mut acceptor, authorizer, handler).await;
+            accept_loop_tracked(&mut acceptor, authorizer, handler, streams).await;
+            drop(forget);
             if let Some((sync, id)) = live {
                 sync.forget(peer, network_id, id);
             }

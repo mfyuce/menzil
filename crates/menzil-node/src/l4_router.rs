@@ -1897,7 +1897,7 @@ fn docs_only_close() -> CloseReason {
 
 /// The CLOSE of a session whose standing is gone (protocol.md 5.3): one reason for every
 /// cause, the detail stays in the local log (TOBEDECIDED 30 T1).
-fn grant_removed_close() -> CloseReason {
+pub(crate) fn grant_removed_close() -> CloseReason {
     CloseReason {
         code: ErrorCode::GrantRemoved,
         msg: "grant removed".to_string(),

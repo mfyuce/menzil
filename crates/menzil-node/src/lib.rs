@@ -72,14 +72,15 @@ mod l5_stream;
 mod node;
 mod outbound;
 mod policy_store;
+mod revalidate;
 mod roster_store;
 mod serve;
 mod session;
 
 pub use admission::{
     HandshakeAdmission, InitiatorAdmission, PolicyAuthorizer, decide_initiator_admission,
-    decide_responder_admission, docs_service, is_docs_service, is_unrevoked_roster_member,
-    resolve_dial_cert, session_standing,
+    decide_responder_admission, docs_only_standing, docs_service, is_docs_service,
+    is_unrevoked_roster_member, resolve_dial_cert, session_standing,
 };
 pub use docs_access::{DocsGate, DocsLimits, DocsPermit, SessionHandler, SessionOpened};
 pub use docs_store::{Adopted, AdoptedDocs, DocStore};

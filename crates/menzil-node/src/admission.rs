@@ -112,12 +112,11 @@
 //! list, so a node removed from `members` but still named by a leftover
 //! direct grant got `NotMember` at handshake time yet `Allow` for the
 //! identical service through [`PolicyAuthorizer`]; closed by L4k K2: a
-//! direct grant now counts only for a node the Policy lists. And: nothing
-//! here yet gave a
-//! *pre-dial* caller (TODO.md L4e1/L4h6, not yet built) a way to resolve
-//! "the cert I should dial with" the way [`resolve_member_cert`] resolves
-//! one after the fact from an already-known key — needed before
-//! `E2eInitiatorHandshake::start` can actually be driven.
+//! direct grant now counts only for a node the Policy lists. And: a
+//! *pre-dial* caller had no way to resolve "the cert I should dial with" the
+//! way [`resolve_member_cert`] resolves one after the fact from an
+//! already-known key; [`resolve_dial_cert`] is that (built with the router,
+//! TODO.md L4h6).
 //!
 //! **Deliberately not done here**: putting any of the above on the wire
 //! with more detail than "allow" / "allow, no grant" / refuse outright —
@@ -211,7 +210,7 @@ fn resolve_member_cert(
 
 /// [`resolve_member_cert`] against a Policy body the caller already holds, so that a check
 /// that reads other parts of the same body (see [`session_standing`]) sees one snapshot.
-fn resolve_cert_in(
+pub(crate) fn resolve_cert_in(
     policy: &PolicyBody,
     node_id: &NodeId,
     claimed_key: &X25519PublicKey,
@@ -367,6 +366,39 @@ pub fn session_standing(
     Ok(())
 }
 
+/// [`session_standing`] for a docs only session (protocol.md 5.1), either role: the Roster
+/// alone. Such a session exists because the Policy cannot vouch for one side yet (the peer has
+/// no certificate or listing there, or this node's own listing is what the awaited push
+/// brings), so asking the Policy would end it the moment it began. What the session must keep
+/// is the Roster's word: neither node revoked or unlisted, and this node's cert serial not
+/// below its `min_serial` (the peer's serial is not known without a cert: its floor is
+/// enforced by the full handshake that follows the push). A network without a Roster is
+/// `UnknownNetwork`.
+pub fn docs_only_standing(
+    rosters: &RosterStore,
+    network_id: &NetworkId,
+    peer: &NodeId,
+    local: &NodeId,
+    local_serial: u32,
+) -> Result<(), ErrorCode> {
+    let roster = rosters.body(network_id).ok_or(ErrorCode::UnknownNetwork)?;
+    roster_own_standing(&roster, local, local_serial)?;
+    roster_standing(&roster, peer)?;
+    Ok(())
+}
+
+/// The Roster part of [`own_standing`].
+fn roster_own_standing(
+    roster: &RosterBody,
+    local: &NodeId,
+    local_serial: u32,
+) -> Result<(), ErrorCode> {
+    if local_serial < roster_standing(roster, local)? {
+        return Err(ErrorCode::StaleSerial);
+    }
+    Ok(())
+}
+
 /// This node's own standing, the first half of [`session_standing`]: unrevoked and listed in
 /// the Roster with `local_serial` not below its `min_serial`, and listed in the Policy.
 fn own_standing(
@@ -375,9 +407,7 @@ fn own_standing(
     local: &NodeId,
     local_serial: u32,
 ) -> Result<(), ErrorCode> {
-    if local_serial < roster_standing(roster, local)? {
-        return Err(ErrorCode::StaleSerial);
-    }
+    roster_own_standing(roster, local, local_serial)?;
     if !policy.members.iter().any(|member| &member.node_id == local) {
         return Err(ErrorCode::NotMember);
     }
@@ -741,6 +771,13 @@ impl PolicyAuthorizer {
     /// Whether this node is still a member in good standing by the documents held now. Reads
     /// the Roster and the Policy once each, like [`session_standing`].
     fn own_standing_holds(&self) -> bool {
+        // A docs only session is for a node whose own Policy listing may be what the push
+        // brings (TODO.md, K2 edge cases): its own standing is the Roster's.
+        if self.docs_only {
+            return self.rosters.body(&self.network_id).is_some_and(|roster| {
+                roster_own_standing(&roster, &self.to_node, self.to_node_serial).is_ok()
+            });
+        }
         match (
             self.rosters.body(&self.network_id),
             self.policies.body(&self.network_id),
@@ -2459,6 +2496,129 @@ mod tests {
         assert!(matches!(
             authorizer.authorize(&docs_request(&f.ids)),
             OpenDecision::Allow
+        ));
+    }
+
+    // --- docs only standing (L4k K4) ------------------------------------
+
+    /// A docs only session is judged by the Roster alone: neither the peer's missing cert or
+    /// Policy listing nor this node's own missing Policy listing is a reason to end it.
+    #[test]
+    fn docs_only_standing_is_the_rosters_word_and_only_the_rosters() {
+        let call = |f: &Fixture, rosters: &RosterStore| {
+            docs_only_standing(
+                rosters,
+                &f.ids.network_id,
+                &f.ids.initiator_node_id,
+                &f.ids.responder_node_id,
+                f.ids.responder_cert_serial,
+            )
+        };
+        let f = fixture(vec![]);
+        assert_eq!(call(&f, &f.rosters), Ok(()));
+
+        // Nothing the Policy says matters: no peer cert, nobody listed.
+        edit_policy_in(&f.ids, &f.policies, |b| {
+            b.certs.clear();
+            b.members.clear();
+        });
+        assert_eq!(call(&f, &f.rosters), Ok(()));
+
+        type Case = (&'static str, fn(&Ids, &RosterStore), ErrorCode);
+        let cases: [Case; 5] = [
+            (
+                "the peer is revoked",
+                |ids, rosters| {
+                    edit_roster_in(ids, rosters, |b| {
+                        b.revoked.push(revoked(ids.initiator_node_id));
+                    })
+                },
+                ErrorCode::Revoked,
+            ),
+            (
+                "the peer is no longer listed",
+                |ids, rosters| {
+                    edit_roster_in(ids, rosters, |b| {
+                        b.members.retain(|m| m.node_id != ids.initiator_node_id);
+                    })
+                },
+                ErrorCode::NotMember,
+            ),
+            (
+                "this node is revoked",
+                |ids, rosters| {
+                    edit_roster_in(ids, rosters, |b| {
+                        b.revoked.push(revoked(ids.responder_node_id));
+                    })
+                },
+                ErrorCode::Revoked,
+            ),
+            (
+                "this node is no longer listed",
+                |ids, rosters| {
+                    edit_roster_in(ids, rosters, |b| {
+                        b.members.retain(|m| m.node_id != ids.responder_node_id);
+                    })
+                },
+                ErrorCode::NotMember,
+            ),
+            (
+                "this node's min_serial is above its cert",
+                |ids, rosters| {
+                    edit_roster_in(ids, rosters, |b| {
+                        for m in &mut b.members {
+                            if m.node_id == ids.responder_node_id {
+                                m.min_serial = ids.responder_cert_serial + 1;
+                            }
+                        }
+                    })
+                },
+                ErrorCode::StaleSerial,
+            ),
+        ];
+        for (label, change, expected) in cases {
+            let f = fixture(vec![]);
+            change(&f.ids, &f.rosters);
+            assert_eq!(call(&f, &f.rosters), Err(expected), "{label}");
+        }
+        assert_eq!(
+            docs_only_standing(
+                &RosterStore::new(),
+                &f.ids.network_id,
+                &f.ids.initiator_node_id,
+                &f.ids.responder_node_id,
+                f.ids.responder_cert_serial,
+            ),
+            Err(ErrorCode::UnknownNetwork)
+        );
+    }
+
+    /// The window a docs only session is for: this node is in the Roster and not yet in its
+    /// older Policy. The push that brings the Policy must be taken, so the docs only
+    /// authorizer asks the Roster for this node's own standing; a revoked node still serves
+    /// nothing.
+    #[test]
+    fn a_docs_only_authorizer_takes_a_push_before_this_node_is_in_its_policy() {
+        let f = fixture(vec![]);
+        let (full, rosters, policies) = authorizer_of(&f);
+        let narrowed = full.clone().docs_only();
+        edit_policy_in(&f.ids, &policies, |b| {
+            b.members.retain(|m| m.node_id != f.ids.responder_node_id);
+        });
+        assert!(matches!(
+            full.authorize(&docs_request(&f.ids)),
+            OpenDecision::Deny(_)
+        ));
+        assert!(matches!(
+            narrowed.authorize(&docs_request(&f.ids)),
+            OpenDecision::Allow
+        ));
+        edit_roster_in(&f.ids, &rosters, |b| {
+            b.revoked.push(revoked(f.ids.responder_node_id));
+        });
+        assert!(matches!(
+            narrowed.authorize(&docs_request(&f.ids)),
+            OpenDecision::Deny(_)
         ));
     }
 }

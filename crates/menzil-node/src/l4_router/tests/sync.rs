@@ -58,6 +58,7 @@ pub(super) fn auto_serve(
                 &handler,
                 &gate,
                 sync.as_ref(),
+                None,
             );
         }
     });

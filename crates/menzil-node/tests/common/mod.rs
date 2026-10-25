@@ -254,3 +254,111 @@ pub async fn controlled_proxy(relay: SocketAddr) -> ControlledProxy {
     });
     ControlledProxy { port, wire }
 }
+
+// ---- served targets and re issued documents (the L4k revocation tests) -----------------
+
+use std::io;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use futures_util::io::{AsyncReadExt as _, AsyncWriteExt as _};
+use menzil_proto::{NodeOrWildcard, Principal, PrincipalTarget, ServiceId};
+use menzil_stream::Stream;
+use tokio::net::TcpListener;
+use tokio::sync::mpsc;
+
+pub fn service(s: &str) -> ServiceId {
+    s.parse().unwrap()
+}
+
+pub fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+}
+
+/// `from` may use `services` on `to`, until `expires`.
+pub fn grant(
+    network_id: NetworkId,
+    from: NodeId,
+    to: NodeId,
+    services: &[&str],
+    expires: Option<u64>,
+) -> Grant {
+    Grant {
+        from: Principal {
+            network_id,
+            target: PrincipalTarget::Node(from),
+        },
+        to_node: NodeOrWildcard::Node(to),
+        services: services.iter().map(|s| service(s)).collect(),
+        expires,
+    }
+}
+
+/// `policy` and `roster` re issued as `seq` (fresh dates), with `edit` applied to the bodies.
+pub fn reissue(
+    owner: &SigningKey,
+    roster: &Roster,
+    policy: &Policy,
+    seq: u64,
+    edit_roster: impl FnOnce(&mut RosterBody),
+    edit_policy: impl FnOnce(&mut PolicyBody),
+) -> (Roster, Policy) {
+    let now = unix_now();
+    let mut roster = roster.decode().unwrap();
+    roster.seq = seq;
+    roster.issued = now - 100;
+    roster.expires = now + 10 * 86_400;
+    edit_roster(&mut roster);
+    let mut policy = policy.decode().unwrap();
+    policy.seq = seq;
+    policy.issued = now - 100;
+    policy.expires = now + 10 * 86_400;
+    edit_policy(&mut policy);
+    (
+        Roster::sign(owner, &roster).unwrap(),
+        Policy::sign(owner, &policy).unwrap(),
+    )
+}
+
+/// How a connection to an echo server ended, as the server saw it.
+pub type Ended = Result<(), io::ErrorKind>;
+
+/// Echoes every byte until the peer's end of file. Each connection reports how it ended.
+pub async fn echo_server(listener: TcpListener, ended: mpsc::UnboundedSender<Ended>) {
+    loop {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let ended = ended.clone();
+        tokio::spawn(async move {
+            let mut buf = [0u8; 4096];
+            let outcome = loop {
+                match socket.read(&mut buf).await {
+                    Ok(0) => break Ok(()),
+                    Ok(n) => {
+                        if let Err(e) = socket.write_all(&buf[..n]).await {
+                            break Err(e.kind());
+                        }
+                    }
+                    Err(e) => break Err(e.kind()),
+                }
+            };
+            let _ = socket.shutdown().await;
+            let _ = ended.send(outcome);
+        });
+    }
+}
+
+pub async fn echo_round_trip(stream: &mut Stream, data: &[u8]) {
+    let mut back = vec![0u8; data.len()];
+    let (mut reader, mut writer) = stream.split();
+    let (_, read) = tokio::join!(
+        async {
+            writer.write_all(data).await.unwrap();
+            writer.flush().await.unwrap();
+        },
+        async { reader.read_exact(&mut back).await },
+    );
+    read.unwrap();
+    assert_eq!(back, data);
+}

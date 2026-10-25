@@ -1,0 +1,621 @@
+//! The revalidator (L4k K4) over the routers of the parent module: real sessions between two
+//! in-memory nodes, B serving with a [`Revalidator`] and A observing. What a pass decides for
+//! each kind of session (`plan`), that the running task acts on a change of either store and on
+//! a session that registers late, that the sweep is a safety net, and that a session leaves the
+//! registry when it ends. The pure deadline arithmetic is in `revalidate.rs`; real time (a grant
+//! that expires) is in `tests/grant_expiry_live.rs`.
+
+use super::*;
+use crate::docs_access::{DocsGate, DocsLimits};
+use crate::l5_stream::open as open_stream;
+use crate::node::serve_session;
+use crate::revalidate::{Action, Revalidator};
+use menzil_stream::{OpenRefusal, OpenRequest, ServiceHandler, Stream};
+
+/// A service handler that accepts every stream and holds it open until its task is dropped,
+/// which is what resets it.
+struct Hold;
+
+impl ServiceHandler<Stream> for Hold {
+    type Opened = ();
+    type Handling = std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>;
+
+    async fn open(&self, _request: &OpenRequest) -> Result<(), OpenRefusal> {
+        Ok(())
+    }
+
+    fn handle(&self, stream: Stream, _request: OpenRequest, _opened: ()) -> Self::Handling {
+        Box::pin(async move {
+            let _stream = stream;
+            std::future::pending::<()>().await;
+        })
+    }
+}
+
+fn grant_for(w: &World, from: &Party, to: &Party, services: &[&str]) -> Grant {
+    Grant {
+        from: Principal {
+            network_id: w.network,
+            target: PrincipalTarget::Node(from.id),
+        },
+        to_node: NodeOrWildcard::Node(to.id),
+        services: services.iter().map(|s| s.parse().unwrap()).collect(),
+        expires: None,
+    }
+}
+
+fn edit_policy_of(w: &World, stores: &Stores, edit: impl FnOnce(&mut PolicyBody)) {
+    let mut body = stores.policies.body(&w.network).unwrap().as_ref().clone();
+    body.seq += 1;
+    edit(&mut body);
+    assert!(
+        stores
+            .policies
+            .set(&Policy::sign(&w.owner, &body).unwrap())
+            .unwrap()
+    );
+}
+
+fn revoke_in(w: &World, stores: &Stores, who: NodeId) {
+    edit_roster_of(w, stores, |body| {
+        body.revoked.push(menzil_proto::RevokedMember {
+            node_id: who,
+            since: 0,
+        });
+    });
+}
+
+/// B serves what A opens, with a revalidator at B.
+struct Live {
+    w: World,
+    a: Party,
+    b: Party,
+    stores_a: Stores,
+    stores_b: Stores,
+    _net: Net,
+    _na: TestNode,
+    _nb: TestNode,
+    /// A's end of the session, to open streams on.
+    handle_a: L4SessionHandle,
+    /// A's acceptor, never served: it only tells how the session ended.
+    ready_a: SessionReady,
+    reval: Arc<Revalidator>,
+    ready_b: Option<SessionReady>,
+}
+
+async fn live(grants: impl FnOnce(&World, &Party, &Party) -> Vec<Grant>) -> Live {
+    let w = world();
+    let (a, b) = (party(), party());
+    let grants = grants(&w, &a, &b);
+    let stores_a = w.stores(&[&a, &b], grants.clone());
+    let stores_b = w.stores(&[&a, &b], grants);
+    let net = Net::new();
+    let mut na = node(&net, &a, &stores_a).await;
+    let mut nb = node(&net, &b, &stores_b).await;
+    let handle_a = ensure(&na, b.id, w.network).await.unwrap();
+    let ready_a = na.next_ready().await;
+    let ready_b = nb.next_ready().await;
+    let reval = Revalidator::new(stores_b.policies.clone(), stores_b.rosters.clone(), b.id, 1);
+    Live {
+        w,
+        a,
+        b,
+        stores_a,
+        stores_b,
+        _net: net,
+        _na: na,
+        _nb: nb,
+        handle_a,
+        ready_a,
+        reval,
+        ready_b: Some(ready_b),
+    }
+}
+
+impl Live {
+    /// Starts serving B's end of the session with the revalidator.
+    fn serve_b(&mut self) {
+        let ready = self.ready_b.take().expect("served once");
+        serve_session(
+            ready,
+            &self.stores_b.policies,
+            &self.stores_b.rosters,
+            self.b.id,
+            1,
+            &Arc::new(Hold),
+            &DocsGate::new(DocsLimits::default()),
+            None,
+            Some(&self.reval),
+        );
+    }
+}
+
+fn service(s: &str) -> menzil_proto::ServiceId {
+    s.parse().unwrap()
+}
+
+// ---- what a pass decides ----------------------------------------------------
+
+type Edit = fn(&Live);
+
+#[tokio::test(start_paused = true)]
+async fn a_full_session_is_closed_or_rechecked_by_the_documents_held() {
+    let cases: Vec<(&str, Edit, u64, Action)> = vec![
+        ("nothing changed", |_| {}, 1_000, Action::Recheck),
+        (
+            "the peer is revoked",
+            |l| revoke_in(&l.w, &l.stores_b, l.a.id),
+            1_000,
+            Action::Close(ErrorCode::Revoked),
+        ),
+        (
+            "the peer is dropped from the Roster",
+            |l| {
+                edit_roster_of(&l.w, &l.stores_b, |b| {
+                    b.members.retain(|m| m.node_id != l.a.id);
+                })
+            },
+            1_000,
+            Action::Close(ErrorCode::NotMember),
+        ),
+        (
+            "the peer is dropped from the Policy",
+            |l| {
+                edit_policy_of(&l.w, &l.stores_b, |b| {
+                    b.members.retain(|m| m.node_id != l.a.id);
+                })
+            },
+            1_000,
+            Action::Close(ErrorCode::NotMember),
+        ),
+        (
+            "the peer's cert is gone from the Policy",
+            |l| {
+                edit_policy_of(&l.w, &l.stores_b, |b| {
+                    b.certs.retain(|c| c.decode().unwrap().node_id != l.a.id);
+                })
+            },
+            1_000,
+            Action::Close(ErrorCode::BadCert),
+        ),
+        (
+            "the peer's cert has expired",
+            |_| {},
+            4_000_000_001,
+            Action::Close(ErrorCode::BadCert),
+        ),
+        (
+            "the peer's min_serial is above its cert",
+            |l| {
+                edit_roster_of(&l.w, &l.stores_b, |b| {
+                    for m in &mut b.members {
+                        if m.node_id == l.a.id {
+                            m.min_serial = 2;
+                        }
+                    }
+                })
+            },
+            1_000,
+            Action::Close(ErrorCode::StaleSerial),
+        ),
+        (
+            "this node is revoked",
+            |l| revoke_in(&l.w, &l.stores_b, l.b.id),
+            1_000,
+            Action::Close(ErrorCode::Revoked),
+        ),
+        (
+            "this node's min_serial is above its cert",
+            |l| {
+                edit_roster_of(&l.w, &l.stores_b, |b| {
+                    for m in &mut b.members {
+                        if m.node_id == l.b.id {
+                            m.min_serial = 2;
+                        }
+                    }
+                })
+            },
+            1_000,
+            Action::Close(ErrorCode::StaleSerial),
+        ),
+        (
+            "this node is dropped from the Policy",
+            |l| {
+                edit_policy_of(&l.w, &l.stores_b, |b| {
+                    b.members.retain(|m| m.node_id != l.b.id);
+                })
+            },
+            1_000,
+            Action::Close(ErrorCode::NotMember),
+        ),
+        (
+            "the grant is removed: the streams are asked again, the session stays",
+            |l| edit_policy_of(&l.w, &l.stores_b, |b| b.grants.clear()),
+            1_000,
+            Action::Recheck,
+        ),
+        (
+            "the documents have expired: no session ends",
+            |l| {
+                edit_roster_of(&l.w, &l.stores_b, |b| b.expires = 1);
+                edit_policy_of(&l.w, &l.stores_b, |b| b.expires = 1);
+            },
+            1_000,
+            Action::Recheck,
+        ),
+    ];
+    for (label, edit, now, expected) in cases {
+        let mut live = live(|w, a, b| vec![grant_for(w, a, b, &["tcp:ssh"])]).await;
+        live.serve_b();
+        edit(&live);
+        assert_eq!(
+            live.reval.plan(&live.w.network, now),
+            vec![(0, expected)],
+            "{label}"
+        );
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_pass_over_another_network_plans_nothing() {
+    let mut live = live(|w, a, b| vec![grant_for(w, a, b, &["tcp:ssh"])]).await;
+    live.serve_b();
+    assert!(
+        live.reval
+            .plan(&NetworkId::from([9u8; 32]), 1_000)
+            .is_empty()
+    );
+}
+
+/// A docs only session exists for a peer the Policy cannot vouch for, or a node the Policy does
+/// not list yet; the full rules would end it before the push it is for.
+#[tokio::test(start_paused = true)]
+async fn a_docs_only_session_is_judged_by_the_roster_alone() {
+    let w = world();
+    let (r, m) = (party(), party());
+    // R's Roster lists both; its older Policy lists M with a cert but not R itself.
+    let r_stores = w.split_stores(&[&r, &m], &[&m], &[&m]);
+    let m_stores = w.stores(&[&r, &m], vec![]);
+    let net = Net::new();
+    let mut nm = node(&net, &m, &m_stores).await;
+    let mut nr = node(&net, &r, &r_stores).await;
+    assert_eq!(
+        ensure(&nm, r.id, w.network).await.err(),
+        Some(EnsureError::DocsOnly)
+    );
+    let at_r = nr.next_ready().await;
+    let _at_m = nm.next_ready().await;
+    assert!(at_r.docs_only);
+
+    let reval = Revalidator::new(r_stores.policies.clone(), r_stores.rosters.clone(), r.id, 1);
+    serve_session(
+        at_r,
+        &r_stores.policies,
+        &r_stores.rosters,
+        r.id,
+        1,
+        &Arc::new(Hold),
+        &DocsGate::new(DocsLimits::default()),
+        None,
+        Some(&reval),
+    );
+    // Neither side is in good standing by the full rules (R is missing from its Policy), and the
+    // session is fine: nothing to do.
+    assert_eq!(reval.plan(&w.network, 1_000), vec![]);
+    // The Roster is another matter.
+    revoke_in(&w, &r_stores, m.id);
+    assert_eq!(
+        reval.plan(&w.network, 1_000),
+        vec![(0, Action::Close(ErrorCode::Revoked))]
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_docs_only_session_ends_when_this_node_loses_its_standing_in_the_roster() {
+    let w = world();
+    let (r, m) = (party(), party());
+    let r_stores = w.split_stores(&[&r, &m], &[&m], &[&m]);
+    let m_stores = w.stores(&[&r, &m], vec![]);
+    let net = Net::new();
+    let mut nm = node(&net, &m, &m_stores).await;
+    let mut nr = node(&net, &r, &r_stores).await;
+    assert_eq!(
+        ensure(&nm, r.id, w.network).await.err(),
+        Some(EnsureError::DocsOnly)
+    );
+    let at_r = nr.next_ready().await;
+    let _at_m = nm.next_ready().await;
+    let reval = Revalidator::new(r_stores.policies.clone(), r_stores.rosters.clone(), r.id, 1);
+    serve_session(
+        at_r,
+        &r_stores.policies,
+        &r_stores.rosters,
+        r.id,
+        1,
+        &Arc::new(Hold),
+        &DocsGate::new(DocsLimits::default()),
+        None,
+        Some(&reval),
+    );
+    edit_roster_of(&w, &r_stores, |b| {
+        for member in &mut b.members {
+            if member.node_id == r.id {
+                member.min_serial = 2;
+            }
+        }
+    });
+    assert_eq!(
+        reval.plan(&w.network, 1_000),
+        vec![(0, Action::Close(ErrorCode::StaleSerial))]
+    );
+}
+
+/// The initiator of a docs only session is registered too: when its own Roster revokes the
+/// responder, the session goes.
+#[tokio::test(start_paused = true)]
+async fn the_initiator_of_a_docs_only_session_is_watched_as_well() {
+    let w = world();
+    let (r, m) = (party(), party());
+    let r_stores = w.split_stores(&[&r, &m], &[&m], &[&m]);
+    let m_stores = w.stores(&[&r, &m], vec![]);
+    let net = Net::new();
+    let mut nm = node(&net, &m, &m_stores).await;
+    let _nr = node(&net, &r, &r_stores).await;
+    assert_eq!(
+        ensure(&nm, r.id, w.network).await.err(),
+        Some(EnsureError::DocsOnly)
+    );
+    let at_m = nm.next_ready().await;
+    assert!(at_m.docs_only && at_m.role == Role::Initiator);
+    let reval = Revalidator::new(m_stores.policies.clone(), m_stores.rosters.clone(), m.id, 1);
+    serve_session(
+        at_m,
+        &m_stores.policies,
+        &m_stores.rosters,
+        m.id,
+        1,
+        &Arc::new(Hold),
+        &DocsGate::new(DocsLimits::default()),
+        None,
+        Some(&reval),
+    );
+    assert_eq!(reval.plan(&w.network, 1_000), vec![]);
+    revoke_in(&w, &m_stores, r.id);
+    assert_eq!(
+        reval.plan(&w.network, 1_000),
+        vec![(0, Action::Close(ErrorCode::Revoked))]
+    );
+}
+
+/// The window the docs only rules exist for: R's Roster lists it, its older Policy does not, and
+/// the push that brings the Policy is taken.
+#[tokio::test(start_paused = true)]
+async fn a_docs_only_push_is_taken_by_a_node_its_own_policy_does_not_list_yet() {
+    let w = world();
+    let (r, m) = (party(), party());
+    let (r1, _) = w.fresh_pair(1, &[&r, &m], &[&m], &[&m]);
+    let p1 = w.policy(&[&m], &[&m], vec![]);
+    let (r2, p2) = w.fresh_pair(2, &[&r, &m], &[&r, &m], &[&r, &m]);
+    let (stores_r, stores_m) = (stores_from(&r1, &p1), stores_from(&r2, &p2));
+    let net = Net::new();
+    let mut nr = node(&net, &r, &stores_r).await;
+    let mut nm = node(&net, &m, &stores_m).await;
+    assert_eq!(
+        ensure(&nm, r.id, w.network).await.err(),
+        Some(EnsureError::DocsOnly)
+    );
+    let mut at_m = nm.next_ready().await;
+    let at_r = nr.next_ready().await;
+    let reval = Revalidator::new(stores_r.policies.clone(), stores_r.rosters.clone(), r.id, 1);
+    tokio::spawn(reval.clone().run());
+    let handle = at_m.handle.clone();
+    let mut closed = std::pin::pin!(at_m.acceptor.closed());
+    serve_session(
+        at_r,
+        &stores_r.policies,
+        &stores_r.rosters,
+        r.id,
+        1,
+        &Arc::new(Hold),
+        &DocsGate::new(DocsLimits::default()),
+        None,
+        Some(&reval),
+    );
+
+    let source = crate::docs::StoreDocs::new(&stores_m.rosters, &stores_m.policies, w.network);
+    let bundle = crate::docs::bundle_to_push(&source, docs_params(w.network).now);
+    let mut docs = open_stream(&handle, crate::docs_service(), None)
+        .await
+        .expect("R is in the Roster: it takes the push");
+    let result = crate::docs::push(&mut docs, &bundle, &docs_params(w.network))
+        .await
+        .unwrap();
+    assert_eq!(result.policy, menzil_proto::docs::Outcome::Adopted);
+    assert_eq!(stores_r.policies.seq(&w.network), Some(2));
+    docs.close().await.unwrap();
+    let reason = timeout(Duration::from_secs(5), &mut closed)
+        .await
+        .expect("the session ends with the push");
+    assert!(
+        matches!(
+            reason.as_ref(),
+            EndReason::PeerClosed {
+                code: ErrorCode::DocsOnly,
+                ..
+            }
+        ),
+        "the revalidator must not have ended it first: {reason:?}"
+    );
+}
+
+// ---- the running task -------------------------------------------------------
+
+#[tokio::test(start_paused = true)]
+async fn a_roster_that_revokes_the_peer_ends_the_session_and_the_registry_lets_go_of_it() {
+    let mut live = live(|w, a, b| vec![grant_for(w, a, b, &["tcp:ssh"])]).await;
+    tokio::spawn(live.reval.clone().run());
+    live.serve_b();
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(live.reval.session_count(), 1);
+    // The session is fine until the Roster says otherwise.
+    assert!(
+        timeout(Duration::from_secs(3), live.ready_a.acceptor.closed())
+            .await
+            .is_err()
+    );
+
+    revoke_in(&live.w, &live.stores_b, live.a.id);
+    match ended(&mut live.ready_a.acceptor).await.as_ref() {
+        EndReason::PeerClosed { code, .. } => assert_eq!(*code, ErrorCode::GrantRemoved),
+        other => panic!("expected the peer's close with grant_removed, got {other:?}"),
+    }
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(
+        live.reval.session_count(),
+        0,
+        "an ended session leaves the registry"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_policy_without_the_grant_resets_that_stream_only_and_the_session_stays() {
+    let mut live = live(|w, a, b| {
+        vec![
+            grant_for(w, a, b, &["tcp:ssh"]),
+            grant_for(w, a, b, &["tcp:web"]),
+        ]
+    })
+    .await;
+    tokio::spawn(live.reval.clone().run());
+    live.serve_b();
+    let mut ssh = open_stream(&live.handle_a, service("tcp:ssh"), None)
+        .await
+        .unwrap();
+    let mut web = open_stream(&live.handle_a, service("tcp:web"), None)
+        .await
+        .unwrap();
+
+    // Only the Policy changes: the Roster is as it was, and the store that signals is the
+    // Policy's.
+    let ssh_grant = grant_for(&live.w, &live.a, &live.b, &["tcp:ssh"]);
+    edit_policy_of(&live.w, &live.stores_b, |b| {
+        b.grants.retain(|g| g != &ssh_grant);
+    });
+
+    let mut byte = [0u8; 1];
+    let error = timeout(Duration::from_secs(2), ssh.read(&mut byte))
+        .await
+        .expect("the stream whose grant went is reset at once")
+        .expect_err("a reset, not an end of file");
+    assert_eq!(error.kind(), std::io::ErrorKind::ConnectionReset);
+    assert!(
+        timeout(Duration::from_secs(2), web.read(&mut byte))
+            .await
+            .is_err(),
+        "the other stream goes on"
+    );
+    // The session stays and the grant is refused from now on, while menzil:docs is served.
+    assert!(
+        timeout(Duration::from_secs(1), live.ready_a.acceptor.closed())
+            .await
+            .is_err()
+    );
+    match open_stream(&live.handle_a, service("tcp:ssh"), None).await {
+        Err(crate::l5_stream::OpenStreamError::Refused { code, .. }) => {
+            assert_eq!(code, ErrorCode::NoGrant)
+        }
+        other => panic!("expected no_grant, got {:?}", other.map(|_| ())),
+    }
+    assert!(
+        open_stream(&live.handle_a, crate::docs_service(), None)
+            .await
+            .is_ok(),
+        "a member with no grant still fetches documents"
+    );
+    drop(web);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_roster_alone_that_revokes_this_node_ends_a_session_it_initiated() {
+    let mut live = live(|w, a, b| vec![grant_for(w, a, b, &["tcp:ssh"])]).await;
+    // A's side: A is the initiator here, and its own Roster revokes it.
+    let reval_a = Revalidator::new(
+        live.stores_a.policies.clone(),
+        live.stores_a.rosters.clone(),
+        live.a.id,
+        1,
+    );
+    tokio::spawn(reval_a.clone().run());
+    let ready_a = std::mem::replace(
+        &mut live.ready_a,
+        // B's end, left unserved, tells how the session ended.
+        live.ready_b.take().unwrap(),
+    );
+    assert_eq!(ready_a.role, Role::Initiator);
+    serve_session(
+        ready_a,
+        &live.stores_a.policies,
+        &live.stores_a.rosters,
+        live.a.id,
+        1,
+        &Arc::new(Hold),
+        &DocsGate::new(DocsLimits::default()),
+        None,
+        Some(&reval_a),
+    );
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    revoke_in(&live.w, &live.stores_a, live.a.id);
+    match ended(&mut live.ready_a.acceptor).await.as_ref() {
+        EndReason::PeerClosed { code, .. } => assert_eq!(*code, ErrorCode::GrantRemoved),
+        other => panic!("expected the peer's close with grant_removed, got {other:?}"),
+    }
+}
+
+/// The documents may change between the router's decision and the registration: the
+/// registration alone has the network looked at, no notice of a change will come.
+#[tokio::test(start_paused = true)]
+async fn a_session_that_registers_after_the_documents_changed_is_checked_at_once() {
+    let mut live = live(|w, a, b| vec![grant_for(w, a, b, &["tcp:ssh"])]).await;
+    tokio::spawn(live.reval.clone().run());
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    revoke_in(&live.w, &live.stores_b, live.a.id);
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    live.serve_b();
+    match ended(&mut live.ready_a.acceptor).await.as_ref() {
+        EndReason::PeerClosed { code, .. } => assert_eq!(*code, ErrorCode::GrantRemoved),
+        other => panic!("expected the peer's close with grant_removed, got {other:?}"),
+    }
+}
+
+/// The sweep looks at every network with a session whatever else happens.
+#[tokio::test(start_paused = true)]
+async fn the_sweep_looks_again_at_every_session_on_its_interval() {
+    let mut live = live(|w, a, b| vec![grant_for(w, a, b, &["tcp:ssh"])]).await;
+    live.reval = Revalidator::with_sweep(
+        live.stores_b.policies.clone(),
+        live.stores_b.rosters.clone(),
+        live.b.id,
+        1,
+        Duration::from_secs(60),
+    );
+    tokio::spawn(live.reval.clone().run());
+    live.serve_b();
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    let after_registration = live.reval.passes();
+    assert!(after_registration >= 1, "the registration is a pass");
+
+    tokio::time::sleep(Duration::from_secs(30)).await;
+    assert_eq!(
+        live.reval.passes(),
+        after_registration,
+        "not before it is due"
+    );
+    tokio::time::sleep(Duration::from_secs(35)).await;
+    assert_eq!(
+        live.reval.passes(),
+        after_registration + 1,
+        "one pass for the one network, at the sweep"
+    );
+    tokio::time::sleep(Duration::from_secs(60)).await;
+    assert_eq!(live.reval.passes(), after_registration + 2);
+}
