@@ -79,7 +79,7 @@ mod session;
 pub use admission::{
     HandshakeAdmission, InitiatorAdmission, PolicyAuthorizer, decide_initiator_admission,
     decide_responder_admission, docs_service, is_docs_service, is_unrevoked_roster_member,
-    resolve_dial_cert,
+    resolve_dial_cert, session_standing,
 };
 pub use docs_access::{DocsGate, DocsLimits, DocsPermit, SessionHandler, SessionOpened};
 pub use docs_store::{Adopted, AdoptedDocs, DocStore};

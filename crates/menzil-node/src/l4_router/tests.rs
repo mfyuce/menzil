@@ -609,6 +609,10 @@ async fn a_session_comes_up_between_two_nodes_and_carries_bytes_both_ways() {
     assert_eq!(ready_a.network_id, w.network);
     assert_eq!(ready_b.role, Role::Responder);
     assert_eq!(ready_b.peer, a.id);
+    // Each side announces the Noise static key of the other (L4k: the key the standing check
+    // looks up in the Policy).
+    assert_eq!(ready_a.peer_static, b.x25519_public);
+    assert_eq!(ready_b.peer_static, a.x25519_public);
     // Only the initiator learns the peer's document sequence numbers.
     assert_eq!(ready_a.peer_roster_seq, Some(1));
     assert_eq!(ready_a.peer_policy_seq, Some(1));
@@ -1736,6 +1740,130 @@ async fn the_attached_relay_is_not_dialed_even_when_a_policy_lists_it() {
     assert_eq!(net.count_from(&a.id, "init"), 0, "and sends nothing");
 }
 
+/// Raises the Roster of `stores` to the next seq with `edit` applied.
+fn edit_roster_of(w: &World, stores: &Stores, edit: impl FnOnce(&mut RosterBody)) {
+    let mut body = stores.rosters.body(&w.network).unwrap().as_ref().clone();
+    body.seq += 1;
+    edit(&mut body);
+    assert!(
+        stores
+            .rosters
+            .set(&Roster::sign(&w.owner, &body).unwrap())
+            .unwrap()
+    );
+}
+
+/// Waits for the end of the session behind `acceptor`.
+async fn ended(acceptor: &mut L4SessionAcceptor) -> Arc<EndReason> {
+    timeout(Duration::from_secs(5), acceptor.closed())
+        .await
+        .expect("the session must have ended")
+}
+
+/// L4k, T16: `ensure` re checks a session before it hands it out. A peer the Roster alone has
+/// revoked in the meantime (the relay DOC comes before the Policy) is not handed out: the
+/// session is closed with CLOSE `grant_removed`, on both ends, and the caller is told what a
+/// fresh dial says, without a dial going out.
+#[tokio::test(start_paused = true)]
+async fn ensure_closes_a_session_whose_peer_was_revoked_instead_of_handing_it_out() {
+    let w = world();
+    let (a, b) = (party(), party());
+    let stores = w.stores(&[&a, &b], vec![w.grant(&a, &b)]);
+    let net = Net::new();
+    let mut na = node(&net, &a, &stores).await;
+    let mut nb = node(&net, &b, &stores).await;
+
+    ensure(&na, b.id, w.network).await.unwrap();
+    let mut ready_a = na.next_ready().await;
+    let mut ready_b = nb.next_ready().await;
+    // While both are in good standing the same session is handed out again.
+    ensure(&na, b.id, w.network).await.unwrap();
+    assert_eq!(net.count_from(&a.id, "init"), 1);
+
+    edit_roster_of(&w, &stores, |body| {
+        body.revoked.push(menzil_proto::RevokedMember {
+            node_id: b.id,
+            since: 0,
+        });
+    });
+    assert_eq!(
+        ensure(&na, b.id, w.network).await.err(),
+        Some(EnsureError::UnknownPeer)
+    );
+    assert_eq!(net.count_from(&a.id, "init"), 1, "and nothing is dialed");
+
+    match ended(&mut ready_a.acceptor).await.as_ref() {
+        EndReason::ClosedLocally(Some(close)) => {
+            assert_eq!(close.code, ErrorCode::GrantRemoved);
+        }
+        other => panic!("expected a local close with grant_removed, got {other:?}"),
+    }
+    match ended(&mut ready_b.acceptor).await.as_ref() {
+        EndReason::PeerClosed { code, .. } => assert_eq!(*code, ErrorCode::GrantRemoved),
+        other => panic!("expected the peer's close with grant_removed, got {other:?}"),
+    }
+}
+
+/// The same when it is this node that is no longer in good standing: the session goes, and the
+/// caller is told what the dial checks say of a node that is not a member.
+#[tokio::test(start_paused = true)]
+async fn ensure_closes_a_session_when_this_node_was_revoked_itself() {
+    let w = world();
+    let (a, b) = (party(), party());
+    let stores = w.stores(&[&a, &b], vec![w.grant(&a, &b)]);
+    let net = Net::new();
+    let mut na = node(&net, &a, &stores).await;
+    let _nb = node(&net, &b, &stores).await;
+
+    ensure(&na, b.id, w.network).await.unwrap();
+    let mut ready_a = na.next_ready().await;
+    edit_roster_of(&w, &stores, |body| {
+        body.revoked.push(menzil_proto::RevokedMember {
+            node_id: a.id,
+            since: 0,
+        });
+    });
+    assert_eq!(
+        ensure(&na, b.id, w.network).await.err(),
+        Some(EnsureError::NotAMember)
+    );
+    assert!(matches!(
+        ended(&mut ready_a.acceptor).await.as_ref(),
+        EndReason::ClosedLocally(Some(close)) if close.code == ErrorCode::GrantRemoved
+    ));
+    assert_eq!(net.count_from(&a.id, "init"), 1);
+}
+
+/// A cert serial below the Roster's new `min_serial` ends the session too: the session key's
+/// cert is the one a raised floor kills (protocol.md 7.3).
+#[tokio::test(start_paused = true)]
+async fn ensure_closes_a_session_whose_peer_cert_fell_below_the_min_serial() {
+    let w = world();
+    let (a, b) = (party(), party());
+    let stores = w.stores(&[&a, &b], vec![w.grant(&a, &b)]);
+    let net = Net::new();
+    let mut na = node(&net, &a, &stores).await;
+    let _nb = node(&net, &b, &stores).await;
+
+    ensure(&na, b.id, w.network).await.unwrap();
+    let mut ready_a = na.next_ready().await;
+    edit_roster_of(&w, &stores, |body| {
+        for member in &mut body.members {
+            if member.node_id == b.id {
+                member.min_serial = 2;
+            }
+        }
+    });
+    assert_eq!(
+        ensure(&na, b.id, w.network).await.err(),
+        Some(EnsureError::UnknownPeer)
+    );
+    assert!(matches!(
+        ended(&mut ready_a.acceptor).await.as_ref(),
+        EndReason::ClosedLocally(Some(close)) if close.code == ErrorCode::GrantRemoved
+    ));
+}
+
 #[test]
 fn a_log_throttle_lets_one_line_through_a_second_and_counts_the_rest() {
     let mut throttle = LogThrottle::new();
@@ -2284,6 +2412,7 @@ async fn a_member_the_policy_cannot_vouch_for_is_answered_docs_only_and_the_othe
     assert!(at_r.docs_only);
     assert_eq!(at_r.role, Role::Responder);
     assert_eq!(at_r.peer, m.party.id);
+    assert_eq!(at_r.peer_static, m.party.x25519_public);
 
     let (hs, init) = known.init(&r, w.network, 2);
     net.inject(known.party.id, r.id, &init);
@@ -2499,6 +2628,8 @@ async fn an_initiator_admitted_docs_only_is_told_so_and_never_handed_the_session
     let mut at_m = nm.next_ready().await;
     let at_r = nr.next_ready().await;
     assert!(at_m.docs_only && at_r.docs_only);
+    assert_eq!(at_m.peer_static, r.x25519_public);
+    assert_eq!(at_r.peer_static, m.x25519_public);
     assert_eq!(at_m.role, Role::Initiator);
     assert_eq!(at_m.peer_roster_seq, Some(1));
 
@@ -2585,6 +2716,7 @@ fn serve(
         &stores.policies,
         &stores.rosters,
         me,
+        1,
         &Arc::new(crate::node::RefuseAll),
         gate,
         None,

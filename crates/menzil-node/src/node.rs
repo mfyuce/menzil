@@ -207,7 +207,8 @@ impl Node {
         if !session.e2e_protos.contains(&E2E_PROTO_TAG) {
             return Err(StartError::NoL4Protocol);
         }
-        let local_node_id = session.identity.node_cert.decode()?.node_id;
+        let local_cert = session.identity.node_cert.decode()?;
+        let (local_node_id, local_serial) = (local_cert.node_id, local_cert.serial);
         let router_config = RouterConfig::new(
             session.identity.clone(),
             session.dial.connection_info.relay_node_id,
@@ -250,6 +251,7 @@ impl Node {
                 policies.clone(),
                 rosters.clone(),
                 local_node_id,
+                local_serial,
                 Arc::new(handler),
                 DocsGate::new(DocsLimits::default()),
                 Some(sync.clone()),
@@ -405,11 +407,14 @@ impl Authorizer for DenyAll {
 
 /// Runs an accept loop for every session the router announces, until the
 /// router is gone. A loop ends by itself when its session does.
+// One more independent input of the node's own identity (its cert serial).
+#[allow(clippy::too_many_arguments)]
 async fn serve_sessions<H>(
     mut ready: mpsc::UnboundedReceiver<SessionReady>,
     policies: Arc<PolicyStore>,
     rosters: Arc<RosterStore>,
     local_node_id: NodeId,
+    local_serial: u32,
     handler: Arc<H>,
     gate: Arc<DocsGate>,
     sync: Option<Arc<DocsSync>>,
@@ -423,6 +428,7 @@ async fn serve_sessions<H>(
             &policies,
             &rosters,
             local_node_id,
+            local_serial,
             &handler,
             &gate,
             sync.as_ref(),
@@ -443,11 +449,14 @@ async fn serve_sessions<H>(
 /// session this node compares the responder's seqs with its own and fetches and/or pushes
 /// ([`DocsSync::reconcile`]); as the initiator of a docs only session it pushes, and
 /// when that was adopted starts one new handshake ([`DocsSync::docs_only_push`]).
+// One more independent input of the node's own identity (its cert serial).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn serve_session<H>(
     session: SessionReady,
     policies: &Arc<PolicyStore>,
     rosters: &Arc<RosterStore>,
     local_node_id: NodeId,
+    local_serial: u32,
     handler: &Arc<H>,
     gate: &Arc<DocsGate>,
     sync: Option<&Arc<DocsSync>>,
@@ -466,8 +475,13 @@ pub(crate) fn serve_session<H>(
         peer_policy_seq,
         ..
     } = session;
-    let authorizer =
-        PolicyAuthorizer::new(policies.clone(), rosters.clone(), network_id, local_node_id);
+    let authorizer = PolicyAuthorizer::new(
+        policies.clone(),
+        rosters.clone(),
+        network_id,
+        local_node_id,
+        local_serial,
+    );
     if docs_only && role == Role::Initiator {
         if let Some(sync) = sync {
             let sync = Arc::clone(sync);

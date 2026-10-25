@@ -65,6 +65,7 @@ use menzil_proto::{
     ErrorCode, NetworkId, NodeId, NodeOrWildcard, Policy, PolicyBody, PolicyMember, Principal,
     PrincipalTarget, ProtoError, RosterBody, ServiceId,
 };
+use tokio::sync::broadcast;
 
 use crate::error::NodeError;
 use crate::roster_store::RosterStore;
@@ -72,10 +73,26 @@ use crate::roster_store::RosterStore;
 /// This node's held Policies, at most one per network. The decoded
 /// [`PolicyBody`] is kept behind an [`Arc`], for the same reason as
 /// [`crate::RosterStore`]'s identical choice — see its doc comment.
-#[derive(Default)]
 pub struct PolicyStore {
     by_network: RwLock<PolicyMap>,
+    /// Tells whoever subscribed ([`Self::subscribe`]) which network just got a newer Policy
+    /// (L4k: grants are re evaluated on it, protocol.md 5.3), like
+    /// [`RosterStore::subscribe`] does for Rosters.
+    changes: broadcast::Sender<NetworkId>,
 }
+
+impl Default for PolicyStore {
+    fn default() -> Self {
+        Self {
+            by_network: RwLock::default(),
+            changes: broadcast::channel(CHANGE_BACKLOG).0,
+        }
+    }
+}
+
+/// How many change notices a slow subscriber may miss before it is told it lagged (it then
+/// looks at every network, which is all a notice ever asks for).
+const CHANGE_BACKLOG: usize = 64;
 
 /// One held Policy: the signed form, its decoded body, who signed it and, when a steward did,
 /// the owner signed base Policy it was made from (a steward signed Policy is never held
@@ -157,7 +174,23 @@ impl PolicyStore {
             return Ok(false);
         }
         guard.insert(body.network_id, Held::new(policy, None, Signer::Owner)?);
+        self.notify(body.network_id);
         Ok(true)
+    }
+
+    /// Notices of a newer Policy stored here, one per store, carrying its network. Nobody
+    /// listening is no problem; a receiver that falls more than a few dozen notices behind gets
+    /// `Lagged` and should look at every network. [`RosterStore::subscribe`] is the same for
+    /// Rosters: a Policy alone can arrive after its Roster (protocol.md 5.5), and then only
+    /// this one speaks.
+    pub fn subscribe(&self) -> broadcast::Receiver<NetworkId> {
+        self.changes.subscribe()
+    }
+
+    /// Says a newer Policy of `network_id` is stored. Called with the store still locked by the
+    /// writer; a notice never waits for anyone.
+    pub(crate) fn notify(&self, network_id: NetworkId) {
+        let _ = self.changes.send(network_id);
     }
 
     /// The write guard, for [`crate::DocStore`].
@@ -366,7 +399,8 @@ impl PolicyStore {
     /// (protocol.md 5.1/5.2, not this check) exists to force.
     ///
     /// A grant matches when: its `from` resolves to `from` (either a
-    /// direct `Principal::Node` match, or a `Principal::Role` the Policy
+    /// direct `Principal::Node` match, which counts only for a node the
+    /// Policy's own `members` lists, or a `Principal::Role` the Policy
     /// lists `from` as holding); its `to_node` resolves to `to_node`
     /// (an exact match or the `"*"` wildcard); it is not itself expired;
     /// and, only when `service` is given, at least one of its `services`
@@ -468,7 +502,12 @@ pub(crate) fn roster_standing(roster: &RosterBody, node_id: &NodeId) -> Result<u
 /// `{ network_id, role }`."
 fn principal_matches(principal: &Principal, candidate: &NodeId, members: &[PolicyMember]) -> bool {
     match &principal.target {
-        PrincipalTarget::Node(node_id) => node_id == candidate,
+        // A direct grant counts only for a node the Policy itself lists (L4k, TOBEDECIDED 30
+        // T10): a revocation removes the member and the grants that name it, and a leftover
+        // grant of an inconsistent Policy must not outlive the membership.
+        PrincipalTarget::Node(node_id) => {
+            node_id == candidate && members.iter().any(|member| &member.node_id == candidate)
+        }
         PrincipalTarget::Role(role) => members
             .iter()
             .any(|member| &member.node_id == candidate && member.roles.iter().any(|r| r == role)),
@@ -1053,6 +1092,91 @@ mod tests {
         assert!(!policies.has_grant(&rosters, &other, &a, &b, None, 1_000));
     }
 
+    /// L4k, TOBEDECIDED 30 T10 (closes the TODO.md line about direct grants): a revoked
+    /// member's grants are removed with it, and one left behind by an inconsistent Policy
+    /// must not outlive the membership.
+    #[test]
+    fn a_direct_grant_to_a_node_the_policy_does_not_list_is_no_grant() {
+        let owner = SigningKey::generate(&mut rand::rng());
+        let network_id = network_id_for(&owner);
+        let a = NodeId::from([1u8; 32]);
+        let b = NodeId::from([2u8; 32]);
+        let rosters = RosterStore::new();
+        // The Roster lists both and revokes neither: only the Policy's `members` differ.
+        rosters
+            .set(&roster_with_members(&owner, network_id, vec![a, b]))
+            .unwrap();
+        let grant = Grant {
+            from: Principal {
+                network_id,
+                target: PrincipalTarget::Node(a),
+            },
+            to_node: NodeOrWildcard::Node(b),
+            services: vec!["tcp:ssh".parse().unwrap()],
+            expires: None,
+        };
+        let policy_listing = |members: Vec<NodeId>, seq: u64| {
+            signed_policy(
+                &owner,
+                policy_body(
+                    network_id,
+                    seq,
+                    members
+                        .into_iter()
+                        .map(|node_id| PolicyMember {
+                            node_id,
+                            name: "node".to_string(),
+                            roles: vec![],
+                        })
+                        .collect(),
+                    vec![grant.clone()],
+                    4_000_000_000,
+                ),
+            )
+        };
+        let store = PolicyStore::new();
+        let ssh = "tcp:ssh".parse().unwrap();
+        // Only `b` listed: `a` holds a leftover direct grant and no membership.
+        store.set(&policy_listing(vec![b], 1)).unwrap();
+        assert!(!store.has_grant(&rosters, &network_id, &a, &b, None, 1_000));
+        assert!(!store.has_grant(&rosters, &network_id, &a, &b, Some(&ssh), 1_000));
+        // Listed again, the same grant works.
+        store.set(&policy_listing(vec![a, b], 2)).unwrap();
+        assert!(store.has_grant(&rosters, &network_id, &a, &b, Some(&ssh), 1_000));
+    }
+
+    /// L4k: the change signal. A newer Policy is announced with its network; one that is not
+    /// stored (equal or lower seq) is not.
+    #[test]
+    fn a_stored_policy_is_announced_and_a_refused_one_is_not() {
+        let owner = SigningKey::generate(&mut rand::rng());
+        let network_id = network_id_for(&owner);
+        let store = PolicyStore::new();
+        let mut changes = store.subscribe();
+        let at = |seq: u64| {
+            signed_policy(
+                &owner,
+                policy_body(network_id, seq, vec![], vec![], 1_000_000_000),
+            )
+        };
+        assert!(store.set(&at(5)).unwrap());
+        assert_eq!(changes.try_recv().unwrap(), network_id);
+        assert!(changes.try_recv().is_err(), "one notice per stored Policy");
+        assert!(!store.set(&at(5)).unwrap());
+        assert!(!store.set(&at(3)).unwrap());
+        assert!(changes.try_recv().is_err(), "nothing stored, nothing said");
+        // A forged one is refused and says nothing either.
+        let thief = SigningKey::generate(&mut rand::rng());
+        let forged = signed_policy(
+            &thief,
+            policy_body(network_id, 9, vec![], vec![], 1_000_000_000),
+        );
+        assert!(store.set(&forged).is_err());
+        assert!(changes.try_recv().is_err());
+        assert!(store.set(&at(6)).unwrap());
+        assert_eq!(changes.try_recv().unwrap(), network_id);
+    }
+
     #[test]
     fn has_grant_true_for_a_direct_node_principal_with_no_service_filter() {
         let owner = SigningKey::generate(&mut rand::rng());
@@ -1076,7 +1200,17 @@ mod tests {
         store
             .set(&signed_policy(
                 &owner,
-                policy_body(network_id, 1, vec![], vec![grant], 4_000_000_000),
+                policy_body(
+                    network_id,
+                    1,
+                    vec![PolicyMember {
+                        node_id: a,
+                        name: "alice".to_string(),
+                        roles: vec![],
+                    }],
+                    vec![grant],
+                    4_000_000_000,
+                ),
             ))
             .unwrap();
         assert!(store.has_grant(&rosters, &network_id, &a, &b, None, 1_000));
@@ -1172,7 +1306,17 @@ mod tests {
         store
             .set(&signed_policy(
                 &owner,
-                policy_body(network_id, 1, vec![], vec![grant], 4_000_000_000),
+                policy_body(
+                    network_id,
+                    1,
+                    vec![PolicyMember {
+                        node_id: a,
+                        name: "alice".to_string(),
+                        roles: vec![],
+                    }],
+                    vec![grant],
+                    4_000_000_000,
+                ),
             ))
             .unwrap();
         assert!(store.has_grant(&rosters, &network_id, &a, &b, None, 100));

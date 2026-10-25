@@ -292,6 +292,7 @@ impl Server {
             self.rosters.clone(),
             self.network,
             self.me,
+            1,
         )
     }
 

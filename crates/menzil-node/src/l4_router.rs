@@ -122,14 +122,16 @@ use menzil_e2e::{
     RegisterError, Removed, RespLookup, Role, Route, SessionIndex, SessionTable, SlotState,
     TableConfig,
 };
-use menzil_proto::{E2eFrame, ErrorCode, Limits, NetworkId, NodeId, ProtoError, Record};
+use menzil_proto::{
+    E2eFrame, ErrorCode, Limits, NetworkId, NodeId, ProtoError, Record, X25519PublicKey,
+};
 use menzil_stream::Mode;
 use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::admission::{
     HandshakeAdmission, InitiatorAdmission, decide_initiator_admission,
     decide_initiator_admission_for_docs, decide_responder_admission, is_unrevoked_roster_member,
-    resolve_dial_cert, resolve_dial_cert_for_docs,
+    resolve_dial_cert, resolve_dial_cert_for_docs, session_standing,
 };
 use crate::identity::LocalIdentity;
 use crate::l4_session::{
@@ -284,6 +286,10 @@ pub struct SessionReady {
     pub peer: NodeId,
     /// The network its authorization is scoped to.
     pub network_id: NetworkId,
+    /// The peer's Noise static key the session was set up with: the key of the NodeCert in
+    /// the Policy that vouches for the session, which [`crate::admission`]'s standing check
+    /// looks up again whenever the documents change (L4k).
+    pub peer_static: X25519PublicKey,
     /// Which side of the handshake this node was.
     pub role: Role,
     /// The L3 attachment the session is pinned to.
@@ -313,6 +319,7 @@ impl std::fmt::Debug for SessionReady {
         f.debug_struct("SessionReady")
             .field("peer", &self.peer)
             .field("network_id", &self.network_id)
+            .field("peer_static", &self.peer_static)
             .field("role", &self.role)
             .field("epoch", &self.epoch)
             .field("peer_roster_seq", &self.peer_roster_seq)
@@ -583,6 +590,8 @@ struct Entry {
     handle: L4SessionHandle,
     peer: NodeId,
     network: NetworkId,
+    /// The peer's Noise static key for this session (see [`SessionReady::peer_static`]).
+    peer_static: X25519PublicKey,
     epoch: Epoch,
     /// Tells a late notice from a session whose index has since been
     /// reused from the new one's: see [`tag_of`].
@@ -929,12 +938,13 @@ impl Engine {
             tracing::debug!(%src, "ignored an L4 init that did not decrypt");
             return;
         };
+        let peer_static = *hs.initiator_static();
         let docs_only = match decide_responder_admission(
             &self.policies,
             &self.rosters,
             &network_id,
             &src,
-            hs.initiator_static(),
+            &peer_static,
             &self.local_node_id,
             self.local_cert_serial,
             now.unix,
@@ -977,6 +987,7 @@ impl Engine {
             index,
             src,
             network_id,
+            peer_static,
             Origin::Answered {
                 sender_index,
                 noise_msg1: msg1_copy,
@@ -1014,6 +1025,7 @@ impl Engine {
         let _ = self.ready.send(SessionReady {
             peer: src,
             network_id,
+            peer_static,
             role: Role::Responder,
             epoch: attached.epoch,
             handle,
@@ -1048,6 +1060,7 @@ impl Engine {
         ) else {
             return;
         };
+        let peer_static = *hs.initiator_static();
         let others = self
             .docs_only
             .values()
@@ -1077,6 +1090,7 @@ impl Engine {
             index,
             src,
             network_id,
+            peer_static,
             Origin::Answered {
                 sender_index,
                 noise_msg1,
@@ -1118,6 +1132,7 @@ impl Engine {
         let _ = self.ready.send(SessionReady {
             peer: src,
             network_id,
+            peer_static,
             role: Role::Responder,
             epoch: attached.epoch,
             handle,
@@ -1181,9 +1196,37 @@ impl Engine {
         if let Some(index) = slot.current
             && let Some(entry) = self.table.get(index)
         {
-            let _ = reply.send(Ok(entry.handle.clone()));
-            return;
+            // A session is handed out only while both ends are still in good standing by
+            // the documents held now (protocol.md 5.3, TOBEDECIDED 30 T16): between an
+            // adoption and the pass that re evaluates every session, a caller must not get a
+            // session the new documents would end. One that fails is closed, uniformly, and
+            // the caller falls through to a fresh dial, which the dial checks then settle.
+            let standing = session_standing(
+                &self.policies,
+                &self.rosters,
+                &network,
+                &peer,
+                &entry.peer_static,
+                &self.local_node_id,
+                self.local_cert_serial,
+                now.unix,
+            );
+            match standing {
+                Ok(()) => {
+                    let _ = reply.send(Ok(entry.handle.clone()));
+                    return;
+                }
+                Err(reason) => {
+                    tracing::info!(%peer, ?reason, "closing a session that is no longer in good standing");
+                    if let Some(Removed::Session { handle: entry, .. }) = self.table.remove(index) {
+                        // The CLOSE goes before the entry is dropped: dropping it ends the
+                        // actor as `EpochEnded`, which the CLOSE must outrank.
+                        entry.handle.close(Some(grant_removed_close()));
+                    }
+                }
+            }
         }
+        let slot = self.table.slot(&peer, &network);
         if self.attached.is_none() {
             let _ = reply.send(Err(EnsureError::NotAttached));
             return;
@@ -1348,6 +1391,7 @@ impl Engine {
                 index,
                 peer,
                 network,
+                responder_static,
                 transport,
                 (payload.roster_seq, payload.policy_seq),
                 now,
@@ -1359,6 +1403,7 @@ impl Engine {
             index,
             peer,
             network,
+            responder_static,
             Origin::Initiated,
             transport,
             attached,
@@ -1384,6 +1429,7 @@ impl Engine {
         let _ = self.ready.send(SessionReady {
             peer,
             network_id: network,
+            peer_static: responder_static,
             role: Role::Initiator,
             epoch: attached.epoch,
             handle: handle.clone(),
@@ -1404,6 +1450,7 @@ impl Engine {
         index: SessionIndex,
         peer: NodeId,
         network: NetworkId,
+        peer_static: X25519PublicKey,
         transport: menzil_e2e::E2eTransport,
         peer_seqs: (u64, u64),
         now: Now,
@@ -1412,6 +1459,7 @@ impl Engine {
             index,
             peer,
             network,
+            peer_static,
             Origin::Initiated,
             transport,
             attached,
@@ -1449,6 +1497,7 @@ impl Engine {
         let _ = self.ready.send(SessionReady {
             peer,
             network_id: network,
+            peer_static,
             role: Role::Initiator,
             epoch: attached.epoch,
             handle,
@@ -1607,6 +1656,7 @@ impl Engine {
         index: SessionIndex,
         peer: NodeId,
         network: NetworkId,
+        peer_static: X25519PublicKey,
         origin: Origin,
         transport: menzil_e2e::E2eTransport,
         attached: Attached,
@@ -1645,6 +1695,7 @@ impl Engine {
                 handle,
                 peer,
                 network,
+                peer_static,
                 epoch: attached.epoch,
                 generation,
                 init,
@@ -1841,6 +1892,15 @@ fn docs_only_close() -> CloseReason {
     CloseReason {
         code: ErrorCode::DocsOnly,
         msg: "docs only session over".to_string(),
+    }
+}
+
+/// The CLOSE of a session whose standing is gone (protocol.md 5.3): one reason for every
+/// cause, the detail stays in the local log (TOBEDECIDED 30 T1).
+fn grant_removed_close() -> CloseReason {
+    CloseReason {
+        code: ErrorCode::GrantRemoved,
+        msg: "grant removed".to_string(),
     }
 }
 

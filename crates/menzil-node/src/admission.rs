@@ -106,13 +106,14 @@
 //!    framing: worth deciding now, not deferring indefinitely).
 //!
 //! **Also found by that same review, flagged rather than fixed here**
-//! (both now their own TODO.md lines, since fixing either is out of this
-//! module's own scope): [`PolicyStore::has_grant`] matches a direct
+//! (both then their own TODO.md lines, since fixing either was out of this
+//! module's own scope): [`PolicyStore::has_grant`] matched a direct
 //! `Principal::Node` grant without checking the Policy's own `members`
 //! list, so a node removed from `members` but still named by a leftover
-//! direct grant gets `NotMember` at handshake time yet `Allow` for the
-//! identical service through [`PolicyAuthorizer`] — an L4c question, not
-//! this module's to silently patch over. And: nothing here yet gives a
+//! direct grant got `NotMember` at handshake time yet `Allow` for the
+//! identical service through [`PolicyAuthorizer`]; closed by L4k K2: a
+//! direct grant now counts only for a node the Policy lists. And: nothing
+//! here yet gave a
 //! *pre-dial* caller (TODO.md L4e1/L4h6, not yet built) a way to resolve
 //! "the cert I should dial with" the way [`resolve_member_cert`] resolves
 //! one after the fact from an already-known key — needed before
@@ -135,8 +136,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use ed25519_dalek::VerifyingKey;
 use menzil_proto::{
-    E2eHandshakePayload, ErrorCode, NetworkId, NodeCert, NodeCertBody, NodeId, ProtoError,
-    ServiceId, ServiceKind, X25519PublicKey,
+    E2eHandshakePayload, ErrorCode, NetworkId, NodeCert, NodeCertBody, NodeId, PolicyBody,
+    ProtoError, RosterBody, ServiceId, ServiceKind, X25519PublicKey,
 };
 use menzil_stream::{Authorizer, OpenDecision, OpenRefusal, OpenRequest};
 
@@ -205,6 +206,17 @@ fn resolve_member_cert(
     now: u64,
 ) -> Option<NodeCertBody> {
     let policy = policies.body(network_id)?;
+    resolve_cert_in(&policy, node_id, claimed_key, now)
+}
+
+/// [`resolve_member_cert`] against a Policy body the caller already holds, so that a check
+/// that reads other parts of the same body (see [`session_standing`]) sees one snapshot.
+fn resolve_cert_in(
+    policy: &PolicyBody,
+    node_id: &NodeId,
+    claimed_key: &X25519PublicKey,
+    now: u64,
+) -> Option<NodeCertBody> {
     policy
         .certs
         .iter()
@@ -305,6 +317,71 @@ pub(crate) fn membership(
     } else {
         policies.check_membership_ignoring_expiry(rosters, network_id, node_id, cert_serial, now)
     }
+}
+
+/// Whether an L4 session between this node (`local`, whose NodeCert serial is `local_serial`)
+/// and `peer` (whose Noise static key for the session is `peer_static`) may go on in
+/// `network_id` at `now`, by the documents held right now (protocol.md 5.3, L4k): the
+/// question the live re evaluation asks of every session whenever the Roster or the Policy
+/// changes, and that a caller about to reuse a session asks first. Pure and synchronous.
+///
+/// 1. This node: unrevoked and listed in the Roster, `local_serial` not below its
+///    `min_serial`, and listed in the Policy `members`.
+/// 2. The peer: unrevoked and listed in the Roster, listed in the Policy `members`, and a
+///    certificate for `peer_static` still in the Policy `certs` (self signed, valid at `now`)
+///    with a serial not below the peer's `min_serial`.
+///
+/// The expiry of the documents is deliberately not asked (TOBEDECIDED 30 T2): expired
+/// documents end no session, `has_grant` stops every granted stream on its own, and
+/// `menzil:docs` stays usable on the session to fetch the renewal. A network this node holds no
+/// Roster and Policy for fails with `UnknownNetwork`. The Roster is read before the Policy, and
+/// each only once, so a Roster that revokes the peer ends the session before the Policy that
+/// goes with it has arrived (the relay DOC comes first).
+///
+/// The error is for the caller's logs. Like [`PolicyStore::check_membership`]'s it must not
+/// reach the wire: the peer is told one uniform CLOSE `grant_removed` (T1).
+// Eight independent scalars, like `decide_responder_admission`.
+#[allow(clippy::too_many_arguments)]
+pub fn session_standing(
+    policies: &PolicyStore,
+    rosters: &RosterStore,
+    network_id: &NetworkId,
+    peer: &NodeId,
+    peer_static: &X25519PublicKey,
+    local: &NodeId,
+    local_serial: u32,
+    now: u64,
+) -> Result<(), ErrorCode> {
+    let roster = rosters.body(network_id).ok_or(ErrorCode::UnknownNetwork)?;
+    let policy = policies.body(network_id).ok_or(ErrorCode::UnknownNetwork)?;
+    own_standing(&roster, &policy, local, local_serial)?;
+
+    let peer_min_serial = roster_standing(&roster, peer)?;
+    if !policy.members.iter().any(|member| &member.node_id == peer) {
+        return Err(ErrorCode::NotMember);
+    }
+    let cert = resolve_cert_in(&policy, peer, peer_static, now).ok_or(ErrorCode::BadCert)?;
+    if cert.serial < peer_min_serial {
+        return Err(ErrorCode::StaleSerial);
+    }
+    Ok(())
+}
+
+/// This node's own standing, the first half of [`session_standing`]: unrevoked and listed in
+/// the Roster with `local_serial` not below its `min_serial`, and listed in the Policy.
+fn own_standing(
+    roster: &RosterBody,
+    policy: &PolicyBody,
+    local: &NodeId,
+    local_serial: u32,
+) -> Result<(), ErrorCode> {
+    if local_serial < roster_standing(roster, local)? {
+        return Err(ErrorCode::StaleSerial);
+    }
+    if !policy.members.iter().any(|member| &member.node_id == local) {
+        return Err(ErrorCode::NotMember);
+    }
+    Ok(())
 }
 
 /// What protocol.md 5.1's responder-side checks decide about one just-read
@@ -625,23 +702,31 @@ pub struct PolicyAuthorizer {
     rosters: Arc<RosterStore>,
     network_id: NetworkId,
     to_node: NodeId,
+    /// The serial of this node's own NodeCert, for the floor of its own standing.
+    to_node_serial: u32,
     docs_only: bool,
 }
 
 impl PolicyAuthorizer {
     /// Builds an authorizer for one L4 session on `network_id`, where
-    /// `to_node` (this node's own identity) is the grant's target.
+    /// `to_node` (this node's own identity, its NodeCert's serial being
+    /// `to_node_serial`) is the grant's target. Every OPEN is refused while this
+    /// node's own standing fails (see [`session_standing`], part 1): a node that is
+    /// revoked, no longer listed or below its `min_serial` serves nothing, for it
+    /// cannot vouch for the documents of a network that dropped it.
     pub fn new(
         policies: Arc<PolicyStore>,
         rosters: Arc<RosterStore>,
         network_id: NetworkId,
         to_node: NodeId,
+        to_node_serial: u32,
     ) -> Self {
         Self {
             policies,
             rosters,
             network_id,
             to_node,
+            to_node_serial,
             docs_only: false,
         }
     }
@@ -651,6 +736,20 @@ impl PolicyAuthorizer {
     pub fn docs_only(mut self) -> Self {
         self.docs_only = true;
         self
+    }
+
+    /// Whether this node is still a member in good standing by the documents held now. Reads
+    /// the Roster and the Policy once each, like [`session_standing`].
+    fn own_standing_holds(&self) -> bool {
+        match (
+            self.rosters.body(&self.network_id),
+            self.policies.body(&self.network_id),
+        ) {
+            (Some(roster), Some(policy)) => {
+                own_standing(&roster, &policy, &self.to_node, self.to_node_serial).is_ok()
+            }
+            _ => false,
+        }
     }
 
     fn no_grant() -> OpenDecision {
@@ -670,6 +769,11 @@ impl Authorizer for PolicyAuthorizer {
         // would be worse than refusing outright — a red-team review
         // found this was previously unchecked.
         if request.network_id != self.network_id {
+            return Self::no_grant();
+        }
+        // This node's own standing, before any service (`menzil:docs` included): checked on
+        // every OPEN, so a revocation of this node that arrives mid session stops the next one.
+        if !self.own_standing_holds() {
             return Self::no_grant();
         }
         if is_docs_service(&request.service) {
@@ -1434,6 +1538,7 @@ mod tests {
             Arc::new(f.rosters),
             f.ids.network_id,
             f.ids.responder_node_id,
+            f.ids.responder_cert_serial,
         );
         assert!(matches!(
             authorizer.authorize(&open_request(&f.ids)),
@@ -1466,6 +1571,7 @@ mod tests {
             Arc::new(f.rosters),
             f.ids.network_id,
             f.ids.responder_node_id,
+            f.ids.responder_cert_serial,
         );
         match authorizer.authorize(&open_request(&f.ids)) {
             OpenDecision::Deny(refusal) => {
@@ -1484,6 +1590,7 @@ mod tests {
             Arc::new(f.rosters),
             f.ids.network_id,
             f.ids.responder_node_id,
+            f.ids.responder_cert_serial,
         );
         let mut request = open_request(&f.ids);
         request.network_id = NetworkId::from([0x11u8; 32]);
@@ -1752,6 +1859,7 @@ mod tests {
                 rosters.clone(),
                 f.ids.network_id,
                 f.ids.responder_node_id,
+                f.ids.responder_cert_serial,
             ),
             rosters,
             policies,
@@ -2022,5 +2130,335 @@ mod tests {
             )
             .is_none()
         );
+    }
+
+    // --- L4k: session_standing and the authorizer's own standing -----------------------------
+
+    /// `session_standing` for the fixture's pair: the initiator is the peer (its cert is in the
+    /// Policy for `initiator_x25519`, serial 3), the responder is this node (serial 5).
+    fn standing(f: &Fixture, now: u64) -> Result<(), ErrorCode> {
+        session_standing(
+            &f.policies,
+            &f.rosters,
+            &f.ids.network_id,
+            &f.ids.initiator_node_id,
+            &f.ids.initiator_x25519,
+            &f.ids.responder_node_id,
+            f.ids.responder_cert_serial,
+            now,
+        )
+    }
+
+    fn revoked(who: NodeId) -> menzil_proto::RevokedMember {
+        menzil_proto::RevokedMember {
+            node_id: who,
+            since: 0,
+        }
+    }
+
+    #[test]
+    fn session_standing_holds_for_two_members_in_good_standing() {
+        let f = fixture(vec![]);
+        assert_eq!(standing(&f, 1_000), Ok(()));
+    }
+
+    #[test]
+    fn session_standing_fails_for_the_peer_in_each_way_it_can_lose_it() {
+        type Case = (&'static str, fn(&Fixture), ErrorCode);
+        let cases: [Case; 6] = [
+            // The Roster alone: the Policy still lists the peer, its cert and a grant (the
+            // relay DOC with the revocation arrives before the Policy does).
+            (
+                "revoked in the Roster",
+                |f| {
+                    edit_roster(f, |b| {
+                        let who = f.ids.initiator_node_id;
+                        b.revoked.push(revoked(who));
+                    })
+                },
+                ErrorCode::Revoked,
+            ),
+            (
+                "dropped from the Roster",
+                |f| {
+                    edit_roster(f, |b| {
+                        b.members.retain(|m| m.node_id != f.ids.initiator_node_id);
+                    })
+                },
+                ErrorCode::NotMember,
+            ),
+            (
+                "dropped from the Policy",
+                |f| {
+                    edit_policy(f, |b| {
+                        b.members.retain(|m| m.node_id != f.ids.initiator_node_id);
+                    })
+                },
+                ErrorCode::NotMember,
+            ),
+            (
+                "its cert gone from the Policy",
+                |f| edit_policy(f, |b| b.certs.clear()),
+                ErrorCode::BadCert,
+            ),
+            (
+                "min_serial raised above the session cert",
+                |f| {
+                    edit_roster(f, |b| {
+                        for m in &mut b.members {
+                            if m.node_id == f.ids.initiator_node_id {
+                                m.min_serial = f.ids.initiator_cert_serial + 1;
+                            }
+                        }
+                    })
+                },
+                ErrorCode::StaleSerial,
+            ),
+            (
+                "the cert of the session key replaced by one for another key",
+                |f| {
+                    let other = signed_cert(
+                        &f.ids,
+                        X25519PublicKey::from([0x43u8; 32]),
+                        0,
+                        4_000_000_000,
+                    );
+                    edit_policy(f, |b| b.certs = vec![other])
+                },
+                ErrorCode::BadCert,
+            ),
+        ];
+        for (label, change, expected) in cases {
+            let f = fixture(vec![]);
+            assert_eq!(standing(&f, 1_000), Ok(()), "{label}: before");
+            change(&f);
+            assert_eq!(standing(&f, 1_000), Err(expected), "{label}");
+        }
+    }
+
+    #[test]
+    fn session_standing_fails_when_the_peers_cert_has_expired_and_the_documents_have_not() {
+        let f = fixture(vec![]);
+        // The cert is valid until 4_000_000_000; the documents are made to outlive it.
+        edit_roster(&f, |b| b.expires = 5_000_000_000);
+        edit_policy(&f, |b| b.expires = 5_000_000_000);
+        assert_eq!(standing(&f, 3_999_999_999), Ok(()));
+        assert_eq!(standing(&f, 4_000_000_001), Err(ErrorCode::BadCert));
+    }
+
+    #[test]
+    fn session_standing_equal_to_the_min_serial_passes() {
+        let f = fixture(vec![]);
+        edit_roster(&f, |b| {
+            for m in &mut b.members {
+                m.min_serial = if m.node_id == f.ids.initiator_node_id {
+                    f.ids.initiator_cert_serial
+                } else {
+                    f.ids.responder_cert_serial
+                };
+            }
+        });
+        assert_eq!(standing(&f, 1_000), Ok(()));
+    }
+
+    #[test]
+    fn session_standing_fails_for_this_node_in_each_way_it_can_lose_it() {
+        type Case = (&'static str, fn(&Fixture), ErrorCode);
+        let cases: [Case; 4] = [
+            (
+                "revoked in the Roster",
+                |f| {
+                    edit_roster(f, |b| {
+                        let who = f.ids.responder_node_id;
+                        b.revoked.push(revoked(who));
+                    })
+                },
+                ErrorCode::Revoked,
+            ),
+            (
+                "dropped from the Roster",
+                |f| {
+                    edit_roster(f, |b| {
+                        b.members.retain(|m| m.node_id != f.ids.responder_node_id);
+                    })
+                },
+                ErrorCode::NotMember,
+            ),
+            (
+                "dropped from the Policy",
+                |f| {
+                    edit_policy(f, |b| {
+                        b.members.retain(|m| m.node_id != f.ids.responder_node_id);
+                    })
+                },
+                ErrorCode::NotMember,
+            ),
+            (
+                "min_serial raised above its own cert",
+                |f| {
+                    edit_roster(f, |b| {
+                        for m in &mut b.members {
+                            if m.node_id == f.ids.responder_node_id {
+                                m.min_serial = f.ids.responder_cert_serial + 1;
+                            }
+                        }
+                    })
+                },
+                ErrorCode::StaleSerial,
+            ),
+        ];
+        for (label, change, expected) in cases {
+            let f = fixture(vec![]);
+            assert_eq!(standing(&f, 1_000), Ok(()), "{label}: before");
+            change(&f);
+            assert_eq!(standing(&f, 1_000), Err(expected), "{label}");
+        }
+        // And exactly at its floor it still holds.
+        let f = fixture(vec![]);
+        edit_roster(&f, |b| {
+            for m in &mut b.members {
+                if m.node_id == f.ids.responder_node_id {
+                    m.min_serial = f.ids.responder_cert_serial;
+                }
+            }
+        });
+        assert_eq!(standing(&f, 1_000), Ok(()));
+    }
+
+    /// TOBEDECIDED 30 T2: documents that expire end no session.
+    #[test]
+    fn session_standing_ignores_the_expiry_of_the_documents() {
+        let f = fixture(vec![]);
+        edit_roster(&f, |b| b.expires = 1_500);
+        edit_policy(&f, |b| b.expires = 1_500);
+        assert_eq!(standing(&f, 1_000), Ok(()));
+        assert_eq!(standing(&f, 2_000), Ok(()), "both documents expired");
+    }
+
+    #[test]
+    fn session_standing_of_a_network_not_held_or_half_held_is_unknown() {
+        let f = fixture(vec![]);
+        let call = |policies: &PolicyStore, rosters: &RosterStore, network: &NetworkId| {
+            session_standing(
+                policies,
+                rosters,
+                network,
+                &f.ids.initiator_node_id,
+                &f.ids.initiator_x25519,
+                &f.ids.responder_node_id,
+                f.ids.responder_cert_serial,
+                1_000,
+            )
+        };
+        let other = NetworkId::from([0x11; 32]);
+        assert_eq!(
+            call(&f.policies, &f.rosters, &other),
+            Err(ErrorCode::UnknownNetwork)
+        );
+        assert_eq!(
+            call(&PolicyStore::new(), &f.rosters, &f.ids.network_id),
+            Err(ErrorCode::UnknownNetwork)
+        );
+        assert_eq!(
+            call(&f.policies, &RosterStore::new(), &f.ids.network_id),
+            Err(ErrorCode::UnknownNetwork)
+        );
+    }
+
+    fn edit_roster_in(ids: &Ids, rosters: &RosterStore, edit: impl FnOnce(&mut RosterBody)) {
+        let mut body = rosters.body(&ids.network_id).unwrap().as_ref().clone();
+        body.seq += 1;
+        edit(&mut body);
+        assert!(
+            rosters
+                .set(&Roster::sign(&ids.owner, &body).unwrap())
+                .unwrap()
+        );
+    }
+
+    fn edit_policy_in(ids: &Ids, policies: &PolicyStore, edit: impl FnOnce(&mut PolicyBody)) {
+        let mut body = policies.body(&ids.network_id).unwrap().as_ref().clone();
+        body.seq += 1;
+        edit(&mut body);
+        assert!(
+            policies
+                .set(&Policy::sign(&ids.owner, &body).unwrap())
+                .unwrap()
+        );
+    }
+
+    /// T13, TODO.md "A node's own standing is checked when it dials and when it answers, not per
+    /// OPEN": the authorizer of a session refuses every OPEN, `menzil:docs` included, once this
+    /// node itself is no longer a member in good standing, and it looks on every OPEN.
+    #[test]
+    fn the_authorizer_refuses_everything_once_this_node_has_lost_its_own_standing() {
+        type Case = (&'static str, fn(&Ids, &RosterStore, &PolicyStore));
+        let cases: [Case; 4] = [
+            ("revoked", |ids, rosters, _| {
+                edit_roster_in(ids, rosters, |b| {
+                    b.revoked.push(revoked(ids.responder_node_id));
+                })
+            }),
+            ("dropped from the Roster", |ids, rosters, _| {
+                edit_roster_in(ids, rosters, |b| {
+                    b.members.retain(|m| m.node_id != ids.responder_node_id);
+                })
+            }),
+            ("min_serial above its cert", |ids, rosters, _| {
+                edit_roster_in(ids, rosters, |b| {
+                    for m in &mut b.members {
+                        if m.node_id == ids.responder_node_id {
+                            m.min_serial = ids.responder_cert_serial + 1;
+                        }
+                    }
+                })
+            }),
+            ("dropped from the Policy", |ids, _, policies| {
+                edit_policy_in(ids, policies, |b| {
+                    b.members.retain(|m| m.node_id != ids.responder_node_id);
+                })
+            }),
+        ];
+        for (label, change) in cases {
+            let f = fixture(vec![]);
+            let grant = allowing_grant(&f.ids);
+            edit_policy(&f, |body| body.grants = vec![grant]);
+            let (authorizer, rosters, policies) = authorizer_of(&f);
+            let allowed = |request: &OpenRequest| {
+                matches!(authorizer.authorize(request), OpenDecision::Allow)
+            };
+            assert!(allowed(&open_request(&f.ids)), "{label}: granted, before");
+            assert!(allowed(&docs_request(&f.ids)), "{label}: docs, before");
+            change(&f.ids, &rosters, &policies);
+            for (what, request) in [
+                ("a granted service", open_request(&f.ids)),
+                ("menzil:docs", docs_request(&f.ids)),
+            ] {
+                match authorizer.authorize(&request) {
+                    OpenDecision::Deny(refusal) => {
+                        assert_eq!(refusal.code, ErrorCode::NoGrant, "{label}: {what}")
+                    }
+                    OpenDecision::Allow => panic!("{label}: {what} must be refused"),
+                }
+            }
+        }
+    }
+
+    /// The same floor, exactly met: a node whose cert serial equals its `min_serial` serves.
+    #[test]
+    fn the_authorizer_serves_a_node_whose_serial_equals_its_floor() {
+        let f = fixture(vec![]);
+        let (authorizer, rosters, _) = authorizer_of(&f);
+        edit_roster_in(&f.ids, &rosters, |b| {
+            for m in &mut b.members {
+                if m.node_id == f.ids.responder_node_id {
+                    m.min_serial = f.ids.responder_cert_serial;
+                }
+            }
+        });
+        assert!(matches!(
+            authorizer.authorize(&docs_request(&f.ids)),
+            OpenDecision::Allow
+        ));
     }
 }

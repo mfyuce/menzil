@@ -119,6 +119,9 @@ impl<'a> DocStore<'a> {
         }
         if let Some(held) = policy {
             policies.insert(network_id, held);
+            // A Policy alone (its Roster came earlier, over the relay) moves no Roster
+            // notice, so it has its own.
+            self.policies.notify(network_id);
         }
         let hook = self.rosters.on_adopted();
         let snapshot = hook.as_ref().map(|_| AdoptedDocs {
@@ -400,6 +403,57 @@ mod tests {
         let thief = SigningKey::generate(&mut rand::rng());
         assert!(docs.adopt(&net.renewal(&thief, 11, true), NOW).is_err());
         assert!(changes.try_recv().is_err());
+    }
+
+    /// L4k, D2: a Policy that arrives alone, after its Roster (the relay DOC came first), moves
+    /// no Roster notice, so the Policy store says it itself. A pair says both.
+    #[test]
+    fn a_policy_adopted_alone_is_announced_on_the_policy_store_and_not_on_the_roster_store() {
+        let net = Net::new();
+        let rosters = RosterStore::new();
+        let policies = PolicyStore::new();
+        let mut roster_changes = rosters.subscribe();
+        let mut policy_changes = policies.subscribe();
+        let docs = DocStore::new(&rosters, &policies);
+        docs.adopt(&net.base_bundle(), NOW).unwrap();
+        assert_eq!(roster_changes.try_recv().unwrap(), net.network_id);
+        assert_eq!(policy_changes.try_recv().unwrap(), net.network_id);
+        assert!(roster_changes.try_recv().is_err() && policy_changes.try_recv().is_err());
+
+        let next = net.renewal(&net.owner, 11, false);
+        // The Roster alone: the Policy store has nothing to say yet.
+        let roster_only = Bundle {
+            roster: next.roster.clone(),
+            ..Bundle::default()
+        };
+        assert_eq!(
+            docs.adopt(&roster_only, NOW).unwrap(),
+            Adopted {
+                roster: true,
+                policy: false
+            }
+        );
+        assert_eq!(roster_changes.try_recv().unwrap(), net.network_id);
+        assert!(policy_changes.try_recv().is_err());
+        // Then the Policy alone.
+        let policy_only = Bundle {
+            policy: next.policy.clone(),
+            ..Bundle::default()
+        };
+        assert_eq!(
+            docs.adopt(&policy_only, NOW).unwrap(),
+            Adopted {
+                roster: false,
+                policy: true
+            }
+        );
+        assert_eq!(policy_changes.try_recv().unwrap(), net.network_id);
+        assert!(roster_changes.try_recv().is_err(), "no newer Roster");
+        // Held, and refused, announce nothing on either.
+        docs.adopt(&policy_only, NOW).unwrap();
+        let thief = SigningKey::generate(&mut rand::rng());
+        assert!(docs.adopt(&net.renewal(&thief, 12, true), NOW).is_err());
+        assert!(roster_changes.try_recv().is_err() && policy_changes.try_recv().is_err());
     }
 
     #[test]

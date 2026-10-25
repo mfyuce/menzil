@@ -54,6 +54,7 @@ pub(super) fn auto_serve(
                 &policies,
                 &rosters,
                 me,
+                1,
                 &handler,
                 &gate,
                 sync.as_ref(),
