@@ -775,3 +775,164 @@ async fn a_roster_adopted_over_doc_does_not_replace_a_newer_file() {
     assert_eq!(running.roster_seq(&id), Some(second.seq));
     running.stop();
 }
+
+// ---- round 10: the keeper updates and never creates; a clean stop flushes ----
+
+/// Round 10, L2: a Roster file the operator deleted while the relay ran (there is no
+/// `remove-network`) is not written back by the next Roster adopted over DOC.
+#[tokio::test]
+async fn a_removed_roster_file_is_not_brought_back_by_an_adopted_roster() {
+    let (_o, owner, id, _) = token_of_a_network();
+    let (dir, relay_home) = home();
+    init(&relay_home, clock()).unwrap();
+    add_network(&relay_home, &relay_token(&owner), clock()).unwrap();
+    let running = start(&relay_home, &run_options(dir.path())).await.unwrap();
+    let path = roster_path(&relay_home, &id);
+    fs::remove_file(&path).unwrap();
+    let renewed = crate::local::renew(&owner, None, clock() + 60).unwrap();
+    let pair = crate::token::decode_documents(&renewed.token).unwrap();
+    assert!(
+        running
+            .relay
+            .rosters()
+            .adopt(pair.roster(), None, clock() + 60)
+            .unwrap()
+    );
+    assert!(running.flush_rosters(FLUSH));
+    assert_eq!(
+        running.roster_seq(&id),
+        Some(renewed.seq),
+        "still held in memory"
+    );
+    assert!(!path.exists(), "the deleted file stays deleted");
+    running.stop();
+    assert!(
+        load_rosters(&relay_home).unwrap().is_empty(),
+        "a restart would not serve the removed network"
+    );
+}
+
+/// Round 10, L2: not even the relay's directory (and its lock file) is made for the keeper.
+#[tokio::test]
+async fn the_keeper_does_not_make_the_relay_directory() {
+    let (_o, owner, id, _) = token_of_a_network();
+    let (dir, relay_home) = home();
+    init(&relay_home, clock()).unwrap();
+    add_network(&relay_home, &relay_token(&owner), clock()).unwrap();
+    let running = start(&relay_home, &run_options(dir.path())).await.unwrap();
+    let relay_dir = roster_path(&relay_home, &id)
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    fs::remove_dir_all(&relay_dir).unwrap();
+    let renewed = crate::local::renew(&owner, None, clock() + 60).unwrap();
+    let pair = crate::token::decode_documents(&renewed.token).unwrap();
+    assert!(
+        running
+            .relay
+            .rosters()
+            .adopt(pair.roster(), None, clock() + 60)
+            .unwrap()
+    );
+    assert!(running.flush_rosters(FLUSH));
+    assert!(
+        !relay_dir.exists(),
+        "the keeper made {}",
+        relay_dir.display()
+    );
+    running.stop();
+}
+
+/// Round 10, N1: the keeper never writes over a Roster file that cannot be read (TOBEDECIDED
+/// 28e), and goes on with the next once it is readable again. `add-network` still replaces it.
+#[tokio::test]
+async fn the_keeper_does_not_write_over_a_damaged_roster_file() {
+    let (_o, owner, id, _) = token_of_a_network();
+    let (dir, relay_home) = home();
+    init(&relay_home, clock()).unwrap();
+    add_network(&relay_home, &relay_token(&owner), clock()).unwrap();
+    let running = start(&relay_home, &run_options(dir.path())).await.unwrap();
+    let path = roster_path(&relay_home, &id);
+    let good = fs::read(&path).unwrap();
+    fs::write(&path, b"damaged").unwrap();
+    let second = crate::local::renew(&owner, None, clock() + 60).unwrap();
+    let pair = crate::token::decode_documents(&second.token).unwrap();
+    assert!(
+        running
+            .relay
+            .rosters()
+            .adopt(pair.roster(), None, clock() + 60)
+            .unwrap()
+    );
+    assert!(running.flush_rosters(FLUSH));
+    assert_eq!(fs::read(&path).unwrap(), b"damaged");
+    assert_eq!(running.roster_seq(&id), Some(second.seq));
+    fs::write(&path, good).unwrap();
+    let third = crate::local::renew(&owner, None, clock() + 120).unwrap();
+    let pair = crate::token::decode_documents(&third.token).unwrap();
+    assert!(
+        running
+            .relay
+            .rosters()
+            .adopt(pair.roster(), None, clock() + 120)
+            .unwrap()
+    );
+    assert!(running.flush_rosters(FLUSH));
+    assert_eq!(
+        load_rosters(&relay_home).unwrap()[0]
+            .roster
+            .decode()
+            .unwrap()
+            .seq,
+        third.seq
+    );
+    // The operator's own command still repairs a damaged file.
+    fs::write(&path, b"damaged").unwrap();
+    add_network(&relay_home, &relay_token(&owner), clock() + 120).unwrap();
+    assert_eq!(
+        load_rosters(&relay_home).unwrap()[0]
+            .roster
+            .decode()
+            .unwrap()
+            .seq,
+        third.seq
+    );
+    running.stop();
+}
+
+/// Round 10, L1: what `menzil relay run` does at a stop writes the Roster adopted last, even
+/// when the relay lock was busy (an `add-network` in progress) when it was adopted.
+#[tokio::test]
+async fn a_clean_stop_flushes_the_roster_adopted_last() {
+    let (_o, owner, id, _) = token_of_a_network();
+    let (dir, relay_home) = home();
+    init(&relay_home, clock()).unwrap();
+    add_network(&relay_home, &relay_token(&owner), clock()).unwrap();
+    let mut running = start(&relay_home, &run_options(dir.path())).await.unwrap();
+    let renewed = crate::local::renew(&owner, None, clock() + 60).unwrap();
+    let pair = crate::token::decode_documents(&renewed.token).unwrap();
+    let busy = relay_home.lock_relay().unwrap();
+    assert!(
+        running
+            .relay
+            .rosters()
+            .adopt(pair.roster(), None, clock() + 60)
+            .unwrap()
+    );
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(300));
+        drop(busy);
+    });
+    // The signal is already here.
+    assert_eq!(run_until(&mut running, async { 7 }).await, Some(7));
+    assert_eq!(
+        load_rosters(&relay_home).unwrap()[0]
+            .roster
+            .decode()
+            .unwrap()
+            .seq,
+        renewed.seq,
+        "the stop returned before the Roster was on disk"
+    );
+    assert_eq!(running.roster_seq(&id), Some(renewed.seq));
+}

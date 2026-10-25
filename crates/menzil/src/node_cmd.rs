@@ -880,11 +880,15 @@ pub fn keep_adopted_documents(
 ) -> Result<Arc<Worker<AdoptedDocs>>> {
     let keeper = {
         let home = home.clone();
-        Worker::spawn("menzil-docs-keep", move |adopted: AdoptedDocs| {
-            if let Err(error) = keep_adopted(&home, &adopted) {
-                tracing::warn!(network = %adopted.network_id, error = %format!("{error:#}"), "documents adopted over the network could not be kept on disk: a restart will start from the older pair");
-            }
-        })?
+        Worker::spawn(
+            "menzil-docs-keep",
+            |adopted: &AdoptedDocs| adopted.network_id,
+            move |adopted: AdoptedDocs| {
+                if let Err(error) = keep_adopted(&home, &adopted) {
+                    tracing::warn!(network = %adopted.network_id, error = %format!("{error:#}"), "documents adopted over the network could not be kept on disk: a restart will start from the older pair");
+                }
+            },
+        )?
     };
     let hook = Arc::clone(&keeper);
     rosters.set_on_adopted(move |adopted| hook.submit(adopted.clone()));
@@ -918,7 +922,7 @@ fn keep_adopted(home: &Home, adopted: &AdoptedDocs) -> Result<()> {
     // it waited in the queue is still the newest the node holds. Signatures, steward rules and
     // `seq` against the disk still count.
     let at = docs.roster_body().issued.max(docs.policy_body().issued);
-    keep_documents(home, &docs, at)?;
+    keep_documents(home, &docs, at, false)?;
     Ok(())
 }
 

@@ -173,6 +173,43 @@ impl Home {
         })
     }
 
+    /// [`Self::lock_network`] for a network already on disk: `None` when its directory is not
+    /// there (deleted by hand, or never joined), which is not created for the lock. For the
+    /// keeper of documents adopted over the network, which updates what is held and never
+    /// brings back a network that was removed.
+    pub fn lock_network_if_held(&self, network_id: &NetworkId) -> Result<Option<FileLock>> {
+        let dir = self.network_dir(network_id);
+        if !dir.is_dir() {
+            return Ok(None);
+        }
+        // No `create_private_dirs` here: a directory removed between the look and the lock
+        // makes the lock file fail to open, which is "not held" as well.
+        match lock_file(&dir.join(".lock"), LOCK_WAIT) {
+            Ok(lock) => Ok(Some(lock)),
+            Err(_) if !dir.is_dir() => Ok(None),
+            Err(error) => Err(error.context(format!(
+                "another menzil command is changing network {network_id}; try again in a moment"
+            ))),
+        }
+    }
+
+    /// [`Self::lock_relay`] when the relay's directory exists: `None` when it does not, which
+    /// is not created for the lock.
+    pub fn lock_relay_if_held(&self) -> Result<Option<FileLock>> {
+        let dir = self.root.join("relay");
+        if !dir.is_dir() {
+            return Ok(None);
+        }
+        match lock_file(&dir.join(".lock"), LOCK_WAIT) {
+            Ok(lock) => Ok(Some(lock)),
+            Err(_) if !dir.is_dir() => Ok(None),
+            Err(error) => Err(error.context(format!(
+                "another `menzil relay add-network` is changing {}; try again in a moment",
+                dir.display()
+            ))),
+        }
+    }
+
     /// Takes the lock that serializes `menzil init`: two at once would each find no identity,
     /// each make one, and write the certificate of one next to the key of the other, both
     /// reporting success (the fourth red-team round, L2). Waits for the other, up to ten

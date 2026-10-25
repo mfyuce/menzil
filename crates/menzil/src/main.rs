@@ -464,9 +464,10 @@ async fn run(cli: Cli) -> Result<()> {
             eprintln!("it serves {} network(s)", relay.networks.len());
             eprintln!("put this in `relay = ` in the config.toml of every node that uses it:");
             println!("{}", relay.connection_info);
-            tokio::select! {
-                _ = relay.wait() => {}
-                why = signals::shutdown() => eprintln!("stopping ({})", why?),
+            // Until a signal; the last Roster adopted over DOC is flushed to disk before the
+            // process goes.
+            if let Some(why) = relay_cmd::run_until(&mut relay, signals::shutdown()).await {
+                eprintln!("stopping ({})", why?);
             }
         }
         Command::Node => node_cmd::run(&home()?).await?,

@@ -606,7 +606,7 @@ pub fn join(home: &Home, token: &str, now: u64) -> Result<Joined> {
             })?;
         }
     }
-    keep_documents(home, &docs, now)
+    keep_documents(home, &docs, now, true)?.ok_or_else(|| anyhow!("the documents were not kept"))
 }
 
 /// Keeps `docs` as this device's documents for their network if the acceptance predicate
@@ -617,9 +617,27 @@ pub fn join(home: &Home, token: &str, now: u64) -> Result<Joined> {
 /// adopted over the network. The caller has verified `docs` (they stand on the network's key
 /// or on a steward it lists); the device being a member is not asked here, since a pair that
 /// removes this device is exactly the one that must reach the disk.
-pub fn keep_documents(home: &Home, docs: &Documents, now: u64) -> Result<Joined> {
+///
+/// `create` says whether a network not held yet may be brought in (`join`: yes). A running node
+/// keeping documents it adopted over the network passes `false`: only an existing pair is
+/// updated, the network directory is not even made for the lock, and the answer is `None` (there
+/// is no `leave`, so deleting the directory by hand is how a device leaves, and the next pair
+/// the network's owner or steward issues must not bring it back).
+pub fn keep_documents(
+    home: &Home,
+    docs: &Documents,
+    now: u64,
+    create: bool,
+) -> Result<Option<Joined>> {
     let network_id = docs.network_id();
-    let _lock = home.lock_network(&network_id)?;
+    let _lock = if create {
+        home.lock_network(&network_id)?
+    } else {
+        match home.lock_network_if_held(&network_id)? {
+            Some(lock) => lock,
+            None => return Ok(None),
+        }
+    };
     match load_documents(home, &network_id) {
         Ok(held) => {
             // Against what is held: a lower or equal `seq` is left alone, a steward may not
@@ -629,25 +647,28 @@ pub fn keep_documents(home: &Home, docs: &Documents, now: u64) -> Result<Joined>
                     if adoption.roster.is_some() && adoption.policy.is_some() =>
                 {
                     save_documents(home, docs)?;
-                    Ok(Joined::Updated {
+                    Ok(Some(Joined::Updated {
                         network_id,
                         from_seq: held.seq(),
                         seq: docs.seq(),
-                    })
+                    }))
                 }
-                Verdict::Adopt(_) | Verdict::Held => Ok(Joined::AlreadyCurrent {
+                Verdict::Adopt(_) | Verdict::Held => Ok(Some(Joined::AlreadyCurrent {
                     network_id,
                     held_seq: held.seq(),
-                }),
+                })),
                 Verdict::Reject(reason) => bail!("{}", refusal(reason)),
             }
         }
         Err(_) if !home.documents_path(&network_id).exists() => {
+            if !create {
+                return Ok(None);
+            }
             save_documents(home, docs)?;
-            Ok(Joined::New {
+            Ok(Some(Joined::New {
                 network_id,
                 seq: docs.seq(),
-            })
+            }))
         }
         // Held documents exist but are damaged: do not write over evidence of that silently.
         Err(error) => Err(error.context("the documents held for this network cannot be read")),

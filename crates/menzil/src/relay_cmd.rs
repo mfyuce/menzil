@@ -62,7 +62,19 @@ pub struct StoredRoster {
 /// kept is left alone. Returns the network and the sequence number now kept.
 pub fn add_network(home: &Home, token: &str, now: u64) -> Result<(NetworkId, u64)> {
     let (roster, base) = decode_roster(token)?;
-    keep_roster(home, &roster, base.as_ref(), now)
+    keep_roster(home, &roster, base.as_ref(), now, Keep::Create)?
+        .ok_or_else(|| anyhow!("the Roster was not kept"))
+}
+
+/// Whether [`keep_roster`] may bring a network into the relay's directory.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Keep {
+    /// `add-network`: the operator asks for the network, so a missing file is made.
+    Create,
+    /// The relay keeping a Roster it adopted over DOC: only a file that is there is updated, and
+    /// one that cannot be read is not written over. A network the operator removed by hand
+    /// stays removed (the tenant's next Roster must not bring it back at the next start).
+    UpdateOnly,
 }
 
 /// Keeps `roster` (with its `base`, for a Roster a steward signed) as the Roster this relay
@@ -70,13 +82,15 @@ pub fn add_network(home: &Home, token: &str, now: u64) -> Result<(NetworkId, u64
 /// what is kept: [`add_network`] after decoding a token, and the relay itself for a Roster it
 /// adopted over DOC. A Roster no newer than the one kept is left alone, so an older one never
 /// replaces a newer one on disk, whoever hands it over and in whatever order. Returns the
-/// network and the sequence number now kept.
+/// network and the sequence number now kept; `None` for [`Keep::UpdateOnly`] when nothing is
+/// held for the network.
 fn keep_roster(
     home: &Home,
     roster: &Roster,
     base: Option<&Roster>,
     now: u64,
-) -> Result<(NetworkId, u64)> {
+    keep: Keep,
+) -> Result<Option<(NetworkId, u64)>> {
     let body = roster.decode()?;
     let bundle = menzil_proto::trust::Bundle {
         base_roster: base.cloned(),
@@ -86,15 +100,43 @@ fn keep_roster(
     // From the look at what is held to the write: two runs at once could each see the older
     // Roster and the slower write would put it over the newer, so the judgement is made under
     // the lock.
-    let _lock = home.lock_relay()?;
+    let _lock = match keep {
+        Keep::Create => home.lock_relay()?,
+        Keep::UpdateOnly => match home.lock_relay_if_held()? {
+            Some(lock) => lock,
+            None => return Ok(None),
+        },
+    };
     let path = roster_path(home, &body.network_id);
     // Judge the token again against what is kept (protocol.md 2.3): a newer `seq` alone is not
     // enough, a steward's Roster on a base older than the kept Roster's base would undo what
-    // the owner changed since. A file that cannot be read counts as nothing held, as before.
-    let held = fs::read(&path)
-        .ok()
+    // the owner changed since. For `add-network` a file that cannot be read counts as nothing
+    // held (the operator is replacing it); the keeper of an adopted Roster neither creates a
+    // missing file nor writes over a damaged one.
+    let bytes = match (fs::read(&path), keep) {
+        (Ok(bytes), _) => Some(bytes),
+        (Err(error), Keep::UpdateOnly) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(None);
+        }
+        (Err(error), Keep::UpdateOnly) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "the Roster file {} cannot be read; not written over",
+                    path.display()
+                )
+            });
+        }
+        (Err(_), Keep::Create) => None,
+    };
+    let held = bytes
         .and_then(|bytes| roster_from_bytes(&bytes).ok())
         .and_then(|(roster, base)| HeldRoster::new(&roster, base.as_ref()).ok());
+    if held.is_none() && keep == Keep::UpdateOnly {
+        bail!(
+            "the Roster file {} cannot be read; not written over",
+            path.display()
+        );
+    }
     let held_seq = held.as_ref().map(HeldRoster::seq);
     let view = HeldView {
         network_id: body.network_id,
@@ -103,7 +145,7 @@ fn keep_roster(
     };
     let adoption = match check_bundle(&view, &bundle, now) {
         Verdict::Adopt(adoption) => adoption,
-        Verdict::Held => return Ok((body.network_id, held_seq.unwrap_or(body.seq))),
+        Verdict::Held => return Ok(Some((body.network_id, held_seq.unwrap_or(body.seq)))),
         Verdict::Reject(Reason::Expired) => {
             bail!("this Roster has expired: ask the owner for a current token")
         }
@@ -120,7 +162,7 @@ fn keep_roster(
         menzil_proto::trust::Signer::Steward { .. } => base,
     };
     home.write_public(&path, &roster_to_bytes(roster, base))?;
-    Ok((body.network_id, body.seq))
+    Ok(Some((body.network_id, body.seq)))
 }
 
 /// The Rosters this relay serves. A file that cannot be read is an error, not a network that
@@ -231,6 +273,9 @@ pub struct RunOptions {
     pub reload_every: std::time::Duration,
 }
 
+/// How long a clean stop waits for the keeper to write the last Roster adopted over DOC.
+pub const STOP_GRACE: std::time::Duration = std::time::Duration::from_secs(3);
+
 /// How often a relay reloads its Rosters unless told otherwise.
 pub const DEFAULT_RELOAD_EVERY: std::time::Duration = std::time::Duration::from_secs(15);
 
@@ -246,7 +291,7 @@ pub struct RunningRelay {
     relay: Relay,
     task: JoinHandle<()>,
     reload: JoinHandle<()>,
-    keeper: Arc<Worker<(Roster, Option<Roster>)>>,
+    keeper: Arc<Worker<(NetworkId, Roster, Option<Roster>)>>,
 }
 
 impl RunningRelay {
@@ -266,11 +311,39 @@ impl RunningRelay {
         self.keeper.flush(timeout)
     }
 
+    /// [`Self::flush_rosters`] off the async threads (it blocks on the keeper, which may wait
+    /// for a lock another command holds): for a clean stop of `menzil relay run`, so that the
+    /// last Roster adopted over DOC is on disk before the process goes.
+    pub async fn flush_rosters_blocking(&self, timeout: std::time::Duration) -> bool {
+        let keeper = Arc::clone(&self.keeper);
+        tokio::task::spawn_blocking(move || keeper.flush(timeout))
+            .await
+            .unwrap_or(false)
+    }
+
     /// Stops the relay.
     pub fn stop(&self) {
         self.task.abort();
         self.reload.abort();
     }
+}
+
+/// What `menzil relay run` does after it has started: waits until `stop` is ready (a signal) or
+/// the relay's task ends, then flushes the keeper, so that the last Roster adopted over DOC is
+/// on disk before the process goes (TOBEDECIDED 28b; bounded by [`STOP_GRACE`], the lock another
+/// command holds is not waited for forever). `Some` with what `stop` gave if it was the signal.
+pub async fn run_until<F: std::future::Future>(
+    relay: &mut RunningRelay,
+    stop: F,
+) -> Option<F::Output> {
+    let stopped = tokio::select! {
+        _ = relay.wait() => None,
+        out = stop => Some(out),
+    };
+    if !relay.flush_rosters_blocking(STOP_GRACE).await {
+        eprintln!("menzil: the Rosters adopted last may not have reached the disk");
+    }
+    stopped
 }
 
 impl Drop for RunningRelay {
@@ -363,13 +436,16 @@ pub async fn start(home: &Home, options: &RunOptions) -> Result<RunningRelay> {
         let home = home.clone();
         Worker::spawn(
             "menzil-relay-keep",
-            move |(roster, base): (Roster, Option<Roster>)| {
+            |job: &(NetworkId, Roster, Option<Roster>)| job.0,
+            move |(_, roster, base): (NetworkId, Roster, Option<Roster>)| {
                 let Ok(body) = roster.decode() else { return };
                 let network = Some(body.network_id);
                 // Judged at the Roster's own `issued` time, like the held-but-expired start: the
                 // time rules were checked when the store took it, and what is left to ask here is
                 // its signatures and `seq` against the file.
-                if let Err(error) = keep_roster(&home, &roster, base.as_ref(), body.issued) {
+                if let Err(error) =
+                    keep_roster(&home, &roster, base.as_ref(), body.issued, Keep::UpdateOnly)
+                {
                     tracing::warn!(?network, error = %format!("{error:#}"), "the Roster adopted over DOC could not be kept on disk: a restart will start from the older file");
                 }
             },
@@ -378,7 +454,9 @@ pub async fn start(home: &Home, options: &RunOptions) -> Result<RunningRelay> {
     {
         let keeper = Arc::clone(&keeper);
         relay.rosters().set_on_adopted(move |roster, base| {
-            keeper.submit((roster.clone(), base.cloned()));
+            if let Ok(body) = roster.decode() {
+                keeper.submit((body.network_id, roster.clone(), base.cloned()));
+            }
         });
     }
     let serving = relay.clone();

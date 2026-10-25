@@ -1227,3 +1227,46 @@ fn only_a_pair_the_stores_adopted_is_written() {
         second.seq
     );
 }
+
+// ---- round 10: the keeper updates and never creates ----
+
+/// Round 10, L2: a network whose directory the user deleted (there is no `leave`) is not
+/// brought back by the next pair adopted over the network, not even as an empty directory.
+#[test]
+fn a_removed_network_is_not_brought_back_by_an_adopted_pair() {
+    let m = running_member();
+    let dir = m.member.network_dir(&m.id);
+    fs::remove_dir_all(&dir).unwrap();
+    let renewed = renew(&m.owner, None, clock() + 60).unwrap();
+    let pair = crate::token::decode_documents(&renewed.token).unwrap();
+    let adopted = DocStore::new(&m.rosters, &m.policies)
+        .adopt(&pair.bundle(), clock() + 60)
+        .unwrap();
+    assert!(adopted.roster && adopted.policy);
+    assert!(m.keeper.flush(FLUSH));
+    assert!(!dir.exists(), "the keeper made {}", dir.display());
+    assert!(m.member.networks().unwrap().is_empty());
+    assert_eq!(
+        m.rosters.seq(&m.id),
+        Some(renewed.seq),
+        "still held in memory"
+    );
+}
+
+/// Round 10, L2: the same when only the documents file is gone and the directory is left.
+#[test]
+fn a_deleted_documents_file_is_not_written_back_by_an_adopted_pair() {
+    let m = running_member();
+    let path = m.member.documents_path(&m.id);
+    fs::remove_file(&path).unwrap();
+    let renewed = renew(&m.owner, None, clock() + 60).unwrap();
+    let pair = crate::token::decode_documents(&renewed.token).unwrap();
+    DocStore::new(&m.rosters, &m.policies)
+        .adopt(&pair.bundle(), clock() + 60)
+        .unwrap();
+    assert!(m.keeper.flush(FLUSH));
+    assert!(!path.exists());
+    // `join` still brings the network back when the user asks for it.
+    join(&m.member, &renewed.token, clock() + 60).unwrap();
+    assert!(path.exists());
+}
