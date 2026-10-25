@@ -13,8 +13,8 @@ use menzil_cli::agent::{self, End};
 use menzil_cli::config::Config;
 use menzil_cli::home::Home;
 use menzil_cli::local::{self, Joined};
-use menzil_cli::stdio::ClosingStdout;
-use menzil_cli::{node_cmd, reach, relay_cmd, signals, text, token};
+use menzil_cli::stdio::{ClosingStdout, reset_message};
+use menzil_cli::{node_cmd, reach, relay_cmd, signals, token};
 use menzil_proto::ServiceId;
 use tracing_subscriber::EnvFilter;
 
@@ -560,10 +560,7 @@ async fn run(cli: Cli) -> Result<()> {
             match end {
                 End::Clean => std::process::exit(0),
                 End::Reset(why) => {
-                    eprintln!(
-                        "menzil: the connection was reset: {}",
-                        text::one_line(&why, 300)
-                    );
+                    eprintln!("menzil: {}", reset_message(&why));
                     std::process::exit(1);
                 }
             }

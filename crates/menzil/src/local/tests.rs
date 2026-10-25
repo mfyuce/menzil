@@ -1402,6 +1402,20 @@ fn a_steward_token_on_a_base_older_than_the_held_one_is_refused() {
 // `revoke` and `ungrant` (protocol.md 7.3; L4k K1)
 // ---------------------------------------------------------------------------------------------
 
+#[test]
+fn status_counts_the_revoked_nodes_and_says_nothing_before_any() {
+    let (two, _phone) = with_phone();
+    let text = status(&two.owner).unwrap().render(NOW);
+    assert!(!text.contains("revoked"), "{text}");
+    revoke(&two.owner, None, "phone", false, NOW + 5).unwrap();
+    let report = status(&two.owner).unwrap();
+    assert_eq!(report.networks[0].revoked, 1);
+    let text = report.render(NOW + 5);
+    assert!(text.contains("0 grants, 1 revoked\n"), "{text}");
+    // The revoked node is gone from the members the status lists.
+    assert!(!text.contains("phone"), "{text}");
+}
+
 /// The owner device with `phone` admitted and joined, and some grants.
 fn with_phone() -> (Two, NodeId) {
     let two = two_devices();

@@ -14,6 +14,19 @@ use std::task::{Context, Poll, ready};
 
 use tokio::io::{AsyncWrite, Stdout};
 
+use crate::text;
+
+/// What `menzil stdio` prints to standard error when the stream was reset, after `menzil: `:
+/// the agent's reason (a single printable line) and, since a reset may be the other device
+/// cutting this one off on purpose, what that looks like ([`text::CUT_OFF`]).
+pub fn reset_message(why: &str) -> String {
+    format!(
+        "the connection was reset: {}. If the service did not fail, {}",
+        text::one_line(why, 300),
+        text::CUT_OFF
+    )
+}
+
 /// Standard output whose [`shutdown`](AsyncWrite::poll_shutdown) really closes it.
 pub struct ClosingStdout {
     inner: Stdout,
@@ -70,4 +83,22 @@ fn close_stdout() -> io::Result<()> {
 #[cfg(not(unix))]
 fn close_stdout() -> io::Result<()> {
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_reset_is_explained_in_plain_words_on_one_safe_line() {
+        let message = reset_message("the stream was reset\n\u{1b}[2J");
+        assert!(message.starts_with("the connection was reset: the stream was reset "));
+        assert!(message.contains("revoked") && message.contains("taken back"));
+        assert!(message.contains("grant_removed"));
+        assert!(message.contains("`menzil status`"));
+        assert!(
+            !message.contains('\n') && !message.contains('\u{1b}'),
+            "{message:?}"
+        );
+    }
 }

@@ -21,7 +21,7 @@ use menzil_node::{
     NodeOpenError, OpenStreamError, PolicyStore, RosterStore, SessionConfig,
 };
 use menzil_proto::trust::{DOC_MAX_LIFETIME, Reason};
-use menzil_proto::{NetworkId, NodeId, ServiceId, ServiceKind};
+use menzil_proto::{ErrorCode, NetworkId, NodeId, ServiceId, ServiceKind};
 use menzil_stream::Stream;
 use tokio::net::{UnixListener, UnixStream};
 use tokio::task::JoinHandle;
@@ -617,15 +617,23 @@ impl NodeOpener {
 fn explain(error: &NodeOpenError) -> String {
     match error {
         NodeOpenError::Session(EnsureError::NotAttached) => {
-            "this node is not connected to the relay (yet): check `relay` in config.toml and the network"
+            "this node is not connected to the relay (yet): check `relay` in config.toml and the network; a device that was revoked is turned away by the relay too, and `menzil status` on the owner's device shows the revoked"
                 .to_string()
         }
         NodeOpenError::Session(EnsureError::Timeout) => {
-            "the other device did not answer: is it running `menzil node` and connected to the same relay?"
+            "the other device did not answer: is it running `menzil node` and connected to the same relay? (A device that was revoked gets no answer either.)"
                 .to_string()
         }
         NodeOpenError::Session(EnsureError::Refused) => {
-            "the other device refused the session: are both of you members of the network, with current documents?"
+            "the other device refused the session: are both of you members of the network, with current documents? (Neither of you may be revoked.)"
+                .to_string()
+        }
+        NodeOpenError::Session(EnsureError::NotAMember) => {
+            "this device is not a member in good standing of that network any more: its documents may have expired (`menzil renew`), or it was revoked or removed by the owner"
+                .to_string()
+        }
+        NodeOpenError::Session(EnsureError::UnknownPeer) => {
+            "this device holds no valid certificate for that member in that network: the member may have been revoked, or these documents are older than its admission (`menzil join` a current token)"
                 .to_string()
         }
         NodeOpenError::Session(EnsureError::DocsOnly) => {
@@ -633,7 +641,13 @@ fn explain(error: &NodeOpenError) -> String {
                 .to_string()
         }
         NodeOpenError::Open(OpenStreamError::Refused { code, msg }) => {
-            format!("refused by the other end: {} ({msg})", code.name())
+            let meaning = match code {
+                ErrorCode::NoGrant => {
+                    ": this device holds no grant for that service (the owner never gave it, or took it back with `menzil ungrant`)"
+                }
+                _ => "",
+            };
+            format!("refused by the other end: {} ({msg}){meaning}", code.name())
         }
         other => other.to_string(),
     }

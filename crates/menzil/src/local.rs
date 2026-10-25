@@ -803,6 +803,8 @@ pub struct NetworkStatus {
     pub members: Vec<MemberStatus>,
     /// How many grants the Policy holds.
     pub grants: usize,
+    /// How many nodes the Roster lists as revoked (protocol.md 7.3).
+    pub revoked: usize,
     /// The steward the Roster lists, if any.
     pub steward: Option<StewardStatus>,
     /// Set when the documents could not be read.
@@ -863,6 +865,7 @@ pub fn status(home: &Home) -> Result<Status> {
                     })
                     .collect(),
                 grants: docs.policy_body().grants.len(),
+                revoked: docs.roster_body().revoked.len(),
                 steward: docs
                     .roster_body()
                     .stewards
@@ -884,6 +887,7 @@ pub fn status(home: &Home) -> Result<Status> {
                 expires: 0,
                 members: vec![],
                 grants: 0,
+                revoked: 0,
                 steward: None,
                 problem: Some(format!("{error:#}")),
             },
@@ -956,11 +960,16 @@ impl Status {
                 "expires"
             };
             out.push_str(&format!(
-                "  documents #{}, {state} {}, {} grant{}\n",
+                "  documents #{}, {state} {}, {} grant{}{}\n",
                 network.seq,
                 relative(network.expires, now),
                 network.grants,
-                if network.grants == 1 { "" } else { "s" }
+                if network.grants == 1 { "" } else { "s" },
+                if network.revoked == 0 {
+                    String::new()
+                } else {
+                    format!(", {} revoked", network.revoked)
+                }
             ));
             if let Some(steward) = &network.steward {
                 let state = if steward.not_after <= now {

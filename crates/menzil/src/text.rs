@@ -6,6 +6,13 @@
 //! file name read backwards, a zero width space that makes two names look alike). Nothing that is
 //! not ours is printed without passing through here.
 
+/// What a person is told when a stream or a session ended and the reason is not on the wire. The
+/// other device ends a session with one uniform CLOSE `grant_removed` whatever the cause (protocol
+/// 5.3: the peer was revoked, left the Policy, lost its certificate, or the grant is gone), and a
+/// relay turns a revoked device away with ERROR and GOAWAY `revoked` (protocol 7.3); neither says
+/// more, so the words name the causes and where to look.
+pub const CUT_OFF: &str = "a member that was revoked, or whose grant was taken back, is cut off at once (the other device ends the session with CLOSE grant_removed, and a relay turns a revoked device away with ERROR and GOAWAY revoked); `menzil status` shows what this device still holds";
+
 /// Whether `c` must not reach a terminal as it is: a control character (C0, DEL, C1), a line or
 /// paragraph separator, or an invisible one (the format characters such as the bidirectional
 /// controls, zero width characters, the soft hyphen, the annotation marks and the tag

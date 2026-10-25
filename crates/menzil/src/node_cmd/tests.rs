@@ -201,6 +201,26 @@ fn what_a_person_is_told_about_a_failed_open_is_plain() {
         text.contains("only took them") && text.contains("try again"),
         "{text}"
     );
+    // A device that was revoked or removed is told so as a possible cause (L4k K6).
+    let text = explain(&NodeOpenError::Session(EnsureError::NotAttached));
+    assert!(
+        text.contains("revoked") && text.contains("turned away"),
+        "{text}"
+    );
+    let text = explain(&NodeOpenError::Session(EnsureError::Timeout));
+    assert!(text.contains("revoked"), "{text}");
+    let text = explain(&NodeOpenError::Session(EnsureError::Refused));
+    assert!(text.contains("revoked"), "{text}");
+    let text = explain(&NodeOpenError::Session(EnsureError::NotAMember));
+    assert!(
+        text.contains("not a member in good standing") && text.contains("revoked"),
+        "{text}"
+    );
+    let text = explain(&NodeOpenError::Session(EnsureError::UnknownPeer));
+    assert!(
+        text.contains("no valid certificate") && text.contains("revoked"),
+        "{text}"
+    );
     // Anything else keeps the library's own words.
     assert_eq!(
         explain(&NodeOpenError::Session(EnsureError::SelfPeer)),
@@ -212,7 +232,16 @@ fn what_a_person_is_told_about_a_failed_open_is_plain() {
     });
     assert_eq!(
         explain(&refused),
-        "refused by the other end: no_grant (no grant)"
+        "refused by the other end: no_grant (no grant): this device holds no grant for that service (the owner never gave it, or took it back with `menzil ungrant`)"
+    );
+    // Another refusal keeps the code and the message and nothing more.
+    let refused = NodeOpenError::Open(OpenStreamError::Refused {
+        code: menzil_proto::ErrorCode::UnknownService,
+        msg: "nope".to_string(),
+    });
+    assert_eq!(
+        explain(&refused),
+        "refused by the other end: unknown_service (nope)"
     );
     let _ = NodeKeys::generate;
 }
