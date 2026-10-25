@@ -36,6 +36,10 @@ use crate::roster_store::RosterStore;
 
 pub use menzil_proto::docs::STREAM_DEADLINE;
 
+/// How long [`serve`] waits for the opener's first message (`fetch` or `push`) before it gives
+/// the stream up. The rest of the operation has [`STREAM_DEADLINE`].
+pub const FIRST_MESSAGE_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Why a `menzil:docs` operation failed. Everything except [`Self::Rejected`] means the stream
 /// is to be reset.
 #[derive(Debug, Error)]
@@ -670,7 +674,11 @@ where
     Snk: DocsSink,
 {
     let mut counter = MessageCounter::new();
-    match read_message(stream, &mut counter).await? {
+    // A stream that opens and then says nothing must not hold its place for the whole deadline.
+    let first = tokio::time::timeout(FIRST_MESSAGE_TIMEOUT, read_message(stream, &mut counter))
+        .await
+        .map_err(|_| DocsStreamError::Timeout)??;
+    match first {
         Message::Fetch {
             roster_seq,
             policy_seq,

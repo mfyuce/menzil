@@ -504,7 +504,13 @@ pub(crate) fn serve_session<H>(
             rosters.clone(),
         );
         let live = sync.map(|sync| {
-            let id = sync.register(peer, network_id, peer_roster_seq, peer_policy_seq);
+            let id = sync.register_as(
+                peer,
+                network_id,
+                role == Role::Initiator,
+                peer_roster_seq,
+                peer_policy_seq,
+            );
             (Arc::clone(sync), id)
         });
         if let Some((sync, _)) = &live

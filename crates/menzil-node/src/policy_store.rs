@@ -289,10 +289,36 @@ impl PolicyStore {
         cert_serial: u32,
         now: u64,
     ) -> Result<(), ErrorCode> {
+        self.check_membership_with(rosters, network_id, node_id, cert_serial, now, true)
+    }
+
+    /// [`Self::check_membership`] without the expiry part: the held pair may be past its
+    /// `expires` (a node that wants to fetch the renewed pair from its peers dials with it,
+    /// TOBEDECIDED 25). Revocation, membership and the serial floor are checked as usual.
+    pub fn check_membership_ignoring_expiry(
+        &self,
+        rosters: &RosterStore,
+        network_id: &NetworkId,
+        node_id: &NodeId,
+        cert_serial: u32,
+        now: u64,
+    ) -> Result<(), ErrorCode> {
+        self.check_membership_with(rosters, network_id, node_id, cert_serial, now, false)
+    }
+
+    fn check_membership_with(
+        &self,
+        rosters: &RosterStore,
+        network_id: &NetworkId,
+        node_id: &NodeId,
+        cert_serial: u32,
+        now: u64,
+        check_expiry: bool,
+    ) -> Result<(), ErrorCode> {
         let roster = rosters.body(network_id).ok_or(ErrorCode::UnknownNetwork)?;
         let policy = self.body(network_id).ok_or(ErrorCode::UnknownNetwork)?;
 
-        if roster.expires <= now || policy.expires <= now {
+        if check_expiry && (roster.expires <= now || policy.expires <= now) {
             return Err(ErrorCode::RosterExpired);
         }
 

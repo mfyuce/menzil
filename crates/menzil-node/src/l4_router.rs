@@ -127,8 +127,9 @@ use menzil_stream::Mode;
 use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::admission::{
-    HandshakeAdmission, InitiatorAdmission, decide_initiator_admission, decide_responder_admission,
-    is_unrevoked_roster_member, resolve_dial_cert,
+    HandshakeAdmission, InitiatorAdmission, decide_initiator_admission,
+    decide_initiator_admission_for_docs, decide_responder_admission, is_unrevoked_roster_member,
+    resolve_dial_cert, resolve_dial_cert_for_docs,
 };
 use crate::identity::LocalIdentity;
 use crate::l4_session::{
@@ -393,11 +394,33 @@ impl RouterHandle {
         peer: NodeId,
         network_id: NetworkId,
     ) -> Result<L4SessionHandle, EnsureError> {
+        self.ensure_with(peer, network_id, false).await
+    }
+
+    /// [`Self::ensure_session`] for a dial whose purpose is `menzil:docs` (to fetch newer
+    /// documents): a node whose own documents have expired may dial with them, only the expiry
+    /// part of the standing checks is relaxed (TOBEDECIDED 25). Every other use of a session
+    /// keeps the refusal. A call that joins a handshake already out takes that one's purpose.
+    pub async fn ensure_session_for_docs(
+        &self,
+        peer: NodeId,
+        network_id: NetworkId,
+    ) -> Result<L4SessionHandle, EnsureError> {
+        self.ensure_with(peer, network_id, true).await
+    }
+
+    async fn ensure_with(
+        &self,
+        peer: NodeId,
+        network_id: NetworkId,
+        docs: bool,
+    ) -> Result<L4SessionHandle, EnsureError> {
         let (reply, answer) = oneshot::channel();
         self.commands
             .send(Command::Ensure {
                 peer,
                 network_id,
+                docs,
                 reply,
             })
             .await
@@ -493,6 +516,8 @@ enum Command {
     Ensure {
         peer: NodeId,
         network_id: NetworkId,
+        /// The dial's purpose is `menzil:docs`.
+        docs: bool,
         reply: oneshot::Sender<Result<L4SessionHandle, EnsureError>>,
     },
     Stop {
@@ -582,6 +607,9 @@ struct Pending {
     network: NetworkId,
     attempt: u32,
     epoch: Epoch,
+    /// The dial's purpose is `menzil:docs`: the expiry of the held documents is not held
+    /// against it.
+    docs: bool,
 }
 
 fn tag_of(generation: u32, index: SessionIndex) -> u64 {
@@ -1133,7 +1161,7 @@ impl Engine {
     // Initiator: our own `init`, and the `resp` to it
     // ------------------------------------------------------------------
 
-    fn ensure(&mut self, peer: NodeId, network: NetworkId, reply: Waiter, now: Now) {
+    fn ensure(&mut self, peer: NodeId, network: NetworkId, docs: bool, reply: Waiter, now: Now) {
         if self.stopping {
             let _ = reply.send(Err(EnsureError::ShuttingDown));
             return;
@@ -1162,7 +1190,7 @@ impl Engine {
         }
         if slot.pending.is_none()
             && slot.candidate.is_none()
-            && let Err(error) = self.begin_initiation(peer, network, 1, now)
+            && let Err(error) = self.begin_initiation(peer, network, 1, docs, now)
         {
             let _ = reply.send(Err(error));
             return;
@@ -1183,15 +1211,18 @@ impl Engine {
         peer: NodeId,
         network: NetworkId,
         attempt: u32,
+        docs: bool,
         now: Now,
     ) -> Result<(), EnsureError> {
         let attached = self.attached.ok_or(EnsureError::NotAttached)?;
-        if let Err(reason) = self.policies.check_membership(
+        if let Err(reason) = crate::admission::membership(
+            &self.policies,
             &self.rosters,
             &network,
             &self.local_node_id,
             self.local_cert_serial,
             now.unix,
+            !docs,
         ) {
             tracing::debug!(
                 ?reason,
@@ -1205,7 +1236,12 @@ impl Engine {
                 EnsureError::NotAMember
             });
         }
-        let cert = resolve_dial_cert(&self.policies, &self.rosters, &network, &peer, now.unix)
+        let resolve = if docs {
+            resolve_dial_cert_for_docs
+        } else {
+            resolve_dial_cert
+        };
+        let cert = resolve(&self.policies, &self.rosters, &network, &peer, now.unix)
             .ok_or(EnsureError::UnknownPeer)?;
         let index = self
             .table
@@ -1232,6 +1268,7 @@ impl Engine {
             network,
             attempt,
             epoch: attached.epoch,
+            docs,
         };
         match self
             .table
@@ -1283,7 +1320,12 @@ impl Engine {
             self.fail_waiters(&key, EnsureError::Refused);
             return;
         }
-        if let InitiatorAdmission::Refuse { reason } = decide_initiator_admission(
+        let decide = if state.docs {
+            decide_initiator_admission_for_docs
+        } else {
+            decide_initiator_admission
+        };
+        if let InitiatorAdmission::Refuse { reason } = decide(
             &self.policies,
             &self.rosters,
             &network,
@@ -1505,6 +1547,7 @@ impl Engine {
                         pending.peer,
                         pending.network,
                         pending.attempt + 1,
+                        pending.docs,
                         now,
                     ) {
                         Ok(()) => continue,
@@ -1763,8 +1806,8 @@ async fn run_router(
             }
             command = commands.recv(), if commands_open => {
                 match command {
-                    Some(Command::Ensure { peer, network_id, reply }) => {
-                        engine.ensure(peer, network_id, reply, Now::capture());
+                    Some(Command::Ensure { peer, network_id, docs, reply }) => {
+                        engine.ensure(peer, network_id, docs, reply, Now::capture());
                     }
                     Some(Command::Stop { reason, done }) => {
                         engine.on_stop(&reason);

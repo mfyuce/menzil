@@ -7,14 +7,18 @@
 //!   nothing else through.
 //! * [`DocsGate`] is the rate limit: one docs stream per peer at a time, four in all, six per peer
 //!   per minute. An OPEN past a limit is answered `rate_limited`.
+//!   A docs only session is admitted for a `src` that nobody has proved, so it never takes a
+//!   place keyed by the peer's NodeId: it has one of its own, keyed by the session
+//!   ([`DocsGate::try_acquire_session`]); the router caps those sessions (8).
 //! * [`SessionHandler`] sits in front of the node's own [`ServiceHandler`] (`LocalServices` in
 //!   production) for one session: `menzil:docs` goes to [`crate::docs::serve`] over the node's
 //!   stores and never to the inner handler, and on a docs only session nothing else is served.
 //!   A docs only session is ended with CLOSE `docs_only` as soon as its one stream is over.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -54,6 +58,8 @@ impl Default for DocsLimits {
 
 #[derive(Default)]
 struct GateState {
+    /// Sessions of docs only sessions that hold their place: not counted in `active`.
+    active_sessions: HashSet<u64>,
     active: usize,
     active_by_peer: HashMap<NodeId, usize>,
     started: HashMap<NodeId, VecDeque<Instant>>,
@@ -62,6 +68,7 @@ struct GateState {
 /// Counts the `menzil:docs` streams of a node: shared by every session.
 pub struct DocsGate {
     limits: DocsLimits,
+    next_session: AtomicU64,
     state: Mutex<GateState>,
 }
 
@@ -70,17 +77,32 @@ pub struct DocsGate {
 #[must_use]
 pub struct DocsPermit {
     gate: Arc<DocsGate>,
-    peer: NodeId,
+    place: Place,
+}
+
+/// What a permit is keyed by.
+enum Place {
+    /// An ordinary session's stream: counted for the peer and in all.
+    Peer(NodeId),
+    /// A docs only session's stream: its own place, counted nowhere else.
+    Session(u64),
 }
 
 impl Drop for DocsPermit {
     fn drop(&mut self) {
         let mut state = self.gate.state.lock().unwrap_or_else(|e| e.into_inner());
-        state.active = state.active.saturating_sub(1);
-        if let Some(count) = state.active_by_peer.get_mut(&self.peer) {
-            *count = count.saturating_sub(1);
-            if *count == 0 {
-                state.active_by_peer.remove(&self.peer);
+        match self.place {
+            Place::Session(session) => {
+                state.active_sessions.remove(&session);
+            }
+            Place::Peer(peer) => {
+                state.active = state.active.saturating_sub(1);
+                if let Some(count) = state.active_by_peer.get_mut(&peer) {
+                    *count = count.saturating_sub(1);
+                    if *count == 0 {
+                        state.active_by_peer.remove(&peer);
+                    }
+                }
             }
         }
     }
@@ -91,7 +113,30 @@ impl DocsGate {
     pub fn new(limits: DocsLimits) -> Arc<Self> {
         Arc::new(Self {
             limits,
+            next_session: AtomicU64::new(0),
             state: Mutex::default(),
+        })
+    }
+
+    /// A key for one docs only session, for [`Self::try_acquire_session`].
+    fn new_session_key(&self) -> u64 {
+        self.next_session.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// The one place of a docs only session (`session` from [`Self::new_session_key`]), or
+    /// `None` when that session has its stream already. It is keyed by the session and
+    /// not by the NodeId of the peer, and counted in none of the per peer, in all or per minute
+    /// limits: a docs only session is admitted for a `src` that nobody has proved, so whatever it
+    /// holds must not be a place that a real session of that member needs. (The number of docs
+    /// only sessions is capped by the router.)
+    pub(crate) fn try_acquire_session(self: &Arc<Self>, session: u64) -> Option<DocsPermit> {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if !state.active_sessions.insert(session) {
+            return None;
+        }
+        Some(DocsPermit {
+            gate: Arc::clone(self),
+            place: Place::Session(session),
         })
     }
 
@@ -138,7 +183,7 @@ impl DocsGate {
         *state.active_by_peer.entry(peer).or_default() += 1;
         Some(DocsPermit {
             gate: Arc::clone(self),
-            peer,
+            place: Place::Peer(peer),
         })
     }
 }
@@ -159,6 +204,8 @@ pub struct SessionHandler<H> {
     rosters: Arc<RosterStore>,
     /// `Some` on a docs only session: what ends the session once its one stream is over.
     docs_only: Option<Arc<dyn Fn() + Send + Sync>>,
+    /// The key of this session's place on a docs only session ([`DocsGate::try_acquire_session`]).
+    session: u64,
 }
 
 impl<H> SessionHandler<H> {
@@ -175,12 +222,19 @@ impl<H> SessionHandler<H> {
             policies,
             rosters,
             docs_only: None,
+            session: 0,
         }
     }
 
     /// The handler of a docs only session this node answered: one `menzil:docs` push and nothing
     /// else. `end_session` is called when that stream is over, whatever came of it (the node
     /// passes a closure that closes the session with CLOSE `docs_only`).
+    ///
+    /// The session has a place of its own for its one stream, keyed by the session and not by
+    /// the peer's NodeId: a docs only session is admitted for a `src` that nobody has proved
+    /// (a relay can put any member's NodeId there), so it must never use up the per peer or the
+    /// in all place that a real session of that member needs. The number of docs only sessions
+    /// is capped by the router (8).
     pub fn docs_only(
         inner: Arc<H>,
         gate: Arc<DocsGate>,
@@ -190,6 +244,7 @@ impl<H> SessionHandler<H> {
     ) -> Self {
         Self {
             inner,
+            session: gate.new_session_key(),
             gate,
             policies,
             rosters,
@@ -217,7 +272,12 @@ where
         if is_docs_service(&request.service) {
             // The authorizer has let the OPEN through, so the peer is an unrevoked member; what
             // is left is how much of this service the node gives it at once.
-            return match self.gate.try_acquire(request.initiator) {
+            let permit = if self.docs_only.is_some() {
+                self.gate.try_acquire_session(self.session)
+            } else {
+                self.gate.try_acquire(request.initiator)
+            };
+            return match permit {
                 Some(permit) => Ok(SessionOpened::Docs(permit)),
                 None => Err(OpenRefusal {
                     code: ErrorCode::RateLimited,

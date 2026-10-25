@@ -241,6 +241,29 @@ pub fn resolve_dial_cert(
     node_id: &NodeId,
     now: u64,
 ) -> Option<NodeCertBody> {
+    resolve_dial_cert_with(policies, rosters, network_id, node_id, now, true)
+}
+
+/// [`resolve_dial_cert`] for a dial whose purpose is `menzil:docs`: the held pair may be past
+/// its `expires` (TOBEDECIDED 25), everything else is checked as usual.
+pub fn resolve_dial_cert_for_docs(
+    policies: &PolicyStore,
+    rosters: &RosterStore,
+    network_id: &NetworkId,
+    node_id: &NodeId,
+    now: u64,
+) -> Option<NodeCertBody> {
+    resolve_dial_cert_with(policies, rosters, network_id, node_id, now, false)
+}
+
+fn resolve_dial_cert_with(
+    policies: &PolicyStore,
+    rosters: &RosterStore,
+    network_id: &NetworkId,
+    node_id: &NodeId,
+    now: u64,
+    check_expiry: bool,
+) -> Option<NodeCertBody> {
     let policy = policies.body(network_id)?;
     policy
         .certs
@@ -253,11 +276,35 @@ pub fn resolve_dial_cert(
         })
         .filter_map(|cert| verify_cert(cert, now).ok())
         .filter(|body| {
-            policies
-                .check_membership(rosters, network_id, node_id, body.serial, now)
-                .is_ok()
+            membership(
+                policies,
+                rosters,
+                network_id,
+                node_id,
+                body.serial,
+                now,
+                check_expiry,
+            )
+            .is_ok()
         })
         .max_by_key(|body| body.serial)
+}
+
+/// [`PolicyStore::check_membership`], or without its expiry part.
+pub(crate) fn membership(
+    policies: &PolicyStore,
+    rosters: &RosterStore,
+    network_id: &NetworkId,
+    node_id: &NodeId,
+    cert_serial: u32,
+    now: u64,
+    check_expiry: bool,
+) -> Result<(), ErrorCode> {
+    if check_expiry {
+        policies.check_membership(rosters, network_id, node_id, cert_serial, now)
+    } else {
+        policies.check_membership_ignoring_expiry(rosters, network_id, node_id, cert_serial, now)
+    }
 }
 
 /// What protocol.md 5.1's responder-side checks decide about one just-read
@@ -463,6 +510,52 @@ pub fn decide_initiator_admission(
     payload: &E2eHandshakePayload,
     now: u64,
 ) -> InitiatorAdmission {
+    decide_initiator_admission_with(
+        policies,
+        rosters,
+        network_id,
+        dialed_node_id,
+        negotiated_responder_static,
+        payload,
+        now,
+        true,
+    )
+}
+
+/// [`decide_initiator_admission`] for a dial whose purpose is `menzil:docs`: the held pair may
+/// be past its `expires` (TOBEDECIDED 25), everything else is checked as usual.
+pub fn decide_initiator_admission_for_docs(
+    policies: &PolicyStore,
+    rosters: &RosterStore,
+    network_id: &NetworkId,
+    dialed_node_id: &NodeId,
+    negotiated_responder_static: &X25519PublicKey,
+    payload: &E2eHandshakePayload,
+    now: u64,
+) -> InitiatorAdmission {
+    decide_initiator_admission_with(
+        policies,
+        rosters,
+        network_id,
+        dialed_node_id,
+        negotiated_responder_static,
+        payload,
+        now,
+        false,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn decide_initiator_admission_with(
+    policies: &PolicyStore,
+    rosters: &RosterStore,
+    network_id: &NetworkId,
+    dialed_node_id: &NodeId,
+    negotiated_responder_static: &X25519PublicKey,
+    payload: &E2eHandshakePayload,
+    now: u64,
+    check_expiry: bool,
+) -> InitiatorAdmission {
     let Ok(claimed) = verify_cert(&payload.node_cert, now) else {
         return InitiatorAdmission::Refuse {
             reason: ErrorCode::BadCert,
@@ -487,7 +580,15 @@ pub fn decide_initiator_admission(
         };
     };
 
-    match policies.check_membership(rosters, network_id, dialed_node_id, own_view.serial, now) {
+    match membership(
+        policies,
+        rosters,
+        network_id,
+        dialed_node_id,
+        own_view.serial,
+        now,
+        check_expiry,
+    ) {
         Ok(()) => InitiatorAdmission::Allow,
         Err(reason) => InitiatorAdmission::Refuse { reason },
     }

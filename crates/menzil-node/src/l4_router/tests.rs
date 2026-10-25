@@ -2054,7 +2054,8 @@ async fn a_peer_whose_session_overflowed_can_be_dialed_again_at_once() {
     // for that peer starts a handshake instead of being handed a handle
     // that was closed.
     let (reply, _answer) = oneshot::channel();
-    d.engine.ensure(m.id, w.network, reply, Now::capture());
+    d.engine
+        .ensure(m.id, w.network, false, reply, Now::capture());
     let mut sent_init = false;
     while let Ok(request) = d.outbound.try_recv() {
         sent_init |= request.dst == m.id
@@ -2074,7 +2075,8 @@ async fn a_caller_waiting_on_a_session_that_overflows_is_told_at_once() {
     // would tell it).
     let (w, _b, m, _n, mut d, recv) = two_sessions_at(256 * 1024).await;
     let (reply, mut answer) = oneshot::channel();
-    d.engine.ensure(m.id, w.network, reply, Now::capture());
+    d.engine
+        .ensure(m.id, w.network, false, reply, Now::capture());
     assert!(
         answer.try_recv().is_err(),
         "nothing to hand out before the candidate proves itself"
@@ -2919,4 +2921,5 @@ async fn a_forged_docs_only_init_does_not_abandon_our_own_initiation_to_that_pee
 }
 
 // The triggers of protocol.md 5.5 (TODO.md L4j S6), over these routers.
+mod docs_places;
 mod sync;

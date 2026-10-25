@@ -47,6 +47,38 @@ async fn a_peer_has_one_docs_stream_at_a_time() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn a_docs_only_sessions_place_is_its_own_and_takes_none_of_the_peers() {
+    let gate = DocsGate::new(DocsLimits::default());
+    // Every place of the peer and of the node is taken by ordinary sessions...
+    let taken: Vec<_> = (1..=4)
+        .map(|n| gate.try_acquire(peer(n)).unwrap())
+        .collect();
+    assert!(gate.try_acquire(peer(5)).is_none(), "in all is full");
+    // ...and docs only sessions still have theirs, one each.
+    let (one, two) = (gate.new_session_key(), gate.new_session_key());
+    let first = gate.try_acquire_session(one).expect("its own place");
+    assert!(gate.try_acquire_session(two).is_some(), "another session");
+    assert!(
+        gate.try_acquire_session(one).is_none(),
+        "one stream a session"
+    );
+    drop(first);
+    assert!(
+        gate.try_acquire_session(one).is_some(),
+        "the place came back"
+    );
+    // And they took nothing from the others: when an ordinary place goes, it is the next
+    // ordinary stream that gets it, and the per peer count of a forged `src` is untouched.
+    drop(taken);
+    assert!(gate.try_acquire(peer(1)).is_some());
+    assert_eq!(
+        gate.started_by(&peer(1)),
+        2,
+        "the minute count is the ordinary one only"
+    );
+}
+
+#[tokio::test(start_paused = true)]
 async fn four_docs_streams_in_all() {
     let gate = DocsGate::new(DocsLimits::default());
     let held: Vec<_> = (1..=4)

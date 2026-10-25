@@ -8,7 +8,7 @@ use crate::docs_access::{DocsGate, DocsLimits};
 use crate::docs_sync::{DocsSync, SyncConfig};
 use crate::node::RefuseAll;
 
-fn now() -> u64 {
+pub(super) fn now() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
@@ -16,7 +16,7 @@ fn now() -> u64 {
 }
 
 /// The sync tasks of `node`, with no jitter.
-fn sync_for(node: &TestNode, party: &Party, stores: &Stores) -> Arc<DocsSync> {
+pub(super) fn sync_for(node: &TestNode, party: &Party, stores: &Stores) -> Arc<DocsSync> {
     DocsSync::new(
         node.handle.clone(),
         stores.rosters.clone(),
@@ -30,7 +30,7 @@ fn sync_for(node: &TestNode, party: &Party, stores: &Stores) -> Arc<DocsSync> {
 
 /// Serves every session `node` announces from now on, the way a running node does, with the
 /// sync triggers when `sync` is given.
-fn auto_serve(
+pub(super) fn auto_serve(
     node: &mut TestNode,
     party: &Party,
     stores: &Stores,
@@ -67,7 +67,7 @@ async fn settle() {
     tokio::time::sleep(Duration::from_secs(5)).await;
 }
 
-fn held(stores: &Stores, network: NetworkId) -> (Option<u64>, Option<u64>) {
+pub(super) fn held(stores: &Stores, network: NetworkId) -> (Option<u64>, Option<u64>) {
     (stores.rosters.seq(&network), stores.policies.seq(&network))
 }
 

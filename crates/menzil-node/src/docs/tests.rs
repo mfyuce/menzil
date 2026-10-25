@@ -1481,7 +1481,8 @@ async fn every_operation_is_cut_off_at_its_deadline() {
     )
     .await;
     assert!(matches!(served, Err(DocsStreamError::Timeout)));
-    assert_eq!(started.elapsed(), Duration::from_secs(7));
+    // The responder gives a silent opener less than the deadline (see the test below).
+    assert_eq!(started.elapsed(), FIRST_MESSAGE_TIMEOUT);
 
     // The deadline covers the whole stream, not each read: a peer that sends the first message
     // and then stalls in the middle of a push is cut off at the deadline too.
@@ -1500,6 +1501,40 @@ async fn every_operation_is_cut_off_at_its_deadline() {
     .await;
     assert!(matches!(served, Err(DocsStreamError::Timeout)));
     assert_eq!(started.elapsed(), Duration::from_secs(7));
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_responder_gives_a_silent_opener_five_seconds_not_the_whole_deadline() {
+    let net = Net::new();
+    let stores = Stores::empty();
+    let p = params(&net);
+    assert!(FIRST_MESSAGE_TIMEOUT < p.deadline);
+    for mode in [ServeMode::Full, ServeMode::PushOnly] {
+        // Opened and never spoken to: the place it holds is back after five seconds.
+        let (mut a, _silent) = pair();
+        let started = tokio::time::Instant::now();
+        let served = serve(&mut a, stores.docs(&net), stores.docs(&net), &p, mode).await;
+        assert!(matches!(served, Err(DocsStreamError::Timeout)));
+        assert_eq!(started.elapsed(), Duration::from_secs(5));
+    }
+
+    // The limit is for the first message only: an opener that has sent it (here, a `push`
+    // and then nothing) keeps the rest of the deadline.
+    let (mut a, mut raw) = raw_pair();
+    raw.write_all(&encode_frame(&Message::Push).unwrap())
+        .await
+        .unwrap();
+    let started = tokio::time::Instant::now();
+    let served = serve(
+        &mut a,
+        stores.docs(&net),
+        stores.docs(&net),
+        &p,
+        ServeMode::Full,
+    )
+    .await;
+    assert!(matches!(served, Err(DocsStreamError::Timeout)));
+    assert_eq!(started.elapsed(), p.deadline);
 }
 
 #[tokio::test(start_paused = true)]

@@ -111,6 +111,35 @@ struct Engine {
     /// raised by every Roster the relay sends that this node verified (protocol.md 4.3, 5.5). A
     /// Roster newer than this is pushed to the relay on the live session, not only at attach.
     relay_rosters: HashMap<NetworkId, u64>,
+    /// When the last warning about a bad DOC transfer was written, and how many were held back
+    /// since: a relay can send bad transfers at link speed.
+    doc_warn: DocWarnThrottle,
+}
+
+/// Lets a warning through at most once a second and counts what it held back.
+#[derive(Debug, Default)]
+struct DocWarnThrottle {
+    last: Option<Instant>,
+    held_back: u64,
+}
+
+impl DocWarnThrottle {
+    const INTERVAL: Duration = Duration::from_secs(1);
+
+    /// `Some(n)` if a line may be written at `now`, `n` being how many were held back since the
+    /// last one; `None` if this one is held back.
+    fn allow(&mut self, now: Instant) -> Option<u64> {
+        match self.last {
+            Some(last) if now.saturating_duration_since(last) < Self::INTERVAL => {
+                self.held_back += 1;
+                None
+            }
+            _ => {
+                self.last = Some(now);
+                Some(std::mem::take(&mut self.held_back))
+            }
+        }
+    }
 }
 
 /// What [`Engine::on_message`] learned from one inbound ciphertext.
@@ -169,6 +198,7 @@ impl Engine {
             doc_reassembler: DocReassembler::new(),
             claimed_networks,
             relay_rosters: HashMap::new(),
+            doc_warn: DocWarnThrottle::default(),
         }
     }
 
@@ -248,22 +278,29 @@ impl Engine {
         let roster = match Roster::decode_strict(&bytes) {
             Ok(roster) => roster,
             Err(err) => {
-                tracing::warn!(error = %err, "reassembled DOC did not decode as a Roster");
+                if let Some(held_back) = self.doc_warn.allow(Instant::now()) {
+                    tracing::warn!(error = %err, held_back, "reassembled DOC did not decode as a Roster");
+                }
                 return;
             }
         };
         let decoded = match roster.decode() {
             Ok(decoded) => decoded,
             Err(err) => {
-                tracing::warn!(error = %err, "reassembled DOC's Roster body did not decode");
+                if let Some(held_back) = self.doc_warn.allow(Instant::now()) {
+                    tracing::warn!(error = %err, held_back, "reassembled DOC's Roster body did not decode");
+                }
                 return;
             }
         };
         if !self.claimed_networks.contains(&decoded.network_id) {
-            tracing::warn!(
-                network_id = %decoded.network_id,
-                "ignoring a DOC(roster) for a network this node does not claim"
-            );
+            if let Some(held_back) = self.doc_warn.allow(Instant::now()) {
+                tracing::warn!(
+                    network_id = %decoded.network_id,
+                    held_back,
+                    "ignoring a DOC(roster) for a network this node does not claim"
+                );
+            }
             return;
         }
         // Owner signed Rosters only: a steward signed Roster arrives with its Policy, as a
@@ -276,7 +313,9 @@ impl Engine {
                 *known = (*known).max(decoded.seq);
             }
             Err(err) => {
-                tracing::warn!(error = %err, "reassembled DOC was not adopted as a Roster");
+                if let Some(held_back) = self.doc_warn.allow(Instant::now()) {
+                    tracing::warn!(error = %err, held_back, "reassembled DOC was not adopted as a Roster");
+                }
             }
         }
     }
@@ -1285,6 +1324,21 @@ mod tests {
     use super::*;
     use ed25519_dalek::SigningKey;
     use menzil_proto::{Limits, NodeCert, NodeCertBody, NodeId, RosterBody, RosterMember};
+
+    #[test]
+    fn warnings_about_bad_doc_transfers_are_let_through_once_a_second() {
+        let t0 = Instant::now();
+        let mut throttle = DocWarnThrottle::default();
+        assert_eq!(throttle.allow(t0), Some(0));
+        assert_eq!(throttle.allow(t0 + Duration::from_millis(10)), None);
+        assert_eq!(throttle.allow(t0 + Duration::from_millis(999)), None);
+        assert_eq!(
+            throttle.allow(t0 + Duration::from_secs(1)),
+            Some(2),
+            "the next line says how many were held back"
+        );
+        assert_eq!(throttle.allow(t0 + Duration::from_millis(1500)), None);
+    }
 
     fn node_cert(seed: u8) -> NodeCert {
         let key = SigningKey::generate(&mut rand::rng());

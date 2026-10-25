@@ -200,8 +200,8 @@ fn the_policy_is_asked_of_live_peers_that_hold_it_and_never_more_than_three() {
     let picked = pick_for_policy(&live[..2], &members, 5);
     assert_eq!(
         picked,
-        vec![node(2)],
-        "a live peer that holds it is enough: no members"
+        vec![node(2), node(20), node(21)],
+        "a live peer that holds it comes first, members follow in the same round"
     );
 }
 

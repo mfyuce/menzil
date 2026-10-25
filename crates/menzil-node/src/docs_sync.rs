@@ -12,8 +12,8 @@
 //!   node starts one new handshake, because the responder now holds a Policy that vouches for it
 //!   ([`REHANDSHAKE_WINDOW`] keeps that to one try, however the peer answers).
 //! * **A Roster newer than the Policy** ([`DocsSync::run_roster_watch`]): the Policy is fetched
-//!   from peers that have a live session with a known `policy_seq` at the Roster's `seq`, else
-//!   from up to three members of the Policy, after a random wait of up to a minute so that a
+//!   from peers that have a live session with a known `policy_seq` at the Roster's `seq`, then
+//!   (in the same round) from members of the Policy, three asked in all, after a random wait of up to a minute so that a
 //!   network does not ask one peer all at once ([`pick_for_policy`]).
 //! * **Documents about to expire** ([`DocsSync::run_expiry`]): when the held pair expires within
 //!   24 hours, every 30 to 90 minutes (random each time) a fetch from up to three peers, those with
@@ -175,25 +175,30 @@ pub(crate) fn plan_sync(
     }
 }
 
-/// Whom to ask for the Policy of a Roster at `roster_seq`: the peers with a live session whose
-/// known `policy_seq` is at least that (at most three), and only when there are none, the first
-/// three of `members`. `live` and `members` come in the order to try (the caller shuffles).
+/// Whom to ask for the Policy of a Roster at `roster_seq`, three in all, none twice: first the
+/// peers with a live session whose known `policy_seq` is at least that, then `members` in the
+/// same round (a live peer's claim is only its own word: one that claims the Policy and gives
+/// none must not be the only one asked). `live` and `members` come in the order to try (the
+/// caller shuffles).
 pub(crate) fn pick_for_policy(
     live: &[(NodeId, Option<u64>)],
     members: &[NodeId],
     roster_seq: u64,
 ) -> Vec<NodeId> {
-    let sure: Vec<NodeId> = live
+    let sure = live
         .iter()
         .filter(|(_, policy_seq)| policy_seq.is_some_and(|seq| seq >= roster_seq))
-        .map(|(peer, _)| *peer)
-        .take(PEER_CAP)
-        .collect();
-    if sure.is_empty() {
-        members.iter().copied().take(PEER_CAP).collect()
-    } else {
-        sure
+        .map(|(peer, _)| peer);
+    let mut picked: Vec<NodeId> = Vec::new();
+    for peer in sure.chain(members) {
+        if picked.len() == PEER_CAP {
+            break;
+        }
+        if !picked.contains(peer) {
+            picked.push(*peer);
+        }
     }
+    picked
 }
 
 /// Whom to ask when the held documents are about to expire: the peers with a live session first,
@@ -436,7 +441,9 @@ pub struct DocsSync {
     policies: Arc<PolicyStore>,
     local: NodeId,
     config: SyncConfig,
-    live: Mutex<HashMap<(NodeId, NetworkId), Live>>,
+    /// Keyed by peer, network and whether this node was the initiator of the session: a session
+    /// the peer started never replaces or removes the entry of one this node started.
+    live: Mutex<HashMap<(NodeId, NetworkId, bool), Live>>,
     next_id: AtomicU64,
     rehandshaken: Mutex<RehandshakeGuard>,
     catching_up: Mutex<HashSet<NetworkId>>,
@@ -486,7 +493,8 @@ impl DocsSync {
 
     // ---- live sessions ------------------------------------------------
 
-    /// Notes a session that came up; returns its id for [`Self::forget`].
+    /// Notes a session this node initiated that came up; returns its id for [`Self::forget`].
+    #[cfg(test)]
     pub(crate) fn register(
         &self,
         peer: NodeId,
@@ -494,9 +502,22 @@ impl DocsSync {
         roster_seq: Option<u64>,
         policy_seq: Option<u64>,
     ) -> u64 {
+        self.register_as(peer, network_id, true, roster_seq, policy_seq)
+    }
+
+    /// Notes a session that came up, started by this node (`initiator`) or by the peer; returns
+    /// its id for [`Self::forget`].
+    pub(crate) fn register_as(
+        &self,
+        peer: NodeId,
+        network_id: NetworkId,
+        initiator: bool,
+        roster_seq: Option<u64>,
+        policy_seq: Option<u64>,
+    ) -> u64 {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         self.live.lock().unwrap_or_else(|e| e.into_inner()).insert(
-            (peer, network_id),
+            (peer, network_id, initiator),
             Live {
                 id,
                 roster_seq,
@@ -506,15 +527,11 @@ impl DocsSync {
         id
     }
 
-    /// Notes that session `id` ended (a newer one for the same peer stays).
+    /// Notes that session `id` ended (a newer one for the same peer stays, and so does the
+    /// session of the other role).
     pub(crate) fn forget(&self, peer: NodeId, network_id: NetworkId, id: u64) {
         let mut live = self.live.lock().unwrap_or_else(|e| e.into_inner());
-        if live
-            .get(&(peer, network_id))
-            .is_some_and(|entry| entry.id == id)
-        {
-            live.remove(&(peer, network_id));
-        }
+        live.retain(|key, entry| !(key.0 == peer && key.1 == network_id && entry.id == id));
     }
 
     fn note_peer_seqs(
@@ -524,28 +541,33 @@ impl DocsSync {
         roster_seq: Option<u64>,
         policy_seq: Option<u64>,
     ) {
-        if let Some(entry) = self
+        // What the peer says it holds is about the peer, whichever session carried it.
+        for ((p, n, _), entry) in self
             .live
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .get_mut(&(peer, network_id))
+            .iter_mut()
         {
-            entry.roster_seq = roster_seq.or(entry.roster_seq);
-            entry.policy_seq = policy_seq.or(entry.policy_seq);
+            if *p == peer && *n == network_id {
+                entry.roster_seq = roster_seq.or(entry.roster_seq);
+                entry.policy_seq = policy_seq.or(entry.policy_seq);
+            }
         }
     }
 
     /// The peers with a session up in `network_id`, with the Policy `seq` each is known to hold,
     /// in random order.
     pub(crate) fn live_peers(&self, network_id: NetworkId) -> Vec<(NodeId, Option<u64>)> {
-        let mut peers: Vec<(NodeId, Option<u64>)> = self
-            .live
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .iter()
-            .filter(|((_, network), _)| *network == network_id)
-            .map(|((peer, _), entry)| (*peer, entry.policy_seq))
-            .collect();
+        let mut by_peer: HashMap<NodeId, Option<u64>> = HashMap::new();
+        for ((peer, network, _), entry) in
+            self.live.lock().unwrap_or_else(|e| e.into_inner()).iter()
+        {
+            if *network == network_id {
+                let seq = by_peer.entry(*peer).or_default();
+                *seq = (*seq).max(entry.policy_seq);
+            }
+        }
+        let mut peers: Vec<(NodeId, Option<u64>)> = by_peer.into_iter().collect();
         fastrand::shuffle(&mut peers);
         peers
     }
@@ -624,7 +646,8 @@ impl DocsSync {
 
     /// One fetch from `peer`, with the session found or made.
     async fn fetch_from(&self, peer: NodeId, network_id: NetworkId) -> Attempt {
-        let handle = match self.router.ensure_session(peer, network_id).await {
+        // A fetch is the one dial that expired documents of our own may not stand in the way of.
+        let handle = match self.router.ensure_session_for_docs(peer, network_id).await {
             Ok(handle) => handle,
             Err(error) => {
                 tracing::debug!(%peer, %error, "no session to fetch documents over");
