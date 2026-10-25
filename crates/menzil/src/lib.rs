@@ -19,5 +19,6 @@ pub mod reach;
 pub mod relay_cmd;
 pub mod signals;
 pub mod stdio;
+pub mod steward_loop;
 pub mod text;
 pub mod token;

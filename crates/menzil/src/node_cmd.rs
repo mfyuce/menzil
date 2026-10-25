@@ -17,7 +17,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow, bail};
 use menzil_carrier::DialConfig;
 use menzil_node::{
-    DocStore, EnsureError, LocalIdentity, Node, NodeConfig, NodeError, NodeOpenError,
+    Adopted, DocStore, EnsureError, LocalIdentity, Node, NodeConfig, NodeError, NodeOpenError,
     OpenStreamError, PolicyStore, RosterStore, SessionConfig,
 };
 use menzil_proto::trust::Reason;
@@ -30,6 +30,7 @@ use crate::agent::{self, Opener};
 use crate::config::Config;
 use crate::home::{FileLock, Home};
 use crate::local::{load_documents, load_identity};
+use crate::steward_loop::{self, is_issuer, spawn_push};
 use crate::text;
 
 /// How often a running node looks for newer documents on disk.
@@ -526,8 +527,9 @@ pub fn load_stores(home: &Home) -> Result<(Arc<PolicyStore>, Arc<RosterStore>, V
 /// What came of reading one network's pair from disk.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Disk {
-    /// The pair was judged; whatever was newer than the stores held is stored now.
-    Judged,
+    /// The pair was judged; whatever was newer than the stores held is stored now (`Adopted`
+    /// says what).
+    Judged(Adopted),
     /// The stores hold a Roster above the pair's `seq` (one that came over L3 ahead of the docs
     /// token). The Policy of the pair cannot be adopted without a Roster of its `seq`, so
     /// nothing is stored until a pair at or above the held Roster arrives.
@@ -553,8 +555,8 @@ fn adopt_documents(
         .map_or(0, |d| d.as_secs());
     // A pair a steward signed goes in with its base, which is what the stores judge it by and
     // pass it on with.
-    DocStore::new(rosters, policies).adopt(&docs.bundle(), now)?;
-    Ok(Disk::Judged)
+    let adopted = DocStore::new(rosters, policies).adopt(&docs.bundle(), now)?;
+    Ok(Disk::Judged(adopted))
 }
 
 /// Opens streams for the agent: resolves the name, then asks the node.
@@ -681,26 +683,48 @@ pub async fn start(home: &Home, config: &Config, socket: &Path) -> Result<Runnin
         Arc::new(NodeOpener::new(node.clone(), directory.clone())),
     ));
     let reload_task = {
-        let (home, directory) = (home.clone(), directory.clone());
+        let (home, directory, node) = (home.clone(), directory.clone(), node.clone());
+        let (policies, rosters) = (policies.clone(), rosters.clone());
         tokio::spawn(async move {
             let mut last: HashMap<NetworkId, u64> = HashMap::new();
             loop {
                 tokio::time::sleep(RELOAD_EVERY).await;
-                match reload(&home, &policies, &rosters, &directory, &mut last) {
+                let mut adopted = Vec::new();
+                match reload_adopting(
+                    &home,
+                    &policies,
+                    &rosters,
+                    &directory,
+                    &mut last,
+                    &mut adopted,
+                ) {
                     Ok(()) => {}
                     Err(error) => {
                         tracing::warn!(error = %format!("{error:#}"), "reloading the documents failed")
                     }
                 }
+                // Documents this device's own commands wrote: it is their issuer, so it tells
+                // the members (a plain member that took a newer token does not).
+                for network_id in adopted {
+                    if is_issuer(&home, &network_id) {
+                        spawn_push(&node, network_id);
+                    }
+                }
             }
         })
     };
+    let steward_task = tokio::spawn(steward_loop::run(
+        home.clone(),
+        rosters.clone(),
+        policies.clone(),
+        node.clone(),
+    ));
     Ok(RunningNode {
         node,
         socket: socket.to_path_buf(),
         socket_identity,
         directory,
-        tasks: vec![agent_task, reload_task],
+        tasks: vec![agent_task, reload_task, steward_task],
         _instance: instance,
     })
 }
@@ -713,6 +737,20 @@ pub fn reload(
     rosters: &RosterStore,
     directory: &RwLock<Directory>,
     last: &mut HashMap<NetworkId, u64>,
+) -> Result<()> {
+    reload_adopting(home, policies, rosters, directory, last, &mut Vec::new())
+}
+
+/// [`reload`], and says which networks got documents from disk that the stores did not hold
+/// (`adopted`, appended to): the ones a device that issues them pushes to the members
+/// (protocol.md 5.5; `menzil admit` or `renew` wrote them while this node ran).
+pub fn reload_adopting(
+    home: &Home,
+    policies: &PolicyStore,
+    rosters: &RosterStore,
+    directory: &RwLock<Directory>,
+    last: &mut HashMap<NetworkId, u64>,
+    adopted: &mut Vec<NetworkId>,
 ) -> Result<()> {
     // One network that cannot be read (a write that failed, a damaged file) must not keep the
     // others from being reloaded: a revocation installed with `menzil join` would otherwise
@@ -729,7 +767,10 @@ pub fn reload(
             Ok((docs, disk))
         });
         match loaded {
-            Ok((docs, Disk::Judged)) => {
+            Ok((docs, Disk::Judged(now_held))) => {
+                if now_held.roster || now_held.policy {
+                    adopted.push(network_id);
+                }
                 let seq = docs.seq();
                 entries.extend(Directory::members_of(&network_id, &docs));
                 if last.insert(network_id, seq) != Some(seq) {

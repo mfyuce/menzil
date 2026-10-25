@@ -258,7 +258,7 @@ A channel is opened by a yamux stream whose OPEN names a `udp:` service or `egre
 
 ### 5.5 Documents end to end
 
-Status: the node serves it and asks for documents (L4j slices S5 and S6): the framing, `serve`, `fetch`, `push` and the sinks, the OPEN checks, the rate limits, docs only sessions, the comparison of seqs when a session comes up, the new handshake after an adopted docs only push, the Policy fetch after a newer Roster, the expiry timer, the Roster pushed to the relay on the live session, and the issuer push as a library function are built and tested. The command that calls the issuer push and the steward renew loop are not built (slice S7).
+Status: the node serves it, asks for documents and issues them (L4j slices S5 to S7): the framing, `serve`, `fetch`, `push` and the sinks, the OPEN checks, the rate limits, docs only sessions, the comparison of seqs when a session comes up, the new handshake after an adopted docs only push, the Policy fetch after a newer Roster, the expiry timer, the Roster pushed to the relay on the live session, the issuer push, and the steward renew loop of section 7.3 in `menzil node` are built and tested. `menzil node` pushes to the members after the renewal and after it picks up documents that `menzil admit` or `menzil renew` wrote on a device that holds the owner or a steward key; those commands do not push themselves, a running node does it within its 15 second reload.
 
 `menzil:docs` is served by every node and named in no grant: any unrevoked member of the session's network, by the responder's Roster, may open it, checked again on every OPEN. It is never configured as a local service.
 
