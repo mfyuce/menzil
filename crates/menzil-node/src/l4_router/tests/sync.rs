@@ -242,9 +242,14 @@ async fn a_docs_only_push_that_was_adopted_is_followed_by_one_new_handshake() {
     auto_serve(&mut nr, &r, &stores_r, Some(&sync_r));
     auto_serve(&mut nm, &m, &stores_m, Some(&sync_m));
 
+    let since = tokio::time::Instant::now();
     assert_eq!(
         ensure(&nm, r.id, w.network).await.err(),
         Some(EnsureError::DocsOnly)
+    );
+    assert!(
+        sync_m.wait_docs_only_push(r.id, w.network, since).await,
+        "adopted and the fresh session came up: a caller may retry"
     );
     settle().await;
     assert_eq!(
@@ -312,10 +317,20 @@ async fn a_docs_only_push_that_was_not_adopted_starts_no_new_handshake() {
     auto_serve(&mut nm, &m, &stores_m, Some(&sync_m));
 
     // M's own Policy has no cert for R's key either? It has R's cert only: M dials R fine.
+    let since = tokio::time::Instant::now();
     assert_eq!(
         ensure(&nm, r.id, w.network).await.err(),
         Some(EnsureError::DocsOnly)
     );
+    assert!(
+        !sync_m.wait_docs_only_push(r.id, w.network, since).await,
+        "not adopted: no retry"
+    );
+    // A completion older than the attempt does not count, and the wait ends at its bound.
+    tokio::time::sleep(Duration::from_millis(1)).await;
+    let later = tokio::time::Instant::now();
+    assert!(!sync_m.wait_docs_only_push(r.id, w.network, later).await);
+    assert!(later.elapsed() >= crate::docs_sync::DOCS_ONLY_WAIT);
     settle().await;
     assert_eq!(held(&stores_r, w.network), (Some(1), Some(1)));
     assert_eq!(

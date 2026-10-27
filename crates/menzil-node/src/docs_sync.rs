@@ -35,7 +35,7 @@ use futures_util::io::AsyncWriteExt;
 use menzil_proto::docs::Outcome;
 use menzil_proto::{NetworkId, NodeId};
 use thiserror::Error;
-use tokio::sync::{Semaphore, broadcast};
+use tokio::sync::{Semaphore, broadcast, watch};
 use tokio::time::Instant;
 
 use crate::admission::{docs_service, is_unrevoked_roster_member};
@@ -73,6 +73,15 @@ pub const POLICY_JITTER_MAX: Duration = Duration::from_secs(60);
 /// A docs only session's push that was adopted is followed by one new handshake; a second docs
 /// only session to the same peer within this window gets no further one.
 pub(crate) const REHANDSHAKE_WINDOW: Duration = Duration::from_secs(60);
+
+/// How long `DocsSync::wait_docs_only_push` (so `Node::open_stream`, once, after a docs only
+/// answer) waits for the push on the docs only session to finish and the fresh session to come
+/// up. When it does not finish in time the caller gets the docs only error, as without a retry.
+pub const DOCS_ONLY_WAIT: Duration = Duration::from_secs(10);
+
+/// The most finished pushes [`DocsSync`] remembers for waiters; past it the memory is cleared
+/// (a waiter then times out). Entries older than twice [`DOCS_ONLY_WAIT`] are dropped first.
+const PUSH_DONE_CAP: usize = 256;
 /// How many times a Policy catch-up repeats because the Roster moved on while it ran.
 const CATCH_UP_ROUNDS: usize = 4;
 
@@ -447,6 +456,13 @@ pub struct DocsSync {
     next_id: AtomicU64,
     rehandshaken: Mutex<RehandshakeGuard>,
     catching_up: Mutex<HashSet<NetworkId>>,
+    /// Docs only pushes this node initiated that finished: when, and whether the push was adopted
+    /// and the fresh session came up. Bounded by [`PUSH_DONE_CAP`] and by age; written only by
+    /// [`Self::docs_only_push`], so a peer cannot add entries beyond the docs only sessions
+    /// this node starts.
+    push_done: Mutex<HashMap<(NodeId, NetworkId), (Instant, bool)>>,
+    /// Bumped whenever `push_done` gains an entry, to wake waiters.
+    push_tick: watch::Sender<u64>,
 }
 
 /// Removes a network from [`DocsSync::catching_up`] when its round ends, however it ends.
@@ -484,6 +500,8 @@ impl DocsSync {
             next_id: AtomicU64::new(0),
             rehandshaken: Mutex::default(),
             catching_up: Mutex::default(),
+            push_done: Mutex::default(),
+            push_tick: watch::channel(0).0,
         })
     }
 
@@ -682,35 +700,90 @@ impl DocsSync {
 
     /// The initiator side of a docs only session: one push, and when it was adopted one new
     /// handshake (never a second within [`REHANDSHAKE_WINDOW`], whatever the peer answers).
+    /// However it ends, the end is noted for [`Self::wait_docs_only_push`].
     pub(crate) async fn docs_only_push(&self, handle: L4SessionHandle) {
         let (peer, network_id) = (handle.peer(), handle.network_id());
-        match self.push_over(&handle).await {
+        let came_up = match self.push_over(&handle).await {
             Ok(Some(result))
                 if result.roster == Outcome::Adopted || result.policy == Outcome::Adopted =>
             {
-                self.rehandshake(peer, network_id).await;
+                self.rehandshake(peer, network_id).await
             }
             Ok(other) => {
                 tracing::debug!(%peer, ?other, "the push on a docs only session was not adopted");
+                false
             }
-            Err(error) => tracing::debug!(%peer, %error, "pushing on a docs only session failed"),
+            Err(error) => {
+                tracing::debug!(%peer, %error, "pushing on a docs only session failed");
+                false
+            }
+        };
+        self.note_push_done(peer, network_id, came_up);
+    }
+
+    fn note_push_done(&self, peer: NodeId, network_id: NetworkId, came_up: bool) {
+        let now = Instant::now();
+        {
+            let mut done = self.push_done.lock().unwrap_or_else(|e| e.into_inner());
+            done.retain(|_, (at, _)| now.duration_since(*at) < DOCS_ONLY_WAIT * 2);
+            if done.len() >= PUSH_DONE_CAP {
+                done.clear();
+            }
+            done.insert((peer, network_id), (now, came_up));
+        }
+        self.push_tick
+            .send_modify(|tick| *tick = tick.wrapping_add(1));
+    }
+
+    /// For a caller whose attempt at `peer` met a docs only answer at `since` or later: waits up
+    /// to [`DOCS_ONLY_WAIT`] for the push on that session to finish, and returns whether it was
+    /// adopted and the handshake after it came up (false: no point in trying again). Holds no
+    /// state of its own, so a hostile peer cannot make it hold anything beyond this one timer
+    /// per caller.
+    pub(crate) async fn wait_docs_only_push(
+        &self,
+        peer: NodeId,
+        network_id: NetworkId,
+        since: Instant,
+    ) -> bool {
+        let deadline = Instant::now() + DOCS_ONLY_WAIT;
+        // Subscribed before the look, so a push that ends in between wakes the loop.
+        let mut tick = self.push_tick.subscribe();
+        loop {
+            let found = self
+                .push_done
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&(peer, network_id))
+                .copied();
+            if let Some((at, came_up)) = found
+                && at >= since
+            {
+                return came_up;
+            }
+            match tokio::time::timeout_at(deadline, tick.changed()).await {
+                Ok(Ok(())) => {}
+                _ => return false,
+            }
         }
     }
 
     /// Starts one handshake with `peer`, unless one was started for it a moment ago. A session
-    /// that comes up is announced like any other.
-    pub(crate) async fn rehandshake(&self, peer: NodeId, network_id: NetworkId) {
+    /// that comes up is announced like any other. Returns whether one came up.
+    pub(crate) async fn rehandshake(&self, peer: NodeId, network_id: NetworkId) -> bool {
         let allowed = self
             .rehandshaken
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .allow(peer, network_id, Instant::now());
         if !allowed {
-            return;
+            return false;
         }
         if let Err(error) = self.router.ensure_session(peer, network_id).await {
             tracing::debug!(%peer, %error, "the handshake after a docs only push did not come up");
+            return false;
         }
+        true
     }
 
     // ---- trigger: a Roster newer than the Policy ---------------------

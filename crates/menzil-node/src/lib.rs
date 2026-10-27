@@ -86,7 +86,7 @@ pub use admission::{
 };
 pub use docs_access::{DocsGate, DocsLimits, DocsPermit, SessionHandler, SessionOpened};
 pub use docs_store::{Adopted, AdoptedDocs, DocStore};
-pub use docs_sync::{POLICY_JITTER_MAX, PushReport, SyncConfig};
+pub use docs_sync::{DOCS_ONLY_WAIT, POLICY_JITTER_MAX, PushReport, SyncConfig};
 pub use error::NodeError;
 pub use identity::LocalIdentity;
 pub use l4_router::{

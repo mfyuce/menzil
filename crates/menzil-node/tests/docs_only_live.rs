@@ -112,39 +112,15 @@ async fn a_member_offline_at_issue_time_learns_the_policy_from_the_new_member_an
     .unwrap();
     nx.wait_attached(PATIENCE).await.expect("X attaches");
 
-    // M's first attempt meets the docs only answer: the callers are told so (the session is kept
-    // aside for the push), and M pushes the Policy it holds in the background.
-    let first = timeout(
-        PATIENCE,
-        nm.open_stream(x.node_id, network_id, service("tcp:echo"), None),
-    )
-    .await
-    .expect("the OPEN must be answered");
-    assert!(
-        matches!(
-            first,
-            Err(menzil_node::NodeOpenError::Session(
-                menzil_node::EnsureError::DocsOnly
-            ))
-        ),
-        "the first attempt is told the peer is docs only"
-    );
-    timeout(PATIENCE, async {
-        while x_policies.seq(&network_id) != Some(2) {
-            sleep(Duration::from_millis(50)).await;
-        }
-    })
-    .await
-    .expect("X must adopt the pushed Policy");
-
-    // M's fresh attempt is a full session and the stream carries bytes.
+    // M's first attempt meets the docs only answer, pushes the Policy it holds in the background,
+    // and open_stream retries once by itself when the push was adopted and the fresh session is up.
     let mut stream = timeout(
         PATIENCE,
         nm.open_stream(x.node_id, network_id, service("tcp:echo"), None),
     )
     .await
     .expect("the OPEN must be answered")
-    .expect("M reaches X after the docs only push");
+    .expect("the first attempt reaches X after the docs only push");
     echo_round_trip(&mut stream, b"hello from the new member").await;
 
     // X adopted M's documents.

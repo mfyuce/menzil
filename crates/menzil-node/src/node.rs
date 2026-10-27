@@ -45,8 +45,13 @@
 //! * **`open_stream` does not wait for the relay.** With no L3 attachment
 //!   it fails at once with [`EnsureError::NotAttached`]; a caller that wants
 //!   to wait (right after [`Node::start`], say) uses [`Node::wait_attached`].
-//! * **Nothing is retried.** A session can end between the router handing
-//!   it out and the OPEN going over it, and a failure after the OPEN
+//! * **Nothing is retried, with one exception.** When the responder answers docs only (it
+//!   lacked this node's documents), this node pushes them in the background, and
+//!   `open_stream` waits up to [`DOCS_ONLY_WAIT`](crate::DOCS_ONLY_WAIT) for that push
+//!   to be adopted and the fresh session to come up, then asks for a session once more; the
+//!   caller gets the stream, or [`EnsureError::DocsOnly`] if the push was not adopted, failed or
+//!   took too long (never a second retry). Nothing else is retried: a session can end between the router
+//!   handing it out and the OPEN going over it, and a failure after the OPEN
 //!   header went out may have reached the peer, which may already have
 //!   acted on it; whether repeating that is harmless depends on the
 //!   service, so the caller decides. The error says which stage failed
@@ -364,8 +369,8 @@ impl Node {
 
     /// A stream to `service` on `peer` in `network`, once the peer has
     /// authorized it (protocol.md 5.3). `target` is only for the
-    /// `egress:*` service. Neither waits for the relay nor retries; see the
-    /// module docs.
+    /// `egress:*` service. Does not wait for the relay and retries nothing except one
+    /// attempt after a docs only answer; see the module docs.
     pub async fn open_stream(
         &self,
         peer: NodeId,
@@ -373,7 +378,17 @@ impl Node {
         service: ServiceId,
         target: Option<OpenTarget>,
     ) -> Result<Stream, NodeOpenError> {
-        let session = self.router.ensure_session(peer, network).await?;
+        let started = tokio::time::Instant::now();
+        let session = match self.router.ensure_session(peer, network).await {
+            Err(EnsureError::DocsOnly)
+                if self.sync.wait_docs_only_push(peer, network, started).await =>
+            {
+                // The one retry: the push was adopted and the fresh handshake came up, so this
+                // goes the normal way (and finds that session). A second DocsOnly is final.
+                self.router.ensure_session(peer, network).await?
+            }
+            other => other?,
+        };
         Ok(open(&session, service, target).await?)
     }
 
