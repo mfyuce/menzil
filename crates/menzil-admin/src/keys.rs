@@ -123,6 +123,35 @@ impl NodeKeys {
         };
         Ok(NodeCert::sign(&self.signing, &body)?)
     }
+
+    /// The renewal of `current` (protocol.md 2.2) with the same keys: the serial is one above
+    /// the highest of `current`'s and `listed_max` (the highest serial of this node in any
+    /// Policy held), `not_before` is one day before `now` (a peer whose clock is behind still
+    /// sees it valid) and `not_after` is 400 days after that. Refused with
+    /// [`AdminError::SerialExhausted`] when the serial cannot go up, and with
+    /// [`AdminError::CertDoesNotVerify`] when `current` is not this node's certificate.
+    pub fn next_cert(
+        &self,
+        current: &NodeCert,
+        listed_max: Option<u32>,
+        now: u64,
+    ) -> Result<NodeCert, AdminError> {
+        let body = current.decode()?;
+        if body.node_id != self.node_id() {
+            return Err(AdminError::CertDoesNotVerify);
+        }
+        let serial = body
+            .serial
+            .max(listed_max.unwrap_or(0))
+            .checked_add(1)
+            .ok_or(AdminError::SerialExhausted)?;
+        let not_before = now.saturating_sub(24 * 60 * 60);
+        self.issue_cert(
+            serial,
+            not_before,
+            not_before.saturating_add(MAX_CERT_LIFETIME_SECS),
+        )
+    }
 }
 
 /// The key a network is named after: its public half is the

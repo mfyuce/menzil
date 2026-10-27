@@ -691,6 +691,65 @@ pub fn revoke(
     Documents::signed(owner, roster, policy)
 }
 
+/// Lists a member's renewed certificate (protocol.md 2.2), owner only: the Policy drops every
+/// certificate of the node and appends `cert`; the Roster keeps its `members` (`min_serial`
+/// stays), so the older certificate is not cut off by this. `cert` must pass the checks of an
+/// admission certificate (verifies, valid now, at most 400 days), the node must be a member
+/// ([`AdminError::Revoked`] when it is revoked, [`AdminError::NotAMember`] otherwise), its serial
+/// must be above every listed one ([`AdminError::StaleCert`]) and its key the one of the highest
+/// listed certificate ([`AdminError::NewKey`]).
+pub fn accept_cert(
+    owner: &OwnerKey,
+    current: &Documents,
+    cert: &NodeCert,
+    now: u64,
+) -> Result<Documents, AdminError> {
+    let body = checked_cert(cert, now)?;
+    if current
+        .roster_body()
+        .revoked
+        .iter()
+        .any(|revoked| revoked.node_id == body.node_id)
+    {
+        return Err(AdminError::Revoked(body.node_id));
+    }
+    if !current.is_member(&body.node_id) {
+        return Err(AdminError::NotAMember(body.node_id));
+    }
+    let mut highest: Option<menzil_proto::NodeCertBody> = None;
+    for listed in &current.policy_body().certs {
+        let listed = listed.decode()?;
+        if listed.node_id == body.node_id
+            && highest
+                .as_ref()
+                .is_none_or(|best| listed.serial > best.serial)
+        {
+            highest = Some(listed);
+        }
+    }
+    if let Some(highest) = highest {
+        if body.serial <= highest.serial {
+            return Err(AdminError::StaleCert {
+                listed: highest.serial,
+                offered: body.serial,
+            });
+        }
+        if body.x25519_pub != highest.x25519_pub {
+            return Err(AdminError::NewKey(body.node_id));
+        }
+    }
+    let (roster, mut policy) = current.successor(owner, now)?;
+    let mut certs = Vec::with_capacity(policy.certs.len() + 1);
+    for listed in policy.certs.drain(..) {
+        if listed.decode()?.node_id != body.node_id {
+            certs.push(listed);
+        }
+    }
+    certs.push(cert.clone());
+    policy.certs = certs;
+    Documents::signed(owner, roster, policy)
+}
+
 /// Takes grants out of the Policy (owner only): those with exactly this `from` and `to_node`.
 /// With `services` `None` they go whole; with `Some(list)` the patterns in the list (exact
 /// match, `tcp:*` is not `tcp:ssh`) are removed from each and a grant left with none goes too.

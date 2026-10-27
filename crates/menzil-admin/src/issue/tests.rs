@@ -2040,3 +2040,230 @@ fn removing_grants_beside_a_steward_jumps_the_span() {
     assert_eq!(next.seq(), with.seq() + STEWARD_SEQ_SPAN + 1);
     assert_eq!(next.roster_body().stewards.len(), 1);
 }
+
+// ---- accept_cert and next_cert (cert rotation S2) ----
+
+/// A network with a founder and a member "phone" (serial 1 listed), by the owner.
+fn with_phone() -> (OwnerKey, NodeKeys, NodeCert, Documents) {
+    let (owner, _, _, docs) = founded();
+    let (phone, phone_cert) = node();
+    let docs = admit(&owner, &docs, &phone_cert, "phone", &[], NOW).unwrap();
+    (owner, phone, phone_cert, docs)
+}
+
+fn certs_of(docs: &Documents, id: NodeId) -> Vec<u32> {
+    docs.policy_body()
+        .certs
+        .iter()
+        .map(|c| c.decode().unwrap())
+        .filter(|b| b.node_id == id)
+        .map(|b| b.serial)
+        .collect()
+}
+
+#[test]
+fn an_accepted_renewal_replaces_the_old_certificate_and_keeps_min_serial() {
+    let (owner, phone, _, docs) = with_phone();
+    let renewed = phone
+        .next_cert(
+            &phone.issue_cert(1, NOW - 100, NOW + DAY).unwrap(),
+            None,
+            NOW + DAY,
+        )
+        .unwrap();
+    let next = accept_cert(&owner, &docs, &renewed, NOW + DAY).unwrap();
+    assert_eq!(next.seq(), docs.seq() + 1);
+    assert_eq!(certs_of(&next, phone.node_id()), vec![2]);
+    assert!(next.policy_body().certs.contains(&renewed));
+    // The founder's certificate is still listed.
+    assert_eq!(
+        next.policy_body().certs.len(),
+        docs.policy_body().certs.len()
+    );
+    // The Roster keeps min_serial 1: the old certificate is not cut off by listing the new.
+    assert_eq!(next.roster_body().members, docs.roster_body().members);
+    assert_eq!(
+        next.roster_body()
+            .members
+            .iter()
+            .find(|m| m.node_id == phone.node_id())
+            .unwrap()
+            .min_serial,
+        1
+    );
+    assert_eq!(next.verify().unwrap(), Signer::Owner);
+    assert_eq!(
+        adopted_signer(judged(Some(&docs), &next, NOW + DAY)),
+        Signer::Owner
+    );
+    // A third rotation replaces the second, the list does not grow.
+    let third = phone.next_cert(&renewed, Some(2), NOW + 2 * DAY).unwrap();
+    let again = accept_cert(&owner, &next, &third, NOW + 2 * DAY).unwrap();
+    assert_eq!(certs_of(&again, phone.node_id()), vec![3]);
+    assert_eq!(
+        again.policy_body().certs.len(),
+        docs.policy_body().certs.len()
+    );
+}
+
+#[test]
+fn a_certificate_not_above_the_listed_serial_is_refused() {
+    let (owner, phone, _, docs) = with_phone();
+    for serial in [0u32, 1] {
+        let cert = phone.issue_cert(serial, NOW - 100, NOW + DAY).unwrap();
+        assert!(matches!(
+            accept_cert(&owner, &docs, &cert, NOW),
+            Err(AdminError::StaleCert { listed: 1, offered }) if offered == serial
+        ));
+    }
+    let two = phone.issue_cert(2, NOW - 100, NOW + DAY).unwrap();
+    let docs = accept_cert(&owner, &docs, &two, NOW).unwrap();
+    // Lower than the new listed one, though above the first.
+    let again = phone.issue_cert(2, NOW - 50, NOW + DAY).unwrap();
+    assert!(matches!(
+        accept_cert(&owner, &docs, &again, NOW),
+        Err(AdminError::StaleCert {
+            listed: 2,
+            offered: 2
+        })
+    ));
+}
+
+#[test]
+fn a_renewal_with_another_key_is_refused() {
+    let (owner, phone, _, docs) = with_phone();
+    let other = NodeKeys::generate();
+    let body = NodeCertBody {
+        v: menzil_proto::PROTOCOL_VERSION,
+        node_id: phone.node_id(),
+        x25519_pub: other.x25519_public(),
+        serial: 2,
+        not_before: NOW - 100,
+        not_after: NOW + DAY,
+    };
+    let cert = NodeCert::sign(phone.signing_key(), &body).unwrap();
+    assert!(matches!(
+        accept_cert(&owner, &docs, &cert, NOW),
+        Err(AdminError::NewKey(id)) if id == phone.node_id()
+    ));
+}
+
+#[test]
+fn a_revoked_or_unknown_node_cannot_have_a_renewal_listed() {
+    let (owner, phone, _, docs) = with_phone();
+    let cert = phone.issue_cert(2, NOW - 100, NOW + DAY).unwrap();
+    let revoked = revoke(&owner, &docs, phone.node_id(), NOW + 1).unwrap();
+    assert!(matches!(
+        accept_cert(&owner, &revoked, &cert, NOW + 2),
+        Err(AdminError::Revoked(id)) if id == phone.node_id()
+    ));
+    let stranger = NodeKeys::generate();
+    let cert = stranger.issue_cert(2, NOW - 100, NOW + DAY).unwrap();
+    assert!(matches!(
+        accept_cert(&owner, &docs, &cert, NOW),
+        Err(AdminError::NotAMember(id)) if id == stranger.node_id()
+    ));
+}
+
+#[test]
+fn a_renewal_must_verify_be_valid_now_and_last_at_most_400_days() {
+    let (owner, phone, _, docs) = with_phone();
+    let long = NodeCertBody {
+        v: menzil_proto::PROTOCOL_VERSION,
+        node_id: phone.node_id(),
+        x25519_pub: phone.x25519_public(),
+        serial: 2,
+        not_before: NOW - 100,
+        not_after: NOW - 100 + 400 * DAY + 1,
+    };
+    let cert = NodeCert::sign(phone.signing_key(), &long).unwrap();
+    assert!(matches!(
+        accept_cert(&owner, &docs, &cert, NOW),
+        Err(AdminError::CertLifetimeTooLong)
+    ));
+    let ok = phone
+        .issue_cert(2, NOW - 100, NOW - 100 + 400 * DAY)
+        .unwrap();
+    accept_cert(&owner, &docs, &ok, NOW).unwrap();
+    let future = phone.issue_cert(2, NOW + 10, NOW + DAY).unwrap();
+    assert!(matches!(
+        accept_cert(&owner, &docs, &future, NOW),
+        Err(AdminError::CertNotValidNow)
+    ));
+    // Signed by another key than its node id.
+    let forger = NodeKeys::generate();
+    let forged = NodeCert::sign(
+        forger.signing_key(),
+        &NodeCertBody {
+            not_after: NOW + DAY,
+            ..long
+        },
+    )
+    .unwrap();
+    assert!(matches!(
+        accept_cert(&owner, &docs, &forged, NOW),
+        Err(AdminError::CertDoesNotVerify)
+    ));
+}
+
+#[test]
+fn accepting_a_renewal_beside_a_steward_jumps_the_span() {
+    let s = stewarded();
+    let (phone, phone_cert) = node();
+    let admitted = steward_admit(&s.steward, &s.base, &phone_cert, "phone", NOW + DAY).unwrap();
+    let renewed = phone.next_cert(&phone_cert, None, NOW + 2 * DAY).unwrap();
+    let next = accept_cert(&s.owner, &admitted, &renewed, NOW + 2 * DAY).unwrap();
+    assert_eq!(next.seq(), s.base.seq() + STEWARD_SEQ_SPAN + 1);
+    assert!(next.base().is_none());
+    assert_eq!(certs_of(&next, phone.node_id()), vec![2]);
+    assert_eq!(
+        adopted_signer(judged(Some(&admitted), &next, NOW + 2 * DAY)),
+        Signer::Owner
+    );
+}
+
+#[test]
+fn the_next_certificate_is_above_the_file_and_the_listed_serial() {
+    let keys = NodeKeys::generate();
+    let file = keys.issue_cert(3, NOW - 100, NOW + DAY).unwrap();
+    let serial = |cert: NodeCert| cert.decode().unwrap().serial;
+    assert_eq!(serial(keys.next_cert(&file, None, NOW).unwrap()), 4);
+    assert_eq!(serial(keys.next_cert(&file, Some(2), NOW).unwrap()), 4);
+    assert_eq!(serial(keys.next_cert(&file, Some(3), NOW).unwrap()), 4);
+    assert_eq!(serial(keys.next_cert(&file, Some(9), NOW).unwrap()), 10);
+    let next = keys.next_cert(&file, None, NOW).unwrap().decode().unwrap();
+    assert_eq!(next.not_before, NOW - DAY);
+    assert_eq!(next.not_after, NOW - DAY + 400 * DAY);
+    assert_eq!(next.node_id, keys.node_id());
+    assert_eq!(next.x25519_pub, keys.x25519_public());
+    // Another node's certificate is not ours to renew.
+    let (_, foreign) = node();
+    assert!(matches!(
+        keys.next_cert(&foreign, None, NOW),
+        Err(AdminError::CertDoesNotVerify)
+    ));
+}
+
+#[test]
+fn the_serial_does_not_wrap_at_its_maximum() {
+    let keys = NodeKeys::generate();
+    let max = keys.issue_cert(u32::MAX, NOW - 100, NOW + DAY).unwrap();
+    assert!(matches!(
+        keys.next_cert(&max, None, NOW),
+        Err(AdminError::SerialExhausted)
+    ));
+    let low = keys.issue_cert(1, NOW - 100, NOW + DAY).unwrap();
+    assert!(matches!(
+        keys.next_cert(&low, Some(u32::MAX), NOW),
+        Err(AdminError::SerialExhausted)
+    ));
+    let below = keys.issue_cert(u32::MAX - 1, NOW - 100, NOW + DAY).unwrap();
+    assert_eq!(
+        keys.next_cert(&below, None, NOW)
+            .unwrap()
+            .decode()
+            .unwrap()
+            .serial,
+        u32::MAX
+    );
+}

@@ -15,6 +15,9 @@
 //!   pair with `seq + 1`, signed by the owner, and leaves the old one alone;
 //!   the clock is a parameter.
 //!
+//! * [`accept_cert`]: the owner lists a member's renewed certificate (protocol.md 2.2),
+//!   [`NodeKeys::next_cert`] makes it.
+//!
 //! * [`revoke`], [`remove_grants`]: the owner takes a node out of the network for good (protocol.md
 //!   7.3: always as a revocation, because a steward could admit a merely removed node again) or
 //!   takes grants out of the Policy.
@@ -41,7 +44,7 @@ mod keys;
 
 pub use error::AdminError;
 pub use issue::{
-    DOCUMENT_LIFETIME_SECS, Documents, admit, check_name, check_role, create_network,
+    DOCUMENT_LIFETIME_SECS, Documents, accept_cert, admit, check_name, check_role, create_network,
     delegate_steward, grant, is_invisible, is_unsafe, remove_grants, remove_steward, renew, revoke,
     steward_admit, steward_renew,
 };

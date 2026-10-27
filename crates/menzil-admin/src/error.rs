@@ -43,6 +43,21 @@ pub enum AdminError {
     /// verifiers refuse a revoked node, a member or not.
     #[error("node {0:?} is revoked in this network")]
     Revoked(NodeId),
+    /// A renewed certificate whose serial is not above the highest one listed for the node.
+    #[error("the certificate has serial {offered}, not above the listed serial {listed}")]
+    StaleCert {
+        /// The highest serial listed for the node.
+        listed: u32,
+        /// The serial of the offered certificate.
+        offered: u32,
+    },
+    /// A renewed certificate for another X25519 key than the listed one: a new key is a new
+    /// identity in this version.
+    #[error("the certificate of node {0:?} carries another key than the listed one")]
+    NewKey(NodeId),
+    /// The serial is at its maximum, so no certificate with a higher one can be made.
+    #[error("the certificate serial is at its maximum")]
+    SerialExhausted,
     /// The node is on the Roster's revoked list already.
     #[error("node {0:?} is revoked already")]
     AlreadyRevoked(NodeId),
