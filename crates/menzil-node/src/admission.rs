@@ -298,7 +298,7 @@ fn resolve_dial_cert_with(
             )
             .is_ok()
         })
-        .max_by_key(|body| body.serial)
+        .max_by_key(|body| (body.serial, <[u8; 32]>::from(body.x25519_pub)))
 }
 
 /// [`PolicyStore::check_membership`], or without its expiry part.

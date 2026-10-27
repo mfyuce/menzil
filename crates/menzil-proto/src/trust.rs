@@ -678,6 +678,12 @@ fn policy_rules(
         Err(_) => true,
     });
     right_for(entry, members.len() > held_len || rotates)?;
+    // A rotation also renews a base member's certificate, which is a `renew` on the Roster side
+    // whatever else the pair does: a pair that admits someone too has a Roster that needs only
+    // `admit`, so the Policy side asks for `renew` itself (round A L1).
+    if rotates {
+        right_for(entry, false)?;
+    }
     if !ids.iter().eq(roster_appended.iter().map(|m| &m.node_id)) {
         return Err(Reason::BadAppend);
     }
@@ -716,19 +722,28 @@ fn policy_rules(
         {
             return Err(Reason::BadCert);
         }
+        // Every tail certificate, an admission one too, is held to the window of protocol.md 2.2
+        // (round A L2).
+        if body.not_after < body.not_before
+            || body.not_after - body.not_before > NODE_CERT_MAX_LIFETIME
+        {
+            return Err(Reason::BadCert);
+        }
         if ids.contains(&body.node_id) {
-            // An admission certificate: nothing more to compare it with.
+            // A tail certificate of an appended member: its key and serial are compared with the
+            // held tail below (`held_tail` loop), which needs a held steward Policy of the same
+            // base. Residual (round A L2): a verifier that holds no such tail has nothing to
+            // compare the key with (the Roster does not carry keys), so it cannot refuse a
+            // steward that lists another key for an appended member; the self signature and the
+            // window are all it can judge. An appended member has no role or grant until the
+            // owner folds it into a base, from which point the base rule above applies.
         } else if known.contains(&body.node_id) {
             let best = match &base_best {
                 Some(best) => best,
                 None => base_best.insert(highest_certs(&base.certs)?),
             };
             let (serial, x25519_pub) = best.get(&body.node_id).ok_or(Reason::BadCert)?;
-            if body.x25519_pub != *x25519_pub
-                || body.serial <= *serial
-                || body.not_after < body.not_before
-                || body.not_after - body.not_before > NODE_CERT_MAX_LIFETIME
-            {
+            if body.x25519_pub != *x25519_pub || body.serial <= *serial {
                 return Err(Reason::BadCert);
             }
         } else {
@@ -763,7 +778,9 @@ fn highest_certs(
         let entry = best
             .entry(body.node_id)
             .or_insert((body.serial, body.x25519_pub));
-        if body.serial > entry.0 {
+        // Equal serials: the larger key wins, as in `CertIndex::resolve` (round A N2), so the
+        // outcome does not depend on the list order.
+        if (body.serial, <[u8; 32]>::from(body.x25519_pub)) > (entry.0, <[u8; 32]>::from(entry.1)) {
             *entry = (body.serial, body.x25519_pub);
         }
     }

@@ -87,7 +87,9 @@ impl CertIndex {
             .into_iter()
             .flatten()
             .filter_map(|entry| verify_decoded(&entry.cert, &entry.body, now))
-            .max_by_key(|body| body.serial)
+            // Equal serials: the larger key wins, the same rule as the steward rotation check
+            // (`trust::highest_certs`, round A N2), whatever the list order.
+            .max_by_key(|body| (body.serial, <[u8; 32]>::from(body.x25519_pub)))
             .filter(|body| &body.x25519_pub == claimed_key)
     }
 }
@@ -241,6 +243,27 @@ mod tests {
         assert!(index.resolve(&id, &k2, 100).is_none(), "not yet valid");
         assert!(index.resolve(&id, &k1, 600).is_none(), "superseded");
         assert_eq!(index.resolve(&id, &k2, 600).unwrap().serial, 2);
+    }
+
+    /// Equal serials with different keys: the larger key wins whatever the list order (round A
+    /// N2), the same tie rule as `menzil_proto::trust`'s steward check.
+    #[test]
+    fn equal_serials_with_different_keys_resolve_to_the_larger_key_in_any_order() {
+        let key = SigningKey::generate(&mut rand::rng());
+        let id = NodeId::from(key.verifying_key().to_bytes());
+        let (small, large) = (
+            X25519PublicKey::from([1; 32]),
+            X25519PublicKey::from([2; 32]),
+        );
+        for order in [[1u8, 2], [2, 1]] {
+            let certs: Vec<NodeCert> = order
+                .iter()
+                .map(|x| cert_window(&key, *x, 5, 0, 1000))
+                .collect();
+            let index = CertIndex::build(&certs);
+            assert!(index.resolve(&id, &small, 5).is_none(), "{order:?}");
+            assert!(index.resolve(&id, &large, 5).is_some(), "{order:?}");
+        }
     }
 
     /// The same key at several serials: the highest wins whatever the list order.

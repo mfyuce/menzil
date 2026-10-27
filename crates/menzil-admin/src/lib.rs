@@ -45,9 +45,9 @@ mod keys;
 
 pub use error::AdminError;
 pub use issue::{
-    DOCUMENT_LIFETIME_SECS, Documents, accept_cert, admit, check_name, check_role, create_network,
-    delegate_steward, grant, is_invisible, is_unsafe, remove_grants, remove_steward, renew, revoke,
-    steward_admit, steward_renew, steward_rotate,
+    CERT_ISSUE_MARGIN_SECS, DOCUMENT_LIFETIME_SECS, Documents, accept_cert, admit, check_name,
+    check_role, create_network, delegate_steward, grant, is_invisible, is_unsafe, remove_grants,
+    remove_steward, renew, revoke, steward_admit, steward_renew, steward_rotate,
 };
 pub use keys::{MAX_CERT_LIFETIME_SECS, NodeKeys, OwnerKey, StewardSecret};
 pub use menzil_proto::trust::{STEWARD_MAX_LIFETIME, STEWARD_SEQ_SPAN};

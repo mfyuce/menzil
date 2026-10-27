@@ -22,6 +22,12 @@ const STEWARD_RIGHTS: [&str; 2] = ["admit", "renew"];
 /// then fails closed (7.3), so the longest allowed is the useful one.
 pub const DOCUMENT_LIFETIME_SECS: u64 = 14 * 24 * 60 * 60;
 
+/// How long before the issuer's `now` a renewed certificate must already be valid
+/// ([`accept_cert`], [`steward_rotate`]): a verifier whose clock is a few minutes behind then
+/// still sees the renewal valid, and `accept_cert` (which drops the older certificate) does not
+/// leave it without one. [`crate::NodeKeys::next_cert`] backdates by a day, far more than this.
+pub const CERT_ISSUE_MARGIN_SECS: u64 = 5 * 60;
+
 /// The owner signed pair a steward signed pair was made from (protocol.md 2.3).
 #[derive(Debug, Clone)]
 struct Base {
@@ -270,6 +276,10 @@ impl Documents {
         let seq = this.next_owner_seq()?;
         let mut roster = self.roster_body.clone();
         let mut policy = self.policy_body.clone();
+        // An owner document has no field rules, so the certificates a steward pair accumulated
+        // (round A L3) are pruned here; the steward side never prunes (its base prefix and held
+        // tail rules need them).
+        policy.certs = prune_superseded(&policy.certs, now)?;
         roster.seq = seq;
         policy.seq = seq;
         roster.issued = now;
@@ -464,12 +474,14 @@ pub fn steward_admit(
 
 /// A steward lists the renewed certificates `certs` of members (protocol.md 2.3 rotation rule),
 /// several in one pair. Each passes the checks of an admission certificate (verifies, valid now,
-/// at most 400 days); its node must be a member ([`AdminError::Revoked`] when revoked,
+/// at most 400 days, not_before at least [`CERT_ISSUE_MARGIN_SECS`] ago, else
+/// [`AdminError::CertTooFresh`]); its node must be a member ([`AdminError::Revoked`] when revoked,
 /// [`AdminError::NotAMember`] otherwise), its serial above every listed one
 /// ([`AdminError::StaleCert`]) and its key the one of the highest listed certificate
 /// ([`AdminError::NewKey`]). A certificate replaces that node's earlier tail certificate in
 /// place, else is appended; the Roster changes only in its dates. Two certificates for one node
-/// in `certs` are refused ([`AdminError::StaleCert`] for the lower or equal one). The result is
+/// in `certs` are accepted when ascending (the later replaces the earlier in place) and refused
+/// with [`AdminError::StaleCert`] when not. The result is
 /// judged by the acceptance predicate against `current` before it is returned, so a steward
 /// without both `admit` and `renew` gets [`AdminError::Rejected`].
 pub fn steward_rotate(
@@ -483,6 +495,7 @@ pub fn steward_rotate(
     let base_len = base.policy.decode()?.certs.len();
     for cert in certs {
         let body = checked_cert(cert, now)?;
+        check_issue_margin(&body, now)?;
         if current
             .roster_body()
             .revoked
@@ -527,6 +540,41 @@ pub fn steward_rotate(
         }
     }
     current.steward_signed(steward, roster, policy, base, now)
+}
+
+/// `certs` without the ones a later certificate of the same node has replaced. A certificate is
+/// dropped when a certificate of the same node with a strictly higher serial exists and either
+/// that one has been valid for [`CERT_ISSUE_MARGIN_SECS`] and is not expired at `now` (every
+/// verifier resolves to it, S1), or the dropped one has expired. A higher certificate that has
+/// not started yet or only just did leaves the older one in place, so a node never loses its
+/// valid certificate to the pruning. Equal serials stay. List order is kept.
+fn prune_superseded(certs: &[NodeCert], now: u64) -> Result<Vec<NodeCert>, AdminError> {
+    let bodies: Vec<menzil_proto::NodeCertBody> = certs
+        .iter()
+        .map(|cert| cert.decode().map_err(AdminError::from))
+        .collect::<Result<_, _>>()?;
+    let mut kept = Vec::with_capacity(certs.len());
+    for (cert, body) in certs.iter().zip(&bodies) {
+        let superseded = bodies.iter().any(|other| {
+            other.node_id == body.node_id
+                && other.serial > body.serial
+                && (body.not_after <= now
+                    || (other.not_before.saturating_add(CERT_ISSUE_MARGIN_SECS) <= now
+                        && other.not_after > now))
+        });
+        if !superseded {
+            kept.push(cert.clone());
+        }
+    }
+    Ok(kept)
+}
+
+/// A renewed certificate must have been valid for [`CERT_ISSUE_MARGIN_SECS`] already.
+fn check_issue_margin(body: &menzil_proto::NodeCertBody, now: u64) -> Result<(), AdminError> {
+    if body.not_before > now.saturating_sub(CERT_ISSUE_MARGIN_SECS) {
+        return Err(AdminError::CertTooFresh);
+    }
+    Ok(())
 }
 
 /// A document of `len` encoded bytes must not be larger than every verifier accepts.
@@ -764,7 +812,8 @@ pub fn revoke(
 /// Lists a member's renewed certificate (protocol.md 2.2), owner only: the Policy drops every
 /// certificate of the node and appends `cert`; the Roster keeps its `members` (`min_serial`
 /// stays), so the older certificate is not cut off by this. `cert` must pass the checks of an
-/// admission certificate (verifies, valid now, at most 400 days), the node must be a member
+/// admission certificate (verifies, valid now, at most 400 days) and have been valid for
+/// [`CERT_ISSUE_MARGIN_SECS`] ([`AdminError::CertTooFresh`] otherwise), the node must be a member
 /// ([`AdminError::Revoked`] when it is revoked, [`AdminError::NotAMember`] otherwise), its serial
 /// must be above every listed one ([`AdminError::StaleCert`]) and its key the one of the highest
 /// listed certificate ([`AdminError::NewKey`]).
@@ -775,6 +824,7 @@ pub fn accept_cert(
     now: u64,
 ) -> Result<Documents, AdminError> {
     let body = checked_cert(cert, now)?;
+    check_issue_margin(&body, now)?;
     if current
         .roster_body()
         .revoked

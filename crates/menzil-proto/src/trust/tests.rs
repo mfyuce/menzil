@@ -1561,3 +1561,90 @@ fn a_base_member_without_a_base_certificate_cannot_be_renewed() {
     let bundle = fx.steward_pair(|_, p| p.certs.push(renewal(&k, 2)));
     assert_eq!(rejected(fx.check(&bundle)), Reason::BadCert);
 }
+
+// ---- round A fixes (L1, L2, N2) ----
+
+#[test]
+fn an_admit_only_steward_cannot_rotate_alongside_an_admission() {
+    let (fx, m) = fx_with_member(&["admit"]);
+    // A pure rotation needs renew on the Roster side.
+    let pure = fx.steward_pair(|_, p| p.certs.push(renewal(&m, 2)));
+    assert_eq!(rejected(fx.check(&pure)), Reason::RightMissing);
+    // So does one that admits somebody in the same pair (round A L1).
+    let newcomer = key();
+    let smuggled = fx.steward_pair(|r, p| {
+        admit(&newcomer, "zzprobe", r, p);
+        p.certs.push(renewal(&m, 2));
+    });
+    assert_eq!(rejected(fx.check(&smuggled)), Reason::RightMissing);
+    // The admission alone is fine, and with both rights so is the combination.
+    let alone = fx.steward_pair(|r, p| admit(&newcomer, "zzprobe", r, p));
+    adopted(fx.check(&alone));
+    let (fx, m) = fx_with_member(&["admit", "renew"]);
+    let both = fx.steward_pair(|r, p| {
+        admit(&newcomer, "zzprobe", r, p);
+        p.certs.push(renewal(&m, 2));
+    });
+    adopted(fx.check(&both));
+}
+
+#[test]
+fn an_appended_members_tail_certificate_is_held_to_the_400_day_window() {
+    let fx = fx_with_may(&["admit", "renew"]);
+    let y = key();
+    let long = fx.pair(&fx.steward, 12, |r, p| {
+        admit(&y, "printer", r, p);
+        p.certs.pop();
+        p.certs.push(cert_for(
+            &y,
+            [7u8; 32],
+            1,
+            NOW - DAY,
+            NOW - DAY + 400 * DAY + 1,
+        ));
+    });
+    assert_eq!(rejected(fx.check(&long)), Reason::BadCert);
+    let exact = fx.pair(&fx.steward, 12, |r, p| {
+        admit(&y, "printer", r, p);
+        p.certs.pop();
+        p.certs
+            .push(cert_for(&y, [7u8; 32], 1, NOW - DAY, NOW - DAY + 400 * DAY));
+    });
+    adopted(fx.check(&exact));
+    // And a renewal of an appended member against a held tail.
+    let held_pair = fx.pair(&fx.steward, 11, |r, p| admit(&y, "printer", r, p));
+    let held = holding_policy(&fx, &held_pair);
+    let renewed_long = fx.pair(&fx.steward, 12, |r, p| {
+        admit(&y, "printer", r, p);
+        p.certs.pop();
+        p.certs
+            .push(cert_for(&y, [7u8; 32], 2, NOW - DAY, NOW + 1000 * DAY));
+    });
+    assert_eq!(
+        rejected(check_bundle(&held, &renewed_long, NOW)),
+        Reason::BadCert
+    );
+}
+
+#[test]
+fn equal_serials_in_the_base_are_judged_against_the_larger_key_in_any_order() {
+    let (mut fx, m) = fx_with_member(&["admit", "renew"]);
+    // The base lists serial 3 twice, with the keys 7 and 9, in either order.
+    for order in [[7u8, 9], [9, 7]] {
+        fx.pb.certs.truncate(1);
+        for x in order {
+            fx.pb
+                .certs
+                .push(cert_for(&m, [x; 32], 3, NOW - 10 * DAY, NOW + 90 * DAY));
+        }
+        fx.base_policy = Policy::sign(&fx.owner, &fx.pb).unwrap();
+        let larger = cert_for(&m, [9u8; 32], 4, NOW - DAY, NOW + 100 * DAY);
+        adopted(fx.check(&fx.steward_pair(|_, p| p.certs.push(larger))));
+        let smaller = cert_for(&m, [7u8; 32], 4, NOW - DAY, NOW + 100 * DAY);
+        assert_eq!(
+            rejected(fx.check(&fx.steward_pair(|_, p| p.certs.push(smaller)))),
+            Reason::BadCert,
+            "{order:?}"
+        );
+    }
+}

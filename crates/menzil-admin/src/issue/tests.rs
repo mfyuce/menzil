@@ -2066,7 +2066,7 @@ fn an_accepted_renewal_replaces_the_old_certificate_and_keeps_min_serial() {
     let (owner, phone, _, docs) = with_phone();
     let renewed = phone
         .next_cert(
-            &phone.issue_cert(1, NOW - 100, NOW + DAY).unwrap(),
+            &phone.issue_cert(1, NOW - 1000, NOW + DAY).unwrap(),
             None,
             NOW + DAY,
         )
@@ -2110,16 +2110,16 @@ fn an_accepted_renewal_replaces_the_old_certificate_and_keeps_min_serial() {
 fn a_certificate_not_above_the_listed_serial_is_refused() {
     let (owner, phone, _, docs) = with_phone();
     for serial in [0u32, 1] {
-        let cert = phone.issue_cert(serial, NOW - 100, NOW + DAY).unwrap();
+        let cert = phone.issue_cert(serial, NOW - 1000, NOW + DAY).unwrap();
         assert!(matches!(
             accept_cert(&owner, &docs, &cert, NOW),
             Err(AdminError::StaleCert { listed: 1, offered }) if offered == serial
         ));
     }
-    let two = phone.issue_cert(2, NOW - 100, NOW + DAY).unwrap();
+    let two = phone.issue_cert(2, NOW - 1000, NOW + DAY).unwrap();
     let docs = accept_cert(&owner, &docs, &two, NOW).unwrap();
     // Lower than the new listed one, though above the first.
-    let again = phone.issue_cert(2, NOW - 50, NOW + DAY).unwrap();
+    let again = phone.issue_cert(2, NOW - 900, NOW + DAY).unwrap();
     assert!(matches!(
         accept_cert(&owner, &docs, &again, NOW),
         Err(AdminError::StaleCert {
@@ -2138,7 +2138,7 @@ fn a_renewal_with_another_key_is_refused() {
         node_id: phone.node_id(),
         x25519_pub: other.x25519_public(),
         serial: 2,
-        not_before: NOW - 100,
+        not_before: NOW - 1000,
         not_after: NOW + DAY,
     };
     let cert = NodeCert::sign(phone.signing_key(), &body).unwrap();
@@ -2151,14 +2151,14 @@ fn a_renewal_with_another_key_is_refused() {
 #[test]
 fn a_revoked_or_unknown_node_cannot_have_a_renewal_listed() {
     let (owner, phone, _, docs) = with_phone();
-    let cert = phone.issue_cert(2, NOW - 100, NOW + DAY).unwrap();
+    let cert = phone.issue_cert(2, NOW - 1000, NOW + DAY).unwrap();
     let revoked = revoke(&owner, &docs, phone.node_id(), NOW + 1).unwrap();
     assert!(matches!(
         accept_cert(&owner, &revoked, &cert, NOW + 2),
         Err(AdminError::Revoked(id)) if id == phone.node_id()
     ));
     let stranger = NodeKeys::generate();
-    let cert = stranger.issue_cert(2, NOW - 100, NOW + DAY).unwrap();
+    let cert = stranger.issue_cert(2, NOW - 1000, NOW + DAY).unwrap();
     assert!(matches!(
         accept_cert(&owner, &docs, &cert, NOW),
         Err(AdminError::NotAMember(id)) if id == stranger.node_id()
@@ -2173,8 +2173,8 @@ fn a_renewal_must_verify_be_valid_now_and_last_at_most_400_days() {
         node_id: phone.node_id(),
         x25519_pub: phone.x25519_public(),
         serial: 2,
-        not_before: NOW - 100,
-        not_after: NOW - 100 + 400 * DAY + 1,
+        not_before: NOW - 1000,
+        not_after: NOW - 1000 + 400 * DAY + 1,
     };
     let cert = NodeCert::sign(phone.signing_key(), &long).unwrap();
     assert!(matches!(
@@ -2182,7 +2182,7 @@ fn a_renewal_must_verify_be_valid_now_and_last_at_most_400_days() {
         Err(AdminError::CertLifetimeTooLong)
     ));
     let ok = phone
-        .issue_cert(2, NOW - 100, NOW - 100 + 400 * DAY)
+        .issue_cert(2, NOW - 1000, NOW - 1000 + 400 * DAY)
         .unwrap();
     accept_cert(&owner, &docs, &ok, NOW).unwrap();
     let future = phone.issue_cert(2, NOW + 10, NOW + DAY).unwrap();
@@ -2225,7 +2225,7 @@ fn accepting_a_renewal_beside_a_steward_jumps_the_span() {
 #[test]
 fn the_next_certificate_is_above_the_file_and_the_listed_serial() {
     let keys = NodeKeys::generate();
-    let file = keys.issue_cert(3, NOW - 100, NOW + DAY).unwrap();
+    let file = keys.issue_cert(3, NOW - 1000, NOW + DAY).unwrap();
     let serial = |cert: NodeCert| cert.decode().unwrap().serial;
     assert_eq!(serial(keys.next_cert(&file, None, NOW).unwrap()), 4);
     assert_eq!(serial(keys.next_cert(&file, Some(2), NOW).unwrap()), 4);
@@ -2247,17 +2247,19 @@ fn the_next_certificate_is_above_the_file_and_the_listed_serial() {
 #[test]
 fn the_serial_does_not_wrap_at_its_maximum() {
     let keys = NodeKeys::generate();
-    let max = keys.issue_cert(u32::MAX, NOW - 100, NOW + DAY).unwrap();
+    let max = keys.issue_cert(u32::MAX, NOW - 1000, NOW + DAY).unwrap();
     assert!(matches!(
         keys.next_cert(&max, None, NOW),
         Err(AdminError::SerialExhausted)
     ));
-    let low = keys.issue_cert(1, NOW - 100, NOW + DAY).unwrap();
+    let low = keys.issue_cert(1, NOW - 1000, NOW + DAY).unwrap();
     assert!(matches!(
         keys.next_cert(&low, Some(u32::MAX), NOW),
         Err(AdminError::SerialExhausted)
     ));
-    let below = keys.issue_cert(u32::MAX - 1, NOW - 100, NOW + DAY).unwrap();
+    let below = keys
+        .issue_cert(u32::MAX - 1, NOW - 1000, NOW + DAY)
+        .unwrap();
     assert_eq!(
         keys.next_cert(&below, None, NOW)
             .unwrap()
@@ -2306,7 +2308,7 @@ fn rotating_with(may: &[&str]) -> Rotating {
 }
 
 fn renewed(keys: &NodeKeys, serial: u32) -> NodeCert {
-    keys.issue_cert(serial, NOW + DAY - 100, NOW + DAY - 100 + 400 * DAY)
+    keys.issue_cert(serial, NOW + DAY - 1000, NOW + DAY - 1000 + 400 * DAY)
         .unwrap()
 }
 
@@ -2441,4 +2443,108 @@ fn a_rotation_refuses_what_the_owner_op_refuses() {
         steward_rotate(&r.steward, &revoked, &[renewed(&r.phone, 2)], at),
         Err(AdminError::Revoked(id)) if id == r.phone.node_id()
     ));
+}
+
+// ---- round A fixes (L3, L4) ----
+
+fn count_certs(docs: &Documents, id: NodeId) -> usize {
+    certs_of(docs, id).len()
+}
+
+#[test]
+fn owner_operations_do_not_carry_superseded_certificates_forward() {
+    let (owner, keys, cert, docs) = founded();
+    let steward = StewardSecret::generate();
+    let mut docs = delegate_steward(
+        &owner,
+        &docs,
+        steward.public(),
+        &rights(&ADMIT_RENEW),
+        NOW + 30 * DAY,
+        NOW,
+    )
+    .unwrap();
+    let id = keys.node_id();
+    let mut current = cert;
+    for i in 1..=4u64 {
+        let at = NOW + i * 3600;
+        let listed = docs
+            .policy_body()
+            .certs
+            .iter()
+            .map(|c| c.decode().unwrap().serial)
+            .max();
+        let next = keys.next_cert(&current, listed, at).unwrap();
+        let rotated = steward_rotate(&steward, &docs, std::slice::from_ref(&next), at).unwrap();
+        // The steward pair keeps the base certificate beside the renewal (its prefix rule).
+        assert_eq!(count_certs(&rotated, id), 2, "round {i}");
+        docs = renew(&owner, &rotated, at + 1).unwrap();
+        // The owner pair keeps the renewal only.
+        assert_eq!(
+            certs_of(&docs, id),
+            vec![next.decode().unwrap().serial],
+            "round {i}"
+        );
+        current = next;
+    }
+}
+
+#[test]
+fn pruning_keeps_the_older_certificate_while_the_higher_one_is_not_yet_established() {
+    let (owner, keys, cert, docs) = founded();
+    let id = keys.node_id();
+    // Serial 2 starts 60 s ago: not yet past the margin, so serial 1 stays.
+    let fresh = keys.issue_cert(2, NOW - 60, NOW + 100 * DAY).unwrap();
+    let mut policy = docs.policy_body().clone();
+    policy.certs.push(fresh.clone());
+    let with_both = Documents::signed(&owner, docs.roster_body().clone(), policy).unwrap();
+    let next = renew(&owner, &with_both, NOW).unwrap();
+    assert_eq!(certs_of(&next, id), vec![1, 2]);
+    // Once it is older than the margin, serial 1 goes.
+    let later = renew(&owner, &next, NOW + CERT_ISSUE_MARGIN_SECS).unwrap();
+    assert_eq!(certs_of(&later, id), vec![2]);
+    let _ = cert;
+}
+
+#[test]
+fn a_renewal_must_have_been_valid_for_the_issue_margin() {
+    let (owner, phone, _, docs) = with_phone();
+    let at = NOW + 1000;
+    let too_fresh = phone
+        .issue_cert(2, at - CERT_ISSUE_MARGIN_SECS + 1, at + DAY)
+        .unwrap();
+    assert!(matches!(
+        accept_cert(&owner, &docs, &too_fresh, at),
+        Err(AdminError::CertTooFresh)
+    ));
+    let exact = phone
+        .issue_cert(2, at - CERT_ISSUE_MARGIN_SECS, at + DAY)
+        .unwrap();
+    let next = accept_cert(&owner, &docs, &exact, at).unwrap();
+    // A verifier a margin behind still sees it valid.
+    assert!(
+        next.policy_body()
+            .certs
+            .iter()
+            .any(|c| c.decode().unwrap().is_valid_at(at - CERT_ISSUE_MARGIN_SECS))
+    );
+}
+
+#[test]
+fn a_steward_rotation_must_have_been_valid_for_the_issue_margin() {
+    let r = rotating_with(&ADMIT_RENEW);
+    let at = NOW + DAY;
+    let too_fresh = r
+        .phone
+        .issue_cert(2, at - CERT_ISSUE_MARGIN_SECS + 1, at + DAY)
+        .unwrap();
+    assert!(matches!(
+        steward_rotate(&r.steward, &r.base, &[too_fresh], at),
+        Err(AdminError::CertTooFresh)
+    ));
+    let exact = r
+        .phone
+        .issue_cert(2, at - CERT_ISSUE_MARGIN_SECS, at + DAY)
+        .unwrap();
+    steward_rotate(&r.steward, &r.base, &[exact], at).unwrap();
 }

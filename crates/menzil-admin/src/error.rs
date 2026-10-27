@@ -33,6 +33,10 @@ pub enum AdminError {
     /// The certificate is not valid at the time of issuing.
     #[error("the node certificate is not valid now")]
     CertNotValidNow,
+    /// A renewed certificate whose `not_before` is too close to now: a verifier whose clock is a
+    /// few minutes behind would not see it valid (`CERT_ISSUE_MARGIN_SECS`).
+    #[error("the renewed certificate starts too recently, make it with an earlier not_before")]
+    CertTooFresh,
     /// The certificate's validity window is longer than protocol.md 2.2 allows.
     #[error("a node certificate is valid for at most 400 days, this one for longer")]
     CertLifetimeTooLong,
