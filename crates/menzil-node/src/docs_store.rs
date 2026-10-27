@@ -81,9 +81,28 @@ impl<'a> DocStore<'a> {
         // The fixed lock order: Roster store, then Policy store.
         let mut rosters = self.rosters.write();
         let mut policies = self.policies.write();
+        // The held Roster view also knows the tail of the held steward Policy (with its base), so
+        // that a steward Policy cannot drop or lower a renewal the held one lists (protocol.md 2.3).
+        let held_roster = match rosters.get(&network_id) {
+            Some(held) => {
+                let view = held.view().clone();
+                Some(
+                    match policies
+                        .get(&network_id)
+                        .map(policy_store::Held::signed_with_base)
+                    {
+                        Some((policy, base)) => view
+                            .with_policy(&policy, base.as_ref())
+                            .map_err(NodeError::DocumentRejected)?,
+                        None => view,
+                    },
+                )
+            }
+            None => None,
+        };
         let view = HeldView {
             network_id,
-            roster: rosters.get(&network_id).map(|held| held.view().clone()),
+            roster: held_roster,
             policy_seq: policies.get(&network_id).map(policy_store::Held::seq),
         };
         let adoption = match check_bundle(&view, bundle, now) {
@@ -640,5 +659,113 @@ mod tests {
             .adopt(&net.base_bundle(), NOW)
             .unwrap();
         assert_eq!(*seen.lock().unwrap(), vec![(Some(10), Some(10))]);
+    }
+
+    /// Cert rotation S3b: the held steward Policy's renewal certificates are a tail a later
+    /// steward Policy of the same base must keep, same key, serial not below.
+    mod held_tail {
+        use super::*;
+        use menzil_proto::{NodeCert, NodeCertBody, X25519PublicKey};
+
+        struct Rot {
+            net: Net,
+            node: SigningKey,
+        }
+
+        fn cert(node: &SigningKey, serial: u32) -> NodeCert {
+            NodeCert::sign(
+                node,
+                &NodeCertBody {
+                    v: PROTOCOL_VERSION,
+                    node_id: NodeId::from(node.verifying_key().to_bytes()),
+                    x25519_pub: X25519PublicKey::from([7u8; 32]),
+                    serial,
+                    not_before: NOW - DAY,
+                    not_after: NOW + 300 * DAY,
+                },
+            )
+            .unwrap()
+        }
+
+        impl Rot {
+            /// Base: one member with a serial 1 certificate; the steward may admit and renew.
+            fn new() -> Self {
+                let mut net = Net::new();
+                let node = SigningKey::generate(&mut rand::rng());
+                let id = NodeId::from(node.verifying_key().to_bytes());
+                net.roster.members[0].node_id = id;
+                net.roster.stewards[0] = Steward::sign(
+                    &net.owner,
+                    &StewardBody {
+                        v: PROTOCOL_VERSION,
+                        network_id: net.network_id,
+                        steward_pub: StewardKey::from(net.steward.verifying_key().to_bytes()),
+                        may: vec!["admit".to_string(), "renew".to_string()],
+                        not_after: NOW + 30 * DAY,
+                    },
+                )
+                .unwrap();
+                net.policy.members[0].node_id = id;
+                net.policy.certs = vec![cert(&node, 1)];
+                net.base_roster = Roster::sign(&net.owner, &net.roster).unwrap();
+                net.base_policy = Policy::sign(&net.owner, &net.policy).unwrap();
+                Self { net, node }
+            }
+
+            /// A steward pair at `seq` whose Policy tail holds the given serials.
+            fn pair(&self, seq: u64, tail: &[u32]) -> Bundle {
+                let mut bundle = self.net.renewal(&self.net.steward, seq, true);
+                let mut policy = self.net.policy.clone();
+                policy.seq = seq;
+                policy.issued = NOW;
+                policy.expires = NOW + 7 * DAY;
+                policy
+                    .certs
+                    .extend(tail.iter().map(|serial| cert(&self.node, *serial)));
+                bundle.policy = Some(Policy::sign(&self.net.steward, &policy).unwrap());
+                bundle
+            }
+        }
+
+        fn held_with_renewal_3() -> (Rot, RosterStore, PolicyStore) {
+            let rot = Rot::new();
+            let (rosters, policies) = stores_holding_base(&rot.net);
+            DocStore::new(&rosters, &policies)
+                .adopt(&rot.pair(11, &[3]), NOW)
+                .unwrap();
+            (rot, rosters, policies)
+        }
+
+        #[test]
+        fn a_steward_policy_dropping_a_held_renewal_is_refused() {
+            let (rot, rosters, policies) = held_with_renewal_3();
+            let docs = DocStore::new(&rosters, &policies);
+            assert_eq!(
+                refused(docs.adopt(&rot.pair(12, &[]), NOW)),
+                Reason::AppendedDropped
+            );
+            assert_eq!(policies.seq(&rot.net.network_id), Some(11));
+            assert_eq!(rosters.seq(&rot.net.network_id), Some(11));
+        }
+
+        #[test]
+        fn a_steward_policy_lowering_a_held_renewal_is_refused() {
+            let (rot, rosters, policies) = held_with_renewal_3();
+            let docs = DocStore::new(&rosters, &policies);
+            assert_eq!(
+                refused(docs.adopt(&rot.pair(12, &[2]), NOW)),
+                Reason::AppendedDropped
+            );
+            assert_eq!(policies.seq(&rot.net.network_id), Some(11));
+        }
+
+        #[test]
+        fn a_steward_policy_keeping_or_raising_a_held_renewal_is_adopted() {
+            let (rot, rosters, policies) = held_with_renewal_3();
+            let docs = DocStore::new(&rosters, &policies);
+            assert!(docs.adopt(&rot.pair(12, &[3]), NOW).unwrap().policy);
+            assert!(docs.adopt(&rot.pair(13, &[4]), NOW).unwrap().policy);
+            assert_eq!(policies.seq(&rot.net.network_id), Some(13));
+        }
     }
 }
