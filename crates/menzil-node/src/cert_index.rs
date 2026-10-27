@@ -68,9 +68,14 @@ impl CertIndex {
             .filter_map(move |entry| verify_decoded(&entry.cert, &entry.body, now))
     }
 
-    /// The certificate that must back `node_id`'s Noise static key `claimed_key` at `now`:
-    /// one for both, self signed and valid, the highest serial among duplicates (the list order
-    /// is not trusted).
+    /// The certificate that must back `node_id`'s Noise static key `claimed_key` at `now`
+    /// (the stateless "highest serial" rule, cert rotation design Q5 b): among the certificates
+    /// listed for `node_id` that are self signed and valid at `now`, only the one with the
+    /// highest serial counts (the list order is not trusted), and it is returned only when its
+    /// key is `claimed_key`. A lower serial listed next to it is never used, so once a higher
+    /// serial cert with another key is valid the older key resolves no more; while the higher
+    /// one is not yet valid (or no longer signed or valid) the lower one still resolves. The
+    /// Policy never goes backwards, so it is the verifier's memory and no state is kept.
     pub(crate) fn resolve(
         &self,
         node_id: &NodeId,
@@ -81,9 +86,9 @@ impl CertIndex {
             .get(node_id)
             .into_iter()
             .flatten()
-            .filter(|entry| &entry.body.x25519_pub == claimed_key)
             .filter_map(|entry| verify_decoded(&entry.cert, &entry.body, now))
             .max_by_key(|body| body.serial)
+            .filter(|body| &body.x25519_pub == claimed_key)
     }
 }
 
@@ -162,7 +167,6 @@ mod tests {
             cert_of(&key, 1, 1, 100),
             cert_of(&key, 1, 4, 100),
             cert_of(&key, 1, 3, 100),
-            cert_of(&key, 2, 8, 100),
             forged,
         ]);
         let one = X25519PublicKey::from([1; 32]);
@@ -181,8 +185,82 @@ mod tests {
         );
         assert_eq!(
             index.valid_for_node(&id, 50).count(),
-            4,
+            3,
             "all valid for the node"
         );
+    }
+
+    fn cert_window(key: &SigningKey, x: u8, serial: u32, from: u64, to: u64) -> NodeCert {
+        NodeCert::sign(
+            key,
+            &NodeCertBody {
+                v: PROTOCOL_VERSION,
+                node_id: NodeId::from(key.verifying_key().to_bytes()),
+                x25519_pub: X25519PublicKey::from([x; 32]),
+                serial,
+                not_before: from,
+                not_after: to,
+            },
+        )
+        .unwrap()
+    }
+
+    /// Two certs for one node with different keys: once the higher serial one is valid the
+    /// lower serial key resolves no more (the highest of the key's own certs is not used).
+    #[test]
+    fn a_lower_serial_cert_with_another_key_stops_resolving_once_the_higher_is_valid() {
+        let key = SigningKey::generate(&mut rand::rng());
+        let id = NodeId::from(key.verifying_key().to_bytes());
+        let index = CertIndex::build(&[
+            cert_window(&key, 1, 1, 0, 1000),
+            cert_window(&key, 2, 2, 0, 1000),
+        ]);
+        let (k1, k2) = (
+            X25519PublicKey::from([1; 32]),
+            X25519PublicKey::from([2; 32]),
+        );
+        assert!(index.resolve(&id, &k1, 50).is_none());
+        assert_eq!(index.resolve(&id, &k2, 50).unwrap().serial, 2);
+    }
+
+    /// A higher serial cert that is not yet valid (or already expired) leaves the lower one
+    /// resolvable.
+    #[test]
+    fn a_higher_cert_not_yet_valid_leaves_the_lower_resolvable() {
+        let key = SigningKey::generate(&mut rand::rng());
+        let id = NodeId::from(key.verifying_key().to_bytes());
+        let index = CertIndex::build(&[
+            cert_window(&key, 1, 1, 0, 1000),
+            cert_window(&key, 2, 2, 500, 2000),
+        ]);
+        let (k1, k2) = (
+            X25519PublicKey::from([1; 32]),
+            X25519PublicKey::from([2; 32]),
+        );
+        assert_eq!(index.resolve(&id, &k1, 100).unwrap().serial, 1);
+        assert!(index.resolve(&id, &k2, 100).is_none(), "not yet valid");
+        assert!(index.resolve(&id, &k1, 600).is_none(), "superseded");
+        assert_eq!(index.resolve(&id, &k2, 600).unwrap().serial, 2);
+    }
+
+    /// The same key at several serials: the highest wins whatever the list order.
+    #[test]
+    fn same_key_the_highest_serial_wins_in_any_order() {
+        let key = SigningKey::generate(&mut rand::rng());
+        let id = NodeId::from(key.verifying_key().to_bytes());
+        let k1 = X25519PublicKey::from([1; 32]);
+        for order in [[1, 2, 3], [3, 2, 1], [2, 3, 1]] {
+            let certs: Vec<NodeCert> = order
+                .iter()
+                .map(|serial| cert_window(&key, 1, *serial, 0, 1000))
+                .collect();
+            assert_eq!(
+                CertIndex::build(&certs)
+                    .resolve(&id, &k1, 5)
+                    .unwrap()
+                    .serial,
+                3
+            );
+        }
     }
 }

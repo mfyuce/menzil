@@ -194,6 +194,11 @@ pub(crate) fn own_cert_standing(
     Ok(())
 }
 
+/// Highest serial rule (cert rotation design Q5 b, S1): resolution is stateless and per
+/// network, by [`CertIndex::resolve`]: only the highest serial valid cert listed for the node
+/// counts and its key must be `claimed_key`. The "among duplicates" text below is superseded
+/// by that rule.
+///
 /// Resolves the member cert that must back `node_id`'s Noise static key
 /// `claimed_key`, from `network_id`'s currently held Policy (protocol.md
 /// 5.1's responder check: "the initiator's `node_id` equals the RECV
@@ -2335,6 +2340,38 @@ mod tests {
         });
         assert_eq!(standing(&f, 1_000), Ok(()));
         assert_eq!(standing(&f, 1_001), Err(ErrorCode::BadCert));
+    }
+
+    /// Cert rotation S1 (Q6): a pair that replaces the peer's cert with a renewal for the same
+    /// key and a higher serial keeps the session, also when the Roster floor is the first
+    /// serial; a higher serial cert with another key ends it.
+    #[test]
+    fn session_standing_survives_a_renewal_swap_and_not_a_key_change() {
+        let renewal = |f: &Fixture, x: X25519PublicKey| {
+            let mut body = signed_cert(&f.ids, x, 0, 4_000_000_000).decode().unwrap();
+            body.serial = f.ids.initiator_cert_serial + 1;
+            NodeCert::sign(&f.ids.initiator_signing_key, &body).unwrap()
+        };
+        let swap = |f: &Fixture, cert: NodeCert| {
+            edit_policy(f, |b| {
+                b.certs
+                    .retain(|c| c.decode().unwrap().node_id != f.ids.initiator_node_id);
+                b.certs.push(cert);
+            });
+        };
+        let f = fixture(vec![]);
+        edit_roster(&f, |b| {
+            for m in &mut b.members {
+                if m.node_id == f.ids.initiator_node_id {
+                    m.min_serial = f.ids.initiator_cert_serial;
+                }
+            }
+        });
+        assert_eq!(standing(&f, 1_000), Ok(()));
+        swap(&f, renewal(&f, f.ids.initiator_x25519));
+        assert_eq!(standing(&f, 1_000), Ok(()), "same key, higher serial");
+        swap(&f, renewal(&f, X25519PublicKey::from([0x55u8; 32])));
+        assert_eq!(standing(&f, 1_000), Err(ErrorCode::BadCert), "new key");
     }
 
     #[test]
