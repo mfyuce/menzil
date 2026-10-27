@@ -6,7 +6,8 @@
 //! `Steward` entry in the base Roster (signed by the owner inside a Roster signed by the owner).
 //! The steward's rights are enforced by comparing the document with its base field by field:
 //! `renew` may change `seq`, `issued` and `expires`; `admit` may also append new, unrevoked
-//! members at the end of the lists. Nothing else may differ. The owner's own next documents
+//! members at the end of the lists and list a member's renewed certificate (same keys, higher
+//! serial) in the tail of `certs`. Nothing else may differ. The owner's own next documents
 //! jump [`STEWARD_SEQ_SPAN`] past the base, so nothing a steward signed from that base can
 //! outrank them.
 //!
@@ -24,6 +25,7 @@ use ed25519_dalek::VerifyingKey;
 use crate::PROTOCOL_VERSION;
 use crate::bytes::{NetworkId, NodeId, StewardKey};
 use crate::error::ErrorCode;
+use crate::identity::NodeCertBody;
 use crate::names::{check_name, check_role};
 use crate::network::{Policy, PolicyBody, PolicyMember, Roster, RosterBody, RosterMember, Steward};
 
@@ -38,6 +40,10 @@ pub const DOC_MAX_LIFETIME: u64 = 14 * 24 * 60 * 60;
 /// The longest lifetime of a `Steward` entry, in seconds (90 days). Only the issuer can check
 /// it, because the entry carries `not_after` and no `issued`.
 pub const STEWARD_MAX_LIFETIME: u64 = 90 * 24 * 60 * 60;
+
+/// The longest validity window of a node certificate, in seconds (400 days, protocol.md 2.2).
+/// The issuers check it; the steward rotation rule checks it again for the certificates it lists.
+pub const NODE_CERT_MAX_LIFETIME: u64 = 400 * 24 * 60 * 60;
 
 /// Who signed the Roster and Policy that a [`Verdict::Adopt`] or a held pair stands on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -106,7 +112,9 @@ pub enum Reason {
     /// The Roster and the Policy were not signed by the same key from the same base.
     PairSigner,
     /// A steward document on the base of a held steward Roster does not keep the members the
-    /// held one appended (a steward cannot un-admit, nor give an admitted name to another node).
+    /// held one appended (a steward cannot un-admit, nor give an admitted name to another node),
+    /// or lacks a certificate the held steward Policy of the same base lists in its tail, or lists
+    /// it with another key or a lower serial (a steward cannot take a renewal back).
     AppendedDropped,
 }
 
@@ -129,6 +137,10 @@ pub struct HeldRoster {
     body: RosterBody,
     base: Option<RosterBody>,
     signer: Signer,
+    /// The certificates the held steward Policy lists after its base's, with the `seq` of that
+    /// base. Empty until [`HeldRoster::with_policy`] is called.
+    tail: Vec<NodeCertBody>,
+    tail_base_seq: Option<u64>,
 }
 
 impl HeldRoster {
@@ -142,6 +154,8 @@ impl HeldRoster {
                 body,
                 base: None,
                 signer: Signer::Owner,
+                tail: Vec::new(),
+                tail_base_seq: None,
             });
         };
         let base = base.decode().map_err(|_| Reason::Malformed)?;
@@ -157,7 +171,34 @@ impl HeldRoster {
             body,
             base: Some(base),
             signer,
+            tail: Vec::new(),
+            tail_base_seq: None,
         })
+    }
+
+    /// The same, knowing the held `policy` and, when a steward signed it, the owner signed
+    /// `base` it was made from: the certificates it lists after its base's are the tail a steward
+    /// document on the same base may not drop or lower (protocol.md 2.3). Without it that rule
+    /// has nothing to compare with and is not applied. Decodes only.
+    pub fn with_policy(mut self, policy: &Policy, base: Option<&Policy>) -> Result<Self, Reason> {
+        let Some(base) = base else {
+            return Ok(self);
+        };
+        let policy = policy.decode().map_err(|_| Reason::Malformed)?;
+        let base = base.decode().map_err(|_| Reason::Malformed)?;
+        let mut tail = Vec::new();
+        for cert in appended_of(&policy.certs, &base.certs)? {
+            tail.push(cert.decode().map_err(|_| Reason::Malformed)?);
+        }
+        self.tail = tail;
+        self.tail_base_seq = Some(base.seq);
+        Ok(self)
+    }
+
+    /// The certificates the held Policy listed after its base's, when its base has `base_seq`.
+    /// `None` when it is not known (no Policy given, or another base).
+    fn tail_on(&self, base_seq: u64) -> Option<&[NodeCertBody]> {
+        (self.tail_base_seq == Some(base_seq)).then_some(&self.tail[..])
     }
 
     /// The members the held Roster appended to its base, when it is steward signed and its base
@@ -328,7 +369,8 @@ fn check(held: &HeldView, bundle: &Bundle, now: u64) -> Result<Option<Adoption>,
         if let (Signer::Steward { .. }, Some((_, base_body))) = (&policy_signer, base) {
             let entry = steward_of_stewards(&roster_body.stewards)?;
             let (appended, held_len) = roster_ctx.appended()?;
-            policy_rules(body, base_body, &entry, &appended, held_len)?;
+            let held_tail = held.roster.as_ref().and_then(|h| h.tail_on(base_body.seq));
+            policy_rules(body, base_body, &entry, &appended, held_len, held_tail)?;
         }
     }
 
@@ -601,13 +643,17 @@ fn appended_of<'a, T: PartialEq>(list: &'a [T], base: &[T]) -> Result<&'a [T], R
 
 /// A steward signed Policy against its base: the same but for the dates, or for the members of
 /// the Roster's admission appended at the end of `members`, with their self signed certificates
-/// at the end of `certs`.
+/// at the end of `certs`, or for the renewed certificates of base members in that tail (the
+/// rotation rule: same node and key as the highest base certificate, a higher serial, at most
+/// one tail certificate per node). `held_tail` is the tail a held steward Policy of the same
+/// base lists, when known: each of its certificates stays, with the same key and a serial not below.
 fn policy_rules(
     policy: &PolicyBody,
     base: &PolicyBody,
     entry: &Steward,
     roster_appended: &[RosterMember],
     held_len: usize,
+    held_tail: Option<&[NodeCertBody]>,
 ) -> Result<(), Reason> {
     if policy.v != base.v
         || policy.grants != base.grants
@@ -618,8 +664,20 @@ fn policy_rules(
     }
     let members = appended_of(&policy.members, &base.members)?;
     let certs = appended_of(&policy.certs, &base.certs)?;
-    right_for(entry, members.len() > held_len)?;
     let ids: Vec<NodeId> = members.iter().map(|m: &PolicyMember| m.node_id).collect();
+    // A tail certificate that is not a new member's admission and differs from the held tail is
+    // a rotation, which is an `admit` (cheap: decodes, no signature).
+    // Without a known held tail every appended member's certificate counts as an admission
+    // certificate: nothing is known to have been listed before.
+    let new_from = if held_tail.is_some() { held_len } else { 0 };
+    let rotates = certs.iter().any(|cert| match cert.decode() {
+        Ok(body) => {
+            !ids.get(new_from..).unwrap_or(&[]).contains(&body.node_id)
+                && !held_tail.unwrap_or(&[]).contains(&body)
+        }
+        Err(_) => true,
+    });
+    right_for(entry, members.len() > held_len || rotates)?;
     if !ids.iter().eq(roster_appended.iter().map(|m| &m.node_id)) {
         return Err(Reason::BadAppend);
     }
@@ -646,11 +704,34 @@ fn policy_rules(
     // Each appended member comes with exactly one certificate, and its `min_serial` may not be
     // above that certificate's serial: otherwise a steward of one network could lock a node of
     // another network out of a shared relay, which takes the highest `min_serial` of any Roster
-    // it holds (the sixth red-team round, M4).
-    let mut serials: HashMap<NodeId, u32> = HashMap::new();
+    // it holds (the sixth red-team round, M4). A certificate of a base member is a renewal
+    // (protocol.md 2.3); a certificate of any other node is refused. At most one per node.
+    let mut tail: HashMap<NodeId, (u32, crate::bytes::X25519PublicKey)> = HashMap::new();
+    let mut base_best: Option<HashMap<NodeId, (u32, crate::bytes::X25519PublicKey)>> = None;
     for cert in certs {
         let body = cert.decode().map_err(|_| Reason::BadCert)?;
-        if !ids.contains(&body.node_id) || serials.insert(body.node_id, body.serial).is_some() {
+        if tail
+            .insert(body.node_id, (body.serial, body.x25519_pub))
+            .is_some()
+        {
+            return Err(Reason::BadCert);
+        }
+        if ids.contains(&body.node_id) {
+            // An admission certificate: nothing more to compare it with.
+        } else if known.contains(&body.node_id) {
+            let best = match &base_best {
+                Some(best) => best,
+                None => base_best.insert(highest_certs(&base.certs)?),
+            };
+            let (serial, x25519_pub) = best.get(&body.node_id).ok_or(Reason::BadCert)?;
+            if body.x25519_pub != *x25519_pub
+                || body.serial <= *serial
+                || body.not_after < body.not_before
+                || body.not_after - body.not_before > NODE_CERT_MAX_LIFETIME
+            {
+                return Err(Reason::BadCert);
+            }
+        } else {
             return Err(Reason::BadCert);
         }
         let key = VerifyingKey::from_bytes(&<[u8; 32]>::from(body.node_id))
@@ -658,12 +739,35 @@ fn policy_rules(
         cert.verify(&key).map_err(|_| Reason::BadCert)?;
     }
     for member in roster_appended {
-        match serials.get(&member.node_id) {
-            Some(serial) if member.min_serial <= *serial => {}
+        match tail.get(&member.node_id) {
+            Some((serial, _)) if member.min_serial <= *serial => {}
             _ => return Err(Reason::BadCert),
         }
     }
+    for held in held_tail.unwrap_or(&[]) {
+        match tail.get(&held.node_id) {
+            Some((serial, key)) if *serial >= held.serial && *key == held.x25519_pub => {}
+            _ => return Err(Reason::AppendedDropped),
+        }
+    }
     Ok(())
+}
+
+/// For each node, the serial and key of the highest serial certificate of `certs`.
+fn highest_certs(
+    certs: &[crate::identity::NodeCert],
+) -> Result<HashMap<NodeId, (u32, crate::bytes::X25519PublicKey)>, Reason> {
+    let mut best: HashMap<NodeId, (u32, crate::bytes::X25519PublicKey)> = HashMap::new();
+    for cert in certs {
+        let body = cert.decode().map_err(|_| Reason::BadCert)?;
+        let entry = best
+            .entry(body.node_id)
+            .or_insert((body.serial, body.x25519_pub));
+        if body.serial > entry.0 {
+            *entry = (body.serial, body.x25519_pub);
+        }
+    }
+    Ok(best)
 }
 
 #[cfg(test)]

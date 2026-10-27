@@ -2267,3 +2267,178 @@ fn the_serial_does_not_wrap_at_its_maximum() {
         u32::MAX
     );
 }
+
+// ---- steward_rotate (cert rotation S3) ----
+
+/// A network whose owner admitted "phone" and "tablet" (serial 1 each) and then delegated a
+/// steward with the rights `may`.
+struct Rotating {
+    owner: OwnerKey,
+    steward: StewardSecret,
+    phone: NodeKeys,
+    tablet: NodeKeys,
+    base: Documents,
+}
+
+fn rotating_with(may: &[&str]) -> Rotating {
+    let (owner, _, _, docs) = founded();
+    let (phone, phone_cert) = node();
+    let (tablet, tablet_cert) = node();
+    let docs = admit(&owner, &docs, &phone_cert, "phone", &[], NOW).unwrap();
+    let docs = admit(&owner, &docs, &tablet_cert, "tablet", &[], NOW).unwrap();
+    let steward = StewardSecret::generate();
+    let base = delegate_steward(
+        &owner,
+        &docs,
+        steward.public(),
+        &rights(may),
+        NOW + 30 * DAY,
+        NOW,
+    )
+    .unwrap();
+    Rotating {
+        owner,
+        steward,
+        phone,
+        tablet,
+        base,
+    }
+}
+
+fn renewed(keys: &NodeKeys, serial: u32) -> NodeCert {
+    keys.issue_cert(serial, NOW + DAY - 100, NOW + DAY - 100 + 400 * DAY)
+        .unwrap()
+}
+
+#[test]
+fn a_steward_rotation_lists_the_renewal_and_the_network_adopts_it() {
+    let r = rotating_with(&ADMIT_RENEW);
+    let at = NOW + DAY;
+    let cert = renewed(&r.phone, 2);
+    let next = steward_rotate(&r.steward, &r.base, std::slice::from_ref(&cert), at).unwrap();
+    assert_eq!(next.seq(), r.base.seq() + 1);
+    // Appended after the base's certificates; the base's own are all still there.
+    let base_certs = &r.base.policy_body().certs;
+    assert_eq!(
+        &next.policy_body().certs[..base_certs.len()],
+        &base_certs[..]
+    );
+    assert_eq!(next.policy_body().certs.last().unwrap(), &cert);
+    assert_eq!(next.policy_body().certs.len(), base_certs.len() + 1);
+    // The Roster keeps its members and every `min_serial`.
+    assert_eq!(next.roster_body().members, r.base.roster_body().members);
+    let signer = Signer::Steward {
+        key: r.steward.public(),
+        base_seq: r.base.seq(),
+    };
+    assert_eq!(adopted_signer(judged(Some(&r.base), &next, at)), signer);
+    assert_eq!(adopted_signer(judged(None, &next, at)), signer);
+    // The relay judges the Roster alone, with its base: that passes too.
+    let roster_only = Bundle {
+        base_roster: next.bundle().base_roster,
+        roster: next.bundle().roster,
+        ..Bundle::default()
+    };
+    let view = r.base.held_view().unwrap();
+    assert!(matches!(
+        check_bundle(&view, &roster_only, at),
+        Verdict::Adopt(_)
+    ));
+    // A node adopts it through its stores.
+    let (rosters, policies) = load(&r.base);
+    let store = menzil_node::DocStore::new(&rosters, &policies);
+    let adopted = store.adopt(&next.bundle(), at).unwrap();
+    assert!(adopted.roster && adopted.policy);
+}
+
+#[test]
+fn a_second_rotation_replaces_the_tail_certificate_in_place_and_batches_several() {
+    let r = rotating_with(&ADMIT_RENEW);
+    let at = NOW + DAY;
+    let first = steward_rotate(&r.steward, &r.base, &[renewed(&r.phone, 2)], at).unwrap();
+    let base_len = r.base.policy_body().certs.len();
+    // Phone again (serial 3) and tablet (serial 2) in one pair.
+    let batch = [renewed(&r.phone, 3), renewed(&r.tablet, 2)];
+    let second = steward_rotate(&r.steward, &first, &batch, at + 60).unwrap();
+    let tail = &second.policy_body().certs[base_len..];
+    assert_eq!(tail.len(), 2, "one tail certificate per node");
+    assert_eq!(tail[0], batch[0]);
+    assert_eq!(tail[1], batch[1]);
+    assert_eq!(
+        adopted_signer(judged(Some(&first), &second, at + 60)),
+        Signer::Steward {
+            key: r.steward.public(),
+            base_seq: r.base.seq(),
+        }
+    );
+}
+
+#[test]
+fn a_rotation_needs_both_the_admit_and_the_renew_right() {
+    let at = NOW + DAY;
+    for may in [&["renew"][..], &["admit"][..]] {
+        let r = rotating_with(may);
+        assert!(
+            matches!(
+                steward_rotate(&r.steward, &r.base, &[renewed(&r.phone, 2)], at),
+                Err(AdminError::Rejected(Reason::RightMissing))
+            ),
+            "{may:?}"
+        );
+    }
+}
+
+#[test]
+fn a_rotation_refuses_what_the_owner_op_refuses() {
+    let r = rotating_with(&ADMIT_RENEW);
+    let at = NOW + DAY;
+    // Not above the listed serial.
+    assert!(matches!(
+        steward_rotate(&r.steward, &r.base, &[renewed(&r.phone, 1)], at),
+        Err(AdminError::StaleCert {
+            listed: 1,
+            offered: 1
+        })
+    ));
+    // Another key.
+    let other = NodeKeys::generate();
+    let body = NodeCertBody {
+        v: menzil_proto::PROTOCOL_VERSION,
+        node_id: r.phone.node_id(),
+        x25519_pub: other.x25519_public(),
+        serial: 2,
+        not_before: NOW,
+        not_after: NOW + DAY,
+    };
+    let cert = NodeCert::sign(r.phone.signing_key(), &body).unwrap();
+    assert!(matches!(
+        steward_rotate(&r.steward, &r.base, &[cert], at),
+        Err(AdminError::NewKey(id)) if id == r.phone.node_id()
+    ));
+    // A stranger.
+    let stranger = NodeKeys::generate();
+    assert!(matches!(
+        steward_rotate(&r.steward, &r.base, &[renewed(&stranger, 2)], at),
+        Err(AdminError::NotAMember(id)) if id == stranger.node_id()
+    ));
+    // A window over 400 days.
+    let body = NodeCertBody {
+        v: menzil_proto::PROTOCOL_VERSION,
+        node_id: r.phone.node_id(),
+        x25519_pub: r.phone.x25519_public(),
+        serial: 2,
+        not_before: NOW,
+        not_after: NOW + 400 * DAY + 1,
+    };
+    let cert = NodeCert::sign(r.phone.signing_key(), &body).unwrap();
+    assert!(matches!(
+        steward_rotate(&r.steward, &r.base, &[cert], at),
+        Err(AdminError::CertLifetimeTooLong)
+    ));
+    // A revoked node: the owner revokes after the delegation, the steward builds on that pair.
+    let revoked = revoke(&r.owner, &r.base, r.phone.node_id(), NOW + 10).unwrap();
+    assert!(matches!(
+        steward_rotate(&r.steward, &revoked, &[renewed(&r.phone, 2)], at),
+        Err(AdminError::Revoked(id)) if id == r.phone.node_id()
+    ));
+}

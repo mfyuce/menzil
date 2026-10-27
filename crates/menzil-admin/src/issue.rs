@@ -158,6 +158,9 @@ impl Documents {
     /// [`check_bundle`]. These documents are trusted as verified: [`Self::verify`] first.
     pub fn held_view(&self) -> Result<HeldView, AdminError> {
         let held = HeldRoster::new(&self.roster, self.base.as_ref().map(|base| &base.roster))
+            .and_then(|held| {
+                held.with_policy(&self.policy, self.base.as_ref().map(|base| &base.policy))
+            })
             .map_err(AdminError::Rejected)?;
         Ok(HeldView {
             network_id: self.network_id(),
@@ -456,6 +459,73 @@ pub fn steward_admit(
         roles: vec![],
     });
     policy.certs.push(member.clone());
+    current.steward_signed(steward, roster, policy, base, now)
+}
+
+/// A steward lists the renewed certificates `certs` of members (protocol.md 2.3 rotation rule),
+/// several in one pair. Each passes the checks of an admission certificate (verifies, valid now,
+/// at most 400 days); its node must be a member ([`AdminError::Revoked`] when revoked,
+/// [`AdminError::NotAMember`] otherwise), its serial above every listed one
+/// ([`AdminError::StaleCert`]) and its key the one of the highest listed certificate
+/// ([`AdminError::NewKey`]). A certificate replaces that node's earlier tail certificate in
+/// place, else is appended; the Roster changes only in its dates. Two certificates for one node
+/// in `certs` are refused ([`AdminError::StaleCert`] for the lower or equal one). The result is
+/// judged by the acceptance predicate against `current` before it is returned, so a steward
+/// without both `admit` and `renew` gets [`AdminError::Rejected`].
+pub fn steward_rotate(
+    steward: &StewardSecret,
+    current: &Documents,
+    certs: &[NodeCert],
+    now: u64,
+) -> Result<Documents, AdminError> {
+    let current = current.clone().into_verified()?;
+    let (roster, mut policy, base) = current.steward_successor(steward, now)?;
+    let base_len = base.policy.decode()?.certs.len();
+    for cert in certs {
+        let body = checked_cert(cert, now)?;
+        if current
+            .roster_body()
+            .revoked
+            .iter()
+            .any(|revoked| revoked.node_id == body.node_id)
+        {
+            return Err(AdminError::Revoked(body.node_id));
+        }
+        if !current.is_member(&body.node_id) {
+            return Err(AdminError::NotAMember(body.node_id));
+        }
+        let mut highest: Option<menzil_proto::NodeCertBody> = None;
+        let mut tail_at: Option<usize> = None;
+        for (at, listed) in policy.certs.iter().enumerate() {
+            let listed = listed.decode()?;
+            if listed.node_id != body.node_id {
+                continue;
+            }
+            if at >= base_len {
+                tail_at = Some(at);
+            }
+            if highest
+                .as_ref()
+                .is_none_or(|best| listed.serial > best.serial)
+            {
+                highest = Some(listed);
+            }
+        }
+        let highest = highest.ok_or(AdminError::NotAMember(body.node_id))?;
+        if body.serial <= highest.serial {
+            return Err(AdminError::StaleCert {
+                listed: highest.serial,
+                offered: body.serial,
+            });
+        }
+        if body.x25519_pub != highest.x25519_pub {
+            return Err(AdminError::NewKey(body.node_id));
+        }
+        match tail_at {
+            Some(at) => policy.certs[at] = cert.clone(),
+            None => policy.certs.push(cert.clone()),
+        }
+    }
     current.steward_signed(steward, roster, policy, base, now)
 }
 

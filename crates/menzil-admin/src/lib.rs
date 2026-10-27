@@ -16,7 +16,8 @@
 //!   the clock is a parameter.
 //!
 //! * [`accept_cert`]: the owner lists a member's renewed certificate (protocol.md 2.2),
-//!   [`NodeKeys::next_cert`] makes it.
+//!   [`NodeKeys::next_cert`] makes it; [`steward_rotate`] is the steward form (a steward holding
+//!   both `admit` and `renew` lists it in the tail of the Policy's `certs`, same keys only).
 //!
 //! * [`revoke`], [`remove_grants`]: the owner takes a node out of the network for good (protocol.md
 //!   7.3: always as a revocation, because a steward could admit a merely removed node again) or
@@ -46,7 +47,7 @@ pub use error::AdminError;
 pub use issue::{
     DOCUMENT_LIFETIME_SECS, Documents, accept_cert, admit, check_name, check_role, create_network,
     delegate_steward, grant, is_invisible, is_unsafe, remove_grants, remove_steward, renew, revoke,
-    steward_admit, steward_renew,
+    steward_admit, steward_renew, steward_rotate,
 };
 pub use keys::{MAX_CERT_LIFETIME_SECS, NodeKeys, OwnerKey, StewardSecret};
 pub use menzil_proto::trust::{STEWARD_MAX_LIFETIME, STEWARD_SEQ_SPAN};

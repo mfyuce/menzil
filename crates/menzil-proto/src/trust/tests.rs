@@ -1270,3 +1270,294 @@ fn the_policy_follows_the_same_rule_for_what_is_new() {
         Reason::RightMissing
     );
 }
+
+// ---------------------------------------------------------------------------------------------
+// Cert rotation S3: a steward lists a member's renewed certificate (protocol.md 2.3)
+// ---------------------------------------------------------------------------------------------
+
+const KEY_A: [u8; 32] = [7u8; 32];
+
+fn cert_for(
+    k: &SigningKey,
+    x25519: [u8; 32],
+    serial: u32,
+    not_before: u64,
+    not_after: u64,
+) -> NodeCert {
+    let body = NodeCertBody {
+        v: PROTOCOL_VERSION,
+        node_id: id_of(k),
+        x25519_pub: X25519PublicKey::from(x25519),
+        serial,
+        not_before,
+        not_after,
+    };
+    NodeCert::sign(k, &body).unwrap()
+}
+
+/// A renewal of `k`'s certificate: same Noise key as the base's, `serial`, a 100 day window.
+fn renewal(k: &SigningKey, serial: u32) -> NodeCert {
+    cert_for(k, KEY_A, serial, NOW - DAY, NOW + 100 * DAY)
+}
+
+/// A fixture whose base also holds the member `m` (a real key) with its serial 1 certificate.
+fn fx_with_member(may: &[&str]) -> (Fx, SigningKey) {
+    let mut fx = fx_with_may(may);
+    let m = key();
+    fx.rb.members.push(RosterMember {
+        node_id: id_of(&m),
+        min_serial: 1,
+    });
+    fx.pb.members.push(PolicyMember {
+        node_id: id_of(&m),
+        name: "phone".to_string(),
+        roles: vec![],
+    });
+    fx.pb
+        .certs
+        .push(cert_for(&m, KEY_A, 1, NOW - 10 * DAY, NOW + 90 * DAY));
+    fx.base_roster = Roster::sign(&fx.owner, &fx.rb).unwrap();
+    fx.base_policy = Policy::sign(&fx.owner, &fx.pb).unwrap();
+    (fx, m)
+}
+
+/// What a verifier holds that adopted the steward pair `held`, Policy included.
+fn holding_policy(fx: &Fx, held: &Bundle) -> HeldView {
+    let roster = HeldRoster::new(held.roster.as_ref().unwrap(), Some(&fx.base_roster))
+        .unwrap()
+        .with_policy(held.policy.as_ref().unwrap(), Some(&fx.base_policy))
+        .unwrap();
+    HeldView {
+        network_id: fx.net,
+        roster: Some(roster),
+        policy_seq: held.policy.as_ref().map(|p| p.decode().unwrap().seq),
+    }
+}
+
+#[test]
+fn a_renewal_of_a_base_member_is_accepted() {
+    let (fx, m) = fx_with_member(&["admit", "renew"]);
+    let bundle = fx.steward_pair(|_, p| p.certs.push(renewal(&m, 2)));
+    let adoption = adopted(fx.check(&bundle));
+    assert!(matches!(adoption.signer, Signer::Steward { .. }));
+    assert_eq!(adoption.policy.unwrap().certs.len(), 2);
+    // The Roster alone (what a relay judges) is the plain renewal and passes.
+    let roster_only = Bundle {
+        base_roster: bundle.base_roster.clone(),
+        roster: bundle.roster.clone(),
+        ..Bundle::default()
+    };
+    adopted(fx.check(&roster_only));
+}
+
+#[test]
+fn a_renewal_with_another_noise_key_is_refused() {
+    let (fx, m) = fx_with_member(&["admit", "renew"]);
+    let other = cert_for(&m, [8u8; 32], 2, NOW - DAY, NOW + 100 * DAY);
+    let bundle = fx.steward_pair(|_, p| p.certs.push(other));
+    assert_eq!(rejected(fx.check(&bundle)), Reason::BadCert);
+}
+
+#[test]
+fn a_renewal_must_have_a_serial_above_every_base_certificate() {
+    let (mut fx, m) = fx_with_member(&["admit", "renew"]);
+    // The base lists serials 1 and 3 for the node (the highest is not the last).
+    fx.pb
+        .certs
+        .push(cert_for(&m, KEY_A, 3, NOW - 10 * DAY, NOW + 90 * DAY));
+    fx.pb
+        .certs
+        .push(cert_for(&m, KEY_A, 2, NOW - 10 * DAY, NOW + 90 * DAY));
+    fx.base_policy = Policy::sign(&fx.owner, &fx.pb).unwrap();
+    for serial in [1, 2, 3] {
+        let bundle = fx.steward_pair(|_, p| p.certs.push(renewal(&m, serial)));
+        assert_eq!(rejected(fx.check(&bundle)), Reason::BadCert, "{serial}");
+    }
+    let bundle = fx.steward_pair(|_, p| p.certs.push(renewal(&m, 4)));
+    adopted(fx.check(&bundle));
+}
+
+#[test]
+fn a_renewal_must_be_self_signed_and_at_most_400_days() {
+    let (fx, m) = fx_with_member(&["admit", "renew"]);
+    let forged = {
+        let body = renewal(&m, 2).decode().unwrap();
+        NodeCert::sign(&key(), &body).unwrap()
+    };
+    let bundle = fx.steward_pair(|_, p| p.certs.push(forged));
+    assert_eq!(rejected(fx.check(&bundle)), Reason::BadCert);
+    let long = cert_for(&m, KEY_A, 2, NOW - DAY, NOW - DAY + 400 * DAY + 1);
+    let bundle = fx.steward_pair(|_, p| p.certs.push(long));
+    assert_eq!(rejected(fx.check(&bundle)), Reason::BadCert);
+    let exact = cert_for(&m, KEY_A, 2, NOW - DAY, NOW - DAY + 400 * DAY);
+    let bundle = fx.steward_pair(|_, p| p.certs.push(exact));
+    adopted(fx.check(&bundle));
+}
+
+#[test]
+fn two_tail_certificates_for_one_node_are_refused() {
+    let (fx, m) = fx_with_member(&["admit", "renew"]);
+    let bundle = fx.steward_pair(|_, p| {
+        p.certs.push(renewal(&m, 2));
+        p.certs.push(renewal(&m, 3));
+    });
+    assert_eq!(rejected(fx.check(&bundle)), Reason::BadCert);
+    // Also for an appended member: its admission certificate and a second one.
+    let (fx, _) = fx_with_member(&["admit", "renew"]);
+    let new_key = key();
+    let bundle = fx.steward_pair(|r, p| {
+        admit(&new_key, "tablet", r, p);
+        p.certs
+            .push(cert_for(&new_key, [7u8; 32], 2, NOW - DAY, NOW + DAY));
+    });
+    assert_eq!(rejected(fx.check(&bundle)), Reason::BadCert);
+}
+
+#[test]
+fn a_held_tail_certificate_may_not_be_dropped() {
+    let (fx, m) = fx_with_member(&["admit", "renew"]);
+    let held_pair = fx.pair(&fx.steward, 11, |_, p| p.certs.push(renewal(&m, 2)));
+    let held = holding_policy(&fx, &held_pair);
+    // The next pair from the same base without the renewal: the steward took it back.
+    let dropped = fx.pair(&fx.steward, 12, |_, _| {});
+    assert_eq!(
+        rejected(check_bundle(&held, &dropped, NOW)),
+        Reason::AppendedDropped
+    );
+    // With it (a plain renewal of dates) the pair passes.
+    let kept = fx.pair(&fx.steward, 12, |_, p| p.certs.push(renewal(&m, 2)));
+    adopted(check_bundle(&held, &kept, NOW));
+}
+
+#[test]
+fn a_held_tail_certificate_may_not_be_lowered_or_given_another_key() {
+    let (fx, m) = fx_with_member(&["admit", "renew"]);
+    let held_pair = fx.pair(&fx.steward, 11, |_, p| p.certs.push(renewal(&m, 3)));
+    let held = holding_policy(&fx, &held_pair);
+    // Lowered: still above the base's serial 1, but below the held 3.
+    let lowered = fx.pair(&fx.steward, 12, |_, p| p.certs.push(renewal(&m, 2)));
+    assert_eq!(
+        rejected(check_bundle(&held, &lowered, NOW)),
+        Reason::AppendedDropped
+    );
+    // Equal serial is not below: allowed (new dates).
+    let same = fx.pair(&fx.steward, 12, |_, p| {
+        p.certs
+            .push(cert_for(&m, KEY_A, 3, NOW - DAY, NOW + 120 * DAY));
+    });
+    adopted(check_bundle(&held, &same, NOW));
+    // Raised is allowed.
+    let raised = fx.pair(&fx.steward, 12, |_, p| p.certs.push(renewal(&m, 4)));
+    adopted(check_bundle(&held, &raised, NOW));
+}
+
+#[test]
+fn a_held_tail_certificate_of_an_admitted_member_keeps_its_key() {
+    let fx = fx_with_may(&["admit", "renew"]);
+    let a = key();
+    let held_pair = fx.pair(&fx.steward, 11, |r, p| admit(&a, "printer", r, p));
+    let held = holding_policy(&fx, &held_pair);
+    // The same admission with a certificate for another Noise key.
+    let rekeyed = fx.pair(&fx.steward, 12, |r, p| {
+        admit(&a, "printer", r, p);
+        p.certs.pop();
+        p.certs
+            .push(cert_for(&a, [9u8; 32], 2, NOW - DAY, NOW + DAY));
+    });
+    assert_eq!(
+        rejected(check_bundle(&held, &rekeyed, NOW)),
+        Reason::AppendedDropped
+    );
+    // The same key with a higher serial is a rotation of the admitted member: allowed.
+    let rotated = fx.pair(&fx.steward, 12, |r, p| {
+        admit(&a, "printer", r, p);
+        p.certs.pop();
+        p.certs.push(cert_for(&a, KEY_A, 2, NOW - DAY, NOW + DAY));
+    });
+    adopted(check_bundle(&held, &rotated, NOW));
+}
+
+#[test]
+fn a_rotation_needs_admit_on_the_policy_and_renew_on_the_roster() {
+    for may in [&["renew"][..], &["admit"][..]] {
+        let (fx, m) = fx_with_member(may);
+        let bundle = fx.steward_pair(|_, p| p.certs.push(renewal(&m, 2)));
+        assert_eq!(rejected(fx.check(&bundle)), Reason::RightMissing, "{may:?}");
+    }
+    // The Policy alone (it travels alone on `menzil:docs`) with a held Roster needs `admit`: a
+    // renew only steward is refused on the Policy side, which is not the Roster's rule.
+    let (fx, m) = fx_with_member(&["renew"]);
+    let renewed = fx.steward_pair(|_, _| {});
+    let held = holding_policy(&fx, &renewed);
+    let policy_only = {
+        let mut p = fx.pb.clone();
+        p.seq = fx.base_seq() + 1;
+        p.issued = NOW;
+        p.expires = (NOW + 7 * DAY).min(fx.not_after);
+        p.certs.push(renewal(&m, 2));
+        Bundle {
+            base_policy: Some(fx.base_policy.clone()),
+            policy: Some(Policy::sign(&fx.steward, &p).unwrap()),
+            ..Bundle::default()
+        }
+    };
+    let held = HeldView {
+        policy_seq: Some(fx.base_seq()),
+        ..held
+    };
+    assert_eq!(
+        rejected(check_bundle(&held, &policy_only, NOW)),
+        Reason::RightMissing
+    );
+    let (fx, _) = fx_with_member(&["admit", "renew"]);
+    adopted(fx.check(&fx.steward_pair(|_, _| {})));
+}
+
+#[test]
+fn a_tail_certificate_for_a_non_member_is_refused() {
+    let (fx, _) = fx_with_member(&["admit", "renew"]);
+    let stranger = key();
+    let bundle = fx.steward_pair(|_, p| p.certs.push(renewal(&stranger, 2)));
+    assert_eq!(rejected(fx.check(&bundle)), Reason::BadCert);
+    // A revoked node is not a member either.
+    let revoked = SigningKey::from_bytes(&[5u8; 32]);
+    let mut fx2 = fx_with_may(&["admit", "renew"]);
+    fx2.rb.revoked.push(RevokedMember {
+        node_id: id_of(&revoked),
+        since: NOW - DAY,
+    });
+    fx2.base_roster = Roster::sign(&fx2.owner, &fx2.rb).unwrap();
+    let bundle = fx2.steward_pair(|_, p| p.certs.push(renewal(&revoked, 2)));
+    assert_eq!(rejected(fx2.check(&bundle)), Reason::BadCert);
+}
+
+#[test]
+fn a_rotation_cannot_change_the_roster_or_a_min_serial() {
+    let (fx, m) = fx_with_member(&["admit", "renew"]);
+    let bundle = fx.steward_pair(|r, p| {
+        p.certs.push(renewal(&m, 2));
+        r.members.last_mut().unwrap().min_serial = 2;
+    });
+    assert_eq!(rejected(fx.check(&bundle)), Reason::FieldChanged);
+}
+
+#[test]
+fn a_base_member_without_a_base_certificate_cannot_be_renewed() {
+    // The base members of the plain fixture list no certificate: there is no key to hold to.
+    let fx = Fx::new();
+    let k = key();
+    let mut fx = fx;
+    fx.rb.members.push(RosterMember {
+        node_id: id_of(&k),
+        min_serial: 1,
+    });
+    fx.pb.members.push(PolicyMember {
+        node_id: id_of(&k),
+        name: "bare".to_string(),
+        roles: vec![],
+    });
+    fx.base_roster = Roster::sign(&fx.owner, &fx.rb).unwrap();
+    fx.base_policy = Policy::sign(&fx.owner, &fx.pb).unwrap();
+    let bundle = fx.steward_pair(|_, p| p.certs.push(renewal(&k, 2)));
+    assert_eq!(rejected(fx.check(&bundle)), Reason::BadCert);
+}
