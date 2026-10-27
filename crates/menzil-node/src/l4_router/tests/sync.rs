@@ -282,21 +282,42 @@ async fn a_second_docs_only_follow_up_within_a_minute_starts_no_handshake() {
     let session = ensure(&nm, r.id, w.network).await.unwrap();
     let inits = net.count_from(&m.id, "init");
 
-    // The follow-up is called while a session stands: it starts nothing, but is written down.
-    sync_m.rehandshake(r.id, w.network).await;
+    // The follow-up is called while a session stands: it starts nothing, but is written down,
+    // and says truthfully that a session is up.
+    assert!(sync_m.rehandshake(r.id, w.network).await);
     assert_eq!(net.count_from(&m.id, "init"), inits);
     session.close(None);
     settle().await;
-    // Within the minute the session is gone and still no new handshake starts.
-    sync_m.rehandshake(r.id, w.network).await;
+    // Within the minute the session is gone and still no new handshake starts, and none is up.
+    assert!(!sync_m.rehandshake(r.id, w.network).await);
     assert_eq!(net.count_from(&m.id, "init"), inits, "the window holds");
     tokio::time::sleep(Duration::from_secs(61)).await;
-    sync_m.rehandshake(r.id, w.network).await;
+    assert!(sync_m.rehandshake(r.id, w.network).await);
     assert_eq!(
         net.count_from(&m.id, "init"),
         inits + 1,
         "after the window it may"
     );
+    // Rate limited again, and a full session stands (the one just made): true (round 14 L2).
+    assert!(sync_m.rehandshake(r.id, w.network).await);
+    assert_eq!(net.count_from(&m.id, "init"), inits + 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_follow_up_handshake_that_gets_no_answer_does_not_say_it_came_up() {
+    let w = world();
+    let (r, m) = (party(), party());
+    let (r1, p1) = w.fresh_pair(1, &[&r, &m], &[&r, &m], &[&r, &m]);
+    let (stores_r, stores_m) = (stores_from(&r1, &p1), stores_from(&r1, &p1));
+    let net = Net::new();
+    let mut nr = node(&net, &r, &stores_r).await;
+    let mut nm = node(&net, &m, &stores_m).await;
+    let sync_m = sync_for(&nm, &m, &stores_m);
+    auto_serve(&mut nr, &r, &stores_r, None);
+    auto_serve(&mut nm, &m, &stores_m, None);
+    net.set_up(&r.id, false);
+    assert!(!sync_m.rehandshake(r.id, w.network).await);
+    assert!(net.count_from(&m.id, "init") >= 1, "a handshake was tried");
 }
 
 #[tokio::test(start_paused = true)]
@@ -338,6 +359,173 @@ async fn a_docs_only_push_that_was_not_adopted_starts_no_new_handshake() {
         1,
         "nothing was adopted: no new handshake"
     );
+}
+
+// ---- round 14: waiters, concurrent callers, the bounds ----------------------------------
+
+/// Delivers the first held frame of `kind` (the rest stay held).
+fn pass_held(net: &Net, kind: &str) -> bool {
+    let frame = {
+        let mut inner = net.inner.lock().unwrap();
+        let pos = inner.held.iter().position(|h| {
+            let k = match E2eFrame::decode(&h.4) {
+                Ok(E2eFrame::Init { .. }) => "init",
+                Ok(E2eFrame::Resp { .. }) => "resp",
+                Ok(E2eFrame::Data { .. }) => "data",
+                Err(_) => "other",
+            };
+            k == kind
+        });
+        match pos {
+            Some(p) => inner.held.remove(p),
+            None => return false,
+        }
+    };
+    net.inner.lock().unwrap().holding = false;
+    net.deliver(frame.0, frame.1, frame.2, frame.3, frame.4);
+    net.inner.lock().unwrap().holding = true;
+    true
+}
+
+async fn pass_until(net: &Net, kind: &str) {
+    for _ in 0..10_000 {
+        if pass_held(net, kind) {
+            return;
+        }
+        tokio::task::yield_now().await;
+    }
+    panic!("no {kind} frame was held");
+}
+
+/// R is behind (its Policy has no cert for M), M holds seq 2.
+async fn behind_responder() -> (
+    World,
+    Party,
+    Party,
+    Stores,
+    Net,
+    TestNode,
+    TestNode,
+    Arc<DocsSync>,
+) {
+    let w = world();
+    let (r, m) = (party(), party());
+    let (r1, _) = w.fresh_pair(1, &[&r, &m], &[&r, &m], &[&r, &m]);
+    let p1 = w.policy(&[&r, &m], &[&r], vec![]);
+    let (r2, p2) = w.fresh_pair(2, &[&r, &m], &[&r, &m], &[&r, &m]);
+    let (stores_r, stores_m) = (stores_from(&r1, &p1), stores_from(&r2, &p2));
+    let net = Net::new();
+    let mut nr = node(&net, &r, &stores_r).await;
+    let mut nm = node(&net, &m, &stores_m).await;
+    let sync_r = sync_for(&nr, &r, &stores_r);
+    let sync_m = sync_for(&nm, &m, &stores_m);
+    auto_serve(&mut nr, &r, &stores_r, Some(&sync_r));
+    auto_serve(&mut nm, &m, &stores_m, Some(&sync_m));
+    (w, r, m, stores_r, net, nr, nm, sync_m)
+}
+
+#[tokio::test(start_paused = true)]
+async fn two_callers_to_a_peer_that_is_behind_both_see_the_push_adopted() {
+    let (w, r, m, _stores_r, net, _nr, nm, sync_m) = behind_responder().await;
+    let (rid, nid) = (r.id, w.network);
+
+    net.hold();
+    // Caller A: its init, R's docs only resp.
+    let since_a = tokio::time::Instant::now();
+    let h1 = nm.handle.clone();
+    let a_task = tokio::spawn(async move { h1.ensure_session(rid, nid).await.err() });
+    pass_until(&net, "init").await;
+    pass_until(&net, "resp").await;
+    assert_eq!(a_task.await.unwrap(), Some(EnsureError::DocsOnly));
+    // Caller B, a moment later: its init reaches R before any frame of A's push, so R replaces
+    // A's docs only session with a second one and A's push fails.
+    let since_b = tokio::time::Instant::now();
+    let h2 = nm.handle.clone();
+    let b_task = tokio::spawn(async move { h2.ensure_session(rid, nid).await.err() });
+    pass_until(&net, "init").await;
+    for _ in 0..200 {
+        tokio::task::yield_now().await;
+    }
+    net.release();
+    assert_eq!(b_task.await.unwrap(), Some(EnsureError::DocsOnly));
+    let wa = tokio::spawn({
+        let s = sync_m.clone();
+        async move { s.wait_docs_only_push(rid, nid, since_a).await }
+    });
+    let wb = tokio::spawn({
+        let s = sync_m.clone();
+        async move { s.wait_docs_only_push(rid, nid, since_b).await }
+    });
+    assert!(wa.await.unwrap(), "A: the second push was adopted");
+    assert!(wb.await.unwrap(), "B: the second push was adopted");
+    settle().await;
+    // The session that came up is found without a new init.
+    let inits = net.count_from(&m.id, "init");
+    assert!(ensure(&nm, rid, nid).await.is_ok());
+    assert_eq!(net.count_from(&m.id, "init"), inits);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_waiter_at_its_bound_says_yes_while_the_follow_up_handshake_is_still_out() {
+    let (w, r, m, stores_r, net, _nr, nm, sync_m) = behind_responder().await;
+    let (rid, nid) = (r.id, w.network);
+
+    net.hold();
+    let since = tokio::time::Instant::now();
+    let h = nm.handle.clone();
+    let task = tokio::spawn(async move { h.ensure_session(rid, nid).await.err() });
+    // Everything passes except the second init of M (the follow up handshake).
+    for _ in 0..20_000 {
+        if net.count_from(&m.id, "init") >= 2 {
+            break;
+        }
+        if !(pass_held(&net, "init") && net.count_from(&m.id, "init") < 2
+            || pass_held(&net, "resp")
+            || pass_held(&net, "data"))
+        {
+            tokio::task::yield_now().await;
+        }
+    }
+    assert_eq!(task.await.unwrap(), Some(EnsureError::DocsOnly));
+    assert_eq!(
+        net.count_from(&m.id, "init"),
+        2,
+        "the follow up init is out"
+    );
+    assert_eq!(held(&stores_r, nid), (Some(2), Some(2)), "and was adopted");
+    let waited = sync_m.wait_docs_only_push(rid, nid, since).await;
+    assert!(waited, "adopted, handshake pending at the bound: retry");
+    assert!(since.elapsed() >= crate::docs_sync::DOCS_ONLY_WAIT);
+    // The retry joins the pending handshake once the wire is back.
+    net.release();
+    assert!(ensure(&nm, rid, nid).await.is_ok());
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_memory_of_finished_pushes_evicts_the_oldest_not_all() {
+    let w = world();
+    let (a, b) = (party(), party());
+    let stores_a = w.stores(&[&a, &b], vec![]);
+    let net = Net::new();
+    let na = node(&net, &a, &stores_a).await;
+    let sync = sync_for(&na, &a, &stores_a);
+    let since = tokio::time::Instant::now();
+    let peer = |i: u32| {
+        let mut id = [0u8; 32];
+        id[..4].copy_from_slice(&i.to_be_bytes());
+        NodeId::from(id)
+    };
+    // One more than the cap, one tick apart.
+    for i in 0..=256u32 {
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        sync.end_push((peer(i), w.network), u64::from(i), true);
+    }
+    // The newest and the second oldest are still there; only the oldest went.
+    assert!(sync.wait_docs_only_push(peer(256), w.network, since).await);
+    assert!(sync.wait_docs_only_push(peer(1), w.network, since).await);
+    let before = tokio::time::Instant::now();
+    assert!(!sync.wait_docs_only_push(peer(0), w.network, since).await);
+    assert!(before.elapsed() >= crate::docs_sync::DOCS_ONLY_WAIT);
 }
 
 // ---- the registry of live sessions -----------------------------------------------

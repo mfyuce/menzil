@@ -585,7 +585,9 @@ pub(crate) fn serve_session<H>(
         if let Some(sync) = sync {
             let sync = Arc::clone(sync);
             let handle = handle.clone();
-            tokio::spawn(async move { sync.docs_only_push(handle).await });
+            // Noted before the task runs, so a waiter never sees a gap between two pushes.
+            let running = sync.begin_docs_only_push(&handle);
+            tokio::spawn(async move { sync.docs_only_push(handle, running).await });
         }
         tokio::spawn(async move {
             accept_loop(&mut acceptor, DenyAll, RefuseAll).await;

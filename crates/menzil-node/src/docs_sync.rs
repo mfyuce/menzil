@@ -79,8 +79,8 @@ pub(crate) const REHANDSHAKE_WINDOW: Duration = Duration::from_secs(60);
 /// up. When it does not finish in time the caller gets the docs only error, as without a retry.
 pub const DOCS_ONLY_WAIT: Duration = Duration::from_secs(10);
 
-/// The most finished pushes [`DocsSync`] remembers for waiters; past it the memory is cleared
-/// (a waiter then times out). Entries older than twice [`DOCS_ONLY_WAIT`] are dropped first.
+/// The most finished pushes [`DocsSync`] remembers for waiters; past it the oldest is evicted.
+/// Entries older than twice [`DOCS_ONLY_WAIT`] are dropped first.
 const PUSH_DONE_CAP: usize = 256;
 /// How many times a Policy catch-up repeats because the Roster moved on while it ran.
 const CATCH_UP_ROUNDS: usize = 4;
@@ -443,6 +443,56 @@ struct Live {
     policy_seq: Option<u64>,
 }
 
+/// What [`DocsSync::wait_docs_only_push`] reads: per `(peer, network)`, the last end of a push
+/// and the last end of one that came up (so a quick failure of one push cannot hide the
+/// success of another), and the pushes still running.
+#[derive(Default)]
+struct PushState {
+    done: HashMap<(NodeId, NetworkId), PushDone>,
+    running: HashMap<(NodeId, NetworkId), Vec<Running>>,
+    next_id: u64,
+}
+
+struct PushDone {
+    /// When the last push ended, however it ended.
+    at: Instant,
+    /// When the last push that was adopted and brought a session up ended.
+    came_up: Option<Instant>,
+}
+
+struct Running {
+    id: u64,
+    started: Instant,
+    /// The push was adopted and the follow up handshake is out (or was just started).
+    handshaking: bool,
+}
+
+/// A docs only push that runs: from the moment its session is handed to [`serve_session`]
+/// until [`DocsSync::docs_only_push`] ends it. Dropped without that (a panic, a cancelled
+/// task), it removes itself and wakes the waiters.
+pub(crate) struct PushRunning {
+    sync: Arc<DocsSync>,
+    key: (NodeId, NetworkId),
+    id: u64,
+    ended: bool,
+}
+
+impl Drop for PushRunning {
+    fn drop(&mut self) {
+        if !self.ended {
+            self.sync.end_push(self.key, self.id, false);
+        }
+    }
+}
+
+/// What [`DocsSync::push_verdict`] says to a waiting caller.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Verdict {
+    CameUp,
+    No,
+    Wait { handshaking: bool },
+}
+
 /// The sync tasks of one node: shared by its sessions (see the module docs).
 pub struct DocsSync {
     router: RouterHandle,
@@ -456,12 +506,11 @@ pub struct DocsSync {
     next_id: AtomicU64,
     rehandshaken: Mutex<RehandshakeGuard>,
     catching_up: Mutex<HashSet<NetworkId>>,
-    /// Docs only pushes this node initiated that finished: when, and whether the push was adopted
-    /// and the fresh session came up. Bounded by [`PUSH_DONE_CAP`] and by age; written only by
-    /// [`Self::docs_only_push`], so a peer cannot add entries beyond the docs only sessions
-    /// this node starts.
-    push_done: Mutex<HashMap<(NodeId, NetworkId), (Instant, bool)>>,
-    /// Bumped whenever `push_done` gains an entry, to wake waiters.
+    /// The docs only pushes this node initiated, finished and running ([`PushState`]). Written
+    /// only for the docs only sessions this node starts, so a peer cannot add entries beyond
+    /// those; bounded by [`PUSH_DONE_CAP`] and by age.
+    pushes: Mutex<PushState>,
+    /// Bumped whenever `pushes` changes in a way a waiter must look at again.
     push_tick: watch::Sender<u64>,
 }
 
@@ -500,7 +549,7 @@ impl DocsSync {
             next_id: AtomicU64::new(0),
             rehandshaken: Mutex::default(),
             catching_up: Mutex::default(),
-            push_done: Mutex::default(),
+            pushes: Mutex::default(),
             push_tick: watch::channel(0).0,
         })
     }
@@ -698,16 +747,36 @@ impl DocsSync {
         run_plan(plan, &mut OverSession { sync: self, handle }).await;
     }
 
+    /// Notes, before its task is spawned, that a docs only push on `handle`'s session will run.
+    pub(crate) fn begin_docs_only_push(self: &Arc<Self>, handle: &L4SessionHandle) -> PushRunning {
+        let key = (handle.peer(), handle.network_id());
+        let mut state = self.pushes.lock().unwrap_or_else(|e| e.into_inner());
+        let id = state.next_id;
+        state.next_id += 1;
+        state.running.entry(key).or_default().push(Running {
+            id,
+            started: Instant::now(),
+            handshaking: false,
+        });
+        PushRunning {
+            sync: Arc::clone(self),
+            key,
+            id,
+            ended: false,
+        }
+    }
+
     /// The initiator side of a docs only session: one push, and when it was adopted one new
     /// handshake (never a second within [`REHANDSHAKE_WINDOW`], whatever the peer answers).
     /// However it ends, the end is noted for [`Self::wait_docs_only_push`].
-    pub(crate) async fn docs_only_push(&self, handle: L4SessionHandle) {
+    pub(crate) async fn docs_only_push(&self, handle: L4SessionHandle, mut running: PushRunning) {
         let (peer, network_id) = (handle.peer(), handle.network_id());
         let came_up = match self.push_over(&handle).await {
             Ok(Some(result))
                 if result.roster == Outcome::Adopted || result.policy == Outcome::Adopted =>
             {
-                self.rehandshake(peer, network_id).await
+                self.rehandshake_inner(peer, network_id, Some((running.key, running.id)))
+                    .await
             }
             Ok(other) => {
                 tracing::debug!(%peer, ?other, "the push on a docs only session was not adopted");
@@ -718,26 +787,82 @@ impl DocsSync {
                 false
             }
         };
-        self.note_push_done(peer, network_id, came_up);
+        running.ended = true;
+        self.end_push(running.key, running.id, came_up);
     }
 
-    fn note_push_done(&self, peer: NodeId, network_id: NetworkId, came_up: bool) {
+    /// Ends push `id` of `key`: removes it from the running ones and writes its result, in one
+    /// step, then wakes the waiters.
+    pub(crate) fn end_push(&self, key: (NodeId, NetworkId), id: u64, came_up: bool) {
         let now = Instant::now();
         {
-            let mut done = self.push_done.lock().unwrap_or_else(|e| e.into_inner());
-            done.retain(|_, (at, _)| now.duration_since(*at) < DOCS_ONLY_WAIT * 2);
-            if done.len() >= PUSH_DONE_CAP {
-                done.clear();
+            let mut state = self.pushes.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(list) = state.running.get_mut(&key) {
+                list.retain(|run| run.id != id);
+                if list.is_empty() {
+                    state.running.remove(&key);
+                }
             }
-            done.insert((peer, network_id), (now, came_up));
+            state
+                .done
+                .retain(|_, done| now.duration_since(done.at) < DOCS_ONLY_WAIT * 2);
+            if !state.done.contains_key(&key)
+                && state.done.len() >= PUSH_DONE_CAP
+                && let Some(oldest) = state
+                    .done
+                    .iter()
+                    .min_by_key(|(_, done)| done.at)
+                    .map(|(key, _)| *key)
+            {
+                state.done.remove(&oldest);
+            }
+            let entry = state.done.entry(key).or_insert(PushDone {
+                at: now,
+                came_up: None,
+            });
+            entry.at = now;
+            if came_up {
+                entry.came_up = Some(now);
+            }
         }
         self.push_tick
             .send_modify(|tick| *tick = tick.wrapping_add(1));
     }
 
+    /// What a caller that started at `since` may conclude from the pushes of `key`.
+    fn push_verdict(&self, key: (NodeId, NetworkId), since: Instant) -> Verdict {
+        let state = self.pushes.lock().unwrap_or_else(|e| e.into_inner());
+        let done = state.done.get(&key);
+        if done.is_some_and(|done| done.came_up.is_some_and(|at| at >= since)) {
+            return Verdict::CameUp;
+        }
+        // A push that began after the caller did (another caller's docs only session replaced
+        // the one this caller met) may still be adopted: no verdict yet.
+        let running = state
+            .running
+            .get(&key)
+            .into_iter()
+            .flatten()
+            .filter(|run| run.started >= since);
+        let (mut any, mut handshaking) = (false, false);
+        for run in running {
+            any = true;
+            handshaking |= run.handshaking;
+        }
+        if any {
+            return Verdict::Wait { handshaking };
+        }
+        if done.is_some_and(|done| done.at >= since) {
+            return Verdict::No;
+        }
+        Verdict::Wait { handshaking: false }
+    }
+
     /// For a caller whose attempt at `peer` met a docs only answer at `since` or later: waits up
-    /// to [`DOCS_ONLY_WAIT`] for the push on that session to finish, and returns whether it was
-    /// adopted and the handshake after it came up (false: no point in trying again). Holds no
+    /// to [`DOCS_ONLY_WAIT`] for the push on that session (or on one that replaced it) to finish,
+    /// and returns whether it was adopted and the handshake after it came up (false: no point in
+    /// trying again). At the bound it also says true while an adopted push's follow up handshake
+    /// is still out: the caller's retry joins it, bounded by the router's own timeout. Holds no
     /// state of its own, so a hostile peer cannot make it hold anything beyond this one timer
     /// per caller.
     pub(crate) async fn wait_docs_only_push(
@@ -746,38 +871,61 @@ impl DocsSync {
         network_id: NetworkId,
         since: Instant,
     ) -> bool {
+        let key = (peer, network_id);
         let deadline = Instant::now() + DOCS_ONLY_WAIT;
         // Subscribed before the look, so a push that ends in between wakes the loop.
         let mut tick = self.push_tick.subscribe();
         loop {
-            let found = self
-                .push_done
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .get(&(peer, network_id))
-                .copied();
-            if let Some((at, came_up)) = found
-                && at >= since
-            {
-                return came_up;
+            let verdict = self.push_verdict(key, since);
+            match verdict {
+                Verdict::CameUp => return true,
+                Verdict::No => return false,
+                Verdict::Wait { .. } => {}
             }
             match tokio::time::timeout_at(deadline, tick.changed()).await {
                 Ok(Ok(())) => {}
-                _ => return false,
+                _ => {
+                    return matches!(
+                        self.push_verdict(key, since),
+                        Verdict::CameUp | Verdict::Wait { handshaking: true }
+                    );
+                }
             }
         }
     }
 
     /// Starts one handshake with `peer`, unless one was started for it a moment ago. A session
-    /// that comes up is announced like any other. Returns whether one came up.
+    /// that comes up is announced like any other. Returns whether a session is up as a result:
+    /// the one this call made, or, when the window forbids a new handshake, the one that already
+    /// stands (asked of the router, which starts nothing).
+    #[cfg(test)]
     pub(crate) async fn rehandshake(&self, peer: NodeId, network_id: NetworkId) -> bool {
+        self.rehandshake_inner(peer, network_id, None).await
+    }
+
+    async fn rehandshake_inner(
+        &self,
+        peer: NodeId,
+        network_id: NetworkId,
+        push: Option<((NodeId, NetworkId), u64)>,
+    ) -> bool {
         let allowed = self
             .rehandshaken
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .allow(peer, network_id, Instant::now());
         if !allowed {
-            return false;
+            return self.router.has_session(peer, network_id).await;
+        }
+        if let Some((key, id)) = push {
+            let mut state = self.pushes.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(run) = state
+                .running
+                .get_mut(&key)
+                .and_then(|list| list.iter_mut().find(|run| run.id == id))
+            {
+                run.handshaking = true;
+            }
         }
         if let Err(error) = self.router.ensure_session(peer, network_id).await {
             tracing::debug!(%peer, %error, "the handshake after a docs only push did not come up");

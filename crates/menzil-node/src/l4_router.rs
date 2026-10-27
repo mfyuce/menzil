@@ -437,6 +437,26 @@ impl RouterHandle {
         answer.await.map_err(|_| EnsureError::RouterGone)?
     }
 
+    /// Whether a full session to `peer` in `network_id` is up now and in good standing by the
+    /// documents held now. Starts no handshake and closes nothing (unlike
+    /// [`Self::ensure_session`]); a router that is gone or stopping says `false`.
+    pub async fn has_session(&self, peer: NodeId, network_id: NetworkId) -> bool {
+        let (reply, answer) = oneshot::channel();
+        if self
+            .commands
+            .send(Command::Standing {
+                peer,
+                network_id,
+                reply,
+            })
+            .await
+            .is_err()
+        {
+            return false;
+        }
+        answer.await.unwrap_or(false)
+    }
+
     /// Ends every session with `reason` as its CLOSE, drops every initiation
     /// that is out and tells every caller still waiting for a session
     /// [`EnsureError::ShuttingDown`]; from then on the router answers no
@@ -528,6 +548,12 @@ enum Command {
         /// The dial's purpose is `menzil:docs`.
         docs: bool,
         reply: oneshot::Sender<Result<L4SessionHandle, EnsureError>>,
+    },
+    /// Whether a session in good standing is up, asking for nothing and changing nothing.
+    Standing {
+        peer: NodeId,
+        network_id: NetworkId,
+        reply: oneshot::Sender<bool>,
     },
     Stop {
         reason: CloseReason,
@@ -1208,6 +1234,31 @@ impl Engine {
             &self.local_static,
             now,
         )
+    }
+
+    /// Whether the slot has a current session that `ensure` would hand out (read only).
+    fn has_standing_session(&self, peer: NodeId, network: NetworkId, now: Now) -> bool {
+        if self.stopping {
+            return false;
+        }
+        let Some(index) = self.table.slot(&peer, &network).current else {
+            return false;
+        };
+        let Some(entry) = self.table.get(index) else {
+            return false;
+        };
+        session_standing(
+            &self.policies,
+            &self.rosters,
+            &network,
+            &peer,
+            &entry.peer_static,
+            &self.local_node_id,
+            self.local_cert_serial,
+            &self.local_static,
+            now.unix,
+        )
+        .is_ok()
     }
 
     fn ensure(&mut self, peer: NodeId, network: NetworkId, docs: bool, reply: Waiter, now: Now) {
@@ -1894,6 +1945,9 @@ async fn run_router(
                 match command {
                     Some(Command::Ensure { peer, network_id, docs, reply }) => {
                         engine.ensure(peer, network_id, docs, reply, Now::capture());
+                    }
+                    Some(Command::Standing { peer, network_id, reply }) => {
+                        let _ = reply.send(engine.has_standing_session(peer, network_id, Now::capture()));
                     }
                     Some(Command::Stop { reason, done }) => {
                         engine.on_stop(&reason);
