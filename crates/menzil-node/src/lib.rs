@@ -60,6 +60,7 @@
 #![forbid(unsafe_code)]
 
 mod admission;
+mod cert_candidates;
 mod cert_index;
 pub mod docs;
 mod docs_access;
@@ -84,6 +85,7 @@ pub use admission::{
     decide_responder_admission, docs_only_standing, docs_service, is_docs_service,
     is_unrevoked_roster_member, resolve_dial_cert, session_standing,
 };
+pub use cert_candidates::{CertCandidates, Holder, Offer, Offerer, Refusal};
 pub use docs_access::{DocsGate, DocsLimits, DocsPermit, SessionHandler, SessionOpened};
 pub use docs_store::{Adopted, AdoptedDocs, DocStore};
 pub use docs_sync::{DOCS_ONLY_WAIT, POLICY_JITTER_MAX, PushReport, SyncConfig};

@@ -23,12 +23,16 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use futures_util::io::{AsyncReadExt, AsyncWriteExt};
-use menzil_proto::{ErrorCode, NodeId};
+use menzil_proto::{ErrorCode, NetworkId, NodeCert, NodeId, X25519PublicKey};
 use menzil_stream::{OpenRefusal, OpenRequest, ServiceHandler, Stream};
 use tokio::time::Instant;
 
 use crate::admission::is_docs_service;
-use crate::docs::{DocsParams, STREAM_DEADLINE, ServeMode, StoreDocs, serve};
+use crate::cert_candidates::{CertCandidates, Offer, Offerer};
+use crate::docs::{
+    DocsParams, DocsSink, DocsSource, HeldBases, HeldDocs, STREAM_DEADLINE, ServeMode, StoreDocs,
+    serve,
+};
 use crate::policy_store::PolicyStore;
 use crate::roster_store::RosterStore;
 
@@ -206,6 +210,18 @@ pub struct SessionHandler<H> {
     docs_only: Option<Arc<dyn Fn() + Send + Sync>>,
     /// The key of this session's place on a docs only session ([`DocsGate::try_acquire_session`]).
     session: u64,
+    /// What judges a `node_cert` pushed on this session (cert rotation S5). `None`: every
+    /// `node_cert` is ignored.
+    candidates: Option<CandidateCtx>,
+}
+
+/// The session a pushed `node_cert` is judged against: who the peer is and the store that
+/// judges.
+#[derive(Clone)]
+struct CandidateCtx {
+    store: Arc<CertCandidates>,
+    peer: NodeId,
+    peer_static: X25519PublicKey,
 }
 
 impl<H> SessionHandler<H> {
@@ -223,7 +239,25 @@ impl<H> SessionHandler<H> {
             rosters,
             docs_only: None,
             session: 0,
+            candidates: None,
         }
+    }
+
+    /// Lets this session's `menzil:docs` pushes carry a `node_cert`, judged by `store` against
+    /// `peer` and its Noise static key `peer_static` (the session's own, as the router learned
+    /// them). Without it every `node_cert` is ignored (`result` 3/3).
+    pub fn with_candidates(
+        mut self,
+        store: Arc<CertCandidates>,
+        peer: NodeId,
+        peer_static: X25519PublicKey,
+    ) -> Self {
+        self.candidates = Some(CandidateCtx {
+            store,
+            peer,
+            peer_static,
+        });
+        self
     }
 
     /// The handler of a docs only session this node answered: one `menzil:docs` push and nothing
@@ -249,6 +283,7 @@ impl<H> SessionHandler<H> {
             policies,
             rosters,
             docs_only: Some(Arc::new(end_session)),
+            candidates: None,
         }
     }
 }
@@ -298,8 +333,17 @@ where
                 let policies = Arc::clone(&self.policies);
                 let rosters = Arc::clone(&self.rosters);
                 let end_session = self.docs_only.clone();
+                let candidates = self.candidates.clone();
                 Box::pin(async move {
-                    run_docs(stream, &request, &rosters, &policies, end_session.is_some()).await;
+                    run_docs(
+                        stream,
+                        &request,
+                        &rosters,
+                        &policies,
+                        end_session.is_some(),
+                        candidates.as_ref(),
+                    )
+                    .await;
                     drop(permit);
                     if let Some(end_session) = end_session {
                         // One try per docs only session, whatever came of it.
@@ -327,6 +371,53 @@ async fn wait_for_peer_to_finish(stream: &mut Stream) {
     }
 }
 
+/// The node's stores for one session: [`StoreDocs`], plus the judge of a pushed `node_cert`.
+#[derive(Clone, Copy)]
+struct SessionDocs<'a> {
+    docs: StoreDocs<'a>,
+    network_id: NetworkId,
+    candidates: Option<&'a CandidateCtx>,
+}
+
+impl DocsSource for SessionDocs<'_> {
+    fn roster(&self) -> Option<(menzil_proto::Roster, Option<menzil_proto::Roster>)> {
+        self.docs.roster()
+    }
+    fn policy(&self) -> Option<(menzil_proto::Policy, Option<menzil_proto::Policy>)> {
+        self.docs.policy()
+    }
+}
+
+impl DocsSink for SessionDocs<'_> {
+    fn adopt(
+        &self,
+        bundle: &menzil_proto::trust::Bundle,
+        now: u64,
+    ) -> Result<crate::Adopted, crate::NodeError> {
+        self.docs.adopt(bundle, now)
+    }
+    fn held(&self) -> HeldDocs {
+        self.docs.held()
+    }
+    fn held_bases(&self) -> HeldBases {
+        self.docs.held_bases()
+    }
+    fn offer_node_cert(&self, cert: &NodeCert, now: u64) -> Offer {
+        match self.candidates {
+            Some(ctx) => ctx.store.offer(
+                &Offerer {
+                    network_id: self.network_id,
+                    peer: ctx.peer,
+                    peer_static: ctx.peer_static,
+                },
+                cert,
+                now,
+            ),
+            None => Offer::Ignored,
+        }
+    }
+}
+
 /// Serves one `menzil:docs` stream whose OPEN_ACK has gone out, over the node's own stores.
 async fn run_docs(
     mut stream: Stream,
@@ -334,8 +425,13 @@ async fn run_docs(
     rosters: &RosterStore,
     policies: &PolicyStore,
     docs_only: bool,
+    candidates: Option<&CandidateCtx>,
 ) {
-    let docs = StoreDocs::new(rosters, policies, request.network_id);
+    let docs = SessionDocs {
+        docs: StoreDocs::new(rosters, policies, request.network_id),
+        network_id: request.network_id,
+        candidates,
+    };
     let params = DocsParams {
         network_id: request.network_id,
         now: SystemTime::now()

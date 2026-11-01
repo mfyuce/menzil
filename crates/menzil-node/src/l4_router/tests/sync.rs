@@ -25,7 +25,59 @@ pub(super) fn sync_for(node: &TestNode, party: &Party, stores: &Stores) -> Arc<D
         SyncConfig {
             policy_jitter_max: Duration::ZERO,
         },
+        None,
     )
+}
+
+/// A renewal of `party`: the same keys, `serial`, valid now for 300 days.
+pub(super) fn renewed(party: &Party, serial: u32) -> NodeCert {
+    let now = now();
+    NodeCert::sign(
+        &party.signing,
+        &NodeCertBody {
+            v: PROTOCOL_VERSION,
+            node_id: party.id,
+            x25519_pub: party.x25519_public,
+            serial,
+            not_before: now - 1_000,
+            not_after: now + 300 * 86_400,
+        },
+    )
+    .unwrap()
+}
+
+/// [`sync_for`] for a node whose own certificate is `cert` (a renewal), so that it pushes it.
+pub(super) fn sync_renewed(
+    node: &TestNode,
+    party: &Party,
+    stores: &Stores,
+    cert: &NodeCert,
+) -> Arc<DocsSync> {
+    DocsSync::new(
+        node.handle.clone(),
+        stores.rosters.clone(),
+        stores.policies.clone(),
+        party.id,
+        SyncConfig {
+            policy_jitter_max: Duration::ZERO,
+        },
+        Some(crate::IdentityCell::new(crate::LocalIdentity {
+            node_cert: cert.clone(),
+            x25519_private: party.x25519_private,
+        })),
+    )
+}
+
+/// Makes the node of `sync` a steward that records the certificates pushed to it.
+pub(super) fn as_steward(sync: &Arc<DocsSync>, network: NetworkId) {
+    sync.candidates().set_holder(
+        network,
+        Some(crate::Holder::Steward {
+            admit: true,
+            renew: true,
+            not_after: now() + 86_400,
+        }),
+    );
 }
 
 /// Serves every session `node` announces from now on, the way a running node does, with the
@@ -859,4 +911,206 @@ async fn only_unrevoked_members_other_than_this_node_are_asked_or_pushed_to() {
     let mut pushed = sync_a.push_targets(w.network);
     pushed.sort_by_key(|id| id.to_string());
     assert_eq!(pushed, expected);
+}
+
+// ---- a renewed certificate is pushed (cert rotation S5) -----------------------------
+
+#[tokio::test(start_paused = true)]
+async fn an_initiator_with_a_renewed_cert_pushes_it_once_per_session() {
+    let w = world();
+    let (a, b) = (party(), party());
+    let (r2, p2) = w.fresh_pair(2, &[&a, &b], &[&a, &b], &[&a, &b]);
+    let (stores_a, stores_b) = (stores_from(&r2, &p2), stores_from(&r2, &p2));
+    let cert2 = renewed(&a, 2);
+    let net = Net::new();
+    let mut na = node(&net, &a, &stores_a).await;
+    let mut nb = node(&net, &b, &stores_b).await;
+    let sync_a = sync_renewed(&na, &a, &stores_a, &cert2);
+    let sync_b = sync_for(&nb, &b, &stores_b);
+    as_steward(&sync_b, w.network);
+    auto_serve(&mut na, &a, &stores_a, Some(&sync_a));
+    let gate_b = auto_serve(&mut nb, &b, &stores_b, Some(&sync_b));
+
+    let session = ensure(&na, b.id, w.network).await.unwrap();
+    settle().await;
+    // Equal documents: no reconcile stream; the only stream is the certificate's.
+    assert_eq!(gate_b.started_by(&a.id), 1);
+    assert_eq!(
+        sync_b.candidates().candidates(w.network),
+        vec![cert2.clone()]
+    );
+    // The same session again, and more time: still the one push.
+    ensure(&na, b.id, w.network).await.unwrap();
+    settle().await;
+    assert_eq!(gate_b.started_by(&a.id), 1, "once per session");
+
+    // A new session pushes once more (the steward, which holds the candidate, answers the
+    // replay with a refusal, and the candidate is untouched).
+    session.close(None);
+    settle().await;
+    ensure(&na, b.id, w.network).await.unwrap();
+    settle().await;
+    assert_eq!(gate_b.started_by(&a.id), 2, "once for the new session");
+    assert_eq!(sync_b.candidates().candidates(w.network), vec![cert2]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_responder_with_a_renewed_cert_pushes_it_too() {
+    let w = world();
+    let (a, b) = (party(), party());
+    let (r2, p2) = w.fresh_pair(2, &[&a, &b], &[&a, &b], &[&a, &b]);
+    let (stores_a, stores_b) = (stores_from(&r2, &p2), stores_from(&r2, &p2));
+    let cert2 = renewed(&b, 2);
+    let net = Net::new();
+    let mut na = node(&net, &a, &stores_a).await;
+    let mut nb = node(&net, &b, &stores_b).await;
+    let sync_a = sync_for(&na, &a, &stores_a);
+    let sync_b = sync_renewed(&nb, &b, &stores_b, &cert2);
+    as_steward(&sync_a, w.network);
+    let gate_a = auto_serve(&mut na, &a, &stores_a, Some(&sync_a));
+    auto_serve(&mut nb, &b, &stores_b, Some(&sync_b));
+
+    // A dials; B, the renewed node, answers and offers its certificate over that session.
+    ensure(&na, b.id, w.network).await.unwrap();
+    settle().await;
+    assert_eq!(gate_a.started_by(&b.id), 1);
+    assert_eq!(sync_a.candidates().candidates(w.network), vec![cert2]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn nothing_is_pushed_once_the_held_policy_lists_the_serial() {
+    let w = world();
+    let (mut a, b) = (party(), party());
+    let cert2 = renewed(&a, 2);
+    // The Policy A holds lists the renewal (and the pair is the same on both sides).
+    a.cert = cert2.clone();
+    let (r2, p2) = w.fresh_pair(2, &[&a, &b], &[&a, &b], &[&a, &b]);
+    let (stores_a, stores_b) = (stores_from(&r2, &p2), stores_from(&r2, &p2));
+    let net = Net::new();
+    let mut na = node(&net, &a, &stores_a).await;
+    let mut nb = node(&net, &b, &stores_b).await;
+    let sync_a = sync_renewed(&na, &a, &stores_a, &cert2);
+    let sync_b = sync_for(&nb, &b, &stores_b);
+    as_steward(&sync_b, w.network);
+    auto_serve(&mut na, &a, &stores_a, Some(&sync_a));
+    let gate_b = auto_serve(&mut nb, &b, &stores_b, Some(&sync_b));
+
+    ensure(&na, b.id, w.network).await.unwrap();
+    settle().await;
+    assert_eq!(gate_b.started_by(&a.id), 0, "listed: nothing to tell");
+    assert!(sync_b.candidates().candidates(w.network).is_empty());
+    assert_eq!(sync_a.node_cert_to_push(w.network), None);
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_push_stops_when_the_policy_catches_up_with_the_renewal() {
+    let w = world();
+    let (a, b) = (party(), party());
+    let cert2 = renewed(&a, 2);
+    // Policy 2 lists serial 1; Policy 3 lists the renewal.
+    let (r2, p2) = w.fresh_pair(2, &[&a, &b], &[&a, &b], &[&a, &b]);
+    let stores_a = stores_from(&r2, &p2);
+    let net = Net::new();
+    let na = node(&net, &a, &stores_a).await;
+    let sync_a = sync_renewed(&na, &a, &stores_a, &cert2);
+    assert_eq!(sync_a.node_cert_to_push(w.network), Some(cert2.clone()));
+    let (r3, p3) = w.fresh_pair(3, &[&a, &b], &[&a, &b], &[&a, &b]);
+    // Policy 3 lists A's renewal in place of its first certificate.
+    let mut body = p3.decode().unwrap();
+    body.certs = vec![cert2.clone(), b.cert.clone()];
+    let p3 = Policy::sign(&w.owner, &body).unwrap();
+    assert!(stores_a.rosters.adopt_owner(&r3, now()).unwrap());
+    assert!(stores_a.policies.set(&p3).unwrap());
+    assert_eq!(sync_a.node_cert_to_push(w.network), None);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_node_without_a_held_policy_or_an_identity_pushes_no_certificate() {
+    let w = world();
+    let (a, b) = (party(), party());
+    let (r2, _) = w.fresh_pair(2, &[&a, &b], &[&a, &b], &[&a, &b]);
+    let stores = Stores {
+        rosters: Arc::new(RosterStore::new()),
+        policies: Arc::new(PolicyStore::new()),
+    };
+    stores.rosters.set(&r2).unwrap();
+    let net = Net::new();
+    let na = node(&net, &a, &stores).await;
+    let cert2 = renewed(&a, 2);
+    // No Policy: nothing to compare the serial with.
+    assert_eq!(
+        sync_renewed(&na, &a, &stores, &cert2).node_cert_to_push(w.network),
+        None
+    );
+    // A Policy that does not list it, but a sync with no identity.
+    let (_, p2) = w.fresh_pair(2, &[&a, &b], &[&a, &b], &[&b]);
+    stores.policies.set(&p2).unwrap();
+    assert_eq!(
+        sync_for(&na, &a, &stores).node_cert_to_push(w.network),
+        None
+    );
+    // The same Policy and an identity: it pushes.
+    assert_eq!(
+        sync_renewed(&na, &a, &stores, &cert2).node_cert_to_push(w.network),
+        Some(cert2)
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_docs_only_dialer_carries_its_node_cert_in_its_one_push_and_the_session_ends() {
+    let w = world();
+    let (r, m) = (party(), party());
+    // R is behind: its Policy has no cert for M. M holds seq 2, which lists M's first cert.
+    let (r1, _) = w.fresh_pair(1, &[&r, &m], &[&r, &m], &[&r, &m]);
+    let p1 = w.policy(&[&r, &m], &[&r], vec![]);
+    let (r2, p2) = w.fresh_pair(2, &[&r, &m], &[&r, &m], &[&r, &m]);
+    let (stores_r, stores_m) = (stores_from(&r1, &p1), stores_from(&r2, &p2));
+    let cert2 = renewed(&m, 2);
+    let net = Net::new();
+    let mut nr = node(&net, &r, &stores_r).await;
+    let mut nm = node(&net, &m, &stores_m).await;
+    let sync_r = sync_for(&nr, &r, &stores_r);
+    let sync_m = sync_renewed(&nm, &m, &stores_m, &cert2);
+    as_steward(&sync_r, w.network);
+    auto_serve(&mut nr, &r, &stores_r, Some(&sync_r));
+    auto_serve(&mut nm, &m, &stores_m, Some(&sync_m));
+
+    // The one follow up handshake is used up beforehand (this call meets the docs only answer
+    // and writes the window down), so no full session can come up and push the certificate
+    // by the ordinary route: whatever R records came in the docs only push.
+    assert!(!sync_m.rehandshake(r.id, w.network).await);
+    settle().await;
+    // The one push carried the documents (adopted) and the certificate (recorded).
+    assert_eq!(held(&stores_r, w.network), (Some(2), Some(2)));
+    assert_eq!(sync_r.candidates().candidates(w.network), vec![cert2]);
+    // The docs only handshake was the only one.
+    assert_eq!(net.count_from(&m.id, "init"), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_docs_only_dialer_that_is_listed_pushes_only_its_documents() {
+    let w = world();
+    let (r, m) = (party(), party());
+    let (r1, _) = w.fresh_pair(1, &[&r, &m], &[&r, &m], &[&r, &m]);
+    let p1 = w.policy(&[&r, &m], &[&r], vec![]);
+    // M's cell holds serial 1, which the Policy it holds lists: nothing to tell.
+    let (r2, p2) = w.fresh_pair(2, &[&r, &m], &[&r, &m], &[&r, &m]);
+    let (stores_r, stores_m) = (stores_from(&r1, &p1), stores_from(&r2, &p2));
+    let net = Net::new();
+    let mut nr = node(&net, &r, &stores_r).await;
+    let mut nm = node(&net, &m, &stores_m).await;
+    let sync_r = sync_for(&nr, &r, &stores_r);
+    let sync_m = sync_renewed(&nm, &m, &stores_m, &m.cert.clone());
+    as_steward(&sync_r, w.network);
+    auto_serve(&mut nr, &r, &stores_r, Some(&sync_r));
+    auto_serve(&mut nm, &m, &stores_m, Some(&sync_m));
+    let since = tokio::time::Instant::now();
+    assert_eq!(
+        ensure(&nm, r.id, w.network).await.err(),
+        Some(EnsureError::DocsOnly)
+    );
+    assert!(sync_m.wait_docs_only_push(r.id, w.network, since).await);
+    settle().await;
+    assert_eq!(held(&stores_r, w.network), (Some(2), Some(2)));
+    assert!(sync_r.candidates().candidates(w.network).is_empty());
 }

@@ -117,7 +117,7 @@ fn the_length_bound_is_exact() {
 }
 
 #[test]
-fn the_seventh_message_is_refused_and_six_are_admitted() {
+fn the_eighth_message_is_refused_and_seven_are_admitted() {
     let mut counter = MessageCounter::new();
     for n in 1..=MAX_MESSAGES {
         counter.admit().unwrap();
@@ -128,7 +128,7 @@ fn the_seventh_message_is_refused_and_six_are_admitted() {
         Err(DocsError::TooManyMessages { max: MAX_MESSAGES })
     );
     assert_eq!(counter.seen(), MAX_MESSAGES);
-    assert_eq!(MAX_MESSAGES, 6);
+    assert_eq!(MAX_MESSAGES, 7);
 }
 
 #[test]
@@ -280,6 +280,31 @@ fn a_wrong_version_an_unknown_tag_kind_or_outcome_is_refused() {
 }
 
 #[test]
+fn a_node_cert_doc_has_the_wire_name_node_cert_and_round_trips() {
+    let message = Message::Doc {
+        kind: DocKind::NodeCert,
+        doc: vec![9, 9],
+    };
+    let entries = vec![
+        ("t", text("doc")),
+        ("kind", text("node_cert")),
+        ("doc", Value::Bytes(vec![9, 9])),
+    ];
+    assert_eq!(decode_message(&map(entries)).unwrap(), message);
+    let frame = encode_frame(&message).unwrap();
+    assert_eq!(decode_message(&frame[FRAME_HEADER_LEN..]).unwrap(), message);
+    // Close spellings of the name stay unknown kinds.
+    for name in ["nodecert", "node-cert", "NodeCert", "cert"] {
+        let entries = vec![
+            ("t", text("doc")),
+            ("kind", text(name)),
+            ("doc", Value::Bytes(vec![])),
+        ];
+        assert!(decode_message(&map(entries)).is_err(), "{name}");
+    }
+}
+
+#[test]
 fn a_doc_that_is_not_a_byte_string_is_refused() {
     let entries = vec![
         ("t", text("doc")),
@@ -334,4 +359,5 @@ fn kinds_are_ordered_bases_first() {
     assert!(DocKind::BaseRoster < DocKind::BasePolicy);
     assert!(DocKind::BasePolicy < DocKind::Roster);
     assert!(DocKind::Roster < DocKind::Policy);
+    assert!(DocKind::Policy < DocKind::NodeCert);
 }

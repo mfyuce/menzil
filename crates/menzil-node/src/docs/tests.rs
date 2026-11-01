@@ -266,6 +266,10 @@ fn kinds(messages: &[Message]) -> Vec<&'static str> {
                 kind: DocKind::Policy,
                 ..
             } => "policy",
+            Message::Doc {
+                kind: DocKind::NodeCert,
+                ..
+            } => "node_cert",
             Message::End { .. } => "end",
             _ => "other",
         })
@@ -534,8 +538,44 @@ fn a_push_is_push_then_bases_first_then_end_with_the_bundles_seqs() {
             policy_seq: Some(11)
         })
     );
-    // The most a push can be is the six messages a receiver admits.
-    assert_eq!(messages.len(), MAX_MESSAGES);
+    // Without a node_cert that is six; the seventh message a receiver admits is the node_cert.
+    assert_eq!(messages.len(), MAX_MESSAGES - 1);
+    let cert = some_cert(5, 2);
+    let with = push_messages_with(&bundle, Some(&cert));
+    assert_eq!(with.len(), MAX_MESSAGES);
+    assert_eq!(
+        kinds(&with[1..]),
+        vec![
+            "base_roster",
+            "base_policy",
+            "roster",
+            "policy",
+            "node_cert",
+            "end"
+        ]
+    );
+    assert_eq!(
+        with[5],
+        Message::Doc {
+            kind: DocKind::NodeCert,
+            doc: cert.encode()
+        }
+    );
+    // A certificate alone is push, node_cert, end with no seqs.
+    assert_eq!(
+        push_messages_with(&Bundle::default(), Some(&cert)),
+        vec![
+            Message::Push,
+            Message::Doc {
+                kind: DocKind::NodeCert,
+                doc: cert.encode()
+            },
+            Message::End {
+                roster_seq: None,
+                policy_seq: None
+            }
+        ]
+    );
     let empty = push_messages(&Bundle::default());
     assert_eq!(
         empty,
@@ -1836,4 +1876,385 @@ async fn a_left_out_policy_base_is_filled_by_the_policy_announcement() {
     served.unwrap();
     assert!(fetched.unwrap().adopted.policy);
     assert_eq!(client.policies.seq(&net.network_id), Some(12));
+}
+
+// ---------------------------------------------------------------- node_cert (cert rotation S5)
+
+/// A well formed certificate of some node (these tests judge the framing, not the certificate).
+fn some_cert(seed: u8, serial: u32) -> NodeCert {
+    let signing = SigningKey::from_bytes(&[seed; 32]);
+    NodeCert::sign(
+        &signing,
+        &menzil_proto::NodeCertBody {
+            v: PROTOCOL_VERSION,
+            node_id: NodeId::from(signing.verifying_key().to_bytes()),
+            x25519_pub: menzil_proto::X25519PublicKey::from([seed; 32]),
+            serial,
+            not_before: NOW - DAY,
+            not_after: NOW + 300 * DAY,
+        },
+    )
+    .unwrap()
+}
+
+/// The stores for the documents and a scripted verdict on the certificate; it remembers what it
+/// was asked and what the Roster was at that moment.
+struct CertSink<'a> {
+    docs: StoreDocs<'a>,
+    verdict: Offer,
+    asked: std::sync::Mutex<Vec<(NodeCert, Option<u64>)>>,
+}
+
+impl<'a> CertSink<'a> {
+    fn new(docs: StoreDocs<'a>, verdict: Offer) -> Self {
+        Self {
+            docs,
+            verdict,
+            asked: std::sync::Mutex::default(),
+        }
+    }
+    fn asked(&self) -> Vec<(NodeCert, Option<u64>)> {
+        self.asked.lock().unwrap().clone()
+    }
+}
+
+impl DocsSink for CertSink<'_> {
+    fn adopt(&self, bundle: &Bundle, now: u64) -> Result<Adopted, NodeError> {
+        self.docs.adopt(bundle, now)
+    }
+    fn held(&self) -> HeldDocs {
+        self.docs.held()
+    }
+    fn offer_node_cert(&self, cert: &NodeCert, _now: u64) -> Offer {
+        let roster_seq = self.docs.held().roster_seq;
+        self.asked.lock().unwrap().push((cert.clone(), roster_seq));
+        self.verdict
+    }
+}
+
+/// Writes `messages` and serves them into `sink` over a stream that holds `source`.
+async fn serve_messages<K: DocsSink>(
+    net: &Net,
+    source: &Stores,
+    sink: &K,
+    messages: &[Message],
+) -> Result<Served, DocsStreamError> {
+    let (mut a, mut raw) = raw_pair();
+    for message in messages {
+        raw.write_all(&encode_frame(message).unwrap())
+            .await
+            .unwrap();
+    }
+    serve(
+        &mut a,
+        source.docs(net),
+        sink,
+        &params(net),
+        ServeMode::Full,
+    )
+    .await
+}
+
+fn cert_doc(cert: &NodeCert) -> Message {
+    Message::Doc {
+        kind: DocKind::NodeCert,
+        doc: cert.encode(),
+    }
+}
+
+fn plain_end() -> Message {
+    Message::End {
+        roster_seq: None,
+        policy_seq: None,
+    }
+}
+
+fn not_sent(code: Option<ErrorCode>) -> (Outcome, Outcome, Option<ErrorCode>) {
+    (Outcome::NotSent, Outcome::NotSent, code)
+}
+
+#[tokio::test]
+async fn a_node_cert_push_is_answered_three_three_whatever_the_receiver_does_with_it() {
+    let net = Net::new();
+    let stores = Stores::with_base(&net);
+    let cert = some_cert(5, 2);
+    let messages = [Message::Push, cert_doc(&cert), plain_end()];
+    for verdict in [Offer::Ignored, Offer::Recorded, Offer::Noted] {
+        let sink = CertSink::new(stores.docs(&net), verdict);
+        let Ok(Served::Push(result)) = serve_messages(&net, &stores, &sink, &messages).await else {
+            panic!("{verdict:?}")
+        };
+        assert_eq!(
+            (result.roster, result.policy, result.code),
+            not_sent(None),
+            "{verdict:?}"
+        );
+        assert_eq!(sink.asked().len(), 1, "judged exactly once: {verdict:?}");
+        assert_eq!(sink.asked()[0].0, cert);
+    }
+}
+
+#[tokio::test]
+async fn a_sink_that_knows_no_session_ignores_a_node_cert_with_three_three() {
+    // The default of the trait: StoreDocs judges documents only.
+    let net = Net::new();
+    let stores = Stores::with_base(&net);
+    let messages = [Message::Push, cert_doc(&some_cert(5, 2)), plain_end()];
+    let Ok(Served::Push(result)) =
+        serve_messages(&net, &stores, &stores.docs(&net), &messages).await
+    else {
+        panic!()
+    };
+    assert_eq!((result.roster, result.policy, result.code), not_sent(None));
+    // Nothing in the stores changed.
+    assert_eq!(stores.rosters.seq(&net.network_id), Some(10));
+}
+
+#[tokio::test]
+async fn a_refused_node_cert_is_answered_bad_document_with_three_three() {
+    let net = Net::new();
+    let stores = Stores::with_base(&net);
+    let sink = CertSink::new(
+        stores.docs(&net),
+        Offer::Refused(crate::cert_candidates::Refusal::Replay),
+    );
+    let messages = [Message::Push, cert_doc(&some_cert(5, 2)), plain_end()];
+    let Ok(Served::Push(result)) = serve_messages(&net, &stores, &sink, &messages).await else {
+        panic!()
+    };
+    assert_eq!(
+        (result.roster, result.policy, result.code),
+        not_sent(Some(ErrorCode::BadDocument))
+    );
+}
+
+#[tokio::test]
+async fn a_second_node_cert_in_one_stream_is_a_violation_and_is_never_judged() {
+    let net = Net::new();
+    let stores = Stores::with_base(&net);
+    let sink = CertSink::new(stores.docs(&net), Offer::Recorded);
+    let messages = [
+        Message::Push,
+        cert_doc(&some_cert(5, 2)),
+        cert_doc(&some_cert(5, 3)),
+        plain_end(),
+    ];
+    assert!(matches!(
+        serve_messages(&net, &stores, &sink, &messages).await,
+        Err(DocsStreamError::Unexpected("document out of order"))
+    ));
+    assert!(sink.asked().is_empty(), "neither of the two was judged");
+}
+
+#[tokio::test]
+async fn a_node_cert_is_the_last_document_a_document_after_it_is_a_violation() {
+    let net = Net::new();
+    let stores = Stores::empty();
+    let sink = CertSink::new(stores.docs(&net), Offer::Recorded);
+    let bundle = net.base_bundle();
+    let mut messages = vec![Message::Push, cert_doc(&some_cert(5, 2))];
+    messages.push(Message::Doc {
+        kind: DocKind::Roster,
+        doc: bundle.roster.as_ref().unwrap().encode(),
+    });
+    messages.push(plain_end());
+    assert!(matches!(
+        serve_messages(&net, &stores, &sink, &messages).await,
+        Err(DocsStreamError::Unexpected("document out of order"))
+    ));
+    assert!(sink.asked().is_empty());
+}
+
+#[tokio::test]
+async fn a_node_cert_is_judged_after_the_documents_of_its_stream_are_adopted() {
+    let net = Net::new();
+    let stores = Stores::empty();
+    let sink = CertSink::new(stores.docs(&net), Offer::Recorded);
+    let mut messages = push_messages(&net.base_bundle());
+    // Between the last document and `end`.
+    messages.insert(messages.len() - 1, cert_doc(&some_cert(5, 2)));
+    let Ok(Served::Push(result)) = serve_messages(&net, &stores, &sink, &messages).await else {
+        panic!()
+    };
+    assert_eq!(result.roster, Outcome::Adopted);
+    assert_eq!(result.policy, Outcome::Adopted);
+    assert_eq!(result.code, None);
+    // The sink saw the adopted Roster: a member a pushed Roster brings in is a member when
+    // its certificate is looked at.
+    assert_eq!(sink.asked()[0].1, Some(10));
+}
+
+#[tokio::test]
+async fn a_node_cert_riding_on_a_refused_push_is_never_judged() {
+    let net = Net::new();
+    let stores = Stores::with_base(&net);
+    let sink = CertSink::new(stores.docs(&net), Offer::Recorded);
+    // A Roster signed by a stranger: the push is rejected, and the certificate with it.
+    let stranger = SigningKey::generate(&mut rand::rng());
+    let mut newer = net.roster.clone();
+    newer.seq = 11;
+    let bad = Bundle {
+        roster: Some(Roster::sign(&stranger, &newer).unwrap()),
+        ..Bundle::default()
+    };
+    let mut messages = push_messages(&bad);
+    messages.insert(messages.len() - 1, cert_doc(&some_cert(5, 2)));
+    let Ok(Served::Push(result)) = serve_messages(&net, &stores, &sink, &messages).await else {
+        panic!()
+    };
+    assert_eq!(result.roster, Outcome::Rejected);
+    assert!(result.code.is_some());
+    assert!(sink.asked().is_empty(), "never judged, so never stored");
+}
+
+#[tokio::test]
+async fn a_node_cert_that_does_not_decode_is_answered_bad_document_and_never_judged() {
+    let net = Net::new();
+    let stores = Stores::with_base(&net);
+    let sink = CertSink::new(stores.docs(&net), Offer::Recorded);
+    let messages = [
+        Message::Push,
+        Message::Doc {
+            kind: DocKind::NodeCert,
+            doc: vec![0xff, 0x00, 0x01],
+        },
+        plain_end(),
+    ];
+    let Ok(Served::Push(result)) = serve_messages(&net, &stores, &sink, &messages).await else {
+        panic!()
+    };
+    assert_eq!(result.code, Some(ErrorCode::BadDocument));
+    assert!(sink.asked().is_empty());
+}
+
+#[tokio::test]
+async fn a_node_cert_over_the_document_limit_is_a_violation() {
+    let net = Net::new();
+    let stores = Stores::with_base(&net);
+    let sink = CertSink::new(stores.docs(&net), Offer::Recorded);
+    let messages = [
+        Message::Push,
+        Message::Doc {
+            kind: DocKind::NodeCert,
+            doc: vec![0u8; MAX_DOC_BYTES + 1],
+        },
+        plain_end(),
+    ];
+    assert!(matches!(
+        serve_messages(&net, &stores, &sink, &messages).await,
+        Err(DocsStreamError::DocTooLarge { .. })
+    ));
+    assert!(sink.asked().is_empty());
+}
+
+#[tokio::test]
+async fn a_node_cert_in_a_fetch_answer_is_a_violation() {
+    let net = Net::new();
+    let (mut a, mut raw) = raw_pair();
+    for message in [cert_doc(&some_cert(5, 2)), plain_end()] {
+        raw.write_all(&encode_frame(&message).unwrap())
+            .await
+            .unwrap();
+    }
+    let client = Stores::empty();
+    let result = fetch(&mut a, client.docs(&net), &params(&net)).await;
+    assert!(
+        matches!(result, Err(DocsStreamError::Unexpected(_))),
+        "{result:?}"
+    );
+    assert_eq!(client.rosters.seq(&net.network_id), None);
+}
+
+#[tokio::test]
+async fn push_with_cert_over_a_stream_reaches_the_receivers_sink() {
+    let net = Net::new();
+    let stores = Stores::with_base(&net);
+    let sink = CertSink::new(stores.docs(&net), Offer::Recorded);
+    let cert = some_cert(5, 2);
+    let (mut a, mut b) = pair();
+    let p = params(&net);
+    let empty = Bundle::default();
+    let (served, pushed) = tokio::join!(
+        serve(&mut b, stores.docs(&net), &sink, &p, ServeMode::Full),
+        push_with_cert(&mut a, &empty, Some(&cert), &p),
+    );
+    assert!(matches!(served, Ok(Served::Push(_))));
+    let result = pushed.unwrap();
+    assert_eq!((result.roster, result.policy, result.code), not_sent(None));
+    // The receiver's own seqs come back as always.
+    assert_eq!(result.roster_seq, Some(10));
+    assert_eq!(sink.asked()[0].0, cert);
+}
+
+#[tokio::test]
+async fn a_node_cert_is_also_served_in_push_only_mode() {
+    // A docs only session takes a push, so it takes a push that carries a node_cert.
+    let net = Net::new();
+    let stores = Stores::with_base(&net);
+    let sink = CertSink::new(stores.docs(&net), Offer::Recorded);
+    let (mut a, mut raw) = raw_pair();
+    for message in [Message::Push, cert_doc(&some_cert(5, 2)), plain_end()] {
+        raw.write_all(&encode_frame(&message).unwrap())
+            .await
+            .unwrap();
+    }
+    let served = serve(
+        &mut a,
+        stores.docs(&net),
+        &sink,
+        &params(&net),
+        ServeMode::PushOnly,
+    )
+    .await;
+    assert!(matches!(served, Ok(Served::Push(_))), "{served:?}");
+    assert_eq!(sink.asked().len(), 1);
+}
+
+#[tokio::test]
+async fn a_push_may_use_seven_messages_with_a_node_cert_and_not_an_eighth() {
+    let net = Net::new();
+    let stores = Stores::empty();
+    let sink = CertSink::new(stores.docs(&net), Offer::Recorded);
+    // push, four documents (junk: the answer is 25), a node_cert, end: seven.
+    let mut seven = vec![Message::Push];
+    for kind in [
+        DocKind::BaseRoster,
+        DocKind::BasePolicy,
+        DocKind::Roster,
+        DocKind::Policy,
+    ] {
+        seven.push(Message::Doc { kind, doc: vec![0] });
+    }
+    seven.push(cert_doc(&some_cert(5, 2)));
+    seven.push(plain_end());
+    assert_eq!(seven.len(), MAX_MESSAGES);
+    let Ok(Served::Push(result)) = serve_messages(&net, &stores, &sink, &seven).await else {
+        panic!("seven messages are admitted")
+    };
+    assert_eq!(result.code, Some(ErrorCode::BadDocument));
+    assert!(
+        sink.asked().is_empty(),
+        "the junk documents refuse the push"
+    );
+
+    // One more message of any kind is the eighth.
+    let mut eight = seven.clone();
+    eight.insert(
+        1,
+        Message::Doc {
+            kind: DocKind::BaseRoster,
+            doc: vec![0],
+        },
+    );
+    eight.insert(
+        2,
+        Message::Doc {
+            kind: DocKind::BasePolicy,
+            doc: vec![0],
+        },
+    );
+    assert!(matches!(
+        serve_messages(&net, &stores, &sink, &eight).await,
+        Err(DocsStreamError::Unexpected(_) | DocsStreamError::Frame(_))
+    ));
 }

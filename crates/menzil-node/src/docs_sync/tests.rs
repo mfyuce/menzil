@@ -545,3 +545,62 @@ fn a_member_that_adopted_or_held_the_documents_is_done_and_one_that_refused_is_n
         PushStep::Rejected
     );
 }
+
+// ---- cert_unlisted (cert rotation S5) ------------------------------------------
+
+#[test]
+fn a_serial_is_unlisted_until_the_policy_lists_it_or_a_higher_one_for_that_node() {
+    use ed25519_dalek::SigningKey;
+    use menzil_proto::{NodeCert, NodeCertBody, PROTOCOL_VERSION, X25519PublicKey};
+
+    let signer = |seed: u8| SigningKey::from_bytes(&[seed; 32]);
+    let cert = |key: &SigningKey, serial: u32| {
+        NodeCert::sign(
+            key,
+            &NodeCertBody {
+                v: PROTOCOL_VERSION,
+                node_id: NodeId::from(key.verifying_key().to_bytes()),
+                x25519_pub: X25519PublicKey::from([1u8; 32]),
+                serial,
+                not_before: 0,
+                not_after: 10,
+            },
+        )
+        .unwrap()
+    };
+    let (me, other) = (signer(1), signer(2));
+    let me_id = NodeId::from(me.verifying_key().to_bytes());
+    let policy = |certs: Vec<NodeCert>| PolicyBody {
+        v: PROTOCOL_VERSION,
+        network_id: net(),
+        seq: 1,
+        issued: 0,
+        expires: 10,
+        members: vec![],
+        certs,
+        grants: vec![],
+        egress: vec![],
+        accept: vec![],
+    };
+    assert!(cert_unlisted(&policy(vec![]), &me_id, 2), "nothing listed");
+    assert!(
+        cert_unlisted(&policy(vec![cert(&me, 1)]), &me_id, 2),
+        "a lower serial"
+    );
+    assert!(
+        !cert_unlisted(&policy(vec![cert(&me, 2)]), &me_id, 2),
+        "the same serial"
+    );
+    assert!(
+        !cert_unlisted(&policy(vec![cert(&me, 3)]), &me_id, 2),
+        "a higher serial"
+    );
+    assert!(
+        !cert_unlisted(&policy(vec![cert(&me, 1), cert(&me, 2)]), &me_id, 2),
+        "listed among others"
+    );
+    assert!(
+        cert_unlisted(&policy(vec![cert(&other, 5)]), &me_id, 2),
+        "another node's higher serial says nothing about this node"
+    );
+}

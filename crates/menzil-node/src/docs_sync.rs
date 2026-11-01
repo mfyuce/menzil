@@ -18,6 +18,10 @@
 //! * **Documents about to expire** ([`DocsSync::run_expiry`]): when the held pair expires within
 //!   24 hours, every 30 to 90 minutes (random each time) a fetch from up to three peers, those with
 //!   a live session first ([`pick_for_expiry`]), stopping at the first that brought something.
+//! * **A renewed certificate** ([`DocsSync::push_node_cert`]): on each full session, once, a
+//!   node whose held Policy does not list its current certificate serial pushes the certificate
+//!   (`node_cert`, cert rotation S5) so that a steward can list it. On a docs only session the
+//!   one push it is allowed carries the certificate after the documents.
 //! * **The issuer pushes** ([`push_to_members`]): both documents to every unrevoked member, eight
 //!   at a time, a member that does not answer retried after 1, 5 and 30 minutes and 2 hours.
 //!
@@ -33,16 +37,18 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use futures_util::future::join_all;
 use futures_util::io::AsyncWriteExt;
 use menzil_proto::docs::Outcome;
-use menzil_proto::{NetworkId, NodeId};
+use menzil_proto::{NetworkId, NodeCert, NodeId, PolicyBody};
 use thiserror::Error;
 use tokio::sync::{Semaphore, broadcast, watch};
 use tokio::time::Instant;
 
 use crate::admission::{docs_service, is_unrevoked_roster_member};
+use crate::cert_candidates::{CertCandidates, listed_serial};
 use crate::docs::{
     DocsParams, DocsSink, DocsStreamError, FetchReport, HeldDocs, PushResult, STREAM_DEADLINE,
-    StoreDocs, bundle_to_push, fetch, push,
+    StoreDocs, bundle_to_push, fetch, push_with_cert,
 };
+use crate::identity::IdentityCell;
 use crate::l4_router::{EnsureError, RouterHandle};
 use crate::l4_session::L4SessionHandle;
 use crate::l5_stream::{OpenStreamError, open};
@@ -261,6 +267,13 @@ pub(crate) async fn run_plan<E: Exchange>(plan: SyncPlan, exchange: &mut E) {
     if matches!(plan, SyncPlan::Fetch | SyncPlan::PushThenFetch) {
         exchange.fetch().await;
     }
+}
+
+/// Whether `own_serial` is not listed yet by `policy`: no certificate of `node_id` in it has that
+/// serial or a higher one. The test for sending a `node_cert`: once the held Policy lists the
+/// serial there is nothing to tell the peers.
+pub(crate) fn cert_unlisted(policy: &PolicyBody, node_id: &NodeId, own_serial: u32) -> bool {
+    listed_serial(&policy.certs, node_id) < Some(own_serial)
 }
 
 /// What one fetch from one peer came to.
@@ -512,6 +525,10 @@ pub struct DocsSync {
     pushes: Mutex<PushState>,
     /// Bumped whenever `pushes` changes in a way a waiter must look at again.
     push_tick: watch::Sender<u64>,
+    /// This node's own certificate, read at each push of a `node_cert`. `None`: it pushes none.
+    identity: Option<IdentityCell>,
+    /// The `node_cert` candidates other nodes pushed to this one.
+    candidates: Arc<CertCandidates>,
 }
 
 /// Removes a network from [`DocsSync::catching_up`] when its round ends, however it ends.
@@ -538,9 +555,12 @@ impl DocsSync {
         policies: Arc<PolicyStore>,
         local: NodeId,
         config: SyncConfig,
+        identity: Option<IdentityCell>,
     ) -> Arc<Self> {
         Arc::new(Self {
             router,
+            candidates: Arc::new(CertCandidates::new(rosters.clone(), policies.clone())),
+            identity,
             rosters,
             policies,
             local,
@@ -552,6 +572,21 @@ impl DocsSync {
             pushes: Mutex::default(),
             push_tick: watch::channel(0).0,
         })
+    }
+
+    /// The `node_cert` candidates this node judged and kept (cert rotation S5).
+    pub(crate) fn candidates(&self) -> &Arc<CertCandidates> {
+        &self.candidates
+    }
+
+    /// This node's current certificate when the held Policy of `network_id` does not list its
+    /// serial; `None` when it does, when no Policy is held (nothing to compare with) or when
+    /// this sync has no identity.
+    pub(crate) fn node_cert_to_push(&self, network_id: NetworkId) -> Option<NodeCert> {
+        let identity = self.identity.as_ref()?.get();
+        let own = identity.node_cert.decode().ok()?;
+        let policy = self.policies.body(&network_id)?;
+        cert_unlisted(&policy, &own.node_id, own.serial).then(|| identity.node_cert.clone())
     }
 
     fn docs(&self, network_id: NetworkId) -> StoreDocs<'_> {
@@ -685,15 +720,27 @@ impl DocsSync {
     /// Pushes what is held over `handle`; `Ok(None)` when there is nothing to push (no unexpired
     /// Roster). The opener closes its side after reading `result` (a docs only responder waits
     /// for that before it closes the session).
-    async fn push_over(&self, handle: &L4SessionHandle) -> Result<Option<PushResult>, SyncError> {
+    ///
+    /// `with_cert`: the push also carries this node's `node_cert` when the held Policy does not
+    /// list its serial (only the docs only push does: it is the one push that session allows).
+    async fn push_over(
+        &self,
+        handle: &L4SessionHandle,
+        with_cert: bool,
+    ) -> Result<Option<PushResult>, SyncError> {
         let network_id = handle.network_id();
         let params = params(network_id);
         let bundle = bundle_to_push(&self.docs(network_id), params.now);
-        if bundle.roster.is_none() {
+        let cert = if with_cert {
+            self.node_cert_to_push(network_id)
+        } else {
+            None
+        };
+        if bundle.roster.is_none() && cert.is_none() {
             return Ok(None);
         }
         let mut stream = open(handle, docs_service(), None).await?;
-        match push(&mut stream, &bundle, &params).await {
+        match push_with_cert(&mut stream, &bundle, cert.as_ref(), &params).await {
             Ok(result) => {
                 let _ = stream.close().await;
                 self.note_peer_seqs(
@@ -707,6 +754,38 @@ impl DocsSync {
             Err(error) => {
                 stream.reset();
                 Err(error.into())
+            }
+        }
+    }
+
+    /// The `node_cert` push of a full session, once: nothing when the held Policy lists this
+    /// node's current serial. Failures are only logged; the next session tries again.
+    pub(crate) async fn push_node_cert(&self, handle: &L4SessionHandle) {
+        let network_id = handle.network_id();
+        let Some(cert) = self.node_cert_to_push(network_id) else {
+            return;
+        };
+        let peer = handle.peer();
+        let params = params(network_id);
+        let mut stream = match open(handle, docs_service(), None).await {
+            Ok(stream) => stream,
+            Err(error) => {
+                tracing::debug!(%peer, %error, "opening a stream to push a node_cert failed");
+                return;
+            }
+        };
+        match push_with_cert(&mut stream, &Default::default(), Some(&cert), &params).await {
+            Ok(result) => {
+                let _ = stream.close().await;
+                if result.code.is_some() {
+                    tracing::warn!(%peer, code = ?result.code, "a peer refused our node_cert");
+                } else {
+                    tracing::debug!(%peer, "pushed our node_cert");
+                }
+            }
+            Err(error) => {
+                stream.reset();
+                tracing::debug!(%peer, %error, "pushing a node_cert failed");
             }
         }
     }
@@ -771,7 +850,7 @@ impl DocsSync {
     /// However it ends, the end is noted for [`Self::wait_docs_only_push`].
     pub(crate) async fn docs_only_push(&self, handle: L4SessionHandle, mut running: PushRunning) {
         let (peer, network_id) = (handle.peer(), handle.network_id());
-        let came_up = match self.push_over(&handle).await {
+        let came_up = match self.push_over(&handle, true).await {
             Ok(Some(result))
                 if result.roster == Outcome::Adopted || result.policy == Outcome::Adopted =>
             {
@@ -1114,7 +1193,7 @@ struct OverSession<'a> {
 impl Exchange for OverSession<'_> {
     async fn push(&mut self) {
         let peer = self.handle.peer();
-        match self.sync.push_over(&self.handle).await {
+        match self.sync.push_over(&self.handle, false).await {
             Ok(Some(result)) => {
                 tracing::debug!(%peer, ?result, "pushed documents to a peer that was behind");
             }
@@ -1153,7 +1232,7 @@ impl MemberPusher for IssuerPush {
             Ok(handle) => handle,
             Err(error) => return step_for_ensure_error(error),
         };
-        match self.sync.push_over(&handle).await {
+        match self.sync.push_over(&handle, false).await {
             Ok(Some(result)) => {
                 let step = step_for_result(&result);
                 if step == PushStep::Rejected {

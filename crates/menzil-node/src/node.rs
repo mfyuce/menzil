@@ -254,6 +254,7 @@ impl Node {
             policies.clone(),
             local_node_id,
             sync_config,
+            Some(identity.clone()),
         );
         let networks = session.networks.clone();
         let revalidator = Revalidator::new(
@@ -355,6 +356,20 @@ impl Node {
             .unwrap_or_default()
             .as_secs();
         self.identity.set(cert, now)
+    }
+
+    /// The renewed certificates peers pushed to this node, one per member, that the held
+    /// Policy of `network` does not list yet (cert rotation S5). Empty unless this node was told
+    /// it holds a steward key for the network ([`Self::set_candidate_holder`]).
+    pub fn cert_candidates(&self, network: NetworkId) -> Vec<menzil_proto::NodeCert> {
+        self.sync.candidates().candidates(network)
+    }
+
+    /// Says what this node holds for `network`, so that it records (a steward with `admit` and
+    /// `renew`) or only notes (the owner) the certificates peers push. `None`, the default, ignores
+    /// them.
+    pub fn set_candidate_holder(&self, network: NetworkId, holder: Option<crate::Holder>) {
+        self.sync.candidates().set_holder(network, holder);
     }
 
     /// The Policies this node holds, to seed or update.
@@ -627,6 +642,10 @@ pub(crate) fn serve_session<H>(
                 }));
             },
         );
+        let handler = match sync {
+            Some(sync) => handler.with_candidates(sync.candidates().clone(), peer, peer_static),
+            None => handler,
+        };
         let authorizer = authorizer.docs_only();
         tokio::spawn(async move {
             accept_loop(&mut acceptor, authorizer, handler).await;
@@ -649,6 +668,10 @@ pub(crate) fn serve_session<H>(
             policies.clone(),
             rosters.clone(),
         );
+        let handler = match sync {
+            Some(sync) => handler.with_candidates(sync.candidates().clone(), peer, peer_static),
+            None => handler,
+        };
         let live = sync.map(|sync| {
             let id = sync.register_as(
                 peer,
@@ -659,13 +682,18 @@ pub(crate) fn serve_session<H>(
             );
             (Arc::clone(sync), id)
         });
-        if let Some((sync, _)) = &live
-            && role == Role::Initiator
-        {
+        if let Some((sync, _)) = &live {
+            // Once per session, from either role: the initiator compares seqs and then, if its
+            // certificate is not listed, offers it; the responder only offers it.
             let sync = Arc::clone(sync);
+            let initiator = role == Role::Initiator;
+            let handle = handle.clone();
             tokio::spawn(async move {
-                sync.reconcile(handle, peer_roster_seq, peer_policy_seq)
-                    .await;
+                if initiator {
+                    sync.reconcile(handle.clone(), peer_roster_seq, peer_policy_seq)
+                        .await;
+                }
+                sync.push_node_cert(&handle).await;
             });
         }
         tokio::spawn(async move {

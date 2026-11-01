@@ -27,8 +27,8 @@ pub const MAX_FRAME_LEN: usize = 1_049_600;
 pub const FRAME_HEADER_LEN: usize = 4;
 
 /// The most messages one side may send on a stream, and so the most a receiver admits: `push`,
-/// four documents and `end` make six.
-pub const MAX_MESSAGES: usize = 6;
+/// four documents, one `node_cert` and `end` make seven.
+pub const MAX_MESSAGES: usize = 7;
 
 /// The time one `menzil:docs` stream may take, from its first byte to its last.
 pub const STREAM_DEADLINE: Duration = Duration::from_secs(30);
@@ -77,6 +77,10 @@ pub enum DocKind {
     Roster,
     /// A Policy.
     Policy,
+    /// The sender's own renewed [`NodeCert`](crate::NodeCert), offered to a steward as a
+    /// candidate for the Policy (cert rotation, protocol.md 5.5). Sent last, at most once per
+    /// stream.
+    NodeCert,
 }
 
 /// What a receiver did with one document of a push (`result.roster`, `result.policy`).

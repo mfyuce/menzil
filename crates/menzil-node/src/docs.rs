@@ -5,14 +5,14 @@
 //! open and past OPEN_ACK, and any `AsyncRead + AsyncWrite` will do.
 //!
 //! What a stream may cost is bounded in this order, and nothing is allocated for a frame before
-//! its length has passed: the message count (the seventh is refused before its header is
+//! its length has passed: the message count (the eighth is refused before its header is
 //! read), the frame length (checked on the four prefix bytes, before a buffer exists), strict
 //! decoding, the size of a document, the network of the session, and only then the signature
 //! checks, which belong to the [`DocsSink`] (the [`StoreDocs`] sink runs
 //! [`menzil_proto::trust::check_bundle`] through [`DocStore::adopt`]). The whole operation has
 //! one deadline ([`menzil_proto::docs::STREAM_DEADLINE`] unless the caller says otherwise).
 //!
-//! A protocol violation (a frame or document over its limit, a seventh message, a message that
+//! A protocol violation (a frame or document over its limit, an eighth message, a message that
 //! does not decode, out of turn or out of order) is an `Err`: the caller resets the stream. A
 //! document that is wrong in itself (does not decode as a Roster or Policy, belongs to another
 //! network, fails the acceptance predicate) is answered with a `result` carrying `bad_document`
@@ -26,9 +26,10 @@ use menzil_proto::docs::{
     decode_message, encode_frame,
 };
 use menzil_proto::trust::{Bundle, Reason, Signer};
-use menzil_proto::{ErrorCode, MAX_DOC_BYTES, NetworkId, Policy, Roster};
+use menzil_proto::{ErrorCode, MAX_DOC_BYTES, NetworkId, NodeCert, Policy, Roster};
 use thiserror::Error;
 
+use crate::cert_candidates::Offer;
 use crate::docs_store::{Adopted, DocStore};
 use crate::error::NodeError;
 use crate::policy_store::PolicyStore;
@@ -47,7 +48,7 @@ pub enum DocsStreamError {
     /// The stream failed or ended early.
     #[error("stream error: {0}")]
     Io(#[from] std::io::Error),
-    /// A frame over its limit, a seventh message, or a message that does not decode.
+    /// A frame over its limit, an eighth message, or a message that does not decode.
     #[error("framing: {0}")]
     Frame(#[from] DocsError),
     /// The operation did not finish within its deadline.
@@ -118,6 +119,13 @@ pub trait DocsSink {
     fn held_bases(&self) -> HeldBases {
         HeldBases::default()
     }
+    /// Judges a `node_cert` the opener pushed (cert rotation S5; see
+    /// [`crate::cert_candidates`]). The default ignores it, which is what a sink that knows no
+    /// session does: the `result` then says 3/3. A [`Offer::Refused`] is answered with
+    /// `bad_document`.
+    fn offer_node_cert(&self, _cert: &NodeCert, _now: u64) -> Offer {
+        Offer::Ignored
+    }
 }
 
 impl<T: DocsSource + ?Sized> DocsSource for &T {
@@ -138,6 +146,9 @@ impl<T: DocsSink + ?Sized> DocsSink for &T {
     }
     fn held_bases(&self) -> HeldBases {
         (**self).held_bases()
+    }
+    fn offer_node_cert(&self, cert: &NodeCert, now: u64) -> Offer {
+        (**self).offer_node_cert(cert, now)
     }
 }
 
@@ -438,7 +449,13 @@ pub fn bundle_to_push<S: DocsSource>(source: &S, now: u64) -> Bundle {
 
 /// The messages that push `bundle`: `push`, the documents bases first, `end` with the seqs of
 /// the bundle's own Roster and Policy.
+#[cfg(test)]
 fn push_messages(bundle: &Bundle) -> Vec<Message> {
+    push_messages_with(bundle, None)
+}
+
+/// [`push_messages`] with the sender's own `node_cert` after the other documents.
+fn push_messages_with(bundle: &Bundle, node_cert: Option<&NodeCert>) -> Vec<Message> {
     let mut out = vec![Message::Push];
     let docs = [
         (
@@ -456,6 +473,12 @@ fn push_messages(bundle: &Bundle) -> Vec<Message> {
         if let Some(doc) = doc {
             out.push(Message::Doc { kind, doc });
         }
+    }
+    if let Some(cert) = node_cert {
+        out.push(Message::Doc {
+            kind: DocKind::NodeCert,
+            doc: cert.encode(),
+        });
     }
     out.push(Message::End {
         roster_seq: bundle.roster.as_ref().and_then(roster_seq_of),
@@ -491,6 +514,9 @@ async fn read_message<S: AsyncRead + Unpin>(
 /// What a run of `doc` messages up to `end` came to.
 struct Collected {
     bundle: Bundle,
+    /// The `node_cert` the opener pushed, if any (it is not part of the bundle: it is judged by
+    /// the sink, after the documents, and by nobody else).
+    node_cert: Option<NodeCert>,
     /// A `roster` / `policy` document was sent (whether or not it decoded).
     sent_roster: bool,
     sent_policy: bool,
@@ -509,6 +535,7 @@ async fn collect<S: AsyncRead + Unpin>(
     network_id: &NetworkId,
 ) -> Result<Collected, DocsStreamError> {
     let mut bundle = Bundle::default();
+    let mut node_cert = None;
     let mut defect = None;
     let mut last: Option<DocKind> = None;
     let (mut sent_roster, mut sent_policy) = (false, false);
@@ -530,6 +557,15 @@ async fn collect<S: AsyncRead + Unpin>(
                 if defect.is_some() {
                     continue;
                 }
+                if kind == DocKind::NodeCert {
+                    // At most one per stream: the strictly increasing kind check above has
+                    // refused a second one already.
+                    match NodeCert::decode_strict(&doc) {
+                        Ok(cert) => node_cert = Some(cert),
+                        Err(_) => defect = Some(Reason::Malformed),
+                    }
+                    continue;
+                }
                 match store_doc(&mut bundle, kind, &doc, network_id) {
                     Ok(()) => {}
                     Err(reason) => defect = Some(reason),
@@ -541,6 +577,7 @@ async fn collect<S: AsyncRead + Unpin>(
             } => {
                 return Ok(Collected {
                     bundle,
+                    node_cert,
                     sent_roster,
                     sent_policy,
                     defect,
@@ -573,6 +610,7 @@ fn store_doc(
                 bundle.base_roster = Some(doc);
             }
         }
+        DocKind::NodeCert => unreachable!("collect keeps a node_cert out of the bundle"),
         DocKind::BasePolicy | DocKind::Policy => {
             let doc = Policy::decode_strict(bytes).map_err(|_| Reason::Malformed)?;
             let body = doc.decode().map_err(|_| Reason::Malformed)?;
@@ -605,6 +643,7 @@ fn judge_push<K: DocsSink>(
     now: u64,
 ) -> Result<Message, DocsStreamError> {
     let bundle = collected.bundle;
+    let node_cert = collected.node_cert;
     let (sent_roster, sent_policy) = (collected.sent_roster, collected.sent_policy);
     let verdict: Result<Adopted, ErrorCode> = if let Some(reason) = collected.defect {
         Err(reason.code())
@@ -629,11 +668,21 @@ fn judge_push<K: DocsSink>(
         (Ok(_), true) => Outcome::Held,
     };
     let adopted = verdict.as_ref().copied().unwrap_or_default();
+    // A `node_cert` is judged only when the documents of the stream were, so one that rode on a
+    // refused push is never stored. The Roster is adopted first: a member that the pushed
+    // Roster brings in is a member by the time its certificate is looked at.
+    let cert_code = match (&verdict, &node_cert) {
+        (Ok(_), Some(cert)) => match sink.offer_node_cert(cert, now) {
+            Offer::Refused(_) => Some(ErrorCode::BadDocument),
+            Offer::Ignored | Offer::Recorded | Offer::Noted => None,
+        },
+        _ => None,
+    };
     let held = sink.held();
     Ok(Message::Result {
         roster: outcome(sent_roster, adopted.roster),
         policy: outcome(sent_policy, adopted.policy),
-        code: verdict.err(),
+        code: verdict.err().or(cert_code),
         roster_seq: held.roster_seq,
         policy_seq: held.policy_seq,
     })
@@ -753,6 +802,9 @@ where
         if let Some(reason) = collected.defect {
             return Err(DocsStreamError::Rejected(reason));
         }
+        if collected.node_cert.is_some() {
+            return Err(DocsStreamError::Unexpected("node_cert in a fetch answer"));
+        }
         fill_bases(
             &mut collected.bundle,
             held.base_seq,
@@ -791,8 +843,22 @@ pub async fn push<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
+    push_with_cert(stream, bundle, None, params).await
+}
+
+/// [`push`] with the opener's own `node_cert` as the last document (cert rotation S5). An empty
+/// `bundle` with a certificate is a push of the certificate alone.
+pub async fn push_with_cert<S>(
+    stream: &mut S,
+    bundle: &Bundle,
+    node_cert: Option<&NodeCert>,
+    params: &DocsParams,
+) -> Result<PushResult, DocsStreamError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     tokio::time::timeout(params.deadline, async {
-        for message in push_messages(bundle) {
+        for message in push_messages_with(bundle, node_cert) {
             write_message(stream, &message).await?;
         }
         let mut counter = MessageCounter::new();

@@ -18,7 +18,10 @@ use tokio::task::JoinHandle;
 
 use super::*;
 use crate::admission::{PolicyAuthorizer, docs_service};
-use crate::docs::{bundle_to_push, fetch, push};
+use menzil_proto::trust::Bundle;
+
+use crate::cert_candidates::{CertCandidates, Holder};
+use crate::docs::{bundle_to_push, fetch, push, push_with_cert};
 
 fn unix_now() -> u64 {
     SystemTime::now()
@@ -657,4 +660,241 @@ async fn a_docs_only_session_refuses_a_fetch_and_every_other_open() {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     assert_eq!(ended.load(Ordering::SeqCst), 1);
+}
+
+// ---------------------------------------------------------------- node_cert (cert rotation S5)
+
+/// A member with a real key, which can sign a renewal.
+struct Signer {
+    signing: SigningKey,
+    id: NodeId,
+    x25519: X25519PublicKey,
+}
+
+fn signer(seed: u8) -> Signer {
+    let signing = SigningKey::from_bytes(&[seed; 32]);
+    Signer {
+        id: NodeId::from(signing.verifying_key().to_bytes()),
+        signing,
+        x25519: X25519PublicKey::from([seed.wrapping_add(100); 32]),
+    }
+}
+
+impl Signer {
+    fn renewal(&self, serial: u32) -> NodeCert {
+        let now = unix_now();
+        NodeCert::sign(
+            &self.signing,
+            &NodeCertBody {
+                v: PROTOCOL_VERSION,
+                node_id: self.id,
+                x25519_pub: self.x25519,
+                serial,
+                not_before: now - 86_400,
+                not_after: now + 300 * 86_400,
+            },
+        )
+        .unwrap()
+    }
+}
+
+fn steward_store(server: &Server) -> Arc<CertCandidates> {
+    let store = Arc::new(CertCandidates::new(
+        server.rosters.clone(),
+        server.policies.clone(),
+    ));
+    store.set_holder(
+        server.network,
+        Some(Holder::Steward {
+            admit: true,
+            renew: true,
+            not_after: unix_now() + 86_400,
+        }),
+    );
+    store
+}
+
+async fn wait_ended(ended: &AtomicUsize) {
+    for _ in 0..100 {
+        if ended.load(Ordering::SeqCst) > 0 {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+#[tokio::test]
+async fn a_docs_only_session_takes_a_node_cert_as_its_one_push_and_ends() {
+    let w = world();
+    let m = signer(3);
+    let (policies, rosters) = w.stores(2, &[server_id(), m.id]);
+    let server = Server::new(&w, policies, rosters);
+    let store = steward_store(&server);
+    let ended = Arc::new(AtomicUsize::new(0));
+    let client = server.connect(
+        m.id,
+        server.authorizer().docs_only(),
+        server
+            .docs_only_handler(ended.clone())
+            .with_candidates(store.clone(), m.id, m.x25519),
+    );
+
+    let (mut stream, ack) = client.open(docs_service()).await;
+    assert!(ack.ok, "{ack:?}");
+    // The one stream of the session holds its place: a second one is refused as today.
+    let (_second, second_ack) = client.open(docs_service()).await;
+    assert!(!second_ack.ok);
+    assert_eq!(second_ack.code, ErrorCode::RateLimited);
+
+    let cert = m.renewal(2);
+    let result = push_with_cert(
+        &mut stream,
+        &Bundle::default(),
+        Some(&cert),
+        &client.params(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        (result.roster, result.policy, result.code),
+        (
+            menzil_proto::docs::Outcome::NotSent,
+            menzil_proto::docs::Outcome::NotSent,
+            None
+        )
+    );
+    assert_eq!(store.candidates(w.network), vec![cert]);
+    assert_eq!(
+        ended.load(Ordering::SeqCst),
+        0,
+        "not ended while the opener may still be reading"
+    );
+    stream.close().await.unwrap();
+    wait_ended(&ended).await;
+    assert_eq!(ended.load(Ordering::SeqCst), 1, "CLOSE docs_only follows");
+}
+
+#[tokio::test]
+async fn a_docs_only_push_carries_its_documents_and_a_node_cert_in_the_one_stream() {
+    let w = world();
+    let m = signer(3);
+    // The server is behind (seq 1); the member comes with seq 2 and its renewal.
+    let (policies, rosters) = w.stores(1, &[server_id(), m.id]);
+    let server = Server::new(&w, policies, rosters.clone());
+    let store = steward_store(&server);
+    let ended = Arc::new(AtomicUsize::new(0));
+    let client = server.connect(
+        m.id,
+        server.authorizer().docs_only(),
+        server
+            .docs_only_handler(ended.clone())
+            .with_candidates(store.clone(), m.id, m.x25519),
+    );
+    let (member_policies, member_rosters) = w.stores(2, &[server_id(), m.id]);
+    let source = StoreDocs::new(&member_rosters, &member_policies, w.network);
+    let bundle = bundle_to_push(&source, unix_now());
+
+    let (mut stream, ack) = client.open(docs_service()).await;
+    assert!(ack.ok);
+    let cert = m.renewal(2);
+    let result = push_with_cert(&mut stream, &bundle, Some(&cert), &client.params())
+        .await
+        .unwrap();
+    assert_eq!(result.roster, menzil_proto::docs::Outcome::Adopted);
+    assert_eq!(result.code, None);
+    assert_eq!(rosters.seq(&w.network), Some(2));
+    assert_eq!(store.candidates(w.network), vec![cert]);
+    stream.close().await.unwrap();
+    wait_ended(&ended).await;
+    assert_eq!(ended.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn a_node_cert_for_another_key_than_the_sessions_is_refused_on_a_docs_only_session() {
+    let w = world();
+    let m = signer(3);
+    let (policies, rosters) = w.stores(2, &[server_id(), m.id]);
+    let server = Server::new(&w, policies, rosters);
+    let store = steward_store(&server);
+    let ended = Arc::new(AtomicUsize::new(0));
+    // The session's static key is not the one m's certificate names.
+    let other_static = X25519PublicKey::from([0x77; 32]);
+    let client = server.connect(
+        m.id,
+        server.authorizer().docs_only(),
+        server
+            .docs_only_handler(ended.clone())
+            .with_candidates(store.clone(), m.id, other_static),
+    );
+    let (mut stream, ack) = client.open(docs_service()).await;
+    assert!(ack.ok);
+    let result = push_with_cert(
+        &mut stream,
+        &Bundle::default(),
+        Some(&m.renewal(2)),
+        &client.params(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(result.code, Some(ErrorCode::BadDocument));
+    assert!(store.candidates(w.network).is_empty());
+    stream.close().await.unwrap();
+    wait_ended(&ended).await;
+    assert_eq!(ended.load(Ordering::SeqCst), 1, "the session ends as ever");
+}
+
+#[tokio::test]
+async fn a_session_handler_without_candidates_ignores_a_node_cert_with_three_three() {
+    let w = world();
+    let m = signer(3);
+    let (policies, rosters) = w.stores(2, &[server_id(), m.id]);
+    let server = Server::new(&w, policies, rosters);
+    let client = server.ordinary(m.id);
+    let (mut stream, ack) = client.open(docs_service()).await;
+    assert!(ack.ok);
+    let result = push_with_cert(
+        &mut stream,
+        &Bundle::default(),
+        Some(&m.renewal(2)),
+        &client.params(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        (result.roster, result.policy, result.code),
+        (
+            menzil_proto::docs::Outcome::NotSent,
+            menzil_proto::docs::Outcome::NotSent,
+            None
+        )
+    );
+}
+
+#[tokio::test]
+async fn an_ordinary_session_records_a_node_cert_for_a_steward_holder() {
+    let w = world();
+    let m = signer(3);
+    let (policies, rosters) = w.stores(2, &[server_id(), m.id]);
+    let server = Server::new(&w, policies, rosters);
+    let store = steward_store(&server);
+    let client = server.connect(
+        m.id,
+        server.authorizer(),
+        server
+            .full_handler()
+            .with_candidates(store.clone(), m.id, m.x25519),
+    );
+    let (mut stream, ack) = client.open(docs_service()).await;
+    assert!(ack.ok);
+    let cert = m.renewal(2);
+    let result = push_with_cert(
+        &mut stream,
+        &Bundle::default(),
+        Some(&cert),
+        &client.params(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(result.code, None);
+    assert_eq!(store.candidates(w.network), vec![cert]);
 }
