@@ -5,9 +5,11 @@
 //! signed document of the same kind it was made from, and the steward's authority is the
 //! `Steward` entry in the base Roster (signed by the owner inside a Roster signed by the owner).
 //! The steward's rights are enforced by comparing the document with its base field by field:
-//! `renew` may change `seq`, `issued` and `expires`; `admit` may also append new, unrevoked
-//! members at the end of the lists and list a member's renewed certificate (same keys, higher
-//! serial) in the tail of `certs`. Nothing else may differ. The owner's own next documents
+//! `renew` may change `seq`, `issued` and `expires`, and list a member's renewed certificate
+//! (same keys, higher serial) in the tail of `certs`; `admit` may also append new, unrevoked
+//! members at the end of the lists. The right a change needs is `admit` when it appends members
+//! the verifier did not hold, else `renew` (so a renewed certificate alone needs `renew`, and a
+//! steward that may only `admit` cannot renew). Nothing else may differ. The owner's own next documents
 //! jump [`STEWARD_SEQ_SPAN`] past the base, so nothing a steward signed from that base can
 //! outrank them.
 //!
