@@ -367,9 +367,14 @@ impl Node {
 
     /// Says what this node holds for `network`, so that it records (a steward with `admit` and
     /// `renew`) or only notes (the owner) the certificates peers push. `None`, the default, ignores
-    /// them.
+    /// them. A node that cannot use candidates any more (no holder, the owner key, a steward
+    /// entry without `admit` or `renew` or one that has ended) loses those it had for `network`.
     pub fn set_candidate_holder(&self, network: NetworkId, holder: Option<crate::Holder>) {
-        self.sync.candidates().set_holder(network, holder);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        self.sync.candidates().set_holder(network, holder, now);
     }
 
     /// The Policies this node holds, to seed or update.

@@ -15,15 +15,19 @@
 //! 3. its `x25519_pub` is the static key of the session (so a relay that forges the `src` of
 //!    a record cannot pass a member's certificate off as another's: the member signed it over
 //!    its own key);
-//! 4. the self signature verifies under the `node_id` key;
-//! 5. it is valid now, and its window is at most [`NODE_CERT_MAX_LIFETIME`];
-//! 6. its serial is strictly above the highest serial known for that node: the certificates
+//! 4. its `x25519_pub` is the key of the highest certificate the held Policy lists for that
+//!    node (a new key is a new identity, as for `accept_cert`); a Policy that lists none
+//!    skips this check;
+//! 5. the self signature verifies under the `node_id` key;
+//! 6. it is valid now, and its window is at most [`NODE_CERT_MAX_LIFETIME`];
+//! 7. its serial is strictly above the highest serial known for that node: the certificates
 //!    the held Policy lists, the candidate already stored, and the Roster's `min_serial`. An
 //!    equal serial is a replay and a lower one a rollback; both are refused.
 //!
 //! The store keeps at most one candidate per member and network, the one with the highest
 //! serial. A candidate the held Policy lists (the same serial or higher) is dropped the next
-//! time the store is looked at. Nothing is persisted: a candidate is idempotent, because the
+//! time the store is looked at, and so is one whose member is no longer an unrevoked member of
+//! the held Roster or whose serial is below the Roster's `min_serial` for it. Nothing is persisted: a candidate is idempotent, because the
 //! node pushes its certificate again on every session until a Policy lists it.
 //!
 //! A node that holds the owner key ([`Holder::Owner`]) stores nothing: when no steward is listed
@@ -61,6 +65,21 @@ pub enum Holder {
     Owner,
 }
 
+impl Holder {
+    /// Whether a node of this kind keeps candidates at `now`: a steward entry with both rights
+    /// and a `not_after` ahead. The owner keeps none.
+    fn records(self, now: u64) -> bool {
+        match self {
+            Self::Steward {
+                admit,
+                renew,
+                not_after,
+            } => admit && renew && not_after > now,
+            Self::Owner => false,
+        }
+    }
+}
+
 /// The session a `node_cert` arrived on, as this node knows it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Offerer {
@@ -72,8 +91,9 @@ pub struct Offerer {
     pub peer_static: X25519PublicKey,
 }
 
-/// Why a certificate was refused. The peer is told `bad_document` and no more; the log keeps
-/// this.
+/// Why a certificate was refused. The peer is told nothing of it (the `result` is the same
+/// whatever happens here, or the answer would tell which peers hold a steward or owner key);
+/// the log keeps this.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Refusal {
     /// The certificate does not decode.
@@ -84,6 +104,9 @@ pub enum Refusal {
     NotAMember,
     /// Its `x25519_pub` is not the session's static key.
     WrongStaticKey,
+    /// Its `x25519_pub` is not the key of the highest certificate the held Policy lists for the
+    /// node: a new key is a new identity, not a renewal.
+    NewKey,
     /// The self signature does not verify.
     BadSignature,
     /// Not valid now (expired or not yet valid).
@@ -103,6 +126,9 @@ impl Refusal {
             Self::NotThePeer => "its node_id is not the session peer",
             Self::NotAMember => "the peer is not an unrevoked member of the network",
             Self::WrongStaticKey => "its x25519_pub is not the session's static key",
+            Self::NewKey => {
+                "its x25519_pub differs from the key the held Policy lists for the node"
+            }
             Self::BadSignature => "its self signature does not verify",
             Self::NotValidNow => "it is not valid now",
             Self::WindowTooLong => "its validity window is over 400 days",
@@ -159,9 +185,11 @@ impl CertCandidates {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Says what this node is for `network_id` (`None`: nothing, ignore candidates). A node
-    /// that stops being a holder loses the candidates it had for the network.
-    pub fn set_holder(&self, network_id: NetworkId, holder: Option<Holder>) {
+    /// Says what this node is for `network_id` (`None`: nothing, ignore candidates) at `now`
+    /// (Unix seconds). A node that stops being able to use candidates loses those it had for the
+    /// network: `None`, the owner key (which stores nothing), a steward entry without `admit` or
+    /// `renew`, or one whose `not_after` has passed.
+    pub fn set_holder(&self, network_id: NetworkId, holder: Option<Holder>, now: u64) {
         let mut state = self.lock();
         match holder {
             Some(holder) => {
@@ -172,15 +200,17 @@ impl CertCandidates {
             }
             None => {
                 state.holders.remove(&network_id);
-                state
-                    .candidates
-                    .retain(|(network, _), _| *network != network_id);
             }
+        }
+        if !holder.is_some_and(|holder| holder.records(now)) {
+            state
+                .candidates
+                .retain(|(network, _), _| *network != network_id);
         }
     }
 
     /// The candidates of `network_id`, one per member, those the held Policy does not list
-    /// yet. A listed one is dropped here.
+    /// yet and whose member still stands in the held Roster. Any other is dropped here.
     pub fn candidates(&self, network_id: NetworkId) -> Vec<NodeCert> {
         let mut state = self.lock();
         self.prune(&mut state, &network_id);
@@ -192,18 +222,31 @@ impl CertCandidates {
             .collect()
     }
 
-    /// Drops the candidates of `network_id` that the held Policy lists with the same serial or
-    /// a higher one.
+    /// Drops the candidates of `network_id` that cannot be used any more: the member is not an
+    /// unrevoked member of the held Roster (revoked, removed, or no Roster), the serial is below
+    /// the Roster's `min_serial` for it, or the held Policy lists the same serial or a higher one.
     fn prune(&self, state: &mut State, network_id: &NetworkId) {
-        let Some(policy) = self.policies.body(network_id) else {
-            return;
-        };
+        let roster = self.rosters.body(network_id);
+        let policy = self.policies.body(network_id);
         state.candidates.retain(|(network, node), cert| {
             if network != network_id {
                 return true;
             }
-            let serial = cert.decode().map_or(0, |body| body.serial);
-            listed_serial(&policy.certs, node) < Some(serial)
+            let Some(min_serial) = roster
+                .as_ref()
+                .and_then(|roster| roster_standing(roster, node).ok())
+            else {
+                return false;
+            };
+            let Ok(body) = cert.decode() else {
+                return false;
+            };
+            if body.serial < min_serial {
+                return false;
+            }
+            policy
+                .as_ref()
+                .is_none_or(|policy| listed_serial(&policy.certs, node) < Some(body.serial))
         });
     }
 
@@ -224,6 +267,10 @@ impl CertCandidates {
                 renew,
                 not_after,
             }) if !(admit && renew && not_after > now) => {
+                // Whatever was recorded while the entry was good is of no use now.
+                state
+                    .candidates
+                    .retain(|(network, _), _| *network != network_id);
                 if state.ignored_logged.insert(network_id) {
                     tracing::warn!(
                         network = %network_id,
@@ -296,6 +343,16 @@ impl CertCandidates {
         if body.x25519_pub != from.peer_static {
             return Err(Refusal::WrongStaticKey);
         }
+        // A listed certificate of the node fixes its key: a renewal keeps it (as `accept_cert`
+        // requires). The check is a comparison, so it comes before the signature.
+        if let Some(listed) = self
+            .policies
+            .body(&from.network_id)
+            .and_then(|policy| listed_highest(&policy.certs, &from.peer))
+            && listed.x25519_pub != body.x25519_pub
+        {
+            return Err(Refusal::NewKey);
+        }
         let key = VerifyingKey::from_bytes(&<[u8; 32]>::from(body.node_id))
             .map_err(|_| Refusal::BadSignature)?;
         cert.verify(&key).map_err(|_| Refusal::BadSignature)?;
@@ -344,12 +401,17 @@ impl CertCandidates {
 /// The highest serial among `certs` that are for `node` (signatures are not looked at: the
 /// Policy is an adopted document).
 pub(crate) fn listed_serial(certs: &[NodeCert], node: &NodeId) -> Option<u32> {
+    listed_highest(certs, node).map(|body| body.serial)
+}
+
+/// The certificate of `node` among `certs` that wins by [`NodeCertBody::rank`] (the one rule of
+/// which certificate of a node is the highest).
+fn listed_highest(certs: &[NodeCert], node: &NodeId) -> Option<NodeCertBody> {
     certs
         .iter()
         .filter_map(|cert| cert.decode().ok())
         .filter(|body| &body.node_id == node)
-        .map(|body| body.serial)
-        .max()
+        .max_by_key(NodeCertBody::rank)
 }
 
 #[cfg(test)]

@@ -18,6 +18,14 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+/// The real clock, Unix seconds: the node judges its renewal against it.
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+}
+
 use common::{
     PATIENCE, echo_round_trip, echo_server, grant, identity, policy, seed_roster, service,
     session_config, start_relay, trust_test_certificate,
@@ -101,8 +109,8 @@ async fn a_node_that_renewed_is_judged_by_its_new_serial_in_open_sessions() {
             node_id: b.node_id,
             x25519_pub: b.x25519_public,
             serial: 2,
-            not_before: 1_000_000_000,
-            not_after: 4_000_000_000,
+            not_before: unix_now() - 86_400,
+            not_after: unix_now() + 300 * 86_400,
         },
     )
     .unwrap();

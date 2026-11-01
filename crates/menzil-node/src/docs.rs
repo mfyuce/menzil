@@ -121,8 +121,8 @@ pub trait DocsSink {
     }
     /// Judges a `node_cert` the opener pushed (cert rotation S5; see
     /// [`crate::cert_candidates`]). The default ignores it, which is what a sink that knows no
-    /// session does: the `result` then says 3/3. A [`Offer::Refused`] is answered with
-    /// `bad_document`.
+    /// session does. The `result` says 3/3 with no code whatever is returned here, a
+    /// [`Offer::Refused`] included: the answer must not tell the pusher what this node holds.
     fn offer_node_cert(&self, _cert: &NodeCert, _now: u64) -> Offer {
         Offer::Ignored
     }
@@ -670,19 +670,17 @@ fn judge_push<K: DocsSink>(
     let adopted = verdict.as_ref().copied().unwrap_or_default();
     // A `node_cert` is judged only when the documents of the stream were, so one that rode on a
     // refused push is never stored. The Roster is adopted first: a member that the pushed
-    // Roster brings in is a member by the time its certificate is looked at.
-    let cert_code = match (&verdict, &node_cert) {
-        (Ok(_), Some(cert)) => match sink.offer_node_cert(cert, now) {
-            Offer::Refused(_) => Some(ErrorCode::BadDocument),
-            Offer::Ignored | Offer::Recorded | Offer::Noted => None,
-        },
-        _ => None,
-    };
+    // Roster brings in is a member by the time its certificate is looked at. The verdict stays
+    // with the sink (its log): whatever it is, the answer is the same, or the `code` would tell
+    // the pusher which peers hold a steward or the owner key (design Q7 c).
+    if let (Ok(_), Some(cert)) = (&verdict, &node_cert) {
+        let _verdict_stays_local = sink.offer_node_cert(cert, now);
+    }
     let held = sink.held();
     Ok(Message::Result {
         roster: outcome(sent_roster, adopted.roster),
         policy: outcome(sent_policy, adopted.policy),
-        code: verdict.err().or(cert_code),
+        code: verdict.err(),
         roster_seq: held.roster_seq,
         policy_seq: held.policy_seq,
     })

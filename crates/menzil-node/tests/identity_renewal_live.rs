@@ -24,6 +24,19 @@ use menzil_node::{IdentityError, Node, NodeConfig, PolicyStore, RefuseAll, Roste
 use menzil_proto::{ErrorCode, NodeCert, NodeCertBody, PROTOCOL_VERSION, Record};
 use tokio::time::timeout;
 
+/// The real clock, Unix seconds: the relay and the node judge certificates against it.
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+}
+
+/// A window around the real clock that `IdentityCell::set` takes (at most 400 days).
+fn window() -> (u64, u64) {
+    (unix_now() - 86_400, unix_now() + 300 * 86_400)
+}
+
 fn cert_with(id: &Identity, serial: u32, not_before: u64, not_after: u64) -> NodeCert {
     NodeCert::sign(
         &id.signing,
@@ -68,7 +81,8 @@ async fn a_renewed_certificate_is_presented_by_the_next_hello_and_the_running_no
     first.close().await;
 
     // Renew: the cell now holds serial 2, and the next connect presents it.
-    cell.set(cert_with(&me, 2, 0, 4_000_000_000), 1_000)
+    let (not_before, not_after) = window();
+    cell.set(cert_with(&me, 2, not_before, not_after), unix_now())
         .unwrap();
     let mut second = Session::connect(&config, &env, rosters.clone())
         .await
@@ -113,7 +127,7 @@ async fn a_renewed_certificate_is_presented_by_the_next_hello_and_the_running_no
     );
     let other = identity();
     assert_eq!(
-        node.renew_identity(cert_with(&other, 2, 0, 4_000_000_000)),
+        node.renew_identity(cert_with(&other, 2, window().0, window().1)),
         Err(IdentityError::OtherNode)
     );
     assert_eq!(
@@ -123,7 +137,8 @@ async fn a_renewed_certificate_is_presented_by_the_next_hello_and_the_running_no
     assert_eq!(node_cell.serial(), 1);
 
     // Valid at the real clock but not at time 0: pins that the node judges against now.
-    let renewed = cert_with(&node_id, 2, 1_000_000_000, 4_000_000_000);
+    let (not_before, not_after) = window();
+    let renewed = cert_with(&node_id, 2, not_before, not_after);
     node.renew_identity(renewed.clone()).unwrap();
     assert_eq!(node_cell.serial(), 2);
     assert_eq!(node_cell.get().node_cert, renewed);

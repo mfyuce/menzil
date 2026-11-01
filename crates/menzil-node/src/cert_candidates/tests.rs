@@ -145,7 +145,7 @@ impl World {
 
     fn store(&self) -> CertCandidates {
         let store = CertCandidates::new(self.rosters.clone(), self.policies.clone());
-        store.set_holder(self.network, Some(steward()));
+        store.set_holder(self.network, Some(steward()), NOW);
         store
     }
 
@@ -184,7 +184,7 @@ fn a_node_that_holds_no_steward_key_ignores_and_stores_nothing() {
     );
     assert!(store.candidates(w.network).is_empty());
     // A holder of another network is no holder of this one.
-    store.set_holder(NetworkId::from([7u8; 32]), Some(steward()));
+    store.set_holder(NetworkId::from([7u8; 32]), Some(steward()), NOW);
     assert_eq!(
         store.offer(&w.from(&m), &renewal(&m, 2), NOW),
         Offer::Ignored
@@ -211,6 +211,7 @@ fn a_steward_entry_needs_admit_and_renew_and_a_not_after_ahead() {
                 renew,
                 not_after,
             }),
+            NOW,
         );
         let offer = store.offer(&w.from(&m), &renewal(&m, 2), NOW);
         assert_eq!(
@@ -242,7 +243,7 @@ fn the_owner_notes_a_newer_certificate_once_per_member_and_stores_nothing() {
         ];
     });
     let store = CertCandidates::new(w.rosters.clone(), w.policies.clone());
-    store.set_holder(w.network, Some(Holder::Owner));
+    store.set_holder(w.network, Some(Holder::Owner), NOW);
     assert_eq!(
         store.offer(&w.from(&m), &renewal(&m, 2), NOW),
         Offer::Noted,
@@ -290,7 +291,7 @@ fn the_owner_says_nothing_when_a_steward_is_listed() {
         roster.stewards = vec![entry];
     });
     let store = CertCandidates::new(w.rosters.clone(), w.policies.clone());
-    store.set_holder(w.network, Some(Holder::Owner));
+    store.set_holder(w.network, Some(Holder::Owner), NOW);
     assert_eq!(
         store.offer(&w.from(&m), &renewal(&m, 2), NOW),
         Offer::Ignored,
@@ -308,7 +309,7 @@ fn dropping_the_holder_drops_its_candidates() {
         store.offer(&w.from(&m), &renewal(&m, 2), NOW),
         Offer::Recorded
     );
-    store.set_holder(w.network, None);
+    store.set_holder(w.network, None, NOW);
     assert!(store.candidates(w.network).is_empty());
     assert_eq!(
         store.offer(&w.from(&m), &renewal(&m, 3), NOW),
@@ -377,7 +378,7 @@ fn a_peer_that_is_not_an_unrevoked_roster_member_is_refused() {
     );
     // No Roster at all for the network.
     let empty = CertCandidates::new(Arc::new(RosterStore::new()), w.policies.clone());
-    empty.set_holder(w.network, Some(steward()));
+    empty.set_holder(w.network, Some(steward()), NOW);
     assert_eq!(
         empty.offer(&w.from(&m), &renewal(&m, 2), NOW),
         Offer::Refused(Refusal::NotAMember)
@@ -398,12 +399,20 @@ fn a_certificate_for_another_static_key_than_the_sessions_is_refused() {
         store.offer(&w.from(&m), &moved, NOW),
         Offer::Refused(Refusal::WrongStaticKey)
     );
-    // The same certificate on a session whose static key it names is judged further (and is
-    // good), which shows the key is what stopped it.
+    // The same certificate on a session whose static key it names is judged further. The
+    // Policy lists serial 1 with m's own key, so the new key is refused as such...
     let session = Offerer {
         peer_static: other_key,
         ..w.from(&m)
     };
+    assert_eq!(
+        store.offer(&session, &moved, NOW),
+        Offer::Refused(Refusal::NewKey)
+    );
+    // ...while a Policy that lists no certificate of the node leaves the key to the session,
+    // which shows the session key is what the WrongStaticKey check above stopped.
+    let w = World::new(&m, 1, &[]);
+    let store = w.store();
     assert_eq!(store.offer(&session, &moved, NOW), Offer::Recorded);
 }
 
@@ -657,4 +666,222 @@ fn candidates_are_kept_per_member_and_network() {
     let mut want = vec![renewal(&a, 2), renewal(&b, 2)];
     want.sort_by_key(|c| <[u8; 32]>::from(c.decode().unwrap().node_id));
     assert_eq!(got, want);
+}
+
+// ---------------------------------------------------------------- round B: L1, L2
+
+#[test]
+fn a_new_key_certificate_is_refused_and_does_not_shadow_the_real_renewal() {
+    let m = member(1);
+    let w = World::new(&m, 1, &[1]);
+    let store = w.store();
+    // The hostile one: serial far above, a key the Policy never listed, on a session that
+    // presents that key.
+    let hostile_key = X25519PublicKey::from([0x66; 32]);
+    let hostile = cert_for_key(&m, hostile_key, u32::MAX, NOW - DAY, NOW + 300 * DAY);
+    let session = Offerer {
+        peer_static: hostile_key,
+        ..w.from(&m)
+    };
+    assert_eq!(
+        store.offer(&session, &hostile, NOW),
+        Offer::Refused(Refusal::NewKey)
+    );
+    assert!(store.candidates(w.network).is_empty());
+    // The legitimate same key renewal that follows is not shadowed by it.
+    let legit = renewal(&m, 2);
+    assert_eq!(store.offer(&w.from(&m), &legit, NOW), Offer::Recorded);
+    assert_eq!(store.candidates(w.network), vec![legit]);
+}
+
+#[test]
+fn the_key_is_compared_with_the_highest_listed_certificate() {
+    let m = member(1);
+    let w = World::new(&m, 1, &[]);
+    // The Policy lists serial 1 with another key and serial 2 with m's key: the highest wins.
+    let old_key = X25519PublicKey::from([0x55; 32]);
+    let body = |serial, key| NodeCertBody {
+        v: PROTOCOL_VERSION,
+        node_id: m.id,
+        x25519_pub: key,
+        serial,
+        not_before: NOW - DAY,
+        not_after: NOW + 300 * DAY,
+    };
+    let listed = [
+        NodeCert::sign(&m.signing, &body(1, old_key)).unwrap(),
+        NodeCert::sign(&m.signing, &body(2, m.x25519)).unwrap(),
+    ];
+    let policy = PolicyBody {
+        v: PROTOCOL_VERSION,
+        network_id: w.network,
+        seq: 2,
+        issued: NOW - DAY,
+        expires: NOW + 10 * DAY,
+        members: vec![PolicyMember {
+            node_id: m.id,
+            name: "node".to_string(),
+            roles: vec![],
+        }],
+        certs: listed.to_vec(),
+        grants: vec![],
+        egress: vec![],
+        accept: vec![],
+    };
+    w.policies
+        .set(&Policy::sign(&w.owner, &policy).unwrap())
+        .unwrap();
+    let store = w.store();
+    assert_eq!(
+        store.offer(&w.from(&m), &renewal(&m, 3), NOW),
+        Offer::Recorded,
+        "m's key is the key of the highest listed certificate"
+    );
+}
+
+#[test]
+fn a_candidate_is_dropped_when_its_member_is_revoked_or_removed() {
+    let m = member(1);
+    let w = World::new(&m, 1, &[1]);
+    let store = w.store();
+    assert_eq!(
+        store.offer(&w.from(&m), &renewal(&m, 2), NOW),
+        Offer::Recorded
+    );
+    assert_eq!(store.candidates(w.network).len(), 1);
+    // Revoked.
+    w.set_roster(2, |roster| {
+        roster.members = vec![RosterMember {
+            node_id: m.id,
+            min_serial: 1,
+        }];
+        roster.revoked = vec![RevokedMember {
+            node_id: m.id,
+            since: 0,
+        }];
+    });
+    assert!(store.candidates(w.network).is_empty());
+    assert!(
+        store.lock().candidates.is_empty(),
+        "the entry is freed, not only hidden"
+    );
+
+    // Removed from the Roster.
+    let w = World::new(&m, 1, &[1]);
+    let store = w.store();
+    store.offer(&w.from(&m), &renewal(&m, 2), NOW);
+    w.set_roster(2, |roster| roster.members.clear());
+    assert!(store.candidates(w.network).is_empty());
+    assert!(store.lock().candidates.is_empty());
+}
+
+#[test]
+fn a_candidate_below_a_raised_min_serial_is_dropped_and_one_at_it_is_kept() {
+    let m = member(1);
+    let w = World::new(&m, 1, &[1]);
+    let store = w.store();
+    assert_eq!(
+        store.offer(&w.from(&m), &renewal(&m, 2), NOW),
+        Offer::Recorded
+    );
+    // A floor equal to the candidate's serial still admits it.
+    w.set_roster(2, |roster| {
+        roster.members = vec![RosterMember {
+            node_id: m.id,
+            min_serial: 2,
+        }];
+    });
+    assert_eq!(store.candidates(w.network), vec![renewal(&m, 2)]);
+    // A floor above it does not.
+    w.set_roster(3, |roster| {
+        roster.members = vec![RosterMember {
+            node_id: m.id,
+            min_serial: 9,
+        }];
+    });
+    assert!(store.candidates(w.network).is_empty());
+    assert!(store.lock().candidates.is_empty());
+}
+
+#[test]
+fn a_holder_that_cannot_use_candidates_clears_the_networks_candidates() {
+    let m = member(1);
+    let other_network = NetworkId::from([7u8; 32]);
+    for (name, holder) in [
+        ("none", None),
+        ("owner", Some(Holder::Owner)),
+        (
+            "no admit",
+            Some(Holder::Steward {
+                admit: false,
+                renew: true,
+                not_after: NOW + DAY,
+            }),
+        ),
+        (
+            "no renew",
+            Some(Holder::Steward {
+                admit: true,
+                renew: false,
+                not_after: NOW + DAY,
+            }),
+        ),
+        (
+            "not_after passed",
+            Some(Holder::Steward {
+                admit: true,
+                renew: true,
+                not_after: NOW,
+            }),
+        ),
+    ] {
+        let w = World::new(&m, 1, &[1]);
+        let store = w.store();
+        assert_eq!(
+            store.offer(&w.from(&m), &renewal(&m, 2), NOW),
+            Offer::Recorded,
+            "{name}"
+        );
+        // A change of another network's holder leaves this one alone.
+        store.set_holder(other_network, holder, NOW);
+        assert_eq!(store.candidates(w.network).len(), 1, "{name}");
+        store.set_holder(w.network, holder, NOW);
+        assert!(store.lock().candidates.is_empty(), "{name}");
+        assert!(store.candidates(w.network).is_empty(), "{name}");
+    }
+}
+
+#[test]
+fn a_holder_that_still_uses_candidates_keeps_them() {
+    let m = member(1);
+    let w = World::new(&m, 1, &[1]);
+    let store = w.store();
+    store.offer(&w.from(&m), &renewal(&m, 2), NOW);
+    // A steward entry with a later not_after is a changed entry, not a lost one.
+    store.set_holder(
+        w.network,
+        Some(Holder::Steward {
+            admit: true,
+            renew: true,
+            not_after: NOW + 90 * DAY,
+        }),
+        NOW,
+    );
+    assert_eq!(store.candidates(w.network), vec![renewal(&m, 2)]);
+}
+
+#[test]
+fn a_steward_entry_that_lapses_between_offers_drops_the_candidates() {
+    let m = member(1);
+    let w = World::new(&m, 1, &[1]);
+    let store = w.store();
+    assert_eq!(
+        store.offer(&w.from(&m), &renewal(&m, 2), NOW),
+        Offer::Recorded
+    );
+    // The entry's not_after is NOW + 30 days; a push 31 days on finds it ended.
+    let later = NOW + 31 * DAY;
+    let cert = cert(&m, 3, later - DAY, later + 300 * DAY);
+    assert_eq!(store.offer(&w.from(&m), &cert, later), Offer::Ignored);
+    assert!(store.lock().candidates.is_empty());
 }

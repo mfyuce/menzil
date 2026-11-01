@@ -2011,21 +2011,62 @@ async fn a_sink_that_knows_no_session_ignores_a_node_cert_with_three_three() {
 }
 
 #[tokio::test]
-async fn a_refused_node_cert_is_answered_bad_document_with_three_three() {
+async fn a_refused_node_cert_is_answered_three_three_with_no_code() {
+    // Design Q7 c: every receiver answers 3/3 code null. A `bad_document` here would tell the
+    // pusher that this node judges candidates, that is, holds a steward or the owner key.
     let net = Net::new();
     let stores = Stores::with_base(&net);
-    let sink = CertSink::new(
-        stores.docs(&net),
+    let cert = some_cert(5, 2);
+    let messages = [Message::Push, cert_doc(&cert), plain_end()];
+    for refusal in [
+        crate::cert_candidates::Refusal::Replay,
+        crate::cert_candidates::Refusal::NotThePeer,
+        crate::cert_candidates::Refusal::NewKey,
+    ] {
+        let sink = CertSink::new(stores.docs(&net), Offer::Refused(refusal));
+        let Ok(Served::Push(result)) = serve_messages(&net, &stores, &sink, &messages).await else {
+            panic!("{refusal:?}")
+        };
+        assert_eq!(
+            (result.roster, result.policy, result.code),
+            not_sent(None),
+            "{refusal:?}"
+        );
+        assert_eq!(sink.asked().len(), 1, "it was judged: {refusal:?}");
+    }
+}
+
+#[tokio::test]
+async fn an_undecodable_node_cert_is_bad_document_for_every_receiver_and_never_judged() {
+    // The decode failure is the stream's, found before the sink is asked: it is the same
+    // answer whatever the sink would do with a good certificate.
+    let net = Net::new();
+    let stores = Stores::with_base(&net);
+    let messages = [
+        Message::Push,
+        Message::Doc {
+            kind: DocKind::NodeCert,
+            doc: vec![0xFF, 0x00, 0x01],
+        },
+        plain_end(),
+    ];
+    for verdict in [
+        Offer::Ignored,
+        Offer::Recorded,
+        Offer::Noted,
         Offer::Refused(crate::cert_candidates::Refusal::Replay),
-    );
-    let messages = [Message::Push, cert_doc(&some_cert(5, 2)), plain_end()];
-    let Ok(Served::Push(result)) = serve_messages(&net, &stores, &sink, &messages).await else {
-        panic!()
-    };
-    assert_eq!(
-        (result.roster, result.policy, result.code),
-        not_sent(Some(ErrorCode::BadDocument))
-    );
+    ] {
+        let sink = CertSink::new(stores.docs(&net), verdict);
+        let Ok(Served::Push(result)) = serve_messages(&net, &stores, &sink, &messages).await else {
+            panic!("{verdict:?}")
+        };
+        assert_eq!(
+            (result.roster, result.policy, result.code),
+            not_sent(Some(ErrorCode::BadDocument)),
+            "{verdict:?}"
+        );
+        assert!(sink.asked().is_empty(), "{verdict:?}");
+    }
 }
 
 #[tokio::test]

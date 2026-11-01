@@ -2014,8 +2014,10 @@ mod tests {
                     node_id: f.ids.responder_node_id,
                     x25519_pub: f.ids.responder_x25519,
                     serial,
-                    not_before: 0,
-                    not_after: 4_000_000_000,
+                    // A window `IdentityCell::set` takes (at most 400 days), around the real
+                    // clock the authorizer reads.
+                    not_before: unix_now() - 86_400,
+                    not_after: unix_now() + 300 * 86_400,
                 },
             )
             .unwrap()
@@ -2061,7 +2063,7 @@ mod tests {
             OpenDecision::Deny(_)
         ));
 
-        cell.set(cert_at(6), 1_000).unwrap();
+        cell.set(cert_at(6), unix_now()).unwrap();
         assert!(
             matches!(
                 authorizer.authorize(&open_request(&f.ids)),

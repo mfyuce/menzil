@@ -3076,7 +3076,8 @@ mod sync;
 // The identity cell (cert rotation S4)
 // ----------------------------------------------------------------------
 
-/// `party`'s certificate at `serial`: same node and key, valid for the whole test.
+/// `party`'s certificate at `serial`: same node and key, valid at the fake times of these tests
+/// (1,000) with the longest window a certificate may have (`IdentityCell::set` refuses more).
 fn renewed_cert(party: &Party, serial: u32) -> NodeCert {
     NodeCert::sign(
         &party.signing,
@@ -3086,7 +3087,7 @@ fn renewed_cert(party: &Party, serial: u32) -> NodeCert {
             x25519_pub: party.x25519_public,
             serial,
             not_before: 0,
-            not_after: 4_000_000_000,
+            not_after: menzil_proto::trust::NODE_CERT_MAX_LIFETIME,
         },
     )
     .unwrap()

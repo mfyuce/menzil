@@ -710,6 +710,7 @@ fn steward_store(server: &Server) -> Arc<CertCandidates> {
             renew: true,
             not_after: unix_now() + 86_400,
         }),
+        unix_now(),
     );
     store
 }
@@ -836,7 +837,8 @@ async fn a_node_cert_for_another_key_than_the_sessions_is_refused_on_a_docs_only
     )
     .await
     .unwrap();
-    assert_eq!(result.code, Some(ErrorCode::BadDocument));
+    // Refused, and the pusher is not told (design Q7 c): the answer is the one of any receiver.
+    assert_eq!(result.code, None);
     assert!(store.candidates(w.network).is_empty());
     stream.close().await.unwrap();
     wait_ended(&ended).await;
@@ -897,4 +899,67 @@ async fn an_ordinary_session_records_a_node_cert_for_a_steward_holder() {
     .unwrap();
     assert_eq!(result.code, None);
     assert_eq!(store.candidates(w.network), vec![cert]);
+}
+
+#[tokio::test]
+async fn a_hostile_node_cert_gets_the_same_answer_from_every_kind_of_receiver() {
+    // Round B M1: a pushed certificate that fails a check must not tell the pusher whether this
+    // node holds a steward key or the owner key. Same push, three receivers.
+    let w = world();
+    let m = signer(3);
+    let other = signer(4);
+    let mut answers = Vec::new();
+    for kind in ["no holder", "steward", "owner"] {
+        let (policies, rosters) = w.stores(2, &[server_id(), m.id, other.id]);
+        let server = Server::new(&w, policies, rosters);
+        let store = Arc::new(CertCandidates::new(
+            server.rosters.clone(),
+            server.policies.clone(),
+        ));
+        match kind {
+            "steward" => store.set_holder(
+                w.network,
+                Some(Holder::Steward {
+                    admit: true,
+                    renew: true,
+                    not_after: unix_now() + 86_400,
+                }),
+                unix_now(),
+            ),
+            "owner" => store.set_holder(w.network, Some(Holder::Owner), unix_now()),
+            _ => {}
+        }
+        let client = server.connect(
+            m.id,
+            server.authorizer(),
+            server
+                .full_handler()
+                .with_candidates(store.clone(), m.id, m.x25519),
+        );
+        let (mut stream, ack) = client.open(docs_service()).await;
+        assert!(ack.ok, "{kind}");
+        // A good self signature over another node's id: no forgery, and refused by a holder
+        // (NotThePeer) before anything else.
+        let result = push_with_cert(
+            &mut stream,
+            &Bundle::default(),
+            Some(&other.renewal(2)),
+            &client.params(),
+        )
+        .await
+        .unwrap();
+        assert!(store.candidates(w.network).is_empty(), "{kind}");
+        answers.push((kind, result.roster, result.policy, result.code));
+    }
+    for (kind, roster, policy, code) in &answers {
+        assert_eq!(
+            (*roster, *policy, *code),
+            (
+                menzil_proto::docs::Outcome::NotSent,
+                menzil_proto::docs::Outcome::NotSent,
+                None
+            ),
+            "{kind}"
+        );
+    }
 }

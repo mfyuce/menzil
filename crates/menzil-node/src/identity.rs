@@ -13,6 +13,7 @@
 use std::sync::{Arc, PoisonError, RwLock};
 
 use ed25519_dalek::VerifyingKey;
+use menzil_proto::trust::NODE_CERT_MAX_LIFETIME;
 use menzil_proto::{NodeCert, ProtoError};
 
 /// What a node needs of its own identity to run an L3 handshake
@@ -63,6 +64,10 @@ pub enum IdentityError {
     /// The offered certificate's validity window does not contain now.
     #[error("the offered certificate is not valid now")]
     NotValidNow,
+    /// The offered certificate's window is over 400 days, or ends before it starts. Every
+    /// steward and verifier refuses such a certificate, so the node must not present it.
+    #[error("the offered certificate's validity window is over 400 days or ends before it starts")]
+    WindowTooLong,
 }
 
 impl From<ProtoError> for IdentityError {
@@ -121,7 +126,8 @@ impl IdentityCell {
 
     /// Replaces the certificate with `new_cert` (the private key stays). Accepted only when it
     /// is for the same `node_id` and `x25519_pub`, has a strictly higher serial, carries a valid
-    /// signature by its `node_id`, and is valid at `now` (Unix seconds). Anything else returns
+    /// signature by its `node_id`, is valid at `now` (Unix seconds) and has a window of at most
+    /// [`NODE_CERT_MAX_LIFETIME`] (what every verifier requires). Anything else returns
     /// an error and changes nothing.
     pub fn set(&self, new_cert: NodeCert, now: u64) -> Result<(), IdentityError> {
         let offered = new_cert.decode()?;
@@ -148,6 +154,11 @@ impl IdentityCell {
             .map_err(|_| IdentityError::BadSignature)?;
         if !offered.is_valid_at(now) {
             return Err(IdentityError::NotValidNow);
+        }
+        if offered.not_after < offered.not_before
+            || offered.not_after - offered.not_before > NODE_CERT_MAX_LIFETIME
+        {
+            return Err(IdentityError::WindowTooLong);
         }
         *guard = Current::new(LocalIdentity {
             node_cert: new_cert,
@@ -367,6 +378,25 @@ mod tests {
         assert_unchanged(&cell, &before, 3);
         // The window ends are inclusive, like `NodeCertBody::is_valid_at`.
         cell.set(cert(&me, 4, NOW, NOW), NOW).unwrap();
+        assert_eq!(cell.serial(), 4);
+    }
+
+    #[test]
+    fn set_refuses_a_window_over_the_maximum_lifetime() {
+        let me = who(1);
+        let cell = cell_of(&me, 3);
+        let before = cell.get().node_cert.clone();
+        // Ten years, valid now: every steward and verifier would refuse it.
+        let ten_years = cert(&me, 4, 0, 10 * 365 * 86_400);
+        assert_eq!(cell.set(ten_years, NOW), Err(IdentityError::WindowTooLong));
+        assert_unchanged(&cell, &before, 3);
+        // One second over the bound.
+        let over = cert(&me, 4, 0, NODE_CERT_MAX_LIFETIME + 1);
+        assert_eq!(cell.set(over, NOW), Err(IdentityError::WindowTooLong));
+        assert_unchanged(&cell, &before, 3);
+        // Exactly the bound is fine.
+        cell.set(cert(&me, 4, 0, NODE_CERT_MAX_LIFETIME), NOW)
+            .unwrap();
         assert_eq!(cell.serial(), 4);
     }
 

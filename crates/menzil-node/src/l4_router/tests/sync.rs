@@ -77,6 +77,7 @@ pub(super) fn as_steward(sync: &Arc<DocsSync>, network: NetworkId) {
             renew: true,
             not_after: now() + 86_400,
         }),
+        now(),
     );
 }
 
