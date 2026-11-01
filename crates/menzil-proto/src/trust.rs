@@ -715,7 +715,7 @@ fn policy_rules(
     // it holds (the sixth red-team round, M4). A certificate of a base member is a renewal
     // (protocol.md 2.3); a certificate of any other node is refused. At most one per node.
     let mut tail: HashMap<NodeId, (u32, crate::bytes::X25519PublicKey)> = HashMap::new();
-    let mut base_best: Option<HashMap<NodeId, (u32, crate::bytes::X25519PublicKey)>> = None;
+    let mut base_best: Option<HashMap<NodeId, (u32, [u8; 32])>> = None;
     for cert in certs {
         let body = cert.decode().map_err(|_| Reason::BadCert)?;
         if tail
@@ -745,7 +745,7 @@ fn policy_rules(
                 None => base_best.insert(highest_certs(&base.certs)?),
             };
             let (serial, x25519_pub) = best.get(&body.node_id).ok_or(Reason::BadCert)?;
-            if body.x25519_pub != *x25519_pub || body.serial <= *serial {
+            if <[u8; 32]>::from(body.x25519_pub) != *x25519_pub || body.serial <= *serial {
                 return Err(Reason::BadCert);
             }
         } else {
@@ -770,21 +770,17 @@ fn policy_rules(
     Ok(())
 }
 
-/// For each node, the serial and key of the highest serial certificate of `certs`.
+/// For each node, the serial and key (as `NodeCertBody::rank` orders them) of the winning
+/// certificate of `certs`.
 fn highest_certs(
     certs: &[crate::identity::NodeCert],
-) -> Result<HashMap<NodeId, (u32, crate::bytes::X25519PublicKey)>, Reason> {
-    let mut best: HashMap<NodeId, (u32, crate::bytes::X25519PublicKey)> = HashMap::new();
+) -> Result<HashMap<NodeId, (u32, [u8; 32])>, Reason> {
+    let mut best: HashMap<NodeId, (u32, [u8; 32])> = HashMap::new();
     for cert in certs {
         let body = cert.decode().map_err(|_| Reason::BadCert)?;
-        let entry = best
-            .entry(body.node_id)
-            .or_insert((body.serial, body.x25519_pub));
-        // Equal serials: the larger key wins, as in `CertIndex::resolve` (round A N2), so the
-        // outcome does not depend on the list order.
-        if (body.serial, <[u8; 32]>::from(body.x25519_pub)) > (entry.0, <[u8; 32]>::from(entry.1)) {
-            *entry = (body.serial, body.x25519_pub);
-        }
+        let rank = body.rank();
+        let entry = best.entry(body.node_id).or_insert(rank);
+        *entry = (*entry).max(rank);
     }
     Ok(best)
 }

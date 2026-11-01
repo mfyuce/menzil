@@ -46,6 +46,16 @@ impl NodeCertBody {
     pub fn is_valid_at(&self, now: u64) -> bool {
         self.not_before <= now && now <= self.not_after
     }
+
+    /// The one definition of which certificate of a node wins: the higher
+    /// `serial`, and at an equal serial the larger X25519 key, so the
+    /// outcome never depends on list order. Compare ranks with `>` or
+    /// `max`; every place that picks a node's reference certificate
+    /// (`trust` rotation checks, `CertIndex::resolve`, the issuer's
+    /// `outranks`) must use this and no second copy of the rule.
+    pub fn rank(&self) -> (u32, [u8; 32]) {
+        (self.serial, <[u8; 32]>::from(self.x25519_pub))
+    }
 }
 
 #[cfg(test)]

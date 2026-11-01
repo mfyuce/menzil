@@ -566,17 +566,13 @@ fn prune_superseded(certs: &[NodeCert], now: u64) -> Result<Vec<NodeCert>, Admin
     Ok(kept)
 }
 
-/// Whether `listed` is the reference certificate of its node instead of `best`: a higher serial,
-/// and at an equal serial the larger x25519 key, whatever the list order (the rule of
-/// `menzil_proto::trust` and of `CertIndex::resolve`, round A N2).
+/// Whether `listed` is the reference certificate of its node instead of `best`, by
+/// `NodeCertBody::rank` (higher serial, then the larger x25519 key), whatever the list order.
 fn outranks(
     listed: &menzil_proto::NodeCertBody,
     best: Option<&menzil_proto::NodeCertBody>,
 ) -> bool {
-    best.is_none_or(|best| {
-        (listed.serial, <[u8; 32]>::from(listed.x25519_pub))
-            > (best.serial, <[u8; 32]>::from(best.x25519_pub))
-    })
+    best.is_none_or(|best| listed.rank() > best.rank())
 }
 
 /// A renewed certificate must have been valid for [`CERT_ISSUE_MARGIN_SECS`] already.

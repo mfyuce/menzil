@@ -698,7 +698,19 @@ async fn run_attached_loop(
         }
     }
 
-    if relay.registry.detach(&node_id, session_id) {
+    // Only the session that actually removed the registration releases
+    // this NodeId's per-pair forwarding state (credit ledgers, queue
+    // budgets, token buckets), and does so under the registry lock (see
+    // `SessionRegistry::detach_then`): a superseded session's late
+    // teardown must not wipe the pairs its newer replacement has already
+    // started using. Without this, a NodeId that never attaches again
+    // would keep its pairs for the life of the relay. The drain loop
+    // above has already settled this session's in-flight items; a
+    // `drained` call from another session's queue that arrives after the
+    // pair is gone finds no pair and is a no-op.
+    if relay.registry.detach_then(&node_id, session_id, || {
+        relay.forwarding.clear_for(&node_id)
+    }) {
         relay.labels.clear_for(&node_id);
     }
 }

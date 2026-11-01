@@ -130,12 +130,33 @@ impl SessionRegistry {
     /// not clear labels the newer, still-attached session has since
     /// re-claimed.
     pub fn detach(&self, node_id: &NodeId, session_id: u32) -> bool {
+        self.detach_then(node_id, session_id, || {})
+    }
+
+    /// [`Self::detach`], running `on_detached` while the registry's write
+    /// lock is still held, and only if this call actually removed the
+    /// registration. `crate::session` uses it to release the leaving
+    /// node's per-pair forwarding state atomically with the removal: done
+    /// after the lock is released, a newer session of the same NodeId
+    /// could attach, clear, and start forwarding in between, and the old
+    /// session's late cleanup would wipe the new session's fresh pairs.
+    /// `on_detached` must not call back into this registry (the lock is
+    /// not reentrant); `ForwardTable::clear_for` takes only its own lock,
+    /// and `ForwardTable` never holds that lock while calling the
+    /// registry, so the ordering registry lock then pairs lock is safe.
+    pub(crate) fn detach_then(
+        &self,
+        node_id: &NodeId,
+        session_id: u32,
+        on_detached: impl FnOnce(),
+    ) -> bool {
         let mut guard = self.by_node.write().unwrap();
         if guard
             .get(node_id)
             .is_some_and(|registration| registration.session_id == session_id)
         {
             guard.remove(node_id);
+            on_detached();
             true
         } else {
             false
@@ -256,6 +277,48 @@ mod tests {
             old_rx.try_recv().is_ok(),
             "the old registration's receiver must fire once superseded"
         );
+    }
+
+    #[test]
+    fn detach_then_runs_the_callback_only_when_it_removed_the_registration() {
+        let registry = SessionRegistry::new();
+        let node_id = NodeId::from([1u8; 32]);
+        let _old_handles = registry.attach(node_id, 1, vec![]);
+        let _new_handles = registry.attach(node_id, 2, vec![]);
+
+        let mut ran = false;
+        assert!(!registry.detach_then(&node_id, 1, || ran = true));
+        assert!(!ran, "a stale session must not run the cleanup");
+        assert_eq!(registry.attached_session_id(&node_id), Some(2));
+
+        assert!(registry.detach_then(&node_id, 2, || ran = true));
+        assert!(ran, "the current session's detach runs the cleanup");
+        assert_eq!(registry.attached_session_id(&node_id), None);
+    }
+
+    #[test]
+    fn a_stale_detach_leaves_the_new_sessions_forwarding_pairs_alone() {
+        use crate::forward::ForwardTable;
+
+        let registry = SessionRegistry::new();
+        let forwarding = ForwardTable::new();
+        let a = NodeId::from([1u8; 32]);
+        let b = NodeId::from([2u8; 32]);
+        let _old_handles = registry.attach(a, 1, vec![]);
+        let _new_handles = registry.attach(a, 2, vec![]);
+        forwarding.insert_test_pair(&a, &b);
+        assert_eq!(forwarding.pair_count_for(&a), 1);
+
+        // Session 1's late teardown, after session 2 already took over.
+        assert!(!registry.detach_then(&a, 1, || forwarding.clear_for(&a)));
+        assert_eq!(
+            forwarding.pair_count_for(&a),
+            1,
+            "the superseded session's cleanup must not wipe the new session's pairs"
+        );
+
+        assert!(registry.detach_then(&a, 2, || forwarding.clear_for(&a)));
+        assert_eq!(forwarding.pair_count_for(&a), 0);
     }
 
     #[test]

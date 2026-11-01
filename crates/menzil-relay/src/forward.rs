@@ -103,12 +103,17 @@
 //! interprets `payload` regardless of which of the two defined tags it
 //! carries ("The relay never inspects payloads").
 //!
-//! Not built, real gaps: `PairState` entries for a NodeId that never
-//! reconnects again are never removed (only reset on a *fresh* attach —
-//! matching every other per-NodeId in-memory store this crate already
-//! has, none of which age out either, an unbounded-over-long-uptime
-//! concern only for a relay serving many distinct, short-lived
-//! identities, not a personal relay's small, stable set); the
+//! A NodeId's pairs are also removed when its session ends and that
+//! session was still the registered one (`crate::session` calls
+//! [`ForwardTable::clear_for`] from `SessionRegistry::detach_then`, only
+//! when the detach actually removed the registration, so a superseded
+//! session's late teardown never touches its replacement's pairs). What
+//! stays: a pair `(X, A)` that `X` creates in the instant after `A` has
+//! detached (a SEND racing the teardown) lives until `A` or `X` next
+//! attaches or detaches; and `drained` for a pair that is already gone
+//! is a deliberate no-op.
+//!
+//! Not built, real gaps: the
 //! sender-side output ordering protocol.md 4.2 states ("control records,
 //! then reliable SEND, then droppable SEND") is a node's own outgoing
 //! queue discipline, not restated here for the relay's *own* outbound
@@ -638,6 +643,29 @@ impl ForwardTable {
             .unwrap()
             .get(&(*src, *dst))
             .map(|pair| pair.credit.remaining())
+    }
+
+    /// Creates a fresh `src`->`dst` pair as `forward` would. Exposed for
+    /// tests that need pair state without a live session.
+    #[cfg(test)]
+    pub(crate) fn insert_test_pair(&self, src: &NodeId, dst: &NodeId) {
+        let generation = self.next_generation.fetch_add(1, Ordering::Relaxed);
+        self.pairs.lock().unwrap().insert(
+            (*src, *dst),
+            PairState::new(1024, Instant::now(), generation),
+        );
+    }
+
+    /// How many pairs involve `node_id`, in either role. Exposed for
+    /// tests (teardown must leave none behind).
+    #[cfg(test)]
+    pub(crate) fn pair_count_for(&self, node_id: &NodeId) -> usize {
+        self.pairs
+            .lock()
+            .unwrap()
+            .keys()
+            .filter(|(src, dst)| src == node_id || dst == node_id)
+            .count()
     }
 
     /// `src`->`dst`'s current shared queue occupancy, or `None` if this

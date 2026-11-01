@@ -1261,6 +1261,184 @@ async fn a_reconnecting_destination_gets_a_fresh_credit_ledger_not_its_previous_
     }
 }
 
+/// Polls until `node_id` is no longer registered (its session's teardown
+/// has passed `detach`); the forwarding cleanup runs under the same lock,
+/// so nothing further is pending once this returns.
+async fn wait_until_detached(relay: &Relay, node_id: &NodeId) {
+    for _ in 0..200 {
+        if !relay.registry.is_attached(node_id) {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    panic!("the session never detached");
+}
+
+#[tokio::test]
+async fn a_disconnecting_node_releases_its_forwarding_pairs() {
+    let (relay, listener, cert, relay_x25519) = bind_test_relay().await;
+    let addr = listener.local_addr().unwrap();
+    let serve_relay = relay.clone();
+    tokio::spawn(async move { serve_relay.serve(&listener).await });
+
+    let (mut client_a, node_a, mut client_b, node_b) =
+        two_attached_members(&relay, addr, cert, relay_x25519).await;
+
+    client_a.send(send_record(node_b, vec![1u8; 50])).await;
+    match client_b.recv().await {
+        Some(Record::Recv { .. }) => {}
+        other => panic!("expected RECV, got {other:?}"),
+    }
+    match client_a.recv().await {
+        Some(Record::Credit(_)) => {}
+        other => panic!("expected CREDIT, got {other:?}"),
+    }
+    assert_eq!(
+        relay.forwarding.pair_count_for(&node_a),
+        1,
+        "the pair must exist before the disconnect, for this test to mean anything"
+    );
+
+    drop(client_a);
+    wait_until_detached(&relay, &node_a).await;
+
+    assert_eq!(
+        relay.forwarding.pair_count_for(&node_a),
+        0,
+        "a node that left and never returns must not keep forwarding state"
+    );
+    assert!(
+        relay
+            .forwarding
+            .remaining_credit(&node_a, &node_b)
+            .is_none(),
+        "the (a, b) ledger must be gone"
+    );
+    assert!(
+        relay.registry.is_attached(&node_b),
+        "an unrelated node stays attached"
+    );
+}
+
+#[tokio::test]
+async fn a_superseded_sessions_teardown_keeps_the_new_sessions_forwarding_pairs() {
+    let (relay, listener, cert, relay_x25519) = bind_test_relay().await;
+    let addr = listener.local_addr().unwrap();
+    let serve_relay = relay.clone();
+    tokio::spawn(async move { serve_relay.serve(&listener).await });
+
+    let owner = SigningKey::generate(&mut rand::rng());
+    let network_id = NetworkId::from(owner.verifying_key().to_bytes());
+    let identity_a = generate_identity();
+    let identity_b = generate_identity();
+    let (node_a, node_b) = (identity_a.node_id, identity_b.node_id);
+    let roster = RosterBody {
+        v: PROTOCOL_VERSION,
+        network_id,
+        seq: 1,
+        issued: 0,
+        expires: 4_000_000_000,
+        members: vec![
+            RosterMember {
+                node_id: node_a,
+                min_serial: 1,
+            },
+            RosterMember {
+                node_id: node_b,
+                min_serial: 1,
+            },
+        ],
+        revoked: vec![],
+        stewards: vec![],
+        labels: vec![],
+    };
+    relay
+        .rosters()
+        .set(&Roster::sign(&owner, &roster).unwrap())
+        .unwrap();
+
+    let (mut client_a1, _) = TestClient::connect(
+        addr,
+        cert.clone(),
+        &identity_a,
+        relay_x25519,
+        vec![network_id],
+        HashMap::new(),
+        1,
+        10,
+    )
+    .await;
+    client_a1.send(Record::Attach).await;
+    let _ = client_a1.recv_roster_doc().await;
+
+    let (mut client_b, _) = TestClient::connect(
+        addr,
+        cert.clone(),
+        &identity_b,
+        relay_x25519,
+        vec![network_id],
+        HashMap::new(),
+        1,
+        10,
+    )
+    .await;
+    client_b.send(Record::Attach).await;
+    let _ = client_b.recv_roster_doc().await;
+
+    // The same identity attaches again, superseding the first session.
+    let (mut client_a2, _) = TestClient::connect(
+        addr,
+        cert,
+        &identity_a,
+        relay_x25519,
+        vec![network_id],
+        HashMap::new(),
+        1,
+        20,
+    )
+    .await;
+    client_a2.send(Record::Attach).await;
+    let _ = client_a2.recv_roster_doc().await;
+
+    // The new session builds forwarding state of its own.
+    client_a2.send(send_record(node_b, vec![3u8; 40])).await;
+    match client_b.recv().await {
+        Some(Record::Recv { .. }) => {}
+        other => panic!("expected RECV, got {other:?}"),
+    }
+    match client_a2.recv().await {
+        Some(Record::Credit(_)) => {}
+        other => panic!("expected CREDIT, got {other:?}"),
+    }
+
+    // Let the old session finish its teardown completely: it is told it
+    // was superseded, then its connection ends.
+    match client_a1.recv().await {
+        Some(Record::Goaway(body)) => assert_eq!(body.reason, "superseded"),
+        other => panic!("expected GOAWAY on the superseded connection, got {other:?}"),
+    }
+    drop(client_a1);
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+    assert_eq!(
+        relay.forwarding.pair_count_for(&node_a),
+        1,
+        "the superseded session's teardown must not wipe the new session's pair"
+    );
+    assert!(
+        relay
+            .forwarding
+            .remaining_credit(&node_a, &node_b)
+            .is_some(),
+        "the new session's (a, b) ledger must survive"
+    );
+
+    // And the surviving session's own departure does release it.
+    drop(client_a2);
+    wait_until_detached(&relay, &node_a).await;
+    assert_eq!(relay.forwarding.pair_count_for(&node_a), 0);
+}
+
 #[tokio::test]
 async fn a_send_to_an_authorized_but_unattached_node_gets_peer_offline() {
     let (relay, listener, cert, relay_x25519) = bind_test_relay().await;

@@ -87,9 +87,8 @@ impl CertIndex {
             .into_iter()
             .flatten()
             .filter_map(|entry| verify_decoded(&entry.cert, &entry.body, now))
-            // Equal serials: the larger key wins, the same rule as the steward rotation check
-            // (`trust::highest_certs`, round A N2), whatever the list order.
-            .max_by_key(|body| (body.serial, <[u8; 32]>::from(body.x25519_pub)))
+            // Equal serials: the larger key wins (`NodeCertBody::rank`), whatever the list order.
+            .max_by_key(|body| body.rank())
             .filter(|body| &body.x25519_pub == claimed_key)
     }
 }
