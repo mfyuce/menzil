@@ -3,8 +3,8 @@
 //! grant check) — TODO.md L4h2. Pure, synchronous, no I/O, in the same
 //! spirit as [`PolicyStore`] itself: this module answers "is this
 //! allowed, right now, given what I currently hold," nothing more.
-//! Running the actual Noise handshake (`menzil-e2e`) and the frame demux
-//! that calls into this module (TODO.md L4h6) are both still to come.
+//! The Noise handshake (`menzil-e2e`) and the frame demux that call into
+//! this module live in `l4_router` and `l4_session`.
 //!
 //! **Both sides' standing, not only the initiator's**: protocol.md 5.1
 //! says the responder verifies "that *both* are unrevoked members of
