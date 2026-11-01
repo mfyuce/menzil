@@ -12,6 +12,7 @@
 //! job, via [`crate::Signed::decode_strict`].
 
 use std::collections::HashMap;
+use std::time::{Duration, Instant};
 
 use thiserror::Error;
 
@@ -37,6 +38,18 @@ pub const MAX_DOC_CHUNK_BYTES: usize = 60_000;
 /// DOC reassembly is new in this item — so this is a conservative,
 /// documented implementation choice, not a spec value.
 const MAX_CONCURRENT_TRANSFERS: usize = 8;
+
+/// How long an incomplete transfer may stay in [`DocReassembler`],
+/// measured from its first chunk (later chunks do not extend it, so a
+/// peer trickling one chunk at a time cannot keep a slot forever). A
+/// transfer older than this is dropped at the start of the next
+/// [`DocReassembler::accept`], before the concurrency check, so a peer
+/// that starts [`MAX_CONCURRENT_TRANSFERS`] transfers and never finishes
+/// them cannot lock out legitimate documents for the connection's
+/// lifetime. A transfer whose age equals the timeout exactly is still
+/// kept. Like the concurrency cap this is an implementation choice, not a
+/// spec value.
+pub const TRANSFER_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// The highest `count` [`DocReassembler::accept`] tolerates a transfer
 /// claiming, derived from the size limits themselves: no legitimate
@@ -125,6 +138,9 @@ struct Transfer {
     doc_type: DocType,
     count: u16,
     chunks: HashMap<u16, Vec<u8>>,
+    /// When the first chunk arrived; the age that [`TRANSFER_TIMEOUT`]
+    /// is measured against.
+    started: Instant,
 }
 
 /// Reassembles inbound `DOC` chunks (protocol.md 4.2) into complete
@@ -146,10 +162,26 @@ impl DocReassembler {
     /// Feeds one chunk in. Returns the reassembled bytes and the
     /// transfer's `doc_type` once every chunk for its `doc_id` has
     /// arrived; `Ok(None)` while a transfer is still incomplete.
+    ///
+    /// Transfers older than [`TRANSFER_TIMEOUT`] are dropped first.
     pub fn accept(
         &mut self,
         body: &DocBody,
     ) -> Result<Option<(DocType, Vec<u8>)>, DocReassemblyError> {
+        self.accept_at(body, Instant::now())
+    }
+
+    /// [`accept`](Self::accept) with an explicit clock reading, so tests
+    /// can drive eviction without sleeping. `now` should not go backwards
+    /// between calls (a smaller `now` than a transfer's start just means
+    /// that transfer is not yet old).
+    pub fn accept_at(
+        &mut self,
+        body: &DocBody,
+        now: Instant,
+    ) -> Result<Option<(DocType, Vec<u8>)>, DocReassemblyError> {
+        self.in_progress
+            .retain(|_, t| now.saturating_duration_since(t.started) <= TRANSFER_TIMEOUT);
         if body.count == 0 || body.index >= body.count {
             return Err(DocReassemblyError::InvalidIndex {
                 index: body.index,
@@ -180,6 +212,7 @@ impl DocReassembler {
                 doc_type: body.doc_type,
                 count: body.count,
                 chunks: HashMap::new(),
+                started: now,
             });
         transfer.chunks.insert(body.index, body.chunk.clone());
         let total_len: usize = transfer.chunks.values().map(Vec::len).sum();
@@ -452,6 +485,80 @@ mod tests {
             })
             .unwrap_err();
         assert_eq!(err, DocReassemblyError::TooManyConcurrentTransfers);
+    }
+
+    /// One chunk of a two-chunk transfer for `id`, index 0.
+    fn first_of_two(id: u8) -> DocBody {
+        DocBody {
+            doc_type: DocType::Roster,
+            doc_id: DocId::from([id; 16]),
+            index: 0,
+            count: 2,
+            chunk: vec![id],
+        }
+    }
+
+    #[test]
+    fn stalled_transfers_are_evicted_after_the_timeout() {
+        let mut reassembler = DocReassembler::new();
+        let t0 = Instant::now();
+        for i in 0..MAX_CONCURRENT_TRANSFERS {
+            reassembler.accept_at(&first_of_two(i as u8), t0).unwrap();
+        }
+        let fresh = first_of_two(200);
+        assert_eq!(
+            reassembler.accept_at(&fresh, t0).unwrap_err(),
+            DocReassemblyError::TooManyConcurrentTransfers
+        );
+        let later = t0 + TRANSFER_TIMEOUT + Duration::from_millis(1);
+        assert_eq!(reassembler.accept_at(&fresh, later).unwrap(), None);
+        assert_eq!(reassembler.in_progress.len(), 1);
+    }
+
+    #[test]
+    fn eviction_boundary_is_strictly_older_than_the_timeout() {
+        let mut reassembler = DocReassembler::new();
+        let t0 = Instant::now();
+        reassembler.accept_at(&first_of_two(1), t0).unwrap();
+        // Age exactly equal to the timeout: still alive, so the second
+        // chunk completes the transfer.
+        let second = DocBody {
+            index: 1,
+            chunk: vec![2],
+            ..first_of_two(1)
+        };
+        let done = reassembler
+            .accept_at(&second, t0 + TRANSFER_TIMEOUT)
+            .unwrap();
+        assert_eq!(done, Some((DocType::Roster, vec![1, 2])));
+
+        // One tick past the timeout: evicted, so the second chunk starts
+        // a fresh, incomplete transfer instead of completing.
+        reassembler.accept_at(&first_of_two(1), t0).unwrap();
+        let past = t0 + TRANSFER_TIMEOUT + Duration::from_nanos(1);
+        assert_eq!(reassembler.accept_at(&second, past).unwrap(), None);
+    }
+
+    #[test]
+    fn an_evicted_doc_id_restarts_without_mixing_old_chunks() {
+        let mut reassembler = DocReassembler::new();
+        let t0 = Instant::now();
+        reassembler.accept_at(&first_of_two(7), t0).unwrap();
+        let later = t0 + TRANSFER_TIMEOUT + Duration::from_secs(1);
+        // Same doc_id, new transfer: chunk 1 first, then chunk 0 with
+        // different bytes. The stale chunk 0 must not be reused.
+        let new_second = DocBody {
+            index: 1,
+            chunk: vec![0xB2],
+            ..first_of_two(7)
+        };
+        assert_eq!(reassembler.accept_at(&new_second, later).unwrap(), None);
+        let new_first = DocBody {
+            chunk: vec![0xB1],
+            ..first_of_two(7)
+        };
+        let done = reassembler.accept_at(&new_first, later).unwrap();
+        assert_eq!(done, Some((DocType::Roster, vec![0xB1, 0xB2])));
     }
 
     #[test]
