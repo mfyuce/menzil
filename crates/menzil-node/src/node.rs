@@ -86,6 +86,7 @@ use tokio::task::JoinHandle;
 use crate::admission::PolicyAuthorizer;
 use crate::docs_access::{DocsGate, DocsLimits, SessionHandler};
 use crate::docs_sync::{DocsSync, PushReport, SyncConfig};
+use crate::identity::{IdentityCell, IdentityError, OwnSerial};
 use crate::l4_router::{
     EnsureError, RouterConfig, RouterHandle, RouterParts, SessionReady, new_router,
 };
@@ -173,6 +174,8 @@ impl ServiceHandler<Stream> for RefuseAll {
 /// A running node. See the module docs.
 pub struct Node {
     local_node_id: NodeId,
+    /// The one cell every reader of this node's own certificate follows.
+    identity: IdentityCell,
     router: RouterHandle,
     attachment: watch::Receiver<Option<Epoch>>,
     events: Option<mpsc::Receiver<SessionEvent>>,
@@ -222,11 +225,13 @@ impl Node {
         if !session.e2e_protos.contains(&E2E_PROTO_TAG) {
             return Err(StartError::NoL4Protocol);
         }
-        let local_cert = session.identity.node_cert.decode()?;
-        let (local_node_id, local_serial, local_static) =
-            (local_cert.node_id, local_cert.serial, local_cert.x25519_pub);
+        let identity = session.identity.clone();
+        let local_cert = identity.get().node_cert.decode()?;
+        let (local_node_id, local_static) = (local_cert.node_id, local_cert.x25519_pub);
+        // Every reader below follows the one cell, so a renewal reaches them all at once.
+        let local_serial = OwnSerial::from(&identity);
         let router_config = RouterConfig::new(
-            session.identity.clone(),
+            identity.clone(),
             session.dial.connection_info.relay_node_id,
             policies.clone(),
             rosters.clone(),
@@ -255,7 +260,7 @@ impl Node {
             policies.clone(),
             rosters.clone(),
             local_node_id,
-            local_serial,
+            local_serial.clone(),
             local_static,
         );
         let (stop_session, stop_rx) = watch::channel(false);
@@ -303,6 +308,7 @@ impl Node {
         }
         Ok(Self {
             local_node_id,
+            identity,
             router: handle,
             attachment,
             events: Some(passthrough),
@@ -335,6 +341,20 @@ impl Node {
     /// This node's own NodeId.
     pub fn local_node_id(&self) -> NodeId {
         self.local_node_id
+    }
+
+    /// Switches this node to a renewed certificate (cert rotation, S4). Accepted only for the
+    /// same `node_id` and `x25519_pub`, with a strictly higher serial, a valid self signature
+    /// and a validity window holding the present time (see [`IdentityCell::set`]); anything
+    /// else is refused and nothing changes. At once, the router's `resp` payloads and every
+    /// standing check use the new certificate; the live relay session keeps the HELLO it sent,
+    /// and the next connect presents the new certificate.
+    pub fn renew_identity(&self, cert: menzil_proto::NodeCert) -> Result<(), IdentityError> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        self.identity.set(cert, now)
     }
 
     /// The Policies this node holds, to seed or update.
@@ -479,7 +499,7 @@ async fn serve_sessions<H>(
     policies: Arc<PolicyStore>,
     rosters: Arc<RosterStore>,
     local_node_id: NodeId,
-    local_serial: u32,
+    local_serial: OwnSerial,
     local_static: X25519PublicKey,
     handler: Arc<H>,
     gate: Arc<DocsGate>,
@@ -495,7 +515,7 @@ async fn serve_sessions<H>(
             &policies,
             &rosters,
             local_node_id,
-            local_serial,
+            local_serial.clone(),
             local_static,
             &handler,
             &gate,
@@ -541,7 +561,7 @@ pub(crate) fn serve_session<H>(
     policies: &Arc<PolicyStore>,
     rosters: &Arc<RosterStore>,
     local_node_id: NodeId,
-    local_serial: u32,
+    local_serial: impl Into<OwnSerial>,
     local_static: X25519PublicKey,
     handler: &Arc<H>,
     gate: &Arc<DocsGate>,

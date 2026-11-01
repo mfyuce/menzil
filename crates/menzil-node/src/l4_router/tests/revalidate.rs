@@ -416,6 +416,92 @@ async fn a_docs_only_session_ends_when_this_node_loses_its_standing_in_the_roste
     );
 }
 
+/// A renewal moves the serial every pass judges this node by (cert rotation S4): the floor the
+/// Roster raised to 2 ends the session at serial 1 and is met once the cell holds serial 2 (and
+/// the Policy lists that certificate, for the full rules).
+#[tokio::test(start_paused = true)]
+async fn a_pass_reads_this_nodes_serial_from_the_identity_cell() {
+    let mut live = live(|w, a, b| vec![grant_for(w, a, b, &["tcp:ssh"])]).await;
+    let cell = IdentityCell::new(live.b.identity());
+    live.reval = Revalidator::new(
+        live.stores_b.policies.clone(),
+        live.stores_b.rosters.clone(),
+        live.b.id,
+        &cell,
+        live.b.x25519_public,
+    );
+    live.serve_b();
+    let b_id = live.b.id;
+    edit_roster_of(&live.w, &live.stores_b, |body| {
+        for member in &mut body.members {
+            if member.node_id == b_id {
+                member.min_serial = 2;
+            }
+        }
+    });
+    let renewed = renewed_cert(&live.b, 2);
+    edit_policy_of(&live.w, &live.stores_b, |body| body.certs.push(renewed));
+    assert_eq!(
+        live.reval.plan(&live.w.network, 1_000),
+        vec![(0, Action::Close(ErrorCode::StaleSerial))]
+    );
+    cell.set(renewed_cert(&live.b, 2), 1_000).unwrap();
+    assert_eq!(
+        live.reval.plan(&live.w.network, 1_000),
+        vec![(0, Action::Recheck)]
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_docs_only_pass_reads_this_nodes_serial_from_the_identity_cell() {
+    let w = world();
+    let (r, m) = (party(), party());
+    let r_stores = w.split_stores(&[&r, &m], &[&m], &[&m]);
+    let m_stores = w.stores(&[&r, &m], vec![]);
+    let net = Net::new();
+    let mut nm = node(&net, &m, &m_stores).await;
+    let mut nr = node(&net, &r, &r_stores).await;
+    assert_eq!(
+        ensure(&nm, r.id, w.network).await.err(),
+        Some(EnsureError::DocsOnly)
+    );
+    let at_r = nr.next_ready().await;
+    let _at_m = nm.next_ready().await;
+    let cell = IdentityCell::new(r.identity());
+    let reval = Revalidator::new(
+        r_stores.policies.clone(),
+        r_stores.rosters.clone(),
+        r.id,
+        &cell,
+        r.x25519_public,
+    );
+    serve_session(
+        at_r,
+        &r_stores.policies,
+        &r_stores.rosters,
+        r.id,
+        &cell,
+        r.x25519_public,
+        &Arc::new(Hold),
+        &DocsGate::new(DocsLimits::default()),
+        None,
+        Some(&reval),
+    );
+    edit_roster_of(&w, &r_stores, |b| {
+        for member in &mut b.members {
+            if member.node_id == r.id {
+                member.min_serial = 2;
+            }
+        }
+    });
+    assert_eq!(
+        reval.plan(&w.network, 1_000),
+        vec![(0, Action::Close(ErrorCode::StaleSerial))]
+    );
+    cell.set(renewed_cert(&r, 2), 1_000).unwrap();
+    assert_eq!(reval.plan(&w.network, 1_000), vec![]);
+}
+
 /// The initiator of a docs only session is registered too: when its own Roster revokes the
 /// responder, the session goes.
 #[tokio::test(start_paused = true)]

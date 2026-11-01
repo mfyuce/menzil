@@ -19,6 +19,7 @@ use tokio::task::JoinHandle;
 use tokio::time::timeout;
 
 use super::*;
+use crate::identity::LocalIdentity;
 use crate::l4_session::EndReason;
 use crate::outbound::EnqueueOutcome;
 
@@ -3070,3 +3071,123 @@ async fn a_forged_docs_only_init_does_not_abandon_our_own_initiation_to_that_pee
 mod docs_places;
 mod revalidate;
 mod sync;
+
+// ----------------------------------------------------------------------
+// The identity cell (cert rotation S4)
+// ----------------------------------------------------------------------
+
+/// `party`'s certificate at `serial`: same node and key, valid for the whole test.
+fn renewed_cert(party: &Party, serial: u32) -> NodeCert {
+    NodeCert::sign(
+        &party.signing,
+        &NodeCertBody {
+            v: PROTOCOL_VERSION,
+            node_id: party.id,
+            x25519_pub: party.x25519_public,
+            serial,
+            not_before: 0,
+            not_after: 4_000_000_000,
+        },
+    )
+    .unwrap()
+}
+
+/// An engine of `party` that reads `cell` and hands out a fresh session index per `init`.
+fn driven_with_cell(party: &Party, cell: &IdentityCell, stores: &Stores) -> Driven {
+    let mut next = 0;
+    let mut d = driven_with(party, stores, NodeId::from([0xAA; 32]), 1024, move || {
+        next += 1;
+        next
+    });
+    d.engine.identity = cell.clone();
+    d.engine.on_attached(Epoch::first(), LIMITS);
+    d
+}
+
+/// Sends `d`'s node an `init` from `from` and returns the serial of the certificate in the
+/// `resp` payload, or `None` if the node stayed silent.
+fn serial_in_answer(
+    d: &mut Driven,
+    w: &World,
+    to: &Party,
+    from: &Party,
+    index: u32,
+) -> Option<u32> {
+    let manual = Manual::new(&Net::new(), from.clone_for_test());
+    let (hs, init) = manual.init(to, w.network, index);
+    let record = Record::Recv {
+        src: from.id,
+        e2e_proto: E2E_PROTO_TAG,
+        flags: 0,
+        payload: init.encode(),
+    };
+    assert!(
+        d.engine
+            .on_record(Epoch::first(), record, Now::capture())
+            .is_none()
+    );
+    let sent = d.outbound.try_recv().ok()?;
+    let resp = E2eFrame::decode(&sent.payload).unwrap();
+    let (_, _, payload) = finish_with_payload(hs, &resp);
+    Some(payload.node_cert.decode().unwrap().serial)
+}
+
+#[tokio::test]
+async fn a_new_handshake_carries_the_renewed_certificate() {
+    let w = world();
+    let (b, m1, m2) = (party(), party(), party());
+    let stores = w.stores(&[&b, &m1, &m2], vec![]);
+    let cell = IdentityCell::new(b.identity());
+    let mut d = driven_with_cell(&b, &cell, &stores);
+
+    assert_eq!(serial_in_answer(&mut d, &w, &b, &m1, 1), Some(1));
+
+    cell.set(renewed_cert(&b, 2), 1_000).unwrap();
+    assert_eq!(
+        serial_in_answer(&mut d, &w, &b, &m2, 2),
+        Some(2),
+        "the next resp payload holds the renewed certificate"
+    );
+}
+
+#[tokio::test]
+async fn the_responder_checks_its_own_floor_with_the_serial_the_cell_holds_now() {
+    let w = world();
+    let (b, m1, m2) = (party(), party(), party());
+    // The Roster raised B's floor to 2; the Policy lists B's serial 2 certificate beside serial 1.
+    let rosters = RosterStore::new();
+    rosters
+        .set(&w.roster_edit(&[&b, &m1, &m2], |body| {
+            for member in &mut body.members {
+                if member.node_id == b.id {
+                    member.min_serial = 2;
+                }
+            }
+        }))
+        .unwrap();
+    let mut b2 = b.clone_for_test();
+    b2.cert = renewed_cert(&b, 2);
+    let policies = PolicyStore::new();
+    policies
+        .set(&w.policy(&[&b, &m1, &m2], &[&b, &b2, &m1, &m2], vec![]))
+        .unwrap();
+    let stores = Stores {
+        policies: Arc::new(policies),
+        rosters: Arc::new(rosters),
+    };
+    let cell = IdentityCell::new(b.identity());
+    let mut d = driven_with_cell(&b, &cell, &stores);
+
+    assert_eq!(
+        serial_in_answer(&mut d, &w, &b, &m1, 1),
+        None,
+        "serial 1 is below the floor of 2: no answer"
+    );
+
+    cell.set(renewed_cert(&b, 2), 1_000).unwrap();
+    assert_eq!(
+        serial_in_answer(&mut d, &w, &b, &m2, 2),
+        Some(2),
+        "after the renewal the floor is met"
+    );
+}

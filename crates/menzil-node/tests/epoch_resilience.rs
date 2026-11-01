@@ -198,7 +198,8 @@ fn session_config_port(
         identity: LocalIdentity {
             node_cert: node_cert(id),
             x25519_private: id.x25519_private,
-        },
+        }
+        .into(),
         networks: vec![network_id],
         caps: vec![],
         e2e_protos: vec![0x01],

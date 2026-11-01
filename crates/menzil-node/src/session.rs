@@ -71,7 +71,7 @@ use menzil_session::{
 };
 
 use crate::error::NodeError;
-use crate::identity::LocalIdentity;
+use crate::identity::IdentityCell;
 use crate::outbound::{EnqueueOutcome, Epoch, MAX_QUEUED_BYTES, OutboundQueue, OutboundSend};
 use crate::relay_notes::RelayNotes;
 use crate::roster_store::RosterStore;
@@ -82,8 +82,9 @@ use crate::roster_store::RosterStore;
 pub struct SessionConfig {
     /// The relay to reach and how (protocol.md 3).
     pub dial: DialConfig,
-    /// This node's own identity.
-    pub identity: LocalIdentity,
+    /// This node's own identity, read at each (re)connect: a renewed certificate is presented
+    /// by the next HELLO, while the live session keeps the one it sent.
+    pub identity: IdentityCell,
     /// Networks this node claims membership in; empty to redeem an
     /// invite only (protocol.md 4.1).
     pub networks: Vec<NetworkId>,
@@ -652,7 +653,7 @@ pub(crate) fn rosters_to_push(
 /// (nothing says it excludes the node), and so is every network when the node's own certificate
 /// does not decode (the relay answers that with `bad_cert`). One warning per network left out.
 fn claimable_networks(config: &SessionConfig, roster_store: &RosterStore) -> Vec<NetworkId> {
-    let Ok(cert) = config.identity.node_cert.decode() else {
+    let Ok(cert) = config.identity.get().node_cert.decode() else {
         return config.networks.clone();
     };
     config
@@ -726,9 +727,12 @@ async fn run_handshake(
         .iter()
         .filter_map(|network_id| roster_store.seq(network_id).map(|seq| (*network_id, seq)))
         .collect();
+    // One read for the whole handshake, so the certificate and its key cannot come from two
+    // different renewals.
+    let identity = config.identity.get();
     let hello = HelloBody {
         v: PROTOCOL_VERSION,
-        node_cert: config.identity.node_cert.clone(),
+        node_cert: identity.node_cert.clone(),
         networks: claims.to_vec(),
         timestamp: tai64n_now(),
         roster_seq,
@@ -738,7 +742,7 @@ async fn run_handshake(
 
     let (node_handshake, message1) = NodeHandshake::start(
         pattern,
-        &config.identity.x25519_private,
+        &identity.x25519_private,
         info.relay_x25519.as_ref(),
         &prologue_bytes,
         &hello,
@@ -1422,6 +1426,7 @@ pub async fn run_session_observed(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::identity::LocalIdentity;
     use ed25519_dalek::SigningKey;
     use menzil_carrier::{ConnectionInfo, DialConfig};
     use menzil_proto::{Limits, NodeCert, NodeCertBody, NodeId, RosterBody, RosterMember};
@@ -1469,7 +1474,8 @@ mod tests {
             identity: LocalIdentity {
                 node_cert: cert,
                 x25519_private: [0u8; 32],
-            },
+            }
+            .into(),
             networks,
             caps: vec![],
             e2e_protos: vec![0x01],

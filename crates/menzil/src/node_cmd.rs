@@ -770,7 +770,8 @@ pub async fn start(home: &Home, config: &Config, socket: &Path) -> Result<Runnin
         identity: LocalIdentity {
             node_cert: cert,
             x25519_private: keys.x25519_private(),
-        },
+        }
+        .into(),
         networks,
         caps: vec![],
         e2e_protos: vec![0x01],

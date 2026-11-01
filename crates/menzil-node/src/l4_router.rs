@@ -133,7 +133,7 @@ use crate::admission::{
     decide_initiator_admission_for_docs, decide_responder_admission, is_unrevoked_roster_member,
     resolve_dial_cert, resolve_dial_cert_for_docs, session_standing,
 };
-use crate::identity::LocalIdentity;
+use crate::identity::IdentityCell;
 use crate::l4_session::{
     CloseReason, E2E_PROTO_TAG, L4_INBOUND_BUDGET_PER_SESSION, L4SessionAcceptor, L4SessionConfig,
     L4SessionHandle, SessionNotice, SessionObserver, new as new_l4_session,
@@ -331,9 +331,8 @@ impl std::fmt::Debug for SessionReady {
 
 /// What a [`Router`](RouterParts) needs from its owner.
 pub struct RouterConfig {
-    identity: LocalIdentity,
+    identity: IdentityCell,
     local_node_id: NodeId,
-    local_cert_serial: u32,
     local_static: X25519PublicKey,
     relay_node_id: NodeId,
     policies: Arc<PolicyStore>,
@@ -344,23 +343,26 @@ pub struct RouterConfig {
 }
 
 impl RouterConfig {
-    /// `identity` is this node's own (its cert says who it is);
+    /// `identity` is this node's own (its cert says who it is; given a bare
+    /// [`LocalIdentity`](crate::LocalIdentity) it is a cell of its own, given the node's
+    /// [`IdentityCell`] the router follows its renewals: the `resp` payload and the serial of
+    /// every standing check are read from it at each use);
     /// `relay_node_id` is the relay it is attached to, whose `init`s are
     /// refused; `policies`/`rosters` are the stores the admission checks
     /// read; `budgets` is the node's one [`SendBudgets`], from which every
     /// session to a peer takes `for_peer(peer)`. Fails only if the local
     /// cert does not decode.
     pub fn new(
-        identity: LocalIdentity,
+        identity: impl Into<IdentityCell>,
         relay_node_id: NodeId,
         policies: Arc<PolicyStore>,
         rosters: Arc<RosterStore>,
         budgets: SendBudgets,
     ) -> Result<Self, ProtoError> {
-        let body = identity.node_cert.decode()?;
+        let identity = identity.into();
+        let body = identity.get().node_cert.decode()?;
         Ok(Self {
             local_node_id: body.node_id,
-            local_cert_serial: body.serial,
             local_static: body.x25519_pub,
             identity,
             relay_node_id,
@@ -659,9 +661,9 @@ fn untag(tag: u64) -> (u32, SessionIndex) {
 
 /// Every decision in this module. See the module docs.
 struct Engine {
-    identity: LocalIdentity,
+    /// Read at each use: a renewal replaces the certificate under a running router.
+    identity: IdentityCell,
     local_node_id: NodeId,
-    local_cert_serial: u32,
     /// This node's own static key, for its certificate in the Policy (round 11 N1).
     local_static: X25519PublicKey,
     relay_node_id: NodeId,
@@ -730,7 +732,6 @@ impl Engine {
         Self {
             identity: config.identity,
             local_node_id: config.local_node_id,
-            local_cert_serial: config.local_cert_serial,
             local_static: config.local_static,
             relay_node_id: config.relay_node_id,
             policies: config.policies,
@@ -961,7 +962,7 @@ impl Engine {
             self.handshakes_started += 1;
         }
         let Ok(hs) = E2eResponderHandshake::start(
-            &self.identity.x25519_private,
+            &self.identity.get().x25519_private,
             src,
             self.local_node_id,
             &init,
@@ -977,7 +978,7 @@ impl Engine {
             &src,
             &peer_static,
             &self.local_node_id,
-            self.local_cert_serial,
+            self.identity.serial(),
             now.unix,
         ) {
             HandshakeAdmission::Allow | HandshakeAdmission::AllowNoGrant => {
@@ -1009,7 +1010,7 @@ impl Engine {
             return;
         };
         let Ok((transport, resp)) = hs.finish(
-            self.identity.node_cert.clone(),
+            self.identity.get().node_cert.clone(),
             roster_seq,
             policy_seq,
             vec![E2E_PROTO_TAG],
@@ -1116,7 +1117,7 @@ impl Engine {
             return;
         };
         let Ok((transport, resp)) = hs.finish_docs_only(
-            self.identity.node_cert.clone(),
+            self.identity.get().node_cert.clone(),
             roster_seq,
             policy_seq,
             vec![E2E_PROTO_TAG],
@@ -1254,7 +1255,7 @@ impl Engine {
             &peer,
             &entry.peer_static,
             &self.local_node_id,
-            self.local_cert_serial,
+            self.identity.serial(),
             &self.local_static,
             now.unix,
         )
@@ -1293,7 +1294,7 @@ impl Engine {
                 &peer,
                 &entry.peer_static,
                 &self.local_node_id,
-                self.local_cert_serial,
+                self.identity.serial(),
                 &self.local_static,
                 now.unix,
             );
@@ -1349,7 +1350,7 @@ impl Engine {
             &self.rosters,
             &network,
             &self.local_node_id,
-            self.local_cert_serial,
+            self.identity.serial(),
             now.unix,
             !docs,
         ) {
@@ -1377,7 +1378,7 @@ impl Engine {
             .reserve_index(now.instant)
             .map_err(|_| EnsureError::TableFull)?;
         let (hs, init) = match E2eInitiatorHandshake::start(
-            &self.identity.x25519_private,
+            &self.identity.get().x25519_private,
             &cert.x25519_pub,
             network,
             self.local_node_id,

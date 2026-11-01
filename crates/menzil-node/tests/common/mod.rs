@@ -190,7 +190,8 @@ pub fn session_config(relay: &TestRelay, id: &Identity, network_id: NetworkId) -
         identity: LocalIdentity {
             node_cert: node_cert(id),
             x25519_private: id.x25519_private,
-        },
+        }
+        .into(),
         networks: vec![network_id],
         caps: vec![],
         e2e_protos: vec![0x01],

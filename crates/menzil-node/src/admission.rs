@@ -141,6 +141,7 @@ use menzil_proto::{
 use menzil_stream::{Authorizer, OpenDecision, OpenRefusal, OpenRequest};
 
 use crate::cert_index::CertIndex;
+use crate::identity::OwnSerial;
 use crate::policy_store::{PolicyStore, roster_standing};
 use crate::roster_store::RosterStore;
 
@@ -752,8 +753,9 @@ pub struct PolicyAuthorizer {
     rosters: Arc<RosterStore>,
     network_id: NetworkId,
     to_node: NodeId,
-    /// The serial of this node's own NodeCert, for the floor of its own standing.
-    to_node_serial: u32,
+    /// The serial of this node's own NodeCert, for the floor of its own standing; read at each
+    /// check, so a renewed certificate counts at once.
+    to_node_serial: OwnSerial,
     /// This node's own static key, for its certificate in the Policy (round 11 N1).
     to_node_static: X25519PublicKey,
     docs_only: bool,
@@ -778,9 +780,10 @@ impl PolicyAuthorizer {
         rosters: Arc<RosterStore>,
         network_id: NetworkId,
         to_node: NodeId,
-        to_node_serial: u32,
+        to_node_serial: impl Into<OwnSerial>,
         to_node_static: X25519PublicKey,
     ) -> Self {
+        let to_node_serial = to_node_serial.into();
         Self {
             policies,
             rosters,
@@ -806,7 +809,7 @@ impl PolicyAuthorizer {
         // brings (TODO.md, K2 edge cases): its own standing is the Roster's.
         if self.docs_only {
             return self.rosters.body(&self.network_id).is_some_and(|roster| {
-                roster_own_standing(&roster, &self.to_node, self.to_node_serial).is_ok()
+                roster_own_standing(&roster, &self.to_node, self.to_node_serial.get()).is_ok()
             });
         }
         match (
@@ -818,7 +821,7 @@ impl PolicyAuthorizer {
                 &view.body,
                 &view.certs,
                 &self.to_node,
-                self.to_node_serial,
+                self.to_node_serial.get(),
                 &self.to_node_static,
                 unix_now(),
             )
@@ -1995,6 +1998,81 @@ mod tests {
             OpenDecision::Deny(refusal) => assert_eq!(refusal.code, ErrorCode::NoGrant),
             OpenDecision::Allow => panic!("a peer revoked mid session must be refused"),
         }
+    }
+
+    #[test]
+    fn the_authorizer_checks_the_floor_against_the_serial_the_cell_holds_now() {
+        use crate::identity::{IdentityCell, LocalIdentity};
+        let f = fixture(vec![]);
+        // The Roster raised the responder's floor to 6; the Policy lists its serial 6
+        // certificate beside the serial 5 one that `signed_policy` adds, and carries a grant.
+        let cert_at = |serial: u32| {
+            NodeCert::sign(
+                &f.ids.responder_signing_key,
+                &NodeCertBody {
+                    v: menzil_proto::PROTOCOL_VERSION,
+                    node_id: f.ids.responder_node_id,
+                    x25519_pub: f.ids.responder_x25519,
+                    serial,
+                    not_before: 0,
+                    not_after: 4_000_000_000,
+                },
+            )
+            .unwrap()
+        };
+        let rosters = Arc::new(RosterStore::new());
+        let mut roster = signed_roster(&f.ids, 1).decode().unwrap();
+        roster.members[1].min_serial = 6;
+        rosters
+            .set(&Roster::sign(&f.ids.owner, &roster).unwrap())
+            .unwrap();
+        let initiator_cert = signed_cert(&f.ids, f.ids.initiator_x25519, 0, 4_000_000_000);
+        let mut policy = signed_policy(&f.ids, vec![initiator_cert], vec![allowing_grant(&f.ids)])
+            .decode()
+            .unwrap();
+        policy.certs.push(cert_at(6));
+        let policies = Arc::new(PolicyStore::new());
+        policies
+            .set(&Policy::sign(&f.ids.owner, &policy).unwrap())
+            .unwrap();
+
+        let cell = IdentityCell::new(LocalIdentity {
+            node_cert: cert_at(f.ids.responder_cert_serial),
+            x25519_private: [0u8; 32],
+        });
+        let authorizer = PolicyAuthorizer::new(
+            policies,
+            rosters,
+            f.ids.network_id,
+            f.ids.responder_node_id,
+            &cell,
+            f.ids.responder_x25519,
+        );
+        assert!(
+            matches!(
+                authorizer.authorize(&open_request(&f.ids)),
+                OpenDecision::Deny(_)
+            ),
+            "serial 5 is below the floor of 6: a granted OPEN is refused"
+        );
+        let docs = authorizer.clone().docs_only();
+        assert!(matches!(
+            docs.authorize(&docs_request(&f.ids)),
+            OpenDecision::Deny(_)
+        ));
+
+        cell.set(cert_at(6), 1_000).unwrap();
+        assert!(
+            matches!(
+                authorizer.authorize(&open_request(&f.ids)),
+                OpenDecision::Allow
+            ),
+            "the same authorizer reads serial 6 after the renewal"
+        );
+        assert!(matches!(
+            docs.authorize(&docs_request(&f.ids)),
+            OpenDecision::Allow
+        ));
     }
 
     #[test]

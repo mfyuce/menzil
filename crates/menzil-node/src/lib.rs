@@ -88,7 +88,7 @@ pub use docs_access::{DocsGate, DocsLimits, DocsPermit, SessionHandler, SessionO
 pub use docs_store::{Adopted, AdoptedDocs, DocStore};
 pub use docs_sync::{DOCS_ONLY_WAIT, POLICY_JITTER_MAX, PushReport, SyncConfig};
 pub use error::NodeError;
-pub use identity::LocalIdentity;
+pub use identity::{IdentityCell, IdentityError, LocalIdentity, OwnSerial};
 pub use l4_router::{
     EnsureError, HANDSHAKE_ATTEMPTS, RouterConfig, RouterHandle, RouterParts, SessionReady,
     new_router,

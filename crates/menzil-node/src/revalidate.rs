@@ -44,6 +44,7 @@ use tokio::time::MissedTickBehavior;
 
 use crate::admission::{PolicyAuthorizer, docs_only_standing, session_standing};
 use crate::cert_index::CertIndex;
+use crate::identity::OwnSerial;
 use crate::l4_router::grant_removed_close;
 use crate::l4_session::L4SessionHandle;
 use crate::l5_stream::AcceptedStreams;
@@ -123,7 +124,8 @@ pub(crate) struct Revalidator {
     policies: Arc<PolicyStore>,
     rosters: Arc<RosterStore>,
     local: NodeId,
-    local_serial: u32,
+    /// Read at each judgment, so a renewed certificate counts at once.
+    local_serial: OwnSerial,
     /// This node's own static key, for its certificate in the Policy (round 11 N1).
     local_static: X25519PublicKey,
     sweep: Duration,
@@ -165,7 +167,7 @@ impl Revalidator {
         policies: Arc<PolicyStore>,
         rosters: Arc<RosterStore>,
         local: NodeId,
-        local_serial: u32,
+        local_serial: impl Into<OwnSerial>,
         local_static: X25519PublicKey,
     ) -> Arc<Self> {
         Self::with_sweep(
@@ -183,7 +185,7 @@ impl Revalidator {
         policies: Arc<PolicyStore>,
         rosters: Arc<RosterStore>,
         local: NodeId,
-        local_serial: u32,
+        local_serial: impl Into<OwnSerial>,
         local_static: X25519PublicKey,
         sweep: Duration,
     ) -> Arc<Self> {
@@ -204,7 +206,7 @@ impl Revalidator {
         policies: Arc<PolicyStore>,
         rosters: Arc<RosterStore>,
         local: NodeId,
-        local_serial: u32,
+        local_serial: impl Into<OwnSerial>,
         local_static: X25519PublicKey,
         sweep: Duration,
         restart_delays: (Duration, Duration),
@@ -213,7 +215,7 @@ impl Revalidator {
             policies,
             rosters,
             local,
-            local_serial,
+            local_serial: local_serial.into(),
             local_static,
             sweep,
             restart_delays,
@@ -371,7 +373,7 @@ impl Revalidator {
                             peer,
                             peer_static,
                             &self.local,
-                            self.local_serial,
+                            self.local_serial.get(),
                             &self.local_static,
                             now,
                         ) {
@@ -385,7 +387,7 @@ impl Revalidator {
                         network_id,
                         peer,
                         &self.local,
-                        self.local_serial,
+                        self.local_serial.get(),
                     )
                     .err()
                     .map(Action::Close)
