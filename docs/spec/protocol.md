@@ -179,7 +179,7 @@ u8 type | body
 
 GOAWAY `reason` is `superseded` (4.1) or `revoked` (7.3); `revoked` also ends a session whose node a Roster of a claimed network no longer lists or whose `min_serial` it now exceeds, the ERROR before it says which (`revoked`, `not_member` or `stale_serial`). Before that ERROR the relay sends the node the Roster of the network concerned, so that the node can leave the network out of its next HELLO.
 
-`e2e_proto`: `0x01` menzil Noise (section 5), `0x02` reserved for QUIC. Others are rejected with ERROR `unknown_e2e`. `flags` bit 0 = droppable (datagram class). SEND payload is at most 65,535 minus 35 bytes.
+`e2e_proto`: `0x01` menzil Noise (section 5), `0x02` reserved for QUIC. Others are rejected with ERROR `unknown_e2e`. `flags` bit 0 = droppable (datagram class). SEND payload is at most 65,535 minus 35 minus the 16 byte AEAD tag, that is 65,484 bytes at the default `max_record` (live-verified against a real relay, L4b round).
 
 Forwarding rule: the relay forwards a SEND as a RECV to `dst` only if `src` and `dst` are both listed and unrevoked in one common, unexpired Roster the relay holds, `dst` is online and attached, and `dst` has not set `accept_peers: false` in its ADVERTISE. Otherwise ERROR `forbidden` or `peer_offline` goes back to the sender. The relay never inspects payloads.
 

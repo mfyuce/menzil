@@ -399,8 +399,7 @@ pub const L3_AEAD_TAG_LEN: usize = 16;
 /// is actually encrypted (TODO.md L4b's own review, live-verified
 /// against a real relay: 65,484 bytes of payload is the largest that
 /// round-trips at the default `max_record`, not 65,500). This function
-/// uses the verified number; the spec prose above it is one byte short
-/// of correct and worth fixing there too.
+/// uses the verified number; protocol.md section 4.2 now states it too (65,535 - 1 - 34 - 16).
 pub fn max_send_payload(max_record: u32) -> usize {
     (max_record as usize).saturating_sub(1 + SEND_RECV_PREFIX_LEN + L3_AEAD_TAG_LEN)
 }
