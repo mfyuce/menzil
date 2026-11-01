@@ -924,7 +924,7 @@ async fn a_clean_stop_flushes_the_roster_adopted_last() {
         drop(busy);
     });
     // The signal is already here.
-    assert_eq!(run_until(&mut running, async { 7 }).await, Some(7));
+    assert_eq!(run_until(&mut running, async { 7 }).await.unwrap(), Some(7));
     assert_eq!(
         load_rosters(&relay_home).unwrap()[0]
             .roster
@@ -935,4 +935,101 @@ async fn a_clean_stop_flushes_the_roster_adopted_last() {
         "the stop returned before the Roster was on disk"
     );
     assert_eq!(running.roster_seq(&id), Some(renewed.seq));
+}
+
+/// Shared setup for the `run_until` task-end tests: a relay that has adopted a newer Roster over
+/// DOC while the relay lock was busy, so that only a flush at the stop gets it onto the disk.
+/// Returns the pieces and the sequence number the disk must show afterwards.
+async fn relay_with_a_roster_waiting_for_the_flush() -> (tempfile::TempDir, Home, RunningRelay, u64)
+{
+    let (_o, owner, _id, _) = token_of_a_network();
+    let (dir, relay_home) = home();
+    init(&relay_home, clock()).unwrap();
+    add_network(&relay_home, &relay_token(&owner), clock()).unwrap();
+    let running = start(&relay_home, &run_options(dir.path())).await.unwrap();
+    let renewed = crate::local::renew(&owner, None, clock() + 60).unwrap();
+    let pair = crate::token::decode_documents(&renewed.token).unwrap();
+    let busy = relay_home.lock_relay().unwrap();
+    assert!(
+        running
+            .relay
+            .rosters()
+            .adopt(pair.roster(), None, clock() + 60)
+            .unwrap()
+    );
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(300));
+        drop(busy);
+    });
+    (dir, relay_home, running, renewed.seq)
+}
+
+/// A relay task that panics is not a stop: `run_until` is an error naming the panic (so that
+/// `menzil relay run` exits non-zero), and it still flushes the Roster adopted last first.
+#[tokio::test]
+async fn a_panicking_relay_task_is_an_error_and_still_flushes() {
+    let (_dir, relay_home, mut running, seq) = relay_with_a_roster_waiting_for_the_flush().await;
+    running.task.abort();
+    running.task = tokio::spawn(async { panic!("relay boom") });
+    let error = run_until(&mut running, std::future::pending::<u8>())
+        .await
+        .unwrap_err();
+    let text = format!("{error:#}");
+    assert!(text.contains("relay task panicked"), "{text}");
+    assert!(text.contains("relay boom"), "{text}");
+    assert_eq!(
+        load_rosters(&relay_home).unwrap()[0]
+            .roster
+            .decode()
+            .unwrap()
+            .seq,
+        seq,
+        "the error path returned before the Roster was on disk"
+    );
+}
+
+/// A relay task that returns by itself (or is aborted) is not a stop either.
+#[tokio::test]
+async fn a_relay_task_that_ends_by_itself_is_an_error() {
+    let (_dir, _relay_home, mut running, _seq) = relay_with_a_roster_waiting_for_the_flush().await;
+    running.task.abort();
+    running.task = tokio::spawn(async {});
+    let error = run_until(&mut running, std::future::pending::<u8>())
+        .await
+        .unwrap_err();
+    assert!(
+        format!("{error:#}").contains("relay task ended unexpectedly"),
+        "{error:#}"
+    );
+    running.task = tokio::spawn(std::future::pending::<()>());
+    running.task.abort();
+    let error = run_until(&mut running, std::future::pending::<u8>())
+        .await
+        .unwrap_err();
+    assert!(
+        format!("{error:#}").contains("relay task ended unexpectedly"),
+        "{error:#}"
+    );
+}
+
+/// The stop firing while the relay task lives is `Ok(Some(what the stop gave))`, and the flush
+/// has happened.
+#[tokio::test]
+async fn a_stop_with_a_live_relay_task_is_ok_some_and_flushes() {
+    let (_dir, relay_home, mut running, seq) = relay_with_a_roster_waiting_for_the_flush().await;
+    let out = run_until(&mut running, async {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        "signal"
+    })
+    .await
+    .unwrap();
+    assert_eq!(out, Some("signal"));
+    assert_eq!(
+        load_rosters(&relay_home).unwrap()[0]
+            .roster
+            .decode()
+            .unwrap()
+            .seq,
+        seq
+    );
 }

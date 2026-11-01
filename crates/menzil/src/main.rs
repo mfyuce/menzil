@@ -555,7 +555,7 @@ async fn run(cli: Cli) -> Result<()> {
             println!("{}", relay.connection_info);
             // Until a signal; the last Roster adopted over DOC is flushed to disk before the
             // process goes.
-            if let Some(why) = relay_cmd::run_until(&mut relay, signals::shutdown()).await {
+            if let Some(why) = relay_cmd::run_until(&mut relay, signals::shutdown()).await? {
                 eprintln!("stopping ({})", why?);
             }
         }

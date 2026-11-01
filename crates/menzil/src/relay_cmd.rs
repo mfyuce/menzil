@@ -295,9 +295,10 @@ pub struct RunningRelay {
 }
 
 impl RunningRelay {
-    /// Waits for the relay's task, which only ends if it is aborted.
-    pub async fn wait(&mut self) {
-        let _ = (&mut self.task).await;
+    /// Waits for the relay's task, which serves until it is aborted; what the join gave. A
+    /// task that returns by itself is `Ok(())`, one that panicked or was aborted is the error.
+    pub async fn wait(&mut self) -> Result<(), tokio::task::JoinError> {
+        (&mut self.task).await
     }
 
     /// The sequence number of the Roster the relay holds for `network_id` now.
@@ -331,19 +332,27 @@ impl RunningRelay {
 /// What `menzil relay run` does after it has started: waits until `stop` is ready (a signal) or
 /// the relay's task ends, then flushes the keeper, so that the last Roster adopted over DOC is
 /// on disk before the process goes (TOBEDECIDED 28b; bounded by [`STOP_GRACE`], the lock another
-/// command holds is not waited for forever). `Some` with what `stop` gave if it was the signal.
+/// command holds is not waited for forever). `Ok(Some)` with what `stop` gave if it was the
+/// signal. If the relay's task ends first (it panicked, was aborted, or returned, none of which
+/// is a stop anyone asked for) the keeper is flushed all the same and the result is an error, so
+/// that the process exits non-zero.
 pub async fn run_until<F: std::future::Future>(
     relay: &mut RunningRelay,
     stop: F,
-) -> Option<F::Output> {
-    let stopped = tokio::select! {
-        _ = relay.wait() => None,
-        out = stop => Some(out),
+) -> Result<Option<F::Output>> {
+    let ended = tokio::select! {
+        joined = relay.wait() => Err(joined),
+        out = stop => Ok(out),
     };
     if !relay.flush_rosters_blocking(STOP_GRACE).await {
         eprintln!("menzil: the Rosters adopted last may not have reached the disk");
     }
-    stopped
+    match ended {
+        Ok(out) => Ok(Some(out)),
+        Err(Ok(())) => bail!("relay task ended unexpectedly"),
+        Err(Err(error)) if error.is_panic() => bail!("relay task panicked: {error}"),
+        Err(Err(error)) => bail!("relay task ended unexpectedly: {error}"),
+    }
 }
 
 impl Drop for RunningRelay {
