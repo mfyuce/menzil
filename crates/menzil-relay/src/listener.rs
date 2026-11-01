@@ -13,7 +13,7 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::TlsAcceptor;
 use tokio_tungstenite::tungstenite::handshake::server::{ErrorResponse, Request, Response};
 use tokio_tungstenite::tungstenite::http::StatusCode;
@@ -25,6 +25,13 @@ use crate::error::RelayError;
 /// the L3 WebSocket upgrade for each.
 pub struct Listener {
     tcp: TcpListener,
+    upgrader: Arc<Upgrader>,
+}
+
+/// The TLS acceptor and expected path: everything the TLS plus WebSocket
+/// upgrade needs, shared (`Arc`) so a spawned handshake task can own it
+/// without borrowing the [`Listener`].
+pub(crate) struct Upgrader {
     acceptor: TlsAcceptor,
     expected_path: String,
 }
@@ -43,8 +50,10 @@ impl Listener {
         let tcp = TcpListener::bind(addr).await?;
         Ok(Self {
             tcp,
-            acceptor: TlsAcceptor::from(tls_config),
-            expected_path: expected_path.into(),
+            upgrader: Arc::new(Upgrader {
+                acceptor: TlsAcceptor::from(tls_config),
+                expected_path: expected_path.into(),
+            }),
         })
     }
 
@@ -54,18 +63,47 @@ impl Listener {
         Ok(self.tcp.local_addr()?)
     }
 
-    /// Accepts one inbound TCP connection, completes TLS, then the L3
-    /// WebSocket upgrade: a request to any path but the one this
-    /// `Listener` was bound with, or one that doesn't offer the
-    /// `menzil.v1` subprotocol, gets a minimal 404 (protocol.md 3.1 step
-    /// 4, 13's "minimal 404 page" row for phase 1) rather than completing
-    /// the upgrade.
-    pub async fn accept(&self) -> Result<InboundConnection, RelayError> {
+    /// Accepts one inbound TCP connection and sets `TCP_NODELAY`; nothing
+    /// else. This never waits on the peer, so a loop around it cannot be
+    /// stalled by a client that connects and then says nothing; the TLS
+    /// and WebSocket steps are [`Listener::handshake`], which a caller
+    /// bounds in time and number itself (see `Relay::serve`).
+    pub async fn accept_tcp(&self) -> Result<TcpStream, RelayError> {
         let (tcp, _peer) = self.tcp.accept().await?;
         // Nagle off, for the same reason as on the dialing side (see
         // `menzil_carrier::connect`'s `low_latency`): the relay's writes
         // are the small records of every session it serves.
         tcp.set_nodelay(true)?;
+        Ok(tcp)
+    }
+
+    /// Completes TLS, then the L3 WebSocket upgrade, on a socket from
+    /// [`Listener::accept_tcp`]: a request to any path but the one this
+    /// `Listener` was bound with, or one that doesn't offer the
+    /// `menzil.v1` subprotocol, gets a minimal 404 (protocol.md 3.1 step
+    /// 4, 13's "minimal 404 page" row for phase 1) rather than completing
+    /// the upgrade. There is no timeout in here: a peer that stalls
+    /// stalls this future, so the caller must wrap it in one.
+    pub async fn handshake(&self, tcp: TcpStream) -> Result<InboundConnection, RelayError> {
+        self.upgrader.handshake(tcp).await
+    }
+
+    /// [`Listener::accept_tcp`] then [`Listener::handshake`] inline, with
+    /// no timeout: one peer that stalls the handshake stalls this call.
+    /// A server loop should use the two halves instead.
+    pub async fn accept(&self) -> Result<InboundConnection, RelayError> {
+        let tcp = self.accept_tcp().await?;
+        self.handshake(tcp).await
+    }
+
+    /// A shared handle on the handshake half, for spawned tasks.
+    pub(crate) fn upgrader(&self) -> Arc<Upgrader> {
+        Arc::clone(&self.upgrader)
+    }
+}
+
+impl Upgrader {
+    pub(crate) async fn handshake(&self, tcp: TcpStream) -> Result<InboundConnection, RelayError> {
         let tls = self.acceptor.accept(tcp).await?;
         let expected_path = self.expected_path.clone();
         // `validate_upgrade` only has borrowed access to the request

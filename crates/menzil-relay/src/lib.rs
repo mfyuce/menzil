@@ -42,6 +42,6 @@ pub use identity::RelayIdentity;
 pub use listener::Listener;
 pub use node_history::{HistoryViolation, NodeHistory};
 pub use registry::SessionRegistry;
-pub use relay::Relay;
+pub use relay::{AcceptConfig, HANDSHAKE_TIMEOUT, MAX_INFLIGHT_HANDSHAKES, Relay};
 pub use roster_store::RosterStore;
 pub use tls::server_config;

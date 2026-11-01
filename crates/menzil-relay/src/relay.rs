@@ -2,10 +2,14 @@
 //! 4.1): bundles the shared state every accepted connection needs (this
 //! relay's own identity, its held Rosters, per-NodeId replay-defense
 //! history, and the attached-session registry) and runs
-//! [`Listener::accept`] in a loop, spawning one task per connection.
+//! [`Listener::accept_tcp`] in a loop, spawning one task per connection
+//! that runs the handshake under a timeout and an in-flight limit.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::time::Duration;
+
+use tokio::sync::Semaphore;
 
 use menzil_proto::Limits;
 
@@ -97,26 +101,94 @@ impl Relay {
         &self.rosters
     }
 
-    /// Accepts connections from `listener` forever, spawning one task
-    /// per connection to run its handshake, HELLO validation
-    /// (protocol.md 4.1), and its attached liveness/REKEY loop
-    /// (protocol.md 3.3, 4.2). A single connection's own accept or
-    /// handshake failure is logged and does not stop this loop — only
-    /// ending the process does.
+    /// [`Relay::serve_with`] with [`AcceptConfig::default`].
     pub async fn serve(&self, listener: &Listener) {
+        self.serve_with(listener, AcceptConfig::default()).await
+    }
+
+    /// Accepts connections from `listener` forever. The loop only does
+    /// the TCP accept ([`Listener::accept_tcp`]); each socket then gets
+    /// its own task, which runs the TLS and WebSocket handshake under
+    /// `config.handshake_timeout`, then HELLO validation (protocol.md
+    /// 4.1) and the attached liveness/REKEY loop (protocol.md 3.3, 4.2).
+    ///
+    /// At most `config.max_inflight_handshakes` handshakes run at once.
+    /// A socket that arrives when none is free is dropped at once, so
+    /// the loop never waits on a peer and memory stays bounded; a
+    /// handshake slot is freed when the handshake ends (done, failed or
+    /// timed out), not when the session does. A single connection's own
+    /// accept or handshake failure is logged and does not stop this
+    /// loop; only ending the process does.
+    pub async fn serve_with(&self, listener: &Listener, config: AcceptConfig) {
+        let slots = Arc::new(Semaphore::new(config.max_inflight_handshakes));
+        let upgrader = listener.upgrader();
         loop {
-            let conn = match listener.accept().await {
-                Ok(conn) => conn,
+            let tcp = match listener.accept_tcp().await {
+                Ok(tcp) => tcp,
                 Err(err) => {
                     tracing::warn!(error = %err, "relay failed to accept a connection");
+                    // A persistent error (no file descriptors left) must not spin the loop.
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                     continue;
                 }
             };
+            let Ok(permit) = Arc::clone(&slots).try_acquire_owned() else {
+                tracing::debug!(
+                    limit = config.max_inflight_handshakes,
+                    "too many handshakes in flight; dropping a new connection"
+                );
+                continue;
+            };
             let session_id = self.next_session_id.fetch_add(1, Ordering::Relaxed);
             let relay = self.clone();
+            let upgrader = Arc::clone(&upgrader);
+            let timeout = config.handshake_timeout;
             tokio::spawn(async move {
+                let handshake = tokio::time::timeout(timeout, upgrader.handshake(tcp)).await;
+                // The slot is for the handshake only: free it before the
+                // session starts, not when the session ends.
+                drop(permit);
+                let conn = match handshake {
+                    Ok(Ok(conn)) => conn,
+                    Ok(Err(err)) => {
+                        tracing::debug!(error = %err, "inbound handshake failed");
+                        return;
+                    }
+                    Err(_elapsed) => {
+                        tracing::debug!(?timeout, "inbound handshake timed out");
+                        return;
+                    }
+                };
                 session::handle_connection(conn, relay, session_id).await;
             });
+        }
+    }
+}
+
+/// How long one inbound TLS plus WebSocket handshake may take.
+pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How many inbound handshakes may be in flight at once; further new
+/// sockets are dropped until one finishes.
+pub const MAX_INFLIGHT_HANDSHAKES: usize = 256;
+
+/// The limits [`Relay::serve_with`] puts on connections that have not yet
+/// finished their handshake. [`Default`] is [`HANDSHAKE_TIMEOUT`] and
+/// [`MAX_INFLIGHT_HANDSHAKES`].
+#[derive(Debug, Clone, Copy)]
+pub struct AcceptConfig {
+    /// A handshake not finished after this long is abandoned and its
+    /// socket closed.
+    pub handshake_timeout: Duration,
+    /// The most handshakes in flight at once.
+    pub max_inflight_handshakes: usize,
+}
+
+impl Default for AcceptConfig {
+    fn default() -> Self {
+        Self {
+            handshake_timeout: HANDSHAKE_TIMEOUT,
+            max_inflight_handshakes: MAX_INFLIGHT_HANDSHAKES,
         }
     }
 }

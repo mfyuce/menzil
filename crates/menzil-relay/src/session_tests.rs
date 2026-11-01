@@ -2127,3 +2127,121 @@ async fn a_claimed_networks_own_min_serial_still_evicts() {
             .any(|r| matches!(r, Record::Error(body) if body.code == ErrorCode::StaleSerial))
     );
 }
+
+// The accept loop's handling of peers that never finish their handshake
+// (`Relay::serve_with`): the TCP accept is never blocked by one, a stalled
+// handshake is closed after the timeout, and the number of handshakes in
+// flight is bounded.
+
+use crate::relay::AcceptConfig;
+use std::time::Duration;
+use tokio::io::AsyncReadExt;
+
+/// Waits up to `within` for the relay to close `sock` (EOF or reset).
+/// Returns false if the socket was still open when the time ran out.
+async fn closed_by_relay(sock: &mut TcpStream, within: Duration) -> bool {
+    let mut buf = [0u8; 16];
+    match tokio::time::timeout(within, sock.read(&mut buf)).await {
+        Err(_elapsed) => false,
+        Ok(Ok(0)) | Ok(Err(_)) => true,
+        Ok(Ok(n)) => panic!("the relay sent {n} unexpected bytes to a silent peer"),
+    }
+}
+
+/// A full session setup (TLS, WebSocket, Noise, WELCOME) plus a PING/PONG
+/// with a fresh identity: proof the relay really serves this client.
+async fn assert_served(
+    addr: SocketAddr,
+    cert: &CertificateDer<'static>,
+    relay_x25519: X25519PublicKey,
+) -> TestClient {
+    let identity = generate_identity();
+    let (mut client, _welcome) = tokio::time::timeout(
+        Duration::from_secs(5),
+        TestClient::connect(
+            addr,
+            cert.clone(),
+            &identity,
+            relay_x25519,
+            vec![],
+            HashMap::new(),
+            1,
+            10,
+        ),
+    )
+    .await
+    .expect("the relay did not serve a real client in time");
+    ping_pong(&mut client, [7; 8]).await;
+    client
+}
+
+#[tokio::test]
+async fn an_idle_socket_does_not_block_other_clients() {
+    let (relay, listener, cert, relay_x25519) = bind_test_relay().await;
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { relay.serve(&listener).await });
+
+    // Connects and never says a word; kept open for the whole test.
+    let _idle = TcpStream::connect(addr).await.unwrap();
+    // Let the accept loop take it before the real client arrives.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let _served = assert_served(addr, &cert, relay_x25519).await;
+}
+
+#[tokio::test]
+async fn a_stalled_handshake_is_closed_after_the_timeout() {
+    let (relay, listener, _cert, _x) = bind_test_relay().await;
+    let addr = listener.local_addr().unwrap();
+    let config = AcceptConfig {
+        handshake_timeout: Duration::from_millis(300),
+        max_inflight_handshakes: 256,
+    };
+    tokio::spawn(async move { relay.serve_with(&listener, config).await });
+
+    let mut stalled = TcpStream::connect(addr).await.unwrap();
+    let started = std::time::Instant::now();
+    assert!(
+        !closed_by_relay(&mut stalled, Duration::from_millis(100)).await,
+        "the relay closed a young handshake early"
+    );
+    assert!(
+        closed_by_relay(&mut stalled, Duration::from_secs(5)).await,
+        "the relay never closed a stalled handshake"
+    );
+    assert!(started.elapsed() >= Duration::from_millis(250));
+}
+
+#[tokio::test]
+async fn handshakes_in_flight_are_limited_and_the_slot_is_freed_afterwards() {
+    let (relay, listener, cert, relay_x25519) = bind_test_relay().await;
+    let addr = listener.local_addr().unwrap();
+    let config = AcceptConfig {
+        handshake_timeout: Duration::from_millis(1000),
+        max_inflight_handshakes: 1,
+    };
+    tokio::spawn(async move { relay.serve_with(&listener, config).await });
+
+    // The only slot is taken by a peer that never speaks.
+    let mut stalled = TcpStream::connect(addr).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // A second socket is dropped at once, long before the stalled
+    // handshake's timeout, and while that one is still open.
+    let mut second = TcpStream::connect(addr).await.unwrap();
+    assert!(
+        closed_by_relay(&mut second, Duration::from_millis(700)).await,
+        "a connection over the in-flight limit was not dropped at once"
+    );
+    assert!(
+        !closed_by_relay(&mut stalled, Duration::from_millis(20)).await,
+        "the stalled handshake ended before its timeout"
+    );
+
+    // Once the stalled handshake times out, its slot is free again.
+    assert!(closed_by_relay(&mut stalled, Duration::from_secs(5)).await);
+    let _third = assert_served(addr, &cert, relay_x25519).await;
+    // The slot is for the handshake only, not for the session: with the
+    // third session still running, a fourth client is served too.
+    let _fourth = assert_served(addr, &cert, relay_x25519).await;
+}
