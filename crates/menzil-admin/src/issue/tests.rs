@@ -2548,3 +2548,129 @@ fn a_steward_rotation_must_have_been_valid_for_the_issue_margin() {
         .unwrap();
     steward_rotate(&r.steward, &r.base, &[exact], at).unwrap();
 }
+
+// ---- equal serials: the larger key is the reference, in any list order ----
+
+/// A certificate of `keys`' node with `serial` carrying the x25519 key `x25519`, signed by the
+/// node's signing key.
+fn cert_with_key(keys: &NodeKeys, serial: u32, x25519: X25519PublicKey) -> NodeCert {
+    let body = NodeCertBody {
+        v: menzil_proto::PROTOCOL_VERSION,
+        node_id: keys.node_id(),
+        x25519_pub: x25519,
+        serial,
+        not_before: NOW - 1000,
+        not_after: NOW + 100 * DAY,
+    };
+    NodeCert::sign(keys.signing_key(), &body).unwrap()
+}
+
+/// Two distinct x25519 keys, the smaller first.
+fn small_and_large_key() -> (X25519PublicKey, X25519PublicKey) {
+    let a = NodeKeys::generate().x25519_public();
+    let b = NodeKeys::generate().x25519_public();
+    if <[u8; 32]>::from(a) < <[u8; 32]>::from(b) {
+        (a, b)
+    } else {
+        (b, a)
+    }
+}
+
+/// Owner documents of the `Rotating` network whose Policy lists, for "phone", two serial 2
+/// certificates with different keys, in the order `large_first` says.
+fn tied_owner_documents(
+    r: &Rotating,
+    small: X25519PublicKey,
+    large: X25519PublicKey,
+    large_first: bool,
+) -> Documents {
+    let small_cert = cert_with_key(&r.phone, 2, small);
+    let large_cert = cert_with_key(&r.phone, 2, large);
+    let (first, second) = if large_first {
+        (large_cert, small_cert)
+    } else {
+        (small_cert, large_cert)
+    };
+    let mut policy = r.base.policy_body().clone();
+    policy.certs.push(first);
+    policy.certs.push(second);
+    Documents::signed(&r.owner, r.base.roster_body().clone(), policy).unwrap()
+}
+
+#[test]
+fn accept_cert_takes_the_larger_key_as_reference_at_equal_serials_in_any_order() {
+    let (small, large) = small_and_large_key();
+    let r = rotating_with(&ADMIT_RENEW);
+    let id = r.phone.node_id();
+    for large_first in [false, true] {
+        let docs = tied_owner_documents(&r, small, large, large_first);
+        // The larger key with a higher serial is a renewal of the reference.
+        let ok = cert_with_key(&r.phone, 3, large);
+        let next = accept_cert(&r.owner, &docs, &ok, NOW).unwrap();
+        assert_eq!(certs_of(&next, id), vec![3], "large_first {large_first}");
+        // The smaller key with a higher serial is another key than the reference.
+        let other = cert_with_key(&r.phone, 3, small);
+        assert!(
+            matches!(
+                accept_cert(&r.owner, &docs, &other, NOW),
+                Err(AdminError::NewKey(n)) if n == id
+            ),
+            "large_first {large_first}"
+        );
+        // Not above the tied serial is stale whatever the key.
+        let stale = cert_with_key(&r.phone, 2, large);
+        assert!(
+            matches!(
+                accept_cert(&r.owner, &docs, &stale, NOW),
+                Err(AdminError::StaleCert {
+                    listed: 2,
+                    offered: 2
+                })
+            ),
+            "large_first {large_first}"
+        );
+    }
+}
+
+#[test]
+fn steward_rotate_takes_the_larger_key_as_reference_at_equal_serials_in_any_order() {
+    let (small, large) = small_and_large_key();
+    let r = rotating_with(&ADMIT_RENEW);
+    let id = r.phone.node_id();
+    let at = NOW + DAY;
+    for large_first in [false, true] {
+        let tied = tied_owner_documents(&r, small, large, large_first);
+        let steward_base = delegate_steward(
+            &r.owner,
+            &tied,
+            r.steward.public(),
+            &rights(&ADMIT_RENEW),
+            NOW + 30 * DAY,
+            NOW,
+        )
+        .unwrap();
+        let ok = cert_with_key(&r.phone, 3, large);
+        let next = steward_rotate(&r.steward, &steward_base, std::slice::from_ref(&ok), at)
+            .unwrap_or_else(|e| panic!("large_first {large_first}: {e:?}"));
+        assert!(next.policy_body().certs.contains(&ok));
+        let other = cert_with_key(&r.phone, 3, small);
+        assert!(
+            matches!(
+                steward_rotate(&r.steward, &steward_base, &[other], at),
+                Err(AdminError::NewKey(n)) if n == id
+            ),
+            "large_first {large_first}"
+        );
+        let stale = cert_with_key(&r.phone, 2, large);
+        assert!(
+            matches!(
+                steward_rotate(&r.steward, &steward_base, &[stale], at),
+                Err(AdminError::StaleCert {
+                    listed: 2,
+                    offered: 2
+                })
+            ),
+            "large_first {large_first}"
+        );
+    }
+}

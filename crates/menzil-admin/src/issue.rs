@@ -517,10 +517,7 @@ pub fn steward_rotate(
             if at >= base_len {
                 tail_at = Some(at);
             }
-            if highest
-                .as_ref()
-                .is_none_or(|best| listed.serial > best.serial)
-            {
+            if outranks(&listed, highest.as_ref()) {
                 highest = Some(listed);
             }
         }
@@ -567,6 +564,19 @@ fn prune_superseded(certs: &[NodeCert], now: u64) -> Result<Vec<NodeCert>, Admin
         }
     }
     Ok(kept)
+}
+
+/// Whether `listed` is the reference certificate of its node instead of `best`: a higher serial,
+/// and at an equal serial the larger x25519 key, whatever the list order (the rule of
+/// `menzil_proto::trust` and of `CertIndex::resolve`, round A N2).
+fn outranks(
+    listed: &menzil_proto::NodeCertBody,
+    best: Option<&menzil_proto::NodeCertBody>,
+) -> bool {
+    best.is_none_or(|best| {
+        (listed.serial, <[u8; 32]>::from(listed.x25519_pub))
+            > (best.serial, <[u8; 32]>::from(best.x25519_pub))
+    })
 }
 
 /// A renewed certificate must have been valid for [`CERT_ISSUE_MARGIN_SECS`] already.
@@ -839,11 +849,7 @@ pub fn accept_cert(
     let mut highest: Option<menzil_proto::NodeCertBody> = None;
     for listed in &current.policy_body().certs {
         let listed = listed.decode()?;
-        if listed.node_id == body.node_id
-            && highest
-                .as_ref()
-                .is_none_or(|best| listed.serial > best.serial)
-        {
+        if listed.node_id == body.node_id && outranks(&listed, highest.as_ref()) {
             highest = Some(listed);
         }
     }
