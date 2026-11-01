@@ -255,6 +255,13 @@ impl RelayHandshake {
         self.hello.as_ref()
     }
 
+    /// The node's Noise static key, if already known at this point (`Ik` only: message 1
+    /// carries it; `Xx` learns it from message 3). With [`Self::hello`] this lets a relay
+    /// check an `Ik` HELLO before it writes WELCOME.
+    pub fn remote_static(&self) -> Option<X25519PublicKey> {
+        remote_static(&self.hs)
+    }
+
     /// Writes `welcome` as message 2. For `Ik` the handshake is now
     /// complete (nothing more to read), so the result carries the
     /// finished [`Transport`] and HELLO directly via

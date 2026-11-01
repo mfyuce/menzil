@@ -279,6 +279,17 @@ impl RosterStore {
             .collect()
     }
 
+    /// The current `seq` of each of `networks` this relay holds, for a WELCOME that lists only
+    /// the networks a session proved it may claim (isolation rule I1). A network not held is
+    /// left out.
+    pub fn seqs_for(&self, networks: &[NetworkId]) -> HashMap<NetworkId, u64> {
+        let held = self.by_network.read().unwrap();
+        networks
+            .iter()
+            .filter_map(|id| held.get(id).map(|held| (*id, held.body.seq)))
+            .collect()
+    }
+
     /// The strictest `min_serial` this NodeId is subject to in the Rosters of `networks` (the
     /// networks a HELLO claims) that this relay holds and lists it in, with the network that sets
     /// it (protocol.md 4.1: "lower than the `min_serial` for that node in a Roster of a network

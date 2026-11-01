@@ -96,6 +96,10 @@ fn detect_pattern(message1: &[u8]) -> HandshakePattern {
     }
 }
 
+/// How long a refused peer's connection stays open, read and discarded, after its ERROR was
+/// sent (see `run_handshake_and_validate`).
+const REJECTION_LINGER: Duration = Duration::from_secs(1);
+
 fn unix_now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -103,24 +107,32 @@ fn unix_now() -> u64 {
         .as_secs()
 }
 
-fn build_welcome(relay: &Relay, session_id: u32) -> WelcomeBody {
+/// WELCOME for one session. `rosters` is what this session may learn about the relay's
+/// networks (isolation rule I1): never the relay's whole list, only networks the peer's own
+/// HELLO claimed and passed.
+fn build_welcome(relay: &Relay, session_id: u32, rosters: HashMap<NetworkId, u64>) -> WelcomeBody {
     WelcomeBody {
         v: menzil_proto::PROTOCOL_VERSION,
         relay_cert: relay.identity.node_cert.clone(),
         session: session_id,
         time: unix_now(),
         limits: relay.limits,
-        rosters: relay.rosters.seqs(),
+        rosters,
     }
 }
 
 /// Runs the Noise handshake to completion (protocol.md 4.1), then checks
 /// HELLO. On a HELLO rejection, best-effort sends an ERROR record over
-/// the now-established transport before returning the error — WELCOME
-/// itself is unconditional (its contents never depend on HELLO, and
-/// `Xx`'s wire order sends it before HELLO is even readable), so there is
-/// no way to avoid completing the handshake before learning whether the
-/// node passes these checks.
+/// the now-established transport before returning the error.
+///
+/// What WELCOME's `rosters` may say depends on what is known when message 2 is written
+/// (isolation rule I1). `Ik`: HELLO rides message 1, so it is checked before message 2 is
+/// written and WELCOME lists exactly the networks it claimed, if it passed; a HELLO that
+/// fails gets an empty list, then the ERROR. `Xx`: message 2 is written before HELLO exists
+/// (it rides message 3), so nothing about the peer is proven yet and the list is empty; the
+/// node pushes its Roster for any claimed network missing from it (protocol.md 4.3), which
+/// the relay drops as equal when it already holds it. The wire format and message order are
+/// unchanged either way.
 async fn run_handshake_and_validate(
     mut conn: InboundConnection,
     relay: &Relay,
@@ -140,29 +152,47 @@ async fn run_handshake_and_validate(
         &prologue_bytes,
         &message1,
     )?;
-    let welcome = build_welcome(relay, session_id);
-    let (step, node_static_ik, message2) = relay_handshake.write_welcome(&welcome)?;
+    // `Ik` only: HELLO and the node's static key are both known after message 1. The check
+    // runs exactly once per session (it records the HELLO's serial and timestamp).
+    let early = match (relay_handshake.hello(), relay_handshake.remote_static()) {
+        (Some(hello), Some(node_static)) => Some(check_hello(
+            hello,
+            &node_static,
+            &relay.rosters,
+            &relay.history,
+            unix_now(),
+        )),
+        _ => None,
+    };
+    let proven_rosters = match (&early, relay_handshake.hello()) {
+        (Some(Ok(_)), Some(hello)) => relay.rosters.seqs_for(&hello.networks),
+        _ => HashMap::new(),
+    };
+    let welcome = build_welcome(relay, session_id, proven_rosters);
+    let (step, _node_static_ik, message2) = relay_handshake.write_welcome(&welcome)?;
     conn.send(message2).await?;
 
-    let (mut transport, hello, node_static) = match step {
-        RelayHandshakeStep::Finished { transport, hello } => {
-            let node_static =
-                node_static_ik.expect("Ik always learns the initiator's static key by message 1");
-            (transport, *hello, node_static)
-        }
+    let (mut transport, hello, checked) = match step {
+        RelayHandshakeStep::Finished { transport, hello } => (
+            transport,
+            *hello,
+            early.expect("Ik always has its HELLO checked before WELCOME"),
+        ),
         RelayHandshakeStep::AwaitingHello(awaiting) => {
             let message3 = conn.recv().await?;
-            awaiting.finish(&message3)?
+            let (transport, hello, node_static) = awaiting.finish(&message3)?;
+            let checked = check_hello(
+                &hello,
+                &node_static,
+                &relay.rosters,
+                &relay.history,
+                unix_now(),
+            );
+            (transport, hello, checked)
         }
     };
 
-    match check_hello(
-        &hello,
-        &node_static,
-        &relay.rosters,
-        &relay.history,
-        unix_now(),
-    ) {
+    match checked {
         Ok(node_id) => Ok((conn, transport, node_id, hello)),
         Err(rejection) => {
             let error_record = Record::Error(ErrorBody {
@@ -172,6 +202,15 @@ async fn run_handshake_and_validate(
             if let Ok(bytes) = transport.encrypt_record(&error_record) {
                 let _ = conn.send(bytes).await;
             }
+            // An `Ik` HELLO is now checked before WELCOME is written, so the ERROR follows
+            // WELCOME at once. The node writes ATTACH right after WELCOME; closing this
+            // socket under it would reset the connection before the node reads the ERROR
+            // (its write fails with a broken pipe and the reason is lost). Read and discard
+            // for a moment, until the node closes or the linger ends.
+            let _ = tokio::time::timeout(REJECTION_LINGER, async {
+                while conn.recv().await.is_ok() {}
+            })
+            .await;
             Err(RelayError::HelloRejected {
                 code: rejection.code,
                 message: rejection.message,

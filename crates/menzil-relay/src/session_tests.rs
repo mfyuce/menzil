@@ -161,6 +161,50 @@ impl TestClient {
         (Self { ws, transport }, welcome)
     }
 
+    /// The first contact shape: a real Noise `Xx` handshake (the node does not know the
+    /// relay's static key), HELLO riding message 3. Returns the client and the WELCOME that
+    /// message 2 carried.
+    async fn connect_xx(
+        addr: SocketAddr,
+        cert: CertificateDer<'static>,
+        client_identity: &TestIdentity,
+        networks: Vec<NetworkId>,
+        timestamp_byte: u8,
+    ) -> (Self, WelcomeBody) {
+        let mut ws = test_client(addr, cert, "/_menzil/v1").await;
+        let pattern = HandshakePattern::Xx;
+        let prologue_bytes = prologue("menzil.v1", "menzil.v1", pattern);
+        let mut timestamp = [0u8; 12];
+        timestamp[7] = timestamp_byte;
+        let hello = HelloBody {
+            v: PROTOCOL_VERSION,
+            node_cert: node_cert_for(client_identity, 1),
+            networks,
+            timestamp: Tai64N::from(timestamp),
+            roster_seq: HashMap::new(),
+            caps: vec![],
+            e2e_protos: vec![0x01],
+        };
+        let (node_handshake, message1) = NodeHandshake::start(
+            pattern,
+            &client_identity.x25519_private,
+            None,
+            &prologue_bytes,
+            &hello,
+        )
+        .unwrap();
+        ws.send(Message::Binary(message1.into())).await.unwrap();
+        let message2 = match ws.next().await.unwrap().unwrap() {
+            Message::Binary(bytes) => bytes.to_vec(),
+            other => panic!("expected a binary message 2, got {other:?}"),
+        };
+        let (transport, welcome, _relay_static, outgoing) =
+            node_handshake.finish(&message2).unwrap();
+        let message3 = outgoing.expect("Xx always has a message 3");
+        ws.send(Message::Binary(message3.into())).await.unwrap();
+        (Self { ws, transport }, welcome)
+    }
+
     async fn send(&mut self, record: Record) {
         let bytes = self.transport.encrypt_record(&record).unwrap();
         self.ws.send(Message::Binary(bytes.into())).await.unwrap();
@@ -2422,4 +2466,209 @@ async fn handshakes_in_flight_are_limited_and_the_slot_is_freed_afterwards() {
     // The slot is for the handshake only, not for the session: with the
     // third session still running, a fourth client is served too.
     let _fourth = assert_served(addr, &cert, relay_x25519).await;
+}
+
+// ---- WELCOME lists only what the peer proved (MT1, isolation rule I1) -----------------------
+
+/// A relay serving three unrelated networks, each listing the NodeIds given for it.
+struct ThreeNetworks {
+    relay: Relay,
+    addr: SocketAddr,
+    cert: CertificateDer<'static>,
+    relay_x25519: X25519PublicKey,
+    owners: [SigningKey; 3],
+    networks: [NetworkId; 3],
+}
+
+async fn three_networks(listed: [&[NodeId]; 3]) -> ThreeNetworks {
+    let (relay, listener, cert, relay_x25519) = bind_test_relay().await;
+    let addr = listener.local_addr().unwrap();
+    let owners = [
+        SigningKey::generate(&mut rand::rng()),
+        SigningKey::generate(&mut rand::rng()),
+        SigningKey::generate(&mut rand::rng()),
+    ];
+    let networks = owners
+        .each_ref()
+        .map(|owner| NetworkId::from(owner.verifying_key().to_bytes()));
+    for index in 0..3 {
+        let members: Vec<(NodeId, u32)> = listed[index].iter().map(|&node| (node, 1)).collect();
+        relay
+            .rosters()
+            .set(&evict_roster(
+                &owners[index],
+                networks[index],
+                1 + index as u64,
+                &members,
+                &[],
+            ))
+            .unwrap();
+    }
+    let serve_relay = relay.clone();
+    tokio::spawn(async move { serve_relay.serve(&listener).await });
+    ThreeNetworks {
+        relay,
+        addr,
+        cert,
+        relay_x25519,
+        owners,
+        networks,
+    }
+}
+
+impl ThreeNetworks {
+    /// The `seq` each network was seeded with (`1 + index`, so a leak of the wrong network or
+    /// the wrong number shows).
+    fn seeded(&self, indexes: &[usize]) -> HashMap<NetworkId, u64> {
+        indexes
+            .iter()
+            .map(|&index| (self.networks[index], 1 + index as u64))
+            .collect()
+    }
+
+    async fn connect_ik(
+        &self,
+        who: &TestIdentity,
+        claims: Vec<NetworkId>,
+        timestamp_byte: u8,
+    ) -> (TestClient, WelcomeBody) {
+        TestClient::connect(
+            self.addr,
+            self.cert.clone(),
+            who,
+            self.relay_x25519,
+            claims,
+            HashMap::new(),
+            1,
+            timestamp_byte,
+        )
+        .await
+    }
+}
+
+#[tokio::test]
+async fn a_stranger_with_a_fresh_key_sees_no_networks_in_welcome() {
+    let member = generate_identity();
+    let three = three_networks([&[member.node_id], &[member.node_id], &[]]).await;
+    let stranger = generate_identity();
+
+    // Claims nothing, which passes HELLO today.
+    let (mut client, welcome) = three.connect_ik(&stranger, vec![], 10).await;
+    assert!(
+        welcome.rosters.is_empty(),
+        "a stranger enumerated {:?}",
+        welcome.rosters
+    );
+    client.send(Record::Attach).await;
+    ping_pong(&mut client, [1; 8]).await;
+
+    // Claims a network that exists: refused, still nothing listed.
+    let (mut client, welcome) = three
+        .connect_ik(&stranger, three.networks.to_vec(), 20)
+        .await;
+    assert!(welcome.rosters.is_empty());
+    assert!(matches!(client.recv().await, Some(Record::Error(_))));
+}
+
+#[tokio::test]
+async fn an_ik_member_of_one_of_three_networks_sees_only_that_one() {
+    let member = generate_identity();
+    let three = three_networks([&[member.node_id], &[], &[]]).await;
+
+    let (mut client, welcome) = three.connect_ik(&member, vec![three.networks[0]], 10).await;
+    assert_eq!(welcome.rosters, three.seeded(&[0]));
+    client.send(Record::Attach).await;
+    // No `roster_seq` was claimed, so the relay's attach time catch up arrives first.
+    client.recv_roster_doc().await;
+    ping_pong(&mut client, [2; 8]).await;
+}
+
+#[tokio::test]
+async fn an_ik_welcome_lists_the_claimed_networks_not_every_network_the_node_is_listed_in() {
+    let member = generate_identity();
+    let three = three_networks([&[member.node_id], &[member.node_id], &[member.node_id]]).await;
+
+    let (_, welcome) = three.connect_ik(&member, vec![three.networks[1]], 10).await;
+    assert_eq!(welcome.rosters, three.seeded(&[1]));
+
+    let (_, welcome) = three
+        .connect_ik(&member, vec![three.networks[0], three.networks[2]], 20)
+        .await;
+    assert_eq!(welcome.rosters, three.seeded(&[0, 2]));
+
+    let (_, welcome) = three.connect_ik(&member, vec![], 30).await;
+    assert!(welcome.rosters.is_empty(), "listed but claiming nothing");
+}
+
+#[tokio::test]
+async fn an_xx_member_sees_no_networks_and_its_roster_push_is_handled_as_before() {
+    let member = generate_identity();
+    let three = three_networks([&[member.node_id], &[], &[]]).await;
+    let network = three.networks[0];
+
+    let (mut client, welcome) =
+        TestClient::connect_xx(three.addr, three.cert.clone(), &member, vec![network], 10).await;
+    assert!(
+        welcome.rosters.is_empty(),
+        "message 2 is written before HELLO exists: {:?}",
+        welcome.rosters
+    );
+    client.send(Record::Attach).await;
+    // This HELLO claimed no `roster_seq`, so the attach time catch up still pushes the
+    // relay's Roster at once, as for IK.
+    let held = client.recv_roster_doc().await;
+    assert_eq!(held.decode().unwrap().seq, 1);
+
+    // The node pushes its Roster for the claimed network: an equal `seq` is dropped...
+    for record in menzil_proto::split_into_doc_records(DocType::Roster, &held.encode()) {
+        client.send(record).await;
+    }
+    ping_pong(&mut client, [3; 8]).await;
+    assert_eq!(three.relay.rosters().seqs().get(&network), Some(&1));
+
+    // ...and a newer one is adopted.
+    let newer = evict_roster(&three.owners[0], network, 2, &[(member.node_id, 1)], &[]);
+    for record in menzil_proto::split_into_doc_records(DocType::Roster, &newer.encode()) {
+        client.send(record).await;
+    }
+    ping_pong(&mut client, [4; 8]).await;
+    assert_eq!(three.relay.rosters().seqs().get(&network), Some(&2));
+}
+
+#[tokio::test]
+async fn a_rejected_ik_hello_sees_empty_rosters_then_the_error() {
+    let member = generate_identity();
+    let three = three_networks([&[member.node_id], &[], &[]]).await;
+
+    // One claim passes, one does not: the whole HELLO is refused and nothing is listed.
+    let (mut client, welcome) = three
+        .connect_ik(&member, vec![three.networks[0], three.networks[1]], 10)
+        .await;
+    assert!(
+        welcome.rosters.is_empty(),
+        "a refused HELLO was told {:?}",
+        welcome.rosters
+    );
+    // A node writes ATTACH and more right after WELCOME, before it reads anything: the relay
+    // keeps the socket open for it, so those writes land and the ERROR is still read.
+    for _ in 0..3 {
+        client.send(Record::Attach).await;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    match client.recv().await {
+        Some(Record::Error(body)) => assert_eq!(body.code, ErrorCode::NotMember),
+        other => panic!("expected ERROR not_member, got {other:?}"),
+    }
+    assert_eq!(client.recv().await, None);
+
+    // A claim of a network that is not served at all.
+    let (mut client, welcome) = three
+        .connect_ik(&member, vec![NetworkId::from([0x42; 32])], 20)
+        .await;
+    assert!(welcome.rosters.is_empty());
+    match client.recv().await {
+        Some(Record::Error(body)) => assert_eq!(body.code, ErrorCode::UnknownNetwork),
+        other => panic!("expected ERROR unknown_network, got {other:?}"),
+    }
+    assert_eq!(client.recv().await, None);
 }
