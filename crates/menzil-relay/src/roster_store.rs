@@ -22,8 +22,11 @@ use tokio::sync::broadcast;
 
 use crate::error::RelayError;
 
-/// How many change notices a subscriber may fall behind by before it gets `Lagged`.
-const CHANGE_BACKLOG: usize = 64;
+/// How many change notices a subscriber may fall behind by before it gets `Lagged`. Large
+/// enough that one tenant's burst of adoptions (each takes a verified Roster, and a session can
+/// only push a few a minute) does not make every other tenant's session judge itself again
+/// (multi tenant threat A12).
+pub(crate) const CHANGE_BACKLOG: usize = 1024;
 
 /// The relay's held Rosters, at most one per network. Each is verified
 /// against its own claimed `network_id` (protocol.md 2.3: `NetworkId`
@@ -41,6 +44,10 @@ pub struct RosterStore {
     /// can assert that a HELLO's work is bounded without timing anything.
     #[cfg(test)]
     lookups: AtomicUsize,
+    /// Called by [`Self::adopt`] after it has read what is held and before it verifies anything,
+    /// so a test can make the verification slow or change the store under it (tests only).
+    #[cfg(test)]
+    verify_hook: std::sync::Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
 }
 
 impl Default for RosterStore {
@@ -51,6 +58,8 @@ impl Default for RosterStore {
             changes: broadcast::channel(CHANGE_BACKLOG).0,
             #[cfg(test)]
             lookups: AtomicUsize::new(0),
+            #[cfg(test)]
+            verify_hook: std::sync::Mutex::new(None),
         }
     }
 }
@@ -102,6 +111,16 @@ impl StandingIndex {
             members,
             revoked: body.revoked.iter().map(|r| r.node_id).collect(),
         }
+    }
+}
+
+impl StandingIndex {
+    /// Listed and not revoked: revocation is checked before, and independently of, membership,
+    /// the same order `crate::hello::check_hello` uses, because a Roster naming a node in both
+    /// `members` and `revoked` at once is possible to construct and revocation must still win.
+    /// One hash lookup each, whatever the Roster's size.
+    fn is_unrevoked_member(&self, node_id: &NodeId) -> bool {
+        !self.revoked.contains(node_id) && self.members.contains_key(node_id)
     }
 }
 
@@ -241,48 +260,100 @@ impl RosterStore {
             roster: Some(roster.clone()),
             ..Bundle::default()
         };
-        let mut guard = self.by_network.write().unwrap();
-        let view = HeldView {
-            network_id,
-            roster: guard.get(&network_id).map(|held| held.view.clone()),
-            policy_seq: None,
-        };
-        let adoption = match check_bundle(&view, &bundle, now) {
-            Verdict::Adopt(adoption) => adoption,
-            Verdict::Held => return Ok(false),
-            Verdict::Reject(reason) => return Err(RelayError::DocumentRejected(reason)),
-        };
-        // A steward signed Roster is held only with its base.
-        let base = match (adoption.signer, base) {
-            (menzil_proto::trust::Signer::Owner, _) => None,
-            (menzil_proto::trust::Signer::Steward { .. }, Some(base)) => Some(base),
-            (menzil_proto::trust::Signer::Steward { .. }, None) => {
-                return Err(RelayError::DocumentRejected(Reason::MissingBase));
+        // The signature checks cost milliseconds of CPU on a Roster an unauthenticated peer's
+        // network owner chose, and every HELLO, standing check and SEND of every tenant needs
+        // this store's lock (multi tenant threat A11, isolation rule I6). So the verdict is
+        // reached on a copy of what is held, with no lock; the write lock is taken only to
+        // check that nothing was stored for this network meanwhile (every store raises the
+        // network's `seq`, so an unchanged `seq` is an unchanged Roster) and to swap. If
+        // something was, the verdict is stale and is reached again against the new state; that
+        // takes a successful adoption of this same network by someone else each time, so it
+        // ends, and the cheap path of `check_bundle` makes a newer-or-equal Roster cost nothing.
+        loop {
+            let seen = self
+                .by_network
+                .read()
+                .unwrap()
+                .get(&network_id)
+                .map(|held| held.view.clone());
+            let seen_seq = seen.as_ref().map(HeldRoster::seq);
+            #[cfg(test)]
+            {
+                let hook = self.verify_hook.lock().unwrap().clone();
+                if let Some(hook) = hook {
+                    hook();
+                }
             }
-        };
-        let view = HeldRoster::new(roster, base).map_err(RelayError::DocumentRejected)?;
-        let body = roster.decode()?;
-        let counted = match base {
-            Some(base) => base.decode()?.members.len().min(body.members.len()),
-            None => body.members.len(),
-        };
-        guard.insert(
-            network_id,
-            Held::new(roster.clone(), body, base.cloned(), view, counted),
-        );
-        drop(guard);
-        // Before the hook, which may be slow: whoever hears this reads the new Roster.
-        let _ = self.changes.send(network_id);
-        // The Roster is held whatever the hook does: a panic in it is logged, never passed on
-        // to the adoption.
-        let hook = self.on_adopted.read().unwrap().clone();
-        if let Some(hook) = hook
-            && std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| hook(roster, base)))
+            let view = HeldView {
+                network_id,
+                roster: seen,
+                policy_seq: None,
+            };
+            let adoption = match check_bundle(&view, &bundle, now) {
+                Verdict::Adopt(adoption) => adoption,
+                Verdict::Held => return Ok(false),
+                Verdict::Reject(reason) => return Err(RelayError::DocumentRejected(reason)),
+            };
+            // A steward signed Roster is held only with its base.
+            let held_base = match (adoption.signer, base) {
+                (menzil_proto::trust::Signer::Owner, _) => None,
+                (menzil_proto::trust::Signer::Steward { .. }, Some(base)) => Some(base),
+                (menzil_proto::trust::Signer::Steward { .. }, None) => {
+                    return Err(RelayError::DocumentRejected(Reason::MissingBase));
+                }
+            };
+            // Everything the new entry needs is built before the lock is taken.
+            let new_view =
+                HeldRoster::new(roster, held_base).map_err(RelayError::DocumentRejected)?;
+            let body = roster.decode()?;
+            let counted = match held_base {
+                Some(base) => base.decode()?.members.len().min(body.members.len()),
+                None => body.members.len(),
+            };
+            let entry = Held::new(roster.clone(), body, held_base.cloned(), new_view, counted);
+
+            let mut guard = self.by_network.write().unwrap();
+            if guard.get(&network_id).map(|held| held.body.seq) != seen_seq {
+                drop(guard);
+                continue;
+            }
+            guard.insert(network_id, entry);
+            drop(guard);
+            // Before the hook, which may be slow: whoever hears this reads the new Roster.
+            let _ = self.changes.send(network_id);
+            // The Roster is held whatever the hook does: a panic in it is logged, never passed
+            // on to the adoption.
+            let hook = self.on_adopted.read().unwrap().clone();
+            if let Some(hook) = hook
+                && std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    hook(roster, held_base)
+                }))
                 .is_err()
-        {
-            tracing::warn!(%network_id, "the on adopted hook panicked; the Roster is held all the same");
+            {
+                tracing::warn!(%network_id, "the on adopted hook panicked; the Roster is held all the same");
+            }
+            return Ok(true);
         }
-        Ok(true)
+    }
+
+    /// Whether this store holds a Roster for `network_id`: no clone, one hash lookup.
+    pub fn serves(&self, network_id: &NetworkId) -> bool {
+        self.by_network.read().unwrap().contains_key(network_id)
+    }
+
+    /// The `seq` of the Roster held for `network_id`, if any: no clone, one hash lookup.
+    pub fn seq_of(&self, network_id: &NetworkId) -> Option<u64> {
+        self.by_network
+            .read()
+            .unwrap()
+            .get(network_id)
+            .map(|held| held.body.seq)
+    }
+
+    /// Sets the function [`Self::adopt`] calls before it verifies (tests only).
+    #[cfg(test)]
+    pub(crate) fn set_verify_hook(&self, hook: impl Fn() + Send + Sync + 'static) {
+        *self.verify_hook.lock().unwrap() = Some(Arc::new(hook));
     }
 
     /// The owner signed base the held Roster for `network_id` was made
@@ -452,15 +523,8 @@ impl RosterStore {
         networks
             .iter()
             .filter_map(|id| guard.get(id))
-            .map(|held| &held.body)
-            .filter(|body| {
-                !body
-                    .revoked
-                    .iter()
-                    .any(|revoked| &revoked.node_id == node_id)
-                    && body.members.iter().any(|member| &member.node_id == node_id)
-            })
-            .flat_map(|body| body.labels.iter())
+            .filter(|held| held.index.is_unrevoked_member(node_id))
+            .flat_map(|held| held.body.labels.iter())
             .filter(|label| &label.node_id == node_id)
             .map(|label| label.name.to_ascii_lowercase())
             .collect()
@@ -501,31 +565,15 @@ impl RosterStore {
         src_claimed
             .iter()
             .filter(|network_id| {
-                guard
-                    .get(network_id)
-                    .map(|held| &held.body)
-                    .is_some_and(|body| {
-                        body.expires > now
-                            && is_unrevoked_member(body, src)
-                            && is_unrevoked_member(body, dst)
-                    })
+                guard.get(network_id).is_some_and(|held| {
+                    held.body.expires > now
+                        && held.index.is_unrevoked_member(src)
+                        && held.index.is_unrevoked_member(dst)
+                })
             })
             .copied()
             .collect()
     }
-}
-
-/// Revocation checked before, and independently of, membership — the
-/// same order `crate::hello::check_hello` and
-/// `RosterStore::labels_granted_to` already use, for the same reason: a
-/// Roster naming a node in both `members` and `revoked` at once is
-/// possible to construct, and revocation must still win.
-fn is_unrevoked_member(body: &RosterBody, node_id: &NodeId) -> bool {
-    !body
-        .revoked
-        .iter()
-        .any(|revoked| &revoked.node_id == node_id)
-        && body.members.iter().any(|member| &member.node_id == node_id)
 }
 
 #[cfg(test)]
@@ -1505,5 +1553,286 @@ mod tests {
         );
         assert_eq!(store.get(&net.network_id).unwrap().seq, 11);
         assert!(store.base(&net.network_id).is_some());
+    }
+
+    // --- MT5: verification outside the lock (threat A11, isolation rule I6) ---
+
+    /// A Roster of `network_id` at `seq` listing nodes 1 and 2, valid at [`NOW`].
+    fn two_members(owner: &SigningKey, network_id: NetworkId, seq: u64) -> Roster {
+        let body = RosterBody {
+            v: menzil_proto::PROTOCOL_VERSION,
+            network_id,
+            seq,
+            issued: NOW - 10,
+            expires: NOW + 1000,
+            members: vec![
+                RosterMember {
+                    node_id: node(1),
+                    min_serial: 1,
+                },
+                RosterMember {
+                    node_id: node(2),
+                    min_serial: 1,
+                },
+            ],
+            revoked: vec![],
+            stewards: vec![],
+            labels: vec![],
+        };
+        Roster::sign(owner, &body).unwrap()
+    }
+
+    /// The store's verification of one adoption is made slow (the hook parks the adopting
+    /// thread where it verifies); every reader the other tenants' traffic needs must still
+    /// answer meanwhile.
+    #[test]
+    fn an_adoption_with_a_slow_verifier_does_not_block_readers() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let owner = SigningKey::generate(&mut rand::rng());
+        let network_id = NetworkId::from(owner.verifying_key().to_bytes());
+        let store = Arc::new(RosterStore::new());
+        assert!(
+            store
+                .adopt(&two_members(&owner, network_id, 1), None, NOW)
+                .unwrap()
+        );
+
+        let (in_verify_tx, in_verify_rx) = mpsc::channel::<()>();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let release_rx = std::sync::Mutex::new(release_rx);
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        store.set_verify_hook(move || {
+            if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                in_verify_tx.send(()).unwrap();
+                // Parked here for as long as the test wants verification to take.
+                let _ = release_rx
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(30));
+            }
+        });
+
+        let adopter = {
+            let store = Arc::clone(&store);
+            let newer = two_members(&owner, network_id, 2);
+            std::thread::spawn(move || store.adopt(&newer, None, NOW))
+        };
+        in_verify_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the adoption never reached its verification");
+
+        let (done_tx, done_rx) = mpsc::channel::<()>();
+        let reader = {
+            let store = Arc::clone(&store);
+            std::thread::spawn(move || {
+                let granted = store.grants_forwarding(&node(1), &[network_id], &node(2), NOW);
+                let standing = store.standing_of(&node(1), &network_id);
+                let seqs = store.seqs_for(&[network_id]);
+                let _ = done_tx.send(());
+                (granted, standing, seqs)
+            })
+        };
+        let answered = done_rx.recv_timeout(Duration::from_secs(5));
+        // Let the adoption go on whatever happened, so no thread is left parked.
+        release_tx.send(()).unwrap();
+        let (granted, standing, seqs) = reader.join().unwrap();
+        assert!(
+            answered.is_ok(),
+            "readers were blocked while an adoption verified a signature"
+        );
+        assert_eq!(granted, vec![network_id]);
+        assert!(standing.listed && !standing.revoked);
+        assert_eq!(
+            seqs.get(&network_id),
+            Some(&1),
+            "the old Roster until the swap"
+        );
+        assert!(adopter.join().unwrap().unwrap());
+        assert_eq!(store.seq_of(&network_id), Some(2));
+    }
+
+    /// While a slow adoption of seq 2 verifies, seq 3 is adopted. The slow one must notice
+    /// that what it judged against is gone, judge again, find seq 3 held, and store nothing
+    /// (and announce nothing).
+    #[test]
+    fn an_adoption_that_loses_a_race_never_overwrites_a_newer_roster() {
+        let owner = SigningKey::generate(&mut rand::rng());
+        let network_id = NetworkId::from(owner.verifying_key().to_bytes());
+        let store = Arc::new(RosterStore::new());
+        assert!(
+            store
+                .adopt(&two_members(&owner, network_id, 1), None, NOW)
+                .unwrap()
+        );
+        let mut changes = store.subscribe();
+
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let inner = Arc::clone(&store);
+        let newest = two_members(&owner, network_id, 3);
+        store.set_verify_hook(move || {
+            if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                assert!(inner.adopt(&newest, None, NOW).unwrap());
+            }
+        });
+
+        let result = store.adopt(&two_members(&owner, network_id, 2), None, NOW);
+        assert!(
+            !result.unwrap(),
+            "seq 2 is older than the seq 3 adopted meanwhile"
+        );
+        assert_eq!(store.seq_of(&network_id), Some(3));
+        assert_eq!(changes.try_recv().unwrap(), network_id);
+        assert!(
+            changes.try_recv().is_err(),
+            "only the Roster that was stored is announced"
+        );
+    }
+
+    /// The same race with a newer Roster: it is judged again against the new state and stored.
+    #[test]
+    fn an_adoption_that_loses_a_race_to_an_older_one_is_judged_again_and_stored() {
+        let owner = SigningKey::generate(&mut rand::rng());
+        let network_id = NetworkId::from(owner.verifying_key().to_bytes());
+        let store = Arc::new(RosterStore::new());
+        assert!(
+            store
+                .adopt(&two_members(&owner, network_id, 1), None, NOW)
+                .unwrap()
+        );
+
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let inner = Arc::clone(&store);
+        let middle = two_members(&owner, network_id, 2);
+        store.set_verify_hook(move || {
+            if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                assert!(inner.adopt(&middle, None, NOW).unwrap());
+            }
+        });
+        assert!(
+            store
+                .adopt(&two_members(&owner, network_id, 5), None, NOW)
+                .unwrap()
+        );
+        assert_eq!(store.seq_of(&network_id), Some(5));
+    }
+
+    #[test]
+    fn serves_and_seq_of_answer_without_cloning_the_roster() {
+        let owner = SigningKey::generate(&mut rand::rng());
+        let network_id = NetworkId::from(owner.verifying_key().to_bytes());
+        let store = RosterStore::new();
+        assert!(!store.serves(&network_id));
+        assert_eq!(store.seq_of(&network_id), None);
+        store.set(&signed_roster(&owner, network_id, 7)).unwrap();
+        assert!(store.serves(&network_id));
+        assert_eq!(store.seq_of(&network_id), Some(7));
+    }
+
+    /// Revocation wins over membership in the indexed checks too (a Roster that lists a node in
+    /// both), for forwarding and for label grants.
+    #[test]
+    fn forwarding_and_label_grants_use_the_index_and_revocation_wins() {
+        use menzil_proto::{Label, RevokedMember};
+        let owner = SigningKey::generate(&mut rand::rng());
+        let network_id = NetworkId::from(owner.verifying_key().to_bytes());
+        let body = RosterBody {
+            v: menzil_proto::PROTOCOL_VERSION,
+            network_id,
+            seq: 1,
+            issued: NOW - 10,
+            expires: NOW + 1000,
+            members: vec![
+                RosterMember {
+                    node_id: node(1),
+                    min_serial: 1,
+                },
+                RosterMember {
+                    node_id: node(2),
+                    min_serial: 1,
+                },
+                RosterMember {
+                    node_id: node(3),
+                    min_serial: 1,
+                },
+            ],
+            revoked: vec![RevokedMember {
+                node_id: node(3),
+                since: 0,
+            }],
+            stewards: vec![],
+            labels: vec![
+                Label {
+                    name: "Web".into(),
+                    node_id: node(1),
+                },
+                Label {
+                    name: "gone".into(),
+                    node_id: node(3),
+                },
+            ],
+        };
+        let store = RosterStore::new();
+        assert!(
+            store
+                .adopt(&Roster::sign(&owner, &body).unwrap(), None, NOW)
+                .unwrap()
+        );
+        assert_eq!(
+            store.grants_forwarding(&node(1), &[network_id], &node(2), NOW),
+            vec![network_id]
+        );
+        assert!(
+            store
+                .grants_forwarding(&node(1), &[network_id], &node(3), NOW)
+                .is_empty(),
+            "dst revoked"
+        );
+        assert!(
+            store
+                .grants_forwarding(&node(3), &[network_id], &node(1), NOW)
+                .is_empty(),
+            "src revoked"
+        );
+        assert!(
+            store
+                .grants_forwarding(&node(1), &[network_id], &node(9), NOW)
+                .is_empty(),
+            "dst unlisted"
+        );
+        assert!(
+            store
+                .grants_forwarding(&node(1), &[network_id], &node(2), NOW + 1000)
+                .is_empty(),
+            "expired"
+        );
+        assert_eq!(
+            store.labels_granted_to(&[network_id], &node(1)),
+            ["web".to_string()].into_iter().collect()
+        );
+        assert!(store.labels_granted_to(&[network_id], &node(3)).is_empty());
+    }
+
+    /// Threat A12: a burst of adoptions (one network's owner pushing Rosters as fast as it is
+    /// allowed) must not make the other tenants' sessions `Lagged`: a subscriber that has not
+    /// read for 200 notices still reads every one, in order.
+    #[test]
+    fn one_tenants_burst_of_adoptions_does_not_lag_a_subscriber() {
+        let owner = SigningKey::generate(&mut rand::rng());
+        let network_id = NetworkId::from(owner.verifying_key().to_bytes());
+        let store = RosterStore::new();
+        let mut changes = store.subscribe();
+        for seq in 1..=200 {
+            assert!(
+                store
+                    .adopt(&two_members(&owner, network_id, seq), None, NOW)
+                    .unwrap()
+            );
+        }
+        for _ in 1..=200 {
+            assert_eq!(changes.try_recv().unwrap(), network_id);
+        }
+        assert!(changes.try_recv().is_err());
     }
 }

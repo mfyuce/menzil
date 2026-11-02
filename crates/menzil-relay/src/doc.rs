@@ -32,6 +32,8 @@ use menzil_proto::{
     DocBody, DocReassembler, DocReassemblyError, DocType, NetworkId, NodeId, Record, Roster,
 };
 
+use crate::log_throttle::NodeLog;
+use crate::rate::TokenBucket;
 use crate::registry::SessionRegistry;
 use crate::roster_store::RosterStore;
 
@@ -79,10 +81,16 @@ impl PendingBases {
 /// What [`accept_roster_chunk`] learned from one inbound DOC chunk.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum AcceptOutcome {
-    /// The transfer is not complete yet, or completed but turned out to
-    /// be a stale/duplicate resend (`RosterStore::set` said so) — nothing
-    /// further to do.
+    /// The transfer is not complete yet, or was a base held for the Roster that follows it —
+    /// nothing further to do.
     Nothing,
+    /// A transfer completed, but the session is over its allowance of completed transfers
+    /// (`crate::rate`): dropped without being decoded or verified, no answer.
+    OverRate,
+    /// A transfer completed and decoded, for a claimed and served network, but the relay holds a
+    /// Roster for it that is as new or newer (a stale or duplicate resend; no signature was
+    /// checked). Nothing was stored.
+    Stale(NetworkId),
     /// A transfer completed as a doc_type this build doesn't act on at
     /// L3 (protocol.md 4.3: "Policies travel only end to end" — never a
     /// raw L3 DOC to or from a relay).
@@ -139,6 +147,12 @@ pub(crate) enum AcceptOutcome {
 /// action (`Relay::rosters()`), never introduced by an untrusted wire
 /// record; DOC only ever *updates* a network already held.
 ///
+/// `transfers` is the session's allowance of completed transfers (`crate::rate`): one token is
+/// taken the moment a transfer completes, before it is decoded, so a session over its rate
+/// costs the relay the reassembly it already paid and nothing more ([`AcceptOutcome::OverRate`]).
+/// `log` throttles the warn lines a peer can cause (isolation rule I7); what a line would have
+/// said is still available at `debug` level in full.
+///
 /// A malformed chunk (bad index/count, a mid-transfer doc_type/count
 /// change — see [`DocReassemblyError`]) is logged and treated as
 /// [`AcceptOutcome::Nothing`]: a protocol violation here costs this one
@@ -147,6 +161,7 @@ pub(crate) enum AcceptOutcome {
 /// unserved network, or an invalid document each get their own
 /// [`AcceptOutcome`] instead, so `crate::session` can decide whether a
 /// registry `ErrorCode` applies.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn accept_roster_chunk(
     reassembler: &mut DocReassembler,
     pending: &mut PendingBases,
@@ -154,6 +169,8 @@ pub(crate) fn accept_roster_chunk(
     rosters: &RosterStore,
     claimed: &[NetworkId],
     now: u64,
+    transfers: &mut TokenBucket,
+    log: NodeLog<'_>,
 ) -> AcceptOutcome {
     let (doc_type, bytes) = match reassembler.accept(body) {
         Ok(Some(done)) => done,
@@ -166,6 +183,15 @@ pub(crate) fn accept_roster_chunk(
             return AcceptOutcome::Nothing;
         }
     };
+    if !transfers.try_take() {
+        if let Some(held_back) = log.admit("doc_over_rate") {
+            tracing::warn!(
+                held_back,
+                "a session sends DOC transfers faster than allowed; dropping them undecoded"
+            );
+        }
+        return AcceptOutcome::OverRate;
+    }
     if !matches!(doc_type, DocType::Roster | DocType::BaseRoster) {
         tracing::debug!(?doc_type, "ignoring a non-Roster DOC transfer at L3");
         return AcceptOutcome::IgnoredDocType(doc_type);
@@ -174,18 +200,24 @@ pub(crate) fn accept_roster_chunk(
     let roster = match Roster::decode_strict(&bytes) {
         Ok(roster) => roster,
         Err(err) => {
-            tracing::warn!(error = %err, "reassembled DOC did not decode as a Roster");
+            tracing::debug!(error = %err, "reassembled DOC did not decode as a Roster");
+            if let Some(held_back) = log.admit("doc_refused") {
+                tracing::warn!(held_back, error = %err, "a session sent a DOC that did not decode as a Roster");
+            }
             return AcceptOutcome::Invalid;
         }
     };
     let decoded = match roster.decode() {
         Ok(decoded) => decoded,
         Err(err) => {
-            tracing::warn!(error = %err, "reassembled DOC's Roster body did not decode");
+            tracing::debug!(error = %err, "reassembled DOC's Roster body did not decode");
+            if let Some(held_back) = log.admit("doc_refused") {
+                tracing::warn!(held_back, error = %err, "a session sent a DOC whose Roster body did not decode");
+            }
             return AcceptOutcome::Invalid;
         }
     };
-    if !claimed.contains(&decoded.network_id) || rosters.get(&decoded.network_id).is_none() {
+    if !claimed.contains(&decoded.network_id) || !rosters.serves(&decoded.network_id) {
         tracing::debug!(
             network_id = %decoded.network_id,
             "dropping a DOC(roster) for a network this session did not claim or this relay does not serve"
@@ -194,17 +226,25 @@ pub(crate) fn accept_roster_chunk(
     }
     if doc_type == DocType::BaseRoster {
         // Judged with the Roster it belongs to, which follows; not stored.
-        if !pending.keep(decoded.network_id, roster) {
-            tracing::warn!("too many pending base Rosters on this session, dropping one");
+        if !pending.keep(decoded.network_id, roster)
+            && let Some(held_back) = log.admit("doc_refused")
+        {
+            tracing::warn!(
+                held_back,
+                "too many pending base Rosters on this session, dropping one"
+            );
         }
         return AcceptOutcome::Nothing;
     }
     let base = pending.take(&decoded.network_id);
     match rosters.adopt(&roster, base.as_ref(), now) {
         Ok(true) => AcceptOutcome::NewRoster(decoded.network_id),
-        Ok(false) => AcceptOutcome::Nothing,
+        Ok(false) => AcceptOutcome::Stale(decoded.network_id),
         Err(err) => {
-            tracing::warn!(error = %err, "reassembled DOC was not adopted as a Roster");
+            tracing::debug!(error = %err, "reassembled DOC was not adopted as a Roster");
+            if let Some(held_back) = log.admit("doc_refused") {
+                tracing::warn!(held_back, error = %err, "a session sent a DOC that was not adopted as a Roster");
+            }
             AcceptOutcome::Invalid
         }
     }
@@ -264,11 +304,9 @@ pub(crate) fn catch_up_targets(
     claimed
         .iter()
         .filter(|network_id| {
-            rosters.get(network_id).is_some_and(|body| {
-                their_seq
-                    .get(network_id)
-                    .is_none_or(|&held| body.seq > held)
-            })
+            rosters
+                .seq_of(network_id)
+                .is_some_and(|seq| their_seq.get(network_id).is_none_or(|&held| seq > held))
         })
         .copied()
         .collect()
@@ -328,12 +366,42 @@ mod tests {
         rosters: &RosterStore,
         claimed: &[NetworkId],
     ) -> AcceptOutcome {
+        // An allowance that these tests never run out of; `crate::rate` has its own.
+        feed_limited(
+            reassembler,
+            pending,
+            records,
+            rosters,
+            claimed,
+            &mut TokenBucket::new(60_000, 1_000),
+        )
+    }
+
+    fn feed_limited(
+        reassembler: &mut DocReassembler,
+        pending: &mut PendingBases,
+        records: &[Record],
+        rosters: &RosterStore,
+        claimed: &[NetworkId],
+        transfers: &mut TokenBucket,
+    ) -> AcceptOutcome {
+        let throttle = crate::log_throttle::LogThrottle::default();
+        let log = throttle.about(&NodeId::from([7u8; 32]));
         let mut last = AcceptOutcome::Nothing;
         for record in records {
             let Record::Doc(body) = record else {
                 unreachable!()
             };
-            last = accept_roster_chunk(reassembler, pending, body, rosters, claimed, NOW);
+            last = accept_roster_chunk(
+                reassembler,
+                pending,
+                body,
+                rosters,
+                claimed,
+                NOW,
+                transfers,
+                log,
+            );
         }
         last
     }
@@ -514,7 +582,7 @@ mod tests {
     }
 
     #[test]
-    fn a_stale_resend_is_reported_as_nothing() {
+    fn a_stale_resend_is_reported_as_stale() {
         let owner = SigningKey::generate(&mut rand::rng());
         let network_id = NetworkId::from(owner.verifying_key().to_bytes());
         let rosters = RosterStore::new();
@@ -525,7 +593,7 @@ mod tests {
         let mut reassembler = DocReassembler::new();
         assert_eq!(
             feed_all(&mut reassembler, &records, &rosters),
-            AcceptOutcome::Nothing
+            AcceptOutcome::Stale(network_id)
         );
     }
 
@@ -548,6 +616,8 @@ mod tests {
             &rosters,
             &[],
             NOW,
+            &mut TokenBucket::new(60_000, 1_000),
+            crate::log_throttle::LogThrottle::default().about(&NodeId::from([7u8; 32])),
         );
         assert_eq!(outcome, AcceptOutcome::IgnoredDocType(DocType::Policy));
     }
@@ -601,6 +671,8 @@ mod tests {
                 &rosters,
                 &[],
                 NOW,
+                &mut TokenBucket::new(60_000, 1_000),
+                crate::log_throttle::LogThrottle::default().about(&NodeId::from([7u8; 32])),
             );
             if outcome == AcceptOutcome::TooLarge {
                 return;

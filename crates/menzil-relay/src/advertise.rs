@@ -119,6 +119,10 @@ struct NodeAdvertisement {
 pub struct LabelRegistry {
     by_label: RwLock<HashMap<String, NodeId>>,
     by_node: RwLock<HashMap<NodeId, NodeAdvertisement>>,
+    /// Called by [`Self::advertise`] once the lock free part is decided and before the label
+    /// lock is taken (tests only).
+    #[cfg(test)]
+    decided_hook: std::sync::Mutex<Option<std::sync::Arc<dyn Fn() + Send + Sync>>>,
 }
 
 /// Truncates `name` to [`MAX_ECHOED_NAME_BYTES`] at a valid UTF-8 char
@@ -133,6 +137,13 @@ fn truncate_for_echo(name: &str) -> String {
         end -= 1;
     }
     format!("{}\u{2026}", &name[..end])
+}
+
+/// What the checks that need no lock decided about one share (see [`LabelRegistry::advertise`]).
+enum Verdict<'a> {
+    Rejected(RejectedShare),
+    /// Passed every check but the one that needs the label lock; carries the lowercased key.
+    Free(String, &'a Share),
 }
 
 fn reject(name: &str, reason: impl Into<String>) -> RejectedShare {
@@ -216,15 +227,51 @@ impl LabelRegistry {
             };
         }
 
-        // Computed once, up front, outside any lock this method itself
-        // holds: see `MAX_SHARES_PER_ADVERTISE`'s doc comment for why a
-        // per-share Roster scan mattered in practice.
+        // Everything that depends only on the request, the Rosters and the fixed rules is
+        // decided here, with no lock of this registry held (multi tenant threat A11, isolation
+        // rule I6): one lookup of the node's grants (see `MAX_SHARES_PER_ADVERTISE` for why not
+        // one Roster scan per share), then syntax, reserved names, grants and duplicates per
+        // share, in request order. What is left, `Verdict::Free`, is a name that would be
+        // accepted but for another node holding it; that is the one thing the label lock decides.
         let granted = rosters.labels_granted_to(claimed_networks, node_id);
+        let mut seen = HashSet::new();
+        let verdicts: Vec<Verdict<'_>> = body
+            .shares
+            .iter()
+            .map(|share| {
+                let key = share.name.to_ascii_lowercase();
+                if let Some(reason) = syntax_problem(&share.name) {
+                    return Verdict::Rejected(reject(&share.name, reason));
+                }
+                if DEFAULT_RESERVED_LABELS.contains(&key.as_str()) {
+                    return Verdict::Rejected(reject(&share.name, "reserved name"));
+                }
+                if !granted.contains(&key) {
+                    return Verdict::Rejected(reject(
+                        &share.name,
+                        ErrorCode::LabelUnclaimed.name(),
+                    ));
+                }
+                if !seen.insert(key.clone()) {
+                    return Verdict::Rejected(reject(
+                        &share.name,
+                        "duplicate name in this ADVERTISE",
+                    ));
+                }
+                Verdict::Free(key, share)
+            })
+            .collect();
+        #[cfg(test)]
+        {
+            let hook = self.decided_hook.lock().unwrap().clone();
+            if let Some(hook) = hook {
+                hook();
+            }
+        }
 
         let mut accepted = Vec::new();
         let mut accepted_shares = Vec::new();
         let mut rejected = Vec::new();
-        let mut seen = HashSet::new();
 
         let mut by_label = self.by_label.write().unwrap();
         // Release this node's own previous claims first, so re-claiming
@@ -233,29 +280,18 @@ impl LabelRegistry {
         // someone else to claim.
         by_label.retain(|_, owner| *owner != *node_id);
 
-        for share in &body.shares {
-            let key = share.name.to_ascii_lowercase();
-            if let Some(reason) = syntax_problem(&share.name) {
-                rejected.push(reject(&share.name, reason));
-                continue;
-            }
-            if DEFAULT_RESERVED_LABELS.contains(&key.as_str()) {
-                rejected.push(reject(&share.name, "reserved name"));
-                continue;
-            }
-            if !granted.contains(&key) {
-                rejected.push(reject(&share.name, ErrorCode::LabelUnclaimed.name()));
-                continue;
-            }
-            if !seen.insert(key.clone()) {
-                rejected.push(reject(&share.name, "duplicate name in this ADVERTISE"));
-                continue;
-            }
+        for verdict in verdicts {
+            let (key, share) = match verdict {
+                Verdict::Rejected(rejection) => {
+                    rejected.push(rejection);
+                    continue;
+                }
+                Verdict::Free(key, share) => (key, share),
+            };
             // Any entry still in `by_label` at this key belongs to some
             // other node: this node's own prior claims were already
             // stripped above, and an earlier share in this same request
-            // sharing this key would already have been caught by the
-            // `seen` check just above.
+            // sharing this key was already caught by the duplicate check.
             if by_label.contains_key(&key) {
                 rejected.push(reject(&share.name, ErrorCode::LabelTaken.name()));
                 continue;
@@ -275,6 +311,12 @@ impl LabelRegistry {
         );
 
         AdvertiseAckBody { accepted, rejected }
+    }
+
+    /// Sets the function [`Self::advertise`] calls between deciding and locking (tests only).
+    #[cfg(test)]
+    fn set_decided_hook(&self, hook: impl Fn() + Send + Sync + 'static) {
+        *self.decided_hook.lock().unwrap() = Some(std::sync::Arc::new(hook));
     }
 
     /// Releases every label `node_id` currently holds. `crate::session`
@@ -815,5 +857,42 @@ mod tests {
         let node_id = NodeId::from([1u8; 32]);
         registry.advertise(&rosters, &[], &node_id, &advertise_body(&[], false));
         assert!(!registry.accepts_peers(&node_id));
+    }
+
+    /// MT5, isolation rule I6: the checks that need no label lock are decided before it is
+    /// taken, so a request full of names to reject (or a slow Roster lookup) never holds up
+    /// another node's claim. The hook runs between deciding and locking: neither label lock
+    /// may be held there.
+    #[test]
+    fn the_label_lock_is_not_held_while_a_request_is_judged() {
+        let f = fixture_with_labels(vec!["example", "other"]);
+        let registry = std::sync::Arc::new(LabelRegistry::new());
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        {
+            let registry = std::sync::Arc::clone(&registry);
+            let calls = std::sync::Arc::clone(&calls);
+            let probe = std::sync::Arc::clone(&registry);
+            probe.set_decided_hook(move || {
+                calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                assert!(
+                    registry.by_label.try_write().is_ok(),
+                    "the label lock was already held while the request was judged"
+                );
+            });
+        }
+        let ack = registry.advertise(
+            &f.rosters,
+            &[f.network_id],
+            &f.node_id,
+            &advertise_body(&["example", "www", "nope", "other"], true),
+        );
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(ack.accepted, vec!["example", "other"]);
+        let reasons: Vec<&str> = ack.rejected.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(
+            reasons,
+            ["www", "nope"],
+            "rejections keep the request order"
+        );
     }
 }

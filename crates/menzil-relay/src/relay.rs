@@ -19,7 +19,9 @@ use crate::advertise::LabelRegistry;
 use crate::forward::ForwardTable;
 use crate::identity::RelayIdentity;
 use crate::listener::Listener;
+use crate::log_throttle::LogThrottle;
 use crate::node_history::NodeHistory;
+use crate::rate::SessionRates;
 use crate::registry::SessionRegistry;
 use crate::roster_store::RosterStore;
 use crate::session;
@@ -77,6 +79,9 @@ pub struct Relay {
     pub(crate) labels: Arc<LabelRegistry>,
     pub(crate) forwarding: Arc<ForwardTable>,
     pub(crate) limits: Limits,
+    pub(crate) rates: SessionRates,
+    /// Throttles every warn line a peer's traffic can cause (isolation rule I7).
+    pub(crate) log: Arc<LogThrottle>,
     next_session_id: Arc<SessionIds>,
 }
 
@@ -131,6 +136,8 @@ impl Relay {
             labels: Arc::new(LabelRegistry::new()),
             forwarding: Arc::new(ForwardTable::new()),
             limits,
+            rates: SessionRates::default(),
+            log: Arc::new(LogThrottle::default()),
             next_session_id: Arc::new(SessionIds::new()),
         }
     }
@@ -143,6 +150,15 @@ impl Relay {
     #[must_use]
     pub fn with_admission_limits(mut self, limits: AdmissionLimits) -> Self {
         self.admission = Arc::new(Admission::new(limits));
+        self
+    }
+
+    /// This relay with `rates` as its per session allowances (ADVERTISE records and completed
+    /// DOC transfers per minute, and how many unusable transfers end a session) instead of
+    /// [`SessionRates::default`]. Call it before [`Relay::serve`] and before cloning the relay.
+    #[must_use]
+    pub fn with_session_rates(mut self, rates: SessionRates) -> Self {
+        self.rates = rates;
         self
     }
 

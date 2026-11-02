@@ -264,6 +264,25 @@ pub(crate) struct IpSlot {
     key: PeerKey,
 }
 
+impl IpSlot {
+    /// The peer this slot counts, as a key for `crate::log_throttle` (never equal to a NodeId
+    /// key by accident: the first byte tags the address family and the rest is zero padded).
+    pub(crate) fn log_key(&self) -> [u8; 32] {
+        let mut key = [0u8; 32];
+        match self.key {
+            PeerKey::V4(octets) => {
+                key[0] = 4;
+                key[1..5].copy_from_slice(&octets);
+            }
+            PeerKey::V6Prefix(prefix) => {
+                key[0] = 6;
+                key[1..9].copy_from_slice(&prefix);
+            }
+        }
+        key
+    }
+}
+
 impl Drop for IpSlot {
     fn drop(&mut self) {
         let mut state = self.admission.state.lock().unwrap();

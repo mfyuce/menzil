@@ -24,7 +24,9 @@ mod forward;
 mod hello;
 mod identity;
 mod listener;
+mod log_throttle;
 mod node_history;
+mod rate;
 mod registry;
 mod relay;
 mod roster_store;
@@ -46,6 +48,10 @@ pub use hello::{HelloRejection, check_hello};
 pub use identity::RelayIdentity;
 pub use listener::Listener;
 pub use node_history::{HistoryViolation, MAX_HISTORY_ENTRIES, NodeHistory};
+pub use rate::{
+    ADVERTISE_BURST, ADVERTISE_PER_MINUTE, DOC_BURST, DOC_TRANSFERS_PER_MINUTE, SessionRates,
+    UNADOPTED_DOCS_TO_END, UNADOPTED_WINDOW,
+};
 pub use registry::SessionRegistry;
 pub use relay::{AcceptConfig, HANDSHAKE_TIMEOUT, MAX_INFLIGHT_HANDSHAKES, Relay};
 pub use roster_store::RosterStore;

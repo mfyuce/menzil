@@ -64,6 +64,7 @@ use crate::forward::{ForwardItem, ForwardOutcome};
 use crate::hello::{
     HelloRejection, check_hello_admitting, dedup_networks, over_limit, roster_standing,
 };
+use crate::rate::SessionBudget;
 use crate::relay::Relay;
 
 /// The exact byte length of a Noise `Xx` pattern's message 1: just the
@@ -264,6 +265,24 @@ async fn send_all(conn: &mut InboundConnection, transport: &mut Transport, recor
     }
 }
 
+/// How long a session ended for sending too much is asked to wait before it reconnects.
+const RATE_LIMITED_RETRY_MS: u32 = 60_000;
+
+/// Tells a session it is ending for sending too much: ERROR `rate_limited`, then GOAWAY
+/// `rate_limited` with a retry delay, both best effort. The caller ends the session.
+async fn end_rate_limited(conn: &mut InboundConnection, transport: &mut Transport, what: &str) {
+    let error = Record::Error(ErrorBody {
+        code: ErrorCode::RateLimited,
+        msg: format!("{what}; the session is closed, try again in a minute"),
+    });
+    let _ = send_record(conn, transport, error).await;
+    let goaway = Record::Goaway(GoawayBody {
+        reason: "rate_limited".to_string(),
+        retry_after_ms: RATE_LIMITED_RETRY_MS,
+    });
+    let _ = send_record(conn, transport, goaway).await;
+}
+
 /// What [`dispatch`] learned from one inbound record.
 #[derive(Debug, PartialEq, Eq)]
 enum Dispatch {
@@ -292,6 +311,7 @@ async fn dispatch(
     liveness: &mut Liveness,
     doc_reassembler: &mut DocReassembler,
     pending_bases: &mut PendingBases,
+    budget: &mut SessionBudget,
     relay: &Relay,
     node_id: &NodeId,
     session_id: u32,
@@ -325,14 +345,27 @@ async fn dispatch(
         }
         Record::Attach => Dispatch::Attach,
         Record::Doc(body) => {
-            match doc::accept_roster_chunk(
+            let outcome = doc::accept_roster_chunk(
                 doc_reassembler,
                 pending_bases,
                 &body,
                 &relay.rosters,
                 claimed_networks,
                 unix_now(),
-            ) {
+                &mut budget.docs,
+                relay.log.about(node_id),
+            );
+            // A transfer the relay could not use (stale, invalid, for a network the session did
+            // not claim, over the rate) is counted; a session that keeps sending them is ended
+            // (MT5, threat A13), however it is answered, or not, one by one.
+            let unadopted = matches!(
+                outcome,
+                AcceptOutcome::Stale(_)
+                    | AcceptOutcome::Invalid
+                    | AcceptOutcome::Dropped(_)
+                    | AcceptOutcome::OverRate
+            );
+            match outcome {
                 AcceptOutcome::NewRoster(network_id) => {
                     if let Some(records) = doc::roster_doc_records(&relay.rosters, &network_id) {
                         doc::fan_out(&relay.registry, &network_id, node_id, &records);
@@ -346,11 +379,26 @@ async fn dispatch(
                     let _ = send_record(conn, transport, error).await;
                 }
                 // Silent on purpose (isolation rule I3): a DOC for a network that was not
-                // claimed, that is not served, or that does not verify gets no answer.
+                // claimed, that is not served, or that does not verify gets no answer; nor does
+                // one over the rate, which would only hand the peer a free oracle on the bucket.
                 AcceptOutcome::Nothing
                 | AcceptOutcome::IgnoredDocType(_)
+                | AcceptOutcome::Stale(_)
+                | AcceptOutcome::OverRate
                 | AcceptOutcome::Dropped(_)
                 | AcceptOutcome::Invalid => {}
+            }
+            if unadopted && budget.note_unadopted() {
+                if let Some(held_back) = relay.log.admit_node("doc_session_ended", node_id) {
+                    tracing::warn!(
+                        session_id,
+                        node_id = %node_id,
+                        held_back,
+                        "ending a session that keeps sending DOC transfers the relay cannot use"
+                    );
+                }
+                end_rate_limited(conn, transport, "sending too many DOC transfers").await;
+                return Dispatch::End;
             }
             Dispatch::Continue
         }
@@ -366,7 +414,23 @@ async fn dispatch(
             // forever if that connection then simply disappeared, and
             // let an already-superseded connection's late-arriving
             // ADVERTISE overwrite a newer session's own claims.
-            if relay.registry.is_current(node_id, session_id) {
+            if !budget.advertise.try_take() {
+                // Over the rate: the node's claims stay as they were, and it is told, so a
+                // misbehaving client can see why nothing changed. The line is throttled.
+                if let Some(held_back) = relay.log.admit_node("advertise_over_rate", node_id) {
+                    tracing::warn!(
+                        session_id,
+                        node_id = %node_id,
+                        held_back,
+                        "a session sends ADVERTISE faster than allowed; refusing the excess"
+                    );
+                }
+                let error = Record::Error(ErrorBody {
+                    code: ErrorCode::RateLimited,
+                    msg: "too many ADVERTISE records; try again later".to_string(),
+                });
+                let _ = send_record(conn, transport, error).await;
+            } else if relay.registry.is_current(node_id, session_id) {
                 let ack = relay
                     .labels
                     .advertise(&relay.rosters, claimed_networks, node_id, &body);
@@ -598,6 +662,8 @@ async fn run_attached_loop(
     let mut doc_reassembler = DocReassembler::new();
     // Bases sent ahead of a steward signed Roster; they live and die with this session.
     let mut pending_bases = PendingBases::new();
+    // What this session may still send: ADVERTISE and DOC allowances (`crate::rate`).
+    let mut budget = SessionBudget::new(&relay.rates);
 
     // Phase 1: not yet routable, waiting for ATTACH as the node's first
     // transport record. Liveness and REKEY are already driven here too,
@@ -614,7 +680,7 @@ async fn run_attached_loop(
             }
             incoming = conn.recv() => {
                 let outcome = dispatch(
-                    &mut conn, &mut transport, &mut liveness, &mut doc_reassembler, &mut pending_bases, relay,
+                    &mut conn, &mut transport, &mut liveness, &mut doc_reassembler, &mut pending_bases, &mut budget, relay,
                     &node_id, session_id, &claimed_networks, incoming,
                 ).await;
                 match outcome {
@@ -643,7 +709,9 @@ async fn run_attached_loop(
         .admission
         .admit_attached(relay.registry.attachment_of(&node_id).is_some())
     else {
-        tracing::warn!(session_id, node_id = %node_id, "relay is at its attached session cap, refusing ATTACH");
+        if let Some(held_back) = relay.log.admit_node("attach_cap", &node_id) {
+            tracing::warn!(session_id, node_id = %node_id, held_back, "relay is at its attached session cap, refusing ATTACH");
+        }
         let error = Record::Error(ErrorBody {
             code: ErrorCode::RateLimited,
             msg: "the relay has too many attached sessions; try again later".to_string(),
@@ -687,7 +755,7 @@ async fn run_attached_loop(
         tokio::select! {
             incoming = conn.recv() => {
                 let outcome = dispatch(
-                    &mut conn, &mut transport, &mut liveness, &mut doc_reassembler, &mut pending_bases, relay,
+                    &mut conn, &mut transport, &mut liveness, &mut doc_reassembler, &mut pending_bases, &mut budget, relay,
                     &node_id, session_id, &claimed_networks, incoming,
                 ).await;
                 match outcome {
@@ -812,6 +880,7 @@ pub(crate) async fn handle_connection(
     session_id: u32,
     ip_slot: IpSlot,
 ) {
+    let ip_key = ip_slot.log_key();
     let handshake = tokio::time::timeout(
         NOISE_DEADLINE,
         run_handshake_and_validate(conn, &relay, session_id),
@@ -852,7 +921,11 @@ pub(crate) async fn handle_connection(
             .await;
         }
         Err(err) => {
-            tracing::warn!(error = %err, session_id, "relay inbound session failed before attaching");
+            // Anyone who can open a TCP connection can cause this line, so it is throttled per
+            // peer address.
+            if let Some(held_back) = relay.log.admit("failed_before_attach", ip_key) {
+                tracing::warn!(error = %err, session_id, held_back, "relay inbound session failed before attaching");
+            }
         }
     }
 }
