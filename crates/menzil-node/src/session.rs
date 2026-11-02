@@ -73,7 +73,7 @@ use menzil_session::{
 use crate::error::NodeError;
 use crate::identity::IdentityCell;
 use crate::outbound::{EnqueueOutcome, Epoch, MAX_QUEUED_BYTES, OutboundQueue, OutboundSend};
-use crate::relay_notes::RelayNotes;
+use crate::relay_notes::{RelayNotes, listed_in_own_roster};
 use crate::roster_store::RosterStore;
 
 /// Everything [`Session::connect`] needs beyond what
@@ -1271,7 +1271,27 @@ pub async fn run_session_observed(
                         }
                         Ok(record) => {
                             if let Record::Error(body) = &record {
-                                notes.note_error(body, unix_now());
+                                // A relay answers `not_member` for a network it does not
+                                // serve exactly as for one that does not list the node
+                                // (isolation rule I2), so it cannot say which. The node can
+                                // say that its own Roster disagrees, and names the likely
+                                // causes without claiming one.
+                                let listed = body.code == menzil_proto::ErrorCode::NotMember
+                                    && config.identity.get().node_cert.decode().is_ok_and(
+                                        |cert| {
+                                            listed_in_own_roster(
+                                                &roster_store,
+                                                session.claimed_networks(),
+                                                &cert.node_id,
+                                            )
+                                        },
+                                    );
+                                if listed {
+                                    tracing::warn!(
+                                        "the relay says this node is not a member, but this node's own Roster lists it: the relay may not serve the network or may hold an older Roster, or the node was removed in a Roster it has not seen; ask the relay operator"
+                                    );
+                                }
+                                notes.note_error_listed(body, unix_now(), listed);
                             }
                             pending.push_back(SessionEvent::Record {
                                 epoch,

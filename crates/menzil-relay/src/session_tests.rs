@@ -353,7 +353,7 @@ async fn a_second_attach_supersedes_the_first() {
 }
 
 #[tokio::test]
-async fn an_unknown_claimed_network_gets_an_error_then_the_connection_ends() {
+async fn an_unserved_claimed_network_gets_not_member_then_the_connection_ends() {
     let (relay, listener, cert, relay_x25519) = bind_test_relay().await;
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move { relay.serve(&listener).await });
@@ -373,7 +373,7 @@ async fn an_unknown_claimed_network_gets_an_error_then_the_connection_ends() {
     .await;
 
     match client.recv().await {
-        Some(Record::Error(body)) => assert_eq!(body.code, ErrorCode::UnknownNetwork),
+        Some(Record::Error(body)) => assert_eq!(body.code, ErrorCode::NotMember),
         other => panic!("expected ERROR, got {other:?}"),
     }
     assert_eq!(
@@ -2252,7 +2252,11 @@ async fn another_networks_min_serial_neither_evicts_nor_locks_out_a_node() {
     ping_pong(&mut client_z, [1; 8]).await;
     ping_pong(&mut client_w, [2; 8]).await;
 
-    let mut attacker = shared.connect(&shared.attacker, vec![], 1, 10).await;
+    // The attacker is a real member of A and claims it: since MT2 a DOC for a network the
+    // session did not claim is dropped, so this is the case that still reaches the store.
+    let mut attacker = shared
+        .connect(&shared.attacker, vec![shared.network_a], 1, 10)
+        .await;
     for record in shared.poison(2) {
         attacker.send(record).await;
     }
@@ -2296,7 +2300,11 @@ async fn a_burst_of_other_networks_rosters_does_not_evict_an_honest_node() {
         .await;
     client_z.send(Record::Attach).await;
     ping_pong(&mut client_z, [1; 8]).await;
-    let mut attacker = shared.connect(&shared.attacker, vec![], 1, 10).await;
+    // The attacker is a real member of A and claims it: since MT2 a DOC for a network the
+    // session did not claim is dropped, so this is the case that still reaches the store.
+    let mut attacker = shared
+        .connect(&shared.attacker, vec![shared.network_a], 1, 10)
+        .await;
     let mut all = Vec::new();
     for seq in 2..200u64 {
         all.extend(shared.poison(seq));
@@ -2667,8 +2675,137 @@ async fn a_rejected_ik_hello_sees_empty_rosters_then_the_error() {
         .await;
     assert!(welcome.rosters.is_empty());
     match client.recv().await {
-        Some(Record::Error(body)) => assert_eq!(body.code, ErrorCode::UnknownNetwork),
-        other => panic!("expected ERROR unknown_network, got {other:?}"),
+        Some(Record::Error(body)) => assert_eq!(body.code, ErrorCode::NotMember),
+        other => panic!("expected ERROR not_member, got {other:?}"),
     }
     assert_eq!(client.recv().await, None);
+}
+
+// --- MT2: no oracle for which networks a relay serves (isolation rules I2 and I3) ---
+
+/// The ERROR a relay answers to an IK HELLO of `who` claiming `network`, as encoded bytes, and
+/// what WELCOME listed. `serving` seeds the relay with a Roster of `network` that lists only
+/// `listed`.
+async fn hello_refusal(
+    who: &TestIdentity,
+    network: NetworkId,
+    serving: Option<(&SigningKey, NodeId)>,
+) -> (Vec<u8>, usize) {
+    let (relay, listener, cert, relay_x25519) = bind_test_relay().await;
+    let addr = listener.local_addr().unwrap();
+    if let Some((owner, listed)) = serving {
+        relay
+            .rosters()
+            .set(&evict_roster(owner, network, 1, &[(listed, 1)], &[]))
+            .unwrap();
+    }
+    tokio::spawn(async move { relay.serve(&listener).await });
+    let (mut client, welcome) = TestClient::connect(
+        addr,
+        cert,
+        who,
+        relay_x25519,
+        vec![network],
+        HashMap::new(),
+        1,
+        10,
+    )
+    .await;
+    let error = match client.recv().await {
+        Some(record @ Record::Error(_)) => record.encode(),
+        other => panic!("expected ERROR, got {other:?}"),
+    };
+    assert_eq!(client.recv().await, None);
+    (error, welcome.rosters.len())
+}
+
+#[tokio::test]
+async fn a_hello_for_an_unserved_network_is_refused_byte_for_byte_like_an_unlisted_one() {
+    let who = generate_identity();
+    let owner = SigningKey::generate(&mut rand::rng());
+    let network = NetworkId::from(owner.verifying_key().to_bytes());
+    let other_member = NodeId::from([0x77; 32]);
+
+    let (served_unlisted, served_rosters) =
+        hello_refusal(&who, network, Some((&owner, other_member))).await;
+    let (unserved, unserved_rosters) = hello_refusal(&who, network, None).await;
+
+    assert_eq!(served_rosters, 0);
+    assert_eq!(unserved_rosters, 0);
+    assert_eq!(
+        unserved, served_unlisted,
+        "the refusal must not tell whether the relay serves the network"
+    );
+    // And it is the `not_member` answer, not some other code that happens to match.
+    match Record::decode(&unserved).unwrap() {
+        Record::Error(body) => assert_eq!(body.code, ErrorCode::NotMember),
+        other => panic!("expected ERROR, got {other:?}"),
+    }
+}
+
+/// What a session does not get back from DOC pushes: a Roster for an unserved network, for a
+/// served network the session did not claim, and a forged one for a claimed network. The
+/// relay answers none of them (the next record is the PONG for the PING sent after) and
+/// stores none.
+#[tokio::test]
+async fn a_doc_for_an_unserved_unclaimed_or_forged_roster_gets_no_record_back() {
+    let member = generate_identity();
+    let three = three_networks([&[member.node_id], &[member.node_id], &[]]).await;
+    let claimed = three.networks[0];
+
+    let (mut client, welcome) = three.connect_ik(&member, vec![claimed], 10).await;
+    assert_eq!(welcome.rosters, three.seeded(&[0]));
+    client.send(Record::Attach).await;
+    client.recv_roster_doc().await;
+    ping_pong(&mut client, [1; 8]).await;
+
+    // A valid Roster of a network this relay does not serve.
+    let stranger_owner = SigningKey::generate(&mut rand::rng());
+    let stranger_net = NetworkId::from(stranger_owner.verifying_key().to_bytes());
+    let unserved = evict_roster(
+        &stranger_owner,
+        stranger_net,
+        5,
+        &[(member.node_id, 1)],
+        &[],
+    );
+    for record in menzil_proto::split_into_doc_records(DocType::Roster, &unserved.encode()) {
+        client.send(record).await;
+    }
+    ping_pong(&mut client, [2; 8]).await;
+    assert!(!three.relay.rosters().seqs().contains_key(&stranger_net));
+
+    // A valid, newer Roster of a served network the session did not claim.
+    let unclaimed = evict_roster(
+        &three.owners[1],
+        three.networks[1],
+        9,
+        &[(member.node_id, 1)],
+        &[],
+    );
+    for record in menzil_proto::split_into_doc_records(DocType::Roster, &unclaimed.encode()) {
+        client.send(record).await;
+    }
+    ping_pong(&mut client, [3; 8]).await;
+    assert_eq!(
+        three.relay.rosters().seqs().get(&three.networks[1]),
+        Some(&2)
+    );
+
+    // A newer Roster of the claimed network with a signature that is not the owner's.
+    let impostor = SigningKey::generate(&mut rand::rng());
+    let forged = evict_roster(&impostor, claimed, 9, &[(member.node_id, 1)], &[]);
+    for record in menzil_proto::split_into_doc_records(DocType::Roster, &forged.encode()) {
+        client.send(record).await;
+    }
+    ping_pong(&mut client, [4; 8]).await;
+    assert_eq!(three.relay.rosters().seqs().get(&claimed), Some(&1));
+
+    // The same session still adopts a legitimate newer Roster of the claimed network.
+    let genuine = evict_roster(&three.owners[0], claimed, 7, &[(member.node_id, 1)], &[]);
+    for record in menzil_proto::split_into_doc_records(DocType::Roster, &genuine.encode()) {
+        client.send(record).await;
+    }
+    ping_pong(&mut client, [5; 8]).await;
+    assert_eq!(three.relay.rosters().seqs().get(&claimed), Some(&7));
 }

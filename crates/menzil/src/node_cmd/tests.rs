@@ -198,6 +198,7 @@ fn a_failed_open_states_the_relays_reason_when_it_is_known() {
         code: Some("revoked".to_string()),
         message: "node is revoked".to_string(),
         goaway: Some("revoked".to_string()),
+        listed_in_own_roster: false,
     };
     let not_attached = NodeOpenError::Session(EnsureError::NotAttached);
     let told = explain_with(&not_attached, Some(&rejected), 1_000 + 120);
@@ -237,6 +238,7 @@ fn a_failed_open_states_the_relays_reason_when_it_is_known() {
         message: "gone".to_string(),
         goaway: None,
         at: 9,
+        listed_in_own_roster: false,
     });
     assert_eq!(
         from_node,
@@ -245,6 +247,7 @@ fn a_failed_open_states_the_relays_reason_when_it_is_known() {
             code: Some("not_member".to_string()),
             message: "gone".to_string(),
             goaway: None,
+            listed_in_own_roster: false,
         }
     );
 }
@@ -1371,18 +1374,21 @@ fn the_not_a_member_explanation_with_a_rejection_fits_the_agent_error_line() {
             code: Some("revoked".to_string()),
             message: "node is revoked in network x".to_string(),
             goaway: Some("revoked".to_string()),
+            listed_in_own_roster: false,
         },
         agent::Rejected {
             at: 1_000,
             code: Some("not_member".to_string()),
             message: long.clone(),
             goaway: Some(long.clone()),
+            listed_in_own_roster: false,
         },
         agent::Rejected {
             at: 1_000,
             code: Some("c".repeat(300)),
             message: long.clone(),
             goaway: Some(long),
+            listed_in_own_roster: false,
         },
     ] {
         for error in [
@@ -1408,6 +1414,7 @@ fn the_not_a_member_explanation_with_a_rejection_fits_the_agent_error_line() {
         code: Some("revoked".to_string()),
         message: "node is revoked in network x".to_string(),
         goaway: Some("revoked".to_string()),
+        listed_in_own_roster: false,
     };
     let told = explain_with(
         &NodeOpenError::Session(EnsureError::NotAMember),

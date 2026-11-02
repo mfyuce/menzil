@@ -306,6 +306,7 @@ async fn dispatch(
                 pending_bases,
                 &body,
                 &relay.rosters,
+                claimed_networks,
                 unix_now(),
             ) {
                 AcceptOutcome::NewRoster(network_id) => {
@@ -320,15 +321,11 @@ async fn dispatch(
                     });
                     let _ = send_record(conn, transport, error).await;
                 }
-                AcceptOutcome::NetworkNotServed(_) => {
-                    let error = Record::Error(ErrorBody {
-                        code: ErrorCode::UnknownNetwork,
-                        msg: "this relay does not serve that network".to_string(),
-                    });
-                    let _ = send_record(conn, transport, error).await;
-                }
+                // Silent on purpose (isolation rule I3): a DOC for a network that was not
+                // claimed, that is not served, or that does not verify gets no answer.
                 AcceptOutcome::Nothing
                 | AcceptOutcome::IgnoredDocType(_)
+                | AcceptOutcome::Dropped(_)
                 | AcceptOutcome::Invalid => {}
             }
             Dispatch::Continue

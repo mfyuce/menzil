@@ -108,7 +108,7 @@ pub use outbound::{
     EnqueueOutcome, Epoch, OutboundQueue, OutboundSend, SendBudget, SendBudgets, SendPermit,
 };
 pub use policy_store::PolicyStore;
-pub use relay_notes::{ATTACH_SETTLED, RelayError, RelayNotes};
+pub use relay_notes::{ATTACH_SETTLED, RelayError, RelayNotes, listed_in_own_roster};
 pub use roster_store::RosterStore;
 pub use serve::{
     DEFAULT_CONNECT_TIMEOUT, DEFAULT_MAX_CONNECTIONS, DEFAULT_MAX_CONNECTIONS_PER_PEER,

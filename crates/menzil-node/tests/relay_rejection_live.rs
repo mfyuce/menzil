@@ -83,12 +83,17 @@ async fn the_relays_rejection_is_remembered_and_forgotten_after_a_good_attachmen
     let (_outbound_tx, outbound_rx) = mpsc::channel(16);
     let (stop_tx, stop_rx) = watch::channel(false);
     let started = unix_now();
+    // The node's own copy of network A lists the node (same `seq` as the relay's, so neither
+    // side adopts the other's): the relay's `not_member` contradicts what the node holds.
+    let own = Arc::new(RosterStore::new());
+    own.set(&roster(&owner, 1, &[other, node.node_id]).1)
+        .unwrap();
     let task = tokio::spawn(run_session_observed(
         config,
         HashMap::new(),
         events_tx,
         outbound_rx,
-        Arc::new(RosterStore::new()),
+        own,
         stop_rx,
         notes.clone(),
     ));
@@ -100,6 +105,10 @@ async fn the_relays_rejection_is_remembered_and_forgotten_after_a_good_attachmen
     assert_eq!(first.code, Some(ErrorCode::NotMember), "{first:?}");
     assert!(!first.message.is_empty(), "the relay's own words are kept");
     assert_eq!(first.goaway, None, "a refused HELLO has no GOAWAY");
+    assert!(
+        first.listed_in_own_roster,
+        "the node's own Roster lists it, the relay says it is not a member: {first:?}"
+    );
     assert!(
         first.at >= started && first.at <= unix_now(),
         "the time it came: {first:?}"
@@ -150,6 +159,10 @@ async fn the_relays_rejection_is_remembered_and_forgotten_after_a_good_attachmen
     .await;
     let told = node.last_relay_error().unwrap();
     assert_eq!(told.code, Some(ErrorCode::NotMember), "{told:?}");
+    assert!(
+        !told.listed_in_own_roster,
+        "this node holds no Roster that lists it: {told:?}"
+    );
     node.shutdown().await;
 
     // A node the Roster lists attaches, is attached, and has nothing held against it.

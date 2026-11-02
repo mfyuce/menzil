@@ -620,6 +620,7 @@ fn rejected_of(error: RelayError) -> agent::Rejected {
         code: error.code.map(|code| code.name().to_string()),
         message: error.message,
         goaway: error.goaway,
+        listed_in_own_roster: error.listed_in_own_roster,
     }
 }
 

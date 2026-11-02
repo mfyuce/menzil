@@ -24,15 +24,25 @@ fn ago(at: u64, now: u64) -> String {
 }
 
 /// What the relay's ERROR code means for this device, in plain words, and what to do about it.
-fn code_meaning(code: &str) -> (&'static str, &'static str) {
+/// `listed` is true when this device's own Roster of a claimed network lists it.
+///
+/// A relay answers `not_member` both for a network it does not serve and for one that does not
+/// list the device (so nobody can test which networks a relay serves), so the words name the
+/// likely causes and never claim one: with a Roster that lists the device they point at the
+/// relay, without one at the owner.
+fn code_meaning(code: &str, listed: bool) -> (&'static str, &'static str) {
     match code {
+        "not_member" if listed => (
+            "the relay does not list this device in a network it claimed, although this device's own documents do",
+            "the relay may not serve that network or may hold an older Roster of it, or this device was removed in a newer one it has not seen: ask the relay operator, then the owner",
+        ),
         "revoked" => (
             "this device is revoked in a network it claimed",
             "the owner of that network revoked it; ask the owner whether that was meant",
         ),
         "not_member" => (
-            "this device is not listed as a member of a network it claimed",
-            "it was removed, or never admitted; ask the owner to admit it, then `menzil join` the new token",
+            "this device is not listed as a member of a network it claimed (or the relay does not serve that network)",
+            "it was removed, or never admitted; ask the owner to admit it, then `menzil join` the new token. If the owner says it is admitted, the relay may not serve the network: ask the relay operator",
         ),
         "stale_serial" => (
             "the certificate of this device is older than the owner allows",
@@ -74,7 +84,7 @@ pub fn turned_away(rejected: &crate::agent::Rejected, now: u64) -> String {
     let goaway = rejected.goaway.as_deref().map(|g| one_line(g, 100));
     match (&rejected.code, goaway) {
         (Some(code), goaway) => {
-            let (meaning, advice) = code_meaning(code);
+            let (meaning, advice) = code_meaning(code, rejected.listed_in_own_roster);
             let then = goaway.map_or_else(String::new, |g| {
                 format!("; it then ended the session (GOAWAY {g})")
             });
@@ -222,6 +232,7 @@ mod tests {
             code: code.map(str::to_string),
             message: message.to_string(),
             goaway: goaway.map(str::to_string),
+            listed_in_own_roster: false,
         }
     }
 
@@ -258,6 +269,39 @@ mod tests {
                 "{code}: {text}"
             );
         }
+    }
+
+    /// A relay answers `not_member` for a network it does not serve as for one that does not list
+    /// the device, so the words never claim which; with a Roster that lists the device they point
+    /// at the relay, without one at the owner and then, last, at the relay.
+    #[test]
+    fn a_not_member_names_the_likely_causes_without_claiming_one() {
+        let plain = turned_away(&rejected(Some("not_member"), None, ""), 1_000);
+        assert!(
+            plain.contains("ask the owner to admit")
+                && plain.contains("does not serve that network")
+                && plain.contains("ask the relay operator"),
+            "{plain}"
+        );
+        let mut contradicted = rejected(Some("not_member"), None, "");
+        contradicted.listed_in_own_roster = true;
+        let told = turned_away(&contradicted, 1_000);
+        assert!(
+            told.contains("although this device's own documents do")
+                && told.contains("may not serve that network")
+                && told.contains("older Roster")
+                && told.contains("removed")
+                && told.contains("ask the relay operator"),
+            "{told}"
+        );
+        assert!(!told.contains("ask the owner to admit"), "{told}");
+        // The flag changes nothing for another code.
+        let mut revoked = rejected(Some("revoked"), None, "");
+        revoked.listed_in_own_roster = true;
+        assert_eq!(
+            turned_away(&revoked, 1_000),
+            turned_away(&rejected(Some("revoked"), None, ""), 1_000)
+        );
     }
 
     #[test]

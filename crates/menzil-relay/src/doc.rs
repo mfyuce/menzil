@@ -92,10 +92,11 @@ pub(crate) enum AcceptOutcome {
     /// were already in progress on this connection.
     TooLarge,
     /// A transfer completed and decoded as a Roster, but for a network
-    /// this relay does not already hold — refused rather than silently
-    /// accepted (see `accept_roster_chunk`'s own docs for why this
-    /// matters).
-    NetworkNotServed(NetworkId),
+    /// this relay does not already hold, or one the sending session did
+    /// not claim (and pass) in its HELLO: dropped without any answer
+    /// (isolation rule I3; see `accept_roster_chunk`'s own docs for why
+    /// this matters).
+    Dropped(NetworkId),
     /// A transfer completed but its bytes did not decode, or did not
     /// verify, as a Roster (malformed or forged).
     Invalid,
@@ -109,7 +110,15 @@ pub(crate) enum AcceptOutcome {
 /// completes, decodes and verifies it as a Roster (rejecting any other
 /// `doc_type` without attempting to decode it as one) and stores it via
 /// `rosters` — but only for a network `rosters` already holds something
-/// for.
+/// for and the sending session `claimed` (isolation rule I3).
+///
+/// I3: the network named in the (still unverified) body is compared with `claimed` and with
+/// what `rosters` serves before the signature is looked at, and a miss is dropped with no
+/// answer at all ([`AcceptOutcome::Dropped`] is silent at the caller), so a peer cannot use
+/// DOC to learn which networks a relay serves, and a forged Roster for a network the peer has
+/// no claim on costs it nothing but the bytes. For a claimed network a forged or stale
+/// Roster is silent as well ([`AcceptOutcome::Invalid`]); only the size limit is answered,
+/// and that does not depend on the document.
 ///
 /// That last restriction is not optional: `NetworkId` *is* a network
 /// owner's own Ed25519 public key (protocol.md 2.3), so anyone can mint a
@@ -143,6 +152,7 @@ pub(crate) fn accept_roster_chunk(
     pending: &mut PendingBases,
     body: &DocBody,
     rosters: &RosterStore,
+    claimed: &[NetworkId],
     now: u64,
 ) -> AcceptOutcome {
     let (doc_type, bytes) = match reassembler.accept(body) {
@@ -175,12 +185,12 @@ pub(crate) fn accept_roster_chunk(
             return AcceptOutcome::Invalid;
         }
     };
-    if rosters.get(&decoded.network_id).is_none() {
-        tracing::warn!(
+    if !claimed.contains(&decoded.network_id) || rosters.get(&decoded.network_id).is_none() {
+        tracing::debug!(
             network_id = %decoded.network_id,
-            "refusing a DOC(roster) for a network this relay does not already serve"
+            "dropping a DOC(roster) for a network this session did not claim or this relay does not serve"
         );
-        return AcceptOutcome::NetworkNotServed(decoded.network_id);
+        return AcceptOutcome::Dropped(decoded.network_id);
     }
     if doc_type == DocType::BaseRoster {
         // Judged with the Roster it belongs to, which follows; not stored.
@@ -300,18 +310,30 @@ mod tests {
         feed_pending(reassembler, &mut PendingBases::new(), records, rosters)
     }
 
+    /// A session that claimed every network `rosters` serves.
     fn feed_pending(
         reassembler: &mut DocReassembler,
         pending: &mut PendingBases,
         records: &[Record],
         rosters: &RosterStore,
     ) -> AcceptOutcome {
+        let claimed: Vec<NetworkId> = rosters.seqs().keys().copied().collect();
+        feed_claiming(reassembler, pending, records, rosters, &claimed)
+    }
+
+    fn feed_claiming(
+        reassembler: &mut DocReassembler,
+        pending: &mut PendingBases,
+        records: &[Record],
+        rosters: &RosterStore,
+        claimed: &[NetworkId],
+    ) -> AcceptOutcome {
         let mut last = AcceptOutcome::Nothing;
         for record in records {
             let Record::Doc(body) = record else {
                 unreachable!()
             };
-            last = accept_roster_chunk(reassembler, pending, body, rosters, NOW);
+            last = accept_roster_chunk(reassembler, pending, body, rosters, claimed, NOW);
         }
         last
     }
@@ -341,7 +363,7 @@ mod tests {
 
     /// Round 9, M2: a Roster that ran out on disk is held by the relay at start (judged at its
     /// own `issued`), and then the current Roster a member pushes over DOC replaces it; a relay
-    /// that did not hold it answers every such DOC `NetworkNotServed`.
+    /// that did not hold it drops every such DOC silently.
     #[test]
     fn a_held_expired_roster_is_replaced_by_a_newer_one_over_doc() {
         let owner = SigningKey::generate(&mut rand::rng());
@@ -358,7 +380,7 @@ mod tests {
         assert!(rosters.adopt(&expired, None, NOW).is_err());
         assert_eq!(
             feed_all(&mut DocReassembler::new(), &records, &rosters),
-            AcceptOutcome::NetworkNotServed(network_id)
+            AcceptOutcome::Dropped(network_id)
         );
 
         // Held, judged at its own `issued`: the newer one replaces it.
@@ -384,11 +406,90 @@ mod tests {
 
         assert_eq!(
             feed_all(&mut reassembler, &records, &rosters),
-            AcceptOutcome::NetworkNotServed(network_id)
+            AcceptOutcome::Dropped(network_id)
         );
         assert!(
             rosters.get(&network_id).is_none(),
             "a network this relay wasn't already serving must never be inserted via DOC"
+        );
+    }
+
+    /// Isolation rule I3: a valid Roster of a served network is dropped when the sending
+    /// session did not claim that network, and adopted when it did.
+    #[test]
+    fn a_roster_for_a_served_network_the_session_did_not_claim_is_dropped() {
+        let owner = SigningKey::generate(&mut rand::rng());
+        let network_id = NetworkId::from(owner.verifying_key().to_bytes());
+        let rosters = RosterStore::new();
+        rosters.set(&signed_roster(&owner, network_id, 0)).unwrap();
+        let records = menzil_proto::split_into_doc_records(
+            DocType::Roster,
+            &signed_roster(&owner, network_id, 1).encode(),
+        );
+
+        let other = NetworkId::from([0x33; 32]);
+        for claimed in [&[][..], &[other][..]] {
+            assert_eq!(
+                feed_claiming(
+                    &mut DocReassembler::new(),
+                    &mut PendingBases::new(),
+                    &records,
+                    &rosters,
+                    claimed,
+                ),
+                AcceptOutcome::Dropped(network_id)
+            );
+            assert_eq!(rosters.get(&network_id).unwrap().seq, 0);
+        }
+        assert_eq!(
+            feed_claiming(
+                &mut DocReassembler::new(),
+                &mut PendingBases::new(),
+                &records,
+                &rosters,
+                &[other, network_id],
+            ),
+            AcceptOutcome::NewRoster(network_id)
+        );
+
+        // Claimed but not served (the relay dropped the network after HELLO): still dropped.
+        let empty = RosterStore::new();
+        assert_eq!(
+            feed_claiming(
+                &mut DocReassembler::new(),
+                &mut PendingBases::new(),
+                &records,
+                &empty,
+                &[network_id],
+            ),
+            AcceptOutcome::Dropped(network_id)
+        );
+        assert!(empty.get(&network_id).is_none());
+    }
+
+    /// The drop comes before the signature check: a forged Roster of an unclaimed network is
+    /// `Dropped`, the same outcome as a valid one, so nothing tells a forgery from a genuine
+    /// document, or a served network from an unserved one.
+    #[test]
+    fn a_forged_roster_for_an_unclaimed_network_is_dropped_like_a_valid_one() {
+        let owner = SigningKey::generate(&mut rand::rng());
+        let impostor = SigningKey::generate(&mut rand::rng());
+        let network_id = NetworkId::from(owner.verifying_key().to_bytes());
+        let rosters = RosterStore::new();
+        rosters.set(&signed_roster(&owner, network_id, 0)).unwrap();
+        let forged = menzil_proto::split_into_doc_records(
+            DocType::Roster,
+            &signed_roster(&impostor, network_id, 1).encode(),
+        );
+        assert_eq!(
+            feed_claiming(
+                &mut DocReassembler::new(),
+                &mut PendingBases::new(),
+                &forged,
+                &rosters,
+                &[],
+            ),
+            AcceptOutcome::Dropped(network_id)
         );
     }
 
@@ -445,6 +546,7 @@ mod tests {
             &mut PendingBases::new(),
             &body,
             &rosters,
+            &[],
             NOW,
         );
         assert_eq!(outcome, AcceptOutcome::IgnoredDocType(DocType::Policy));
@@ -497,6 +599,7 @@ mod tests {
                 &mut PendingBases::new(),
                 &body,
                 &rosters,
+                &[],
                 NOW,
             );
             if outcome == AcceptOutcome::TooLarge {
@@ -666,7 +769,7 @@ mod tests {
         let base = doc_records(DocType::BaseRoster, &net.base);
         assert_eq!(
             feed_pending(&mut DocReassembler::new(), &mut pending, &base, &rosters),
-            AcceptOutcome::NetworkNotServed(net.network_id)
+            AcceptOutcome::Dropped(net.network_id)
         );
         assert_eq!(pending.len(), 0);
     }

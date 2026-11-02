@@ -3,8 +3,10 @@
 //! has seen or lower than the `min_serial` for that node in a Roster of a
 //! claimed network,
 //! rejects a `timestamp` not greater than the last accepted for that
-//! NodeId, and checks each claimed network against its Rosters: unknown
-//! network, unlisted node or revoked node fails with ERROR. A node may
+//! NodeId, and checks each claimed network against its Rosters: an unlisted
+//! node (an unserved network counts as listing nobody, so it answers
+//! `not_member` exactly like a served network that does not list the
+//! node) or a revoked node fails with ERROR. A node may
 //! claim no network; it may then only redeem an invite."
 //!
 //! Deliberately not checked here: a claimed network's Roster having
@@ -98,10 +100,11 @@ fn verify_node_cert(
 /// The Roster side of HELLO validation, for `node_id` holding a NodeCert of `cert_serial` and
 /// claiming `networks`: a serial below the `min_serial` for the node in a Roster of a claimed
 /// network (one network's owner has no say over the node's standing in another's, the twelfth
-/// red-team round, M1), then for each claimed network, unknown, revoked there (checked before membership, and independently of
+/// red-team round, M1), then for each claimed network: revoked there (checked before membership, and independently of
 /// it: a Roster may or may not still carry a revoked node in `members` alongside `revoked`
 /// (protocol.md 2.3 doesn't say which), and a revoked node should get the more specific
-/// `Revoked` either way, not `NotMember`), or not listed there.
+/// `Revoked` either way, not `NotMember`), or not listed there. A network this relay does not
+/// serve counts as one that lists nobody and gets the same `NotMember` (isolation rule I2).
 ///
 /// Pure and read only. The one rule both of its callers apply: [`check_hello`] when a session
 /// starts, and `crate::session` again whenever a Roster of a network the session claimed is
@@ -124,28 +127,32 @@ pub(crate) fn roster_standing(
     }
 
     for network_id in networks {
-        let Some(roster) = rosters.get(network_id) else {
-            return Err(reject(
-                ErrorCode::UnknownNetwork,
-                format!("no Roster held for network {network_id}"),
-            ));
-        };
-        if roster
-            .revoked
-            .iter()
-            .any(|revoked| &revoked.node_id == node_id)
-        {
+        // A network this relay does not serve is judged as a served one that lists nobody
+        // (isolation rule I2, decision D5): the same code, message and `network` as "not a
+        // member", so no peer can test which networks a relay serves. The node explains the
+        // likely cause itself from its own Roster. Nothing before this point in the check
+        // order depends on whether the network is served: `min_serial_in` looks only at
+        // Rosters that list this very node, so a stranger's key never reaches a different
+        // answer through it.
+        let standing = rosters.get(network_id);
+        if standing.as_ref().is_some_and(|roster| {
+            roster
+                .revoked
+                .iter()
+                .any(|revoked| &revoked.node_id == node_id)
+        }) {
             return Err(reject_in(
                 ErrorCode::Revoked,
                 format!("node is revoked from network {network_id}"),
                 *network_id,
             ));
         }
-        if !roster
-            .members
-            .iter()
-            .any(|member| &member.node_id == node_id)
-        {
+        if !standing.as_ref().is_some_and(|roster| {
+            roster
+                .members
+                .iter()
+                .any(|member| &member.node_id == node_id)
+        }) {
             return Err(reject_in(
                 ErrorCode::NotMember,
                 format!("node is not a member of network {network_id}"),
@@ -324,13 +331,50 @@ mod tests {
     }
 
     #[test]
-    fn an_unknown_claimed_network_is_rejected() {
+    fn an_unknown_claimed_network_is_rejected_as_not_a_member() {
         let fixture = fixture();
         let hello = hello_with(&fixture, vec![NetworkId::from([1u8; 32])], 1, 10);
         let rosters = RosterStore::new();
         let history = NodeHistory::new();
         let err = check_hello(&hello, &fixture.x25519_static, &rosters, &history, 500).unwrap_err();
-        assert_eq!(err.code, ErrorCode::UnknownNetwork);
+        assert_eq!(err.code, ErrorCode::NotMember);
+    }
+
+    /// Isolation rule I2: the same HELLO, to a relay that does not serve the network and to one
+    /// that serves it without listing the node, is refused with the identical rejection (code,
+    /// message and `network`), so nobody can test which networks a relay serves.
+    #[test]
+    fn an_unserved_network_is_refused_exactly_like_a_served_one_that_does_not_list_the_node() {
+        let fixture = fixture();
+        let owner = SigningKey::generate(&mut rand::rng());
+        let network_id = NetworkId::from(owner.verifying_key().to_bytes());
+        let stranger = NodeId::from([0x55; 32]);
+
+        let serving = RosterStore::new();
+        serving
+            .set(&roster_for(&owner, network_id, stranger, false))
+            .unwrap();
+        let not_serving = RosterStore::new();
+
+        let hello = hello_with(&fixture, vec![network_id], 1, 10);
+        let served_answer = check_hello(
+            &hello,
+            &fixture.x25519_static,
+            &serving,
+            &NodeHistory::new(),
+            500,
+        )
+        .unwrap_err();
+        let unserved_answer = check_hello(
+            &hello,
+            &fixture.x25519_static,
+            &not_serving,
+            &NodeHistory::new(),
+            500,
+        )
+        .unwrap_err();
+        assert_eq!(served_answer.code, ErrorCode::NotMember);
+        assert_eq!(unserved_answer, served_answer);
     }
 
     #[test]
@@ -460,7 +504,7 @@ mod tests {
         let rejected = hello_with(&fixture, vec![unknown_network], 1, 10);
         let err =
             check_hello(&rejected, &fixture.x25519_static, &rosters, &history, 500).unwrap_err();
-        assert_eq!(err.code, ErrorCode::UnknownNetwork);
+        assert_eq!(err.code, ErrorCode::NotMember);
 
         // Retried with the exact same timestamp and no unknown network
         // this time: must still succeed. If the first attempt had

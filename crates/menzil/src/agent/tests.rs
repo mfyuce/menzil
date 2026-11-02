@@ -771,6 +771,7 @@ fn rejected(code: &str) -> Rejected {
         code: Some(code.to_string()),
         message: "node is revoked in network x".to_string(),
         goaway: Some("revoked".to_string()),
+        listed_in_own_roster: false,
     }
 }
 
@@ -806,9 +807,22 @@ async fn the_status_request_carries_the_rejection_and_whether_the_node_is_attach
             code: Some("not_member".to_string()),
             message: String::new(),
             goaway: None,
+            listed_in_own_roster: false,
         }),
     };
     assert_eq!(ask(bare.clone()).await.unwrap(), bare);
+    // A not_member that the node's own Roster contradicts keeps that on the way.
+    let listed = RelayStatus {
+        attached: None,
+        rejected: Some(Rejected {
+            at: 5,
+            code: Some("not_member".to_string()),
+            message: String::new(),
+            goaway: None,
+            listed_in_own_roster: true,
+        }),
+    };
+    assert_eq!(ask(listed.clone()).await.unwrap(), listed);
     let goaway_only = RelayStatus {
         attached: Some(true),
         rejected: Some(Rejected {
@@ -816,6 +830,7 @@ async fn the_status_request_carries_the_rejection_and_whether_the_node_is_attach
             code: None,
             message: String::new(),
             goaway: Some("superseded".to_string()),
+            listed_in_own_roster: false,
         }),
     };
     assert_eq!(ask(goaway_only.clone()).await.unwrap(), goaway_only);
@@ -846,6 +861,7 @@ async fn what_the_agent_says_in_a_status_reply_never_reaches_the_terminal_unesca
             code: Some("revoked\u{1b}[2J".to_string()),
             message: "line one\nrejected_code forged\u{202e}".to_string(),
             goaway: Some("a\u{7}b".to_string()),
+            listed_in_own_roster: false,
         }),
     };
     let got = ask(sent).await.unwrap();
@@ -986,6 +1002,7 @@ fn the_agent_and_the_client_each_make_the_status_text_printable() {
             code: Some("re\u{1b}[2Jvoked\nattached yes".to_string()),
             message: "a\nb\u{202e}".to_string(),
             goaway: Some("g\u{7}".to_string()),
+            listed_in_own_roster: false,
         }),
     };
     // What the agent writes has one line per key and nothing that acts.
@@ -1054,6 +1071,7 @@ async fn four_byte_relay_text_does_not_hide_the_status() {
             code: Some("revoked".to_string()),
             message: kept.message.clone(),
             goaway: kept.goaway.clone(),
+            listed_in_own_roster: false,
         }),
     };
     let got = ask(sent).await.unwrap();

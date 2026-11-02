@@ -20,7 +20,9 @@
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
-use menzil_proto::{ErrorBody, ErrorCode};
+use menzil_proto::{ErrorBody, ErrorCode, NetworkId, NodeId};
+
+use crate::roster_store::RosterStore;
 
 /// How long an attachment must last, with no ERROR that turns it away, to count as good.
 pub const ATTACH_SETTLED: Duration = Duration::from_secs(2);
@@ -54,6 +56,31 @@ pub struct RelayError {
     pub goaway: Option<String>,
     /// When it came, Unix seconds.
     pub at: u64,
+    /// For `not_member`: this node's own Roster of a network it claimed lists it (and does not
+    /// revoke it). A relay answers `not_member` both for a network it does not serve and for
+    /// one that does not list the node (isolation rule I2), so the relay cannot say which; the
+    /// node can only say that its own documents disagree with the relay, which points at the
+    /// relay (it does not serve the network, or holds an older Roster) or at a removal the
+    /// node has not seen. `false` for every other answer.
+    pub listed_in_own_roster: bool,
+}
+
+/// Whether the node's own Rosters list `node_id` (and do not revoke it) in at least one of
+/// `networks`: the case where a `not_member` from the relay contradicts what the node holds.
+pub fn listed_in_own_roster(
+    rosters: &RosterStore,
+    networks: &[NetworkId],
+    node_id: &NodeId,
+) -> bool {
+    networks.iter().any(|network_id| {
+        rosters.body(network_id).is_some_and(|body| {
+            body.members.iter().any(|member| &member.node_id == node_id)
+                && !body
+                    .revoked
+                    .iter()
+                    .any(|revoked| &revoked.node_id == node_id)
+        })
+    })
 }
 
 #[derive(Debug)]
@@ -160,6 +187,12 @@ impl RelayNotes {
     /// An ERROR record arrived at `now` (Unix seconds). Kept when its code says the node was
     /// turned away; a refusal of one record (`forbidden`, `peer_offline`, ...) is not.
     pub fn note_error(&self, body: &ErrorBody, now: u64) {
+        self.note_error_listed(body, now, false);
+    }
+
+    /// [`Self::note_error`] for a node that also knows whether its own Roster of a claimed
+    /// network lists it ([`listed_in_own_roster`]); only a `not_member` keeps that.
+    pub fn note_error_listed(&self, body: &ErrorBody, now: u64, listed_in_own_roster: bool) {
         let mut inner = self.inner();
         if !turns_away(body.code, inner.settled) {
             return;
@@ -171,6 +204,7 @@ impl RelayNotes {
                 message: cut_bytes(&body.msg, MAX_MESSAGE_BYTES),
                 goaway: None,
                 at: now,
+                listed_in_own_roster: body.code == ErrorCode::NotMember && listed_in_own_roster,
             },
             attachment,
         });
@@ -195,6 +229,7 @@ impl RelayNotes {
                 message: String::new(),
                 goaway: Some(reason),
                 at: now,
+                listed_in_own_roster: false,
             },
             attachment,
         });
@@ -225,6 +260,7 @@ mod tests {
                 message: "node is revoked".to_string(),
                 goaway: None,
                 at: 1_000,
+                listed_in_own_roster: false,
             })
         );
     }
@@ -296,6 +332,7 @@ mod tests {
                 message: "evicted".to_string(),
                 goaway: Some("revoked".to_string()),
                 at: 10,
+                listed_in_own_roster: false,
             })
         );
         // A GOAWAY with nothing before it in this attachment.
@@ -308,6 +345,7 @@ mod tests {
                 message: String::new(),
                 goaway: Some("superseded".to_string()),
                 at: 20,
+                listed_in_own_roster: false,
             })
         );
         // The ERROR of an earlier attachment is not joined by a later GOAWAY.
@@ -385,6 +423,79 @@ mod tests {
         notes.note_error(&error(ErrorCode::Revoked, "evicted"), 1);
         notes.note_error(&error(ErrorCode::UnknownE2e, "x"), 2);
         assert_eq!(notes.last_error().unwrap().at, 1);
+    }
+
+    fn roster_of(
+        owner: &ed25519_dalek::SigningKey,
+        network_id: NetworkId,
+        members: &[NodeId],
+        revoked: &[NodeId],
+    ) -> menzil_proto::Roster {
+        let body = menzil_proto::RosterBody {
+            v: menzil_proto::PROTOCOL_VERSION,
+            network_id,
+            seq: 1,
+            issued: 0,
+            expires: 1_000_000_000,
+            members: members
+                .iter()
+                .map(|&node_id| menzil_proto::RosterMember {
+                    node_id,
+                    min_serial: 1,
+                })
+                .collect(),
+            revoked: revoked
+                .iter()
+                .map(|&node_id| menzil_proto::RevokedMember { node_id, since: 0 })
+                .collect(),
+            stewards: vec![],
+            labels: vec![],
+        };
+        menzil_proto::Roster::sign(owner, &body).unwrap()
+    }
+
+    /// A `not_member` while the node's own Roster lists it contradicts the relay: the notes say
+    /// so, for that code only, and only when the Roster lists and does not revoke the node.
+    #[test]
+    fn not_member_remembers_whether_the_nodes_own_roster_lists_it() {
+        let me = NodeId::from([1u8; 32]);
+        let other = NodeId::from([2u8; 32]);
+        let owner = ed25519_dalek::SigningKey::generate(&mut rand::rng());
+        let network = NetworkId::from(owner.verifying_key().to_bytes());
+        let unheld = NetworkId::from([9u8; 32]);
+        let store = RosterStore::new();
+        store
+            .set(&roster_of(&owner, network, &[me, other], &[]))
+            .unwrap();
+        assert!(listed_in_own_roster(&store, &[network], &me));
+        assert!(listed_in_own_roster(&store, &[unheld, network], &me));
+        assert!(!listed_in_own_roster(&store, &[unheld], &me));
+        assert!(!listed_in_own_roster(&store, &[], &me));
+        assert!(!listed_in_own_roster(
+            &store,
+            &[network],
+            &NodeId::from([3u8; 32])
+        ));
+
+        let other_owner = ed25519_dalek::SigningKey::generate(&mut rand::rng());
+        let revoking = NetworkId::from(other_owner.verifying_key().to_bytes());
+        store
+            .set(&roster_of(&other_owner, revoking, &[me], &[me]))
+            .unwrap();
+        assert!(!listed_in_own_roster(&store, &[revoking], &me));
+
+        let notes = RelayNotes::new();
+        notes.begin_attachment();
+        notes.note_error_listed(&error(ErrorCode::NotMember, "x"), 1, true);
+        assert!(notes.last_error().unwrap().listed_in_own_roster);
+        notes.note_error_listed(&error(ErrorCode::NotMember, "x"), 2, false);
+        assert!(!notes.last_error().unwrap().listed_in_own_roster);
+        // Not a `not_member`: the flag is not kept, whatever the caller passed.
+        notes.note_error_listed(&error(ErrorCode::Revoked, "x"), 3, true);
+        assert!(!notes.last_error().unwrap().listed_in_own_roster);
+        // The plain entry point never claims it.
+        notes.note_error(&error(ErrorCode::NotMember, "x"), 4);
+        assert!(!notes.last_error().unwrap().listed_in_own_roster);
     }
 
     /// Round 13 L1: the cut is by bytes, on a character boundary, never inside a character.

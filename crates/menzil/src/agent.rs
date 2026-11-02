@@ -26,6 +26,8 @@
 //!                     rejected_code <name>            the ERROR code, e.g. revoked
 //!                     rejected_message <text>         the ERROR text
 //!                     rejected_goaway <text>          the GOAWAY reason
+//!                     rejected_listed yes             for not_member: the node's own Roster
+//!                                                     lists it (the relay disagrees)
 //!                   A client skips a key it does not know, so a field can be added; an agent
 //!                   that predates the request answers `error ...`, which a client takes as
 //!                   "no word from the node".
@@ -121,6 +123,9 @@ pub struct Rejected {
     pub message: String,
     /// The GOAWAY reason, if one came.
     pub goaway: Option<String>,
+    /// For `not_member`: the node's own Roster of a network it claimed lists it, so the relay
+    /// contradicts what the node holds (see `menzil_node::RelayError::listed_in_own_roster`).
+    pub listed_in_own_roster: bool,
 }
 
 impl RelayStatus {
@@ -147,6 +152,9 @@ impl RelayStatus {
             }
             if let Some(goaway) = &rejected.goaway {
                 out.push_str(&format!("rejected_goaway {}\n", one_line(goaway)));
+            }
+            if rejected.listed_in_own_roster {
+                out.push_str("rejected_listed yes\n");
             }
         }
         out
@@ -175,6 +183,7 @@ impl RelayStatus {
                     rejected.goaway = Some(value);
                     any = true;
                 }
+                "rejected_listed" => rejected.listed_in_own_roster = value == "yes",
                 _ => {}
             }
         }
