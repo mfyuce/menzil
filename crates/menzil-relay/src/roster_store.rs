@@ -455,70 +455,52 @@ impl RosterStore {
             .collect()
     }
 
-    /// Whether one of `src`'s own claimed networks (`src_claimed`, its
-    /// HELLO's `networks`) has a Roster this relay holds that is not yet
-    /// expired at `now` and lists both `src` and `dst` as current,
-    /// unrevoked members (protocol.md 4.2's forwarding rule: "`src` and
-    /// `dst` are both listed and unrevoked in one common, unexpired
-    /// Roster the relay holds").
+    /// The networks among `src_claimed` (`src`'s HELLO `networks`) whose Roster this relay holds,
+    /// that is not yet expired at `now`, and that lists both `src` and `dst` as current,
+    /// unrevoked members (protocol.md 4.2's forwarding rule: "`src` and `dst` are both listed and
+    /// unrevoked in one common, unexpired Roster the relay holds"). Empty means `src` has no
+    /// standing to reach `dst` at all.
     ///
-    /// Deliberately asymmetric — requiring only `src` to have claimed the
-    /// network, not `dst` too — and this is a *correction* of this
-    /// method's own original, symmetric design (which required both
-    /// sides to have claimed it, reasoning from protocol.md 4.1's "a node
-    /// may claim no network; it may then only redeem an invite"). An
-    /// opus red team review found that reading, combined with checking
-    /// `dst`'s attachment before authorization, created a presence
-    /// oracle: since the symmetric check needed `dst`'s own claimed
-    /// networks, `crate::forward::ForwardTable::forward` had to fetch
-    /// `dst`'s attachment state *before* it could even run this check,
-    /// letting anyone who can complete a bare handshake — including a
-    /// revoked ex-member, since a zero-claim HELLO gets no roster
-    /// scrutiny at all — learn whether an arbitrary known NodeId is
-    /// currently online, with no standing of their own required. This
-    /// version needs only `src`'s already-known claims, so
-    /// `crate::forward::ForwardTable::forward` can and does check this
-    /// *before* ever touching `dst`'s attachment state: an unauthorized
-    /// `src` (one with no claimed network whose Roster also lists `dst`)
-    /// gets `Forbidden` whether `dst` exists, is attached, or is offline,
-    /// leaking nothing.
+    /// This is half of isolation rule I4. It reads only `src`'s own claims, never `dst`'s
+    /// attachment, so that an unauthorized `src` (one with no claimed network whose Roster also
+    /// lists `dst`) gets `Forbidden` whether `dst` exists, is attached or is offline (finding
+    /// M2: checking attachment first let anyone probe any NodeId's online status). The other
+    /// half is the caller's: it forwards only if `dst`'s current registration claimed one of the
+    /// networks returned here. Without that half, the owner of one network could list another
+    /// tenant's node in its own Roster, send to it, and learn from the answer whether it is
+    /// online (attack A4). That oracle is closed by the caller answering `peer_offline` for
+    /// every undeliverable case, which is why the symmetric rule that an earlier revision of
+    /// this method dropped can return.
     ///
-    /// This still honors 4.1's "may only redeem an invite" sentence — a
-    /// `src` with no claimed networks at all can never satisfy this
-    /// (`src_claimed` empty means nothing to iterate) — while no longer
-    /// also requiring `dst` to have separately re-claimed the same
-    /// network in its own *current* HELLO: RECV records carry no
-    /// network_id for `dst` to attribute them to, and protocol.md 5.1
-    /// makes the end-to-end (L4) handshake the actual authority on
-    /// membership and grants, verified independently by each peer against
-    /// its own held Roster and Policy — this check exists to keep an
-    /// unrelated stranger from using the relay as a delivery vector
-    /// against an arbitrary target, not to duplicate L4's own
-    /// authorization.
+    /// A `src` with no claimed networks can never be authorized (nothing to iterate), which
+    /// honors 4.1's "may only redeem an invite".
     ///
-    /// This is also where a claimed network's Roster `expires` is finally
-    /// checked at all: neither `check_hello` (protocol.md 4.1) nor
-    /// [`RosterStore::labels_granted_to`] (protocol.md 4.4) do, both
-    /// deliberately, each leaving it to "forwarding" per protocol.md 2.3
-    /// — this is that forwarding.
+    /// This is also where a claimed network's Roster `expires` is finally checked at all:
+    /// neither `check_hello` (protocol.md 4.1) nor [`RosterStore::labels_granted_to`]
+    /// (protocol.md 4.4) do, both deliberately, each leaving it to "forwarding" per protocol.md
+    /// 2.3.
     pub fn grants_forwarding(
         &self,
         src: &NodeId,
         src_claimed: &[NetworkId],
         dst: &NodeId,
         now: u64,
-    ) -> bool {
+    ) -> Vec<NetworkId> {
         let guard = self.by_network.read().unwrap();
-        src_claimed.iter().any(|network_id| {
-            guard
-                .get(network_id)
-                .map(|held| &held.body)
-                .is_some_and(|body| {
-                    body.expires > now
-                        && is_unrevoked_member(body, src)
-                        && is_unrevoked_member(body, dst)
-                })
-        })
+        src_claimed
+            .iter()
+            .filter(|network_id| {
+                guard
+                    .get(network_id)
+                    .map(|held| &held.body)
+                    .is_some_and(|body| {
+                        body.expires > now
+                            && is_unrevoked_member(body, src)
+                            && is_unrevoked_member(body, dst)
+                    })
+            })
+            .copied()
+            .collect()
     }
 }
 
@@ -986,7 +968,7 @@ mod tests {
     }
 
     #[test]
-    fn grants_forwarding_is_true_when_src_claimed_a_network_whose_roster_lists_both() {
+    fn grants_forwarding_returns_the_network_src_claimed_whose_roster_lists_both() {
         let owner = SigningKey::generate(&mut rand::rng());
         let network_id = NetworkId::from(owner.verifying_key().to_bytes());
         let a = NodeId::from([1u8; 32]);
@@ -996,7 +978,10 @@ mod tests {
             .set(&roster_for_pair(&owner, network_id, a, b, 4_000_000_000))
             .unwrap();
 
-        assert!(store.grants_forwarding(&a, &[network_id], &b, 1_000));
+        assert_eq!(
+            store.grants_forwarding(&a, &[network_id], &b, 1_000),
+            vec![network_id]
+        );
     }
 
     #[test]
@@ -1010,7 +995,11 @@ mod tests {
             .set(&roster_for_pair(&owner, network_id, a, b, 500))
             .unwrap();
 
-        assert!(!store.grants_forwarding(&a, &[network_id], &b, 1_000));
+        assert!(
+            store
+                .grants_forwarding(&a, &[network_id], &b, 1_000)
+                .is_empty()
+        );
     }
 
     #[test]
@@ -1028,17 +1017,14 @@ mod tests {
             .set(&roster_for_pair(&owner, network_id, a, b, 4_000_000_000))
             .unwrap();
 
-        assert!(!store.grants_forwarding(&a, &[], &b, 1_000));
+        assert!(store.grants_forwarding(&a, &[], &b, 1_000).is_empty());
     }
 
     #[test]
-    fn grants_forwarding_does_not_require_dst_to_have_separately_claimed_it() {
-        // Deliberate, corrected behavior (see `grants_forwarding`'s own
-        // doc comment): only `src`'s claim is consulted. `dst` need not
-        // have claimed this network in its own (possibly unrelated, e.g.
-        // invite-redemption-only) current HELLO to be a legitimate
-        // forwarding target, as long as the Roster `src` claimed still
-        // lists `dst` as an unrevoked member.
+    fn grants_forwarding_consults_only_src_claims_and_leaves_dsts_attachment_to_the_caller() {
+        // The store never sees `dst`'s attachment: it returns the networks `src` claimed whose
+        // Roster lists both, and `ForwardTable::forward` intersects that with what `dst`'s
+        // registration claimed (isolation rule I4).
         let owner = SigningKey::generate(&mut rand::rng());
         let network_id = NetworkId::from(owner.verifying_key().to_bytes());
         let a = NodeId::from([1u8; 32]);
@@ -1048,7 +1034,10 @@ mod tests {
             .set(&roster_for_pair(&owner, network_id, a, b, 4_000_000_000))
             .unwrap();
 
-        assert!(store.grants_forwarding(&a, &[network_id], &b, 1_000));
+        assert_eq!(
+            store.grants_forwarding(&a, &[network_id], &b, 1_000),
+            vec![network_id]
+        );
     }
 
     #[test]
@@ -1067,7 +1056,11 @@ mod tests {
         let store = RosterStore::new();
         store.set(&Roster::sign(&owner, &roster).unwrap()).unwrap();
 
-        assert!(!store.grants_forwarding(&a, &[network_id], &b, 1_000));
+        assert!(
+            store
+                .grants_forwarding(&a, &[network_id], &b, 1_000)
+                .is_empty()
+        );
     }
 
     #[test]
@@ -1086,7 +1079,11 @@ mod tests {
         let store = RosterStore::new();
         store.set(&Roster::sign(&owner, &roster).unwrap()).unwrap();
 
-        assert!(!store.grants_forwarding(&a, &[network_id], &b, 1_000));
+        assert!(
+            store
+                .grants_forwarding(&a, &[network_id], &b, 1_000)
+                .is_empty()
+        );
     }
 
     #[test]
@@ -1109,10 +1106,22 @@ mod tests {
             .set(&roster_for_pair(&owner_b, network_b, a, b, 4_000_000_000))
             .unwrap();
 
-        assert!(store.grants_forwarding(&a, &[network_a, network_b], &b, 1_000));
+        assert_eq!(
+            store.grants_forwarding(&a, &[network_a, network_b], &b, 1_000),
+            vec![network_a, network_b]
+        );
+        // Only the claimed one is returned.
+        assert_eq!(
+            store.grants_forwarding(&a, &[network_a], &b, 1_000),
+            vec![network_a]
+        );
         // Claiming only an unrelated third network finds nothing.
         let unclaimed = NetworkId::from([0x55; 32]);
-        assert!(!store.grants_forwarding(&a, &[unclaimed], &b, 1_000));
+        assert!(
+            store
+                .grants_forwarding(&a, &[unclaimed], &b, 1_000)
+                .is_empty()
+        );
     }
 
     #[test]

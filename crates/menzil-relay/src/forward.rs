@@ -8,9 +8,12 @@
 //! one common, unexpired Roster the relay holds, `dst` is online and
 //! attached, and `dst` has not set `accept_peers: false` in its
 //! ADVERTISE. Otherwise ERROR `forbidden` or `peer_offline` goes back to
-//! the sender." [`ForwardTable::forward`] checks authorization
-//! (`crate::roster_store::RosterStore::grants_forwarding`, then
-//! `accept_peers`) *before* `dst`'s attachment — deliberately the
+//! the sender." Isolation rule I4 adds that `dst`'s registration must have
+//! claimed one of the networks that authorized `src`, and that every
+//! failure after authorization is the same `peer_offline`.
+//! [`ForwardTable::forward`] checks authorization
+//! (`crate::roster_store::RosterStore::grants_forwarding`) *before* `dst`'s
+//! attachment, deliberately the
 //! opposite order from a first, since-corrected draft of this module,
 //! which checked attachment first and let an unauthorized sender probe
 //! any known NodeId's online status; see `grants_forwarding`'s own doc
@@ -176,6 +179,11 @@ const DGRAM_BUCKET_BURST_BYTES: f64 = 256.0 * 1024.0;
 /// charge by the exact same number rather than an independently
 /// maintained copy that could silently drift from what this module
 /// actually enforces.
+/// The one message of every `peer_offline` this module sends for a SEND (isolation rule I4):
+/// destination offline, online without a claimed network in common, closed to peers, or gone
+/// before delivery all read the same.
+const PEER_OFFLINE_MSG: &str = "destination is not attached";
+
 const MIN_FORWARD_CHARGE_BYTES: u32 = menzil_proto::MIN_SEND_CHARGE_BYTES;
 
 /// A byte-metered token bucket, refilled lazily from elapsed wall-clock
@@ -361,14 +369,17 @@ impl ForwardTable {
     /// (`RosterStore::grants_forwarding`, which needs only `src`'s own
     /// claims — deliberately checked *before* `dst`'s attachment, see
     /// `grants_forwarding`'s own doc comment for why the order matters);
-    /// `dst` is currently attached; `dst` has not opted out via
-    /// `accept_peers: false`; then, only once every one of those passes,
+    /// `dst` is currently attached, its registration claimed one of the networks that authorized
+    /// `src`, and it has not opted out via `accept_peers: false` (all three answer the same
+    /// `peer_offline`, isolation rule I4); then, only once every one of those passes,
     /// the credit/queue/token-bucket admission this module's own doc
     /// comment describes.
     ///
     /// A narrow, deliberately accepted race: `dst`'s attachment is
     /// confirmed, then acted on, as two separate steps, so `dst` could in
-    /// principle detach in between — handled by rolling back whatever
+    /// principle detach, or re-attach with other claims, in between. The hand-off goes only to
+    /// the session whose claims were checked, so a re-attached `dst` never receives what its
+    /// new claims were not checked for. Handled by rolling back whatever
     /// this call had already reserved (credit, queue bytes) and reporting
     /// [`ErrorCode::PeerOffline`] rather than silently leaking it, but not
     /// otherwise prevented; the same already-accepted class of gap
@@ -430,7 +441,8 @@ impl ForwardTable {
         // claims — never `dst`'s attachment state (finding M2: checking
         // attachment before authorization let anyone probe any NodeId's
         // online status with no standing of their own).
-        if !rosters.grants_forwarding(src, src_claimed, dst, now_unix) {
+        let authorizing = rosters.grants_forwarding(src, src_claimed, dst, now_unix);
+        if authorizing.is_empty() {
             return refuse(
                 ErrorCode::Forbidden,
                 "sender has no claimed, unexpired network membership in common with the destination"
@@ -438,18 +450,24 @@ impl ForwardTable {
             );
         }
 
-        if !registry.is_attached(dst) {
-            return refuse(
-                ErrorCode::PeerOffline,
-                "destination is not attached".to_string(),
-            );
-        }
-        if !labels.accepts_peers(dst) {
-            return refuse(
-                ErrorCode::Forbidden,
-                "destination is not accepting peer traffic".to_string(),
-            );
-        }
+        // Isolation rule I4. `src`'s claims authorizing `dst` in some Roster is not enough: the
+        // owner of that Roster may have listed another tenant's node without its consent. `dst`
+        // must be attached, its current registration must have claimed one of the authorizing
+        // networks (claims and session id read together, one registry read lock), and it must
+        // accept peers. Every way of failing this is the same answer, byte for byte, so the
+        // reply never says whether `dst` is offline, elsewhere, or closed to peers.
+        let target = registry
+            .attachment_of(dst)
+            .filter(|attachment| {
+                attachment
+                    .claimed_networks
+                    .iter()
+                    .any(|network| authorizing.contains(network))
+            })
+            .filter(|_| labels.accepts_peers(dst));
+        let Some(target) = target else {
+            return refuse(ErrorCode::PeerOffline, PEER_OFFLINE_MSG.to_string());
+        };
 
         let now = Instant::now();
         let generation;
@@ -495,8 +513,9 @@ impl ForwardTable {
         // `ForwardTable::drained` already needs for a genuine reconnect.
         let src_session_id = registry.attached_session_id(src).unwrap_or(u32::MAX);
 
-        let delivered = registry.deliver(
+        let delivered = registry.deliver_to_session(
             dst,
+            target.session_id,
             ForwardItem::Recv {
                 record: Box::new(Record::Recv {
                     src: *src,
@@ -515,8 +534,8 @@ impl ForwardTable {
             return ForwardOutcome::Queued;
         }
 
-        // `dst` disconnected between the `is_attached` check above and
-        // this handoff (see this method's own doc comment) — undo what
+        // `dst` disconnected, or re-attached (a registration whose claims were never checked),
+        // between the attachment read above and this handoff: undo what
         // was reserved so this pair's accounting does not leak credit or
         // queue budget nothing will ever drain. This is exactly what a
         // drained item does, including its `generation` and `is_current`
@@ -534,7 +553,7 @@ impl ForwardTable {
         );
         ForwardOutcome::Refused(ErrorBody {
             code: ErrorCode::PeerOffline,
-            msg: "destination disconnected before delivery".to_string(),
+            msg: PEER_OFFLINE_MSG.to_string(),
         })
     }
 
@@ -1014,7 +1033,7 @@ mod tests {
     }
 
     #[test]
-    fn a_destination_that_opted_out_of_peer_traffic_is_forbidden() {
+    fn a_destination_that_opted_out_of_peer_traffic_is_peer_offline() {
         let f = fixture(4_000_000_000);
         // Simulate `dst`'s own prior ADVERTISE with accept_peers: false.
         f.labels.advertise(
@@ -1043,9 +1062,266 @@ mod tests {
             1_000,
         );
         match outcome {
-            ForwardOutcome::Refused(err) => assert_eq!(err.code, ErrorCode::Forbidden),
-            _ => panic!("expected Refused(Forbidden)"),
+            ForwardOutcome::Refused(err) => {
+                assert_eq!(err.code, ErrorCode::PeerOffline);
+                assert_eq!(err.msg, PEER_OFFLINE_MSG);
+            }
+            _ => panic!("expected Refused(PeerOffline)"),
         }
+    }
+
+    /// Two tenants on one relay: `owner_x` lists `s` and `d` in its own Roster (the hostile case:
+    /// `d` never joined X), while `d` really belongs to the other tenant's network Y.
+    struct Foreign {
+        rosters: RosterStore,
+        registry: SessionRegistry,
+        labels: LabelRegistry,
+        table: ForwardTable,
+        network_x: NetworkId,
+        network_y: NetworkId,
+        s: NodeId,
+        d: NodeId,
+        s_handles: AttachHandles,
+    }
+
+    fn foreign() -> Foreign {
+        let owner_x = SigningKey::generate(&mut rand::rng());
+        let owner_y = SigningKey::generate(&mut rand::rng());
+        let network_x = NetworkId::from(owner_x.verifying_key().to_bytes());
+        let network_y = NetworkId::from(owner_y.verifying_key().to_bytes());
+        let s = NodeId::from([1u8; 32]);
+        let d = NodeId::from([2u8; 32]);
+        let rosters = RosterStore::new();
+        rosters
+            .set(&roster_with_members(
+                &owner_x,
+                network_x,
+                vec![s, d],
+                4_000_000_000,
+            ))
+            .unwrap();
+        rosters
+            .set(&roster_with_members(
+                &owner_y,
+                network_y,
+                vec![d],
+                4_000_000_000,
+            ))
+            .unwrap();
+        let registry = SessionRegistry::new();
+        let s_handles = registry.attach(s, 1, vec![network_x]);
+        Foreign {
+            rosters,
+            registry,
+            labels: LabelRegistry::new(),
+            table: ForwardTable::new(),
+            network_x,
+            network_y,
+            s,
+            d,
+            s_handles,
+        }
+    }
+
+    impl Foreign {
+        /// One reliable SEND of 10 bytes from `s` (claiming X) to `d`.
+        fn send(&self) -> ForwardOutcome {
+            let (e2e, flags, payload) = reliable_send(10);
+            self.table.forward(
+                &self.rosters,
+                &self.registry,
+                &self.labels,
+                &test_limits(),
+                &self.s,
+                &[self.network_x],
+                &self.d,
+                e2e,
+                flags,
+                payload,
+                1_000,
+            )
+        }
+
+        /// The refusal of [`Self::send`], asserting it is a refusal that put the credit back to
+        /// `s` and left no pair behind.
+        fn refusal(&mut self) -> ErrorBody {
+            let ForwardOutcome::Refused(body) = self.send() else {
+                panic!("expected a refusal")
+            };
+            match self.s_handles.2.try_recv() {
+                Ok(ForwardItem::Credit { peer, bytes }) => {
+                    assert_eq!(peer, self.d);
+                    assert_eq!(bytes, MIN_FORWARD_CHARGE_BYTES.max(10));
+                }
+                _ => panic!("a refused reliable SEND must reimburse the sender"),
+            }
+            assert!(self.s_handles.2.try_recv().is_err(), "exactly one CREDIT");
+            assert_eq!(
+                self.table.remaining_credit(&self.s, &self.d),
+                None,
+                "a refusal reserves nothing"
+            );
+            body
+        }
+    }
+
+    #[test]
+    fn a_foreign_owner_listing_a_node_gets_the_same_peer_offline_whether_it_is_online_or_not() {
+        // Isolation rule I4 (attack A4): X's owner lists d without d's consent. d belongs to Y.
+        let mut f = foreign();
+
+        // d offline.
+        let offline = f.refusal();
+        assert_eq!(offline.code, ErrorCode::PeerOffline);
+
+        // d online, claiming only Y.
+        let mut d_handles = f.registry.attach(f.d, 2, vec![f.network_y]);
+        let online = f.refusal();
+
+        // d online, claiming only Y, and closed to peers.
+        f.labels.advertise(
+            &f.rosters,
+            &[f.network_y],
+            &f.d,
+            &menzil_proto::AdvertiseBody {
+                v: menzil_proto::PROTOCOL_VERSION,
+                shares: vec![],
+                accept_peers: false,
+            },
+        );
+        assert!(!f.labels.accepts_peers(&f.d));
+        let closed = f.refusal();
+
+        assert_eq!(offline, online, "online must read like offline");
+        assert_eq!(offline, closed, "closed to peers must read like offline");
+        assert_eq!(offline.msg, PEER_OFFLINE_MSG);
+        assert!(d_handles.2.try_recv().is_err(), "d received nothing");
+    }
+
+    #[test]
+    fn a_node_that_claims_the_foreign_network_too_is_reached_only_on_the_networks_in_common() {
+        let mut f = foreign();
+        // d claims Y and X; s claims only X: X authorizes and d claimed it.
+        let mut d_handles = f.registry.attach(f.d, 2, vec![f.network_y, f.network_x]);
+        assert!(matches!(f.send(), ForwardOutcome::Queued));
+        assert!(matches!(
+            d_handles.2.try_recv(),
+            Ok(ForwardItem::Recv { .. })
+        ));
+
+        // Networks that s did not claim never authorize, even if d claimed them and both are
+        // listed: s claims X only, the Roster of Y lists only d.
+        drop(d_handles);
+        let _again = f.registry.attach(f.d, 3, vec![f.network_y]);
+        let ForwardOutcome::Refused(body) = f.send() else {
+            panic!("expected a refusal")
+        };
+        assert_eq!(body.code, ErrorCode::PeerOffline);
+        let _ = f.s_handles.2.try_recv();
+    }
+
+    #[test]
+    fn a_network_that_only_the_destination_claimed_does_not_count() {
+        // Both are listed in X and in Z; s claims X, d claims Z only. Each side claims a network
+        // that lists both, but no network is claimed by both.
+        let owner_x = SigningKey::generate(&mut rand::rng());
+        let owner_z = SigningKey::generate(&mut rand::rng());
+        let network_x = NetworkId::from(owner_x.verifying_key().to_bytes());
+        let network_z = NetworkId::from(owner_z.verifying_key().to_bytes());
+        let (s, d) = (NodeId::from([1u8; 32]), NodeId::from([2u8; 32]));
+        let rosters = RosterStore::new();
+        for (owner, id) in [(&owner_x, network_x), (&owner_z, network_z)] {
+            rosters
+                .set(&roster_with_members(owner, id, vec![s, d], 4_000_000_000))
+                .unwrap();
+        }
+        let registry = SessionRegistry::new();
+        let _s = registry.attach(s, 1, vec![network_x]);
+        let _d = registry.attach(d, 2, vec![network_z]);
+        let table = ForwardTable::new();
+        let (e2e, flags, payload) = reliable_send(10);
+        let outcome = table.forward(
+            &rosters,
+            &registry,
+            &LabelRegistry::new(),
+            &test_limits(),
+            &s,
+            &[network_x],
+            &d,
+            e2e,
+            flags,
+            payload,
+            1_000,
+        );
+        match outcome {
+            ForwardOutcome::Refused(err) => assert_eq!(err.code, ErrorCode::PeerOffline),
+            _ => panic!("expected Refused(PeerOffline)"),
+        }
+    }
+
+    #[test]
+    fn members_of_a_common_claimed_network_forward_both_ways() {
+        let f = fixture(4_000_000_000);
+        let table = ForwardTable::new();
+        for (from, to, claim) in [(f.src, f.dst, f.network_id), (f.dst, f.src, f.network_id)] {
+            let (e2e, flags, payload) = reliable_send(10);
+            let outcome = table.forward(
+                &f.rosters,
+                &f.registry,
+                &f.labels,
+                &test_limits(),
+                &from,
+                &[claim],
+                &to,
+                e2e,
+                flags,
+                payload,
+                1_000,
+            );
+            assert!(matches!(outcome, ForwardOutcome::Queued));
+        }
+    }
+
+    #[test]
+    fn a_destination_that_reattaches_with_other_claims_is_judged_by_the_new_claims() {
+        let mut f = foreign();
+        let _first = f.registry.attach(f.d, 2, vec![f.network_x]);
+        assert!(matches!(f.send(), ForwardOutcome::Queued));
+
+        let _second = f.registry.attach(f.d, 3, vec![f.network_y]);
+        f.table.clear_for(&f.d);
+        let _ = f.s_handles.2.try_recv();
+        assert_eq!(f.refusal().code, ErrorCode::PeerOffline);
+
+        let mut third = f.registry.attach(f.d, 4, vec![f.network_x, f.network_y]);
+        f.table.clear_for(&f.d);
+        assert!(matches!(f.send(), ForwardOutcome::Queued));
+        assert!(matches!(third.2.try_recv(), Ok(ForwardItem::Recv { .. })));
+    }
+
+    #[test]
+    fn a_refusal_on_a_droppable_send_reimburses_nothing_and_looks_the_same() {
+        let mut f = foreign();
+        let (e2e, flags, payload) = droppable_send(10);
+        let outcome = f.table.forward(
+            &f.rosters,
+            &f.registry,
+            &f.labels,
+            &test_limits(),
+            &f.s,
+            &[f.network_x],
+            &f.d,
+            e2e,
+            flags,
+            payload,
+            1_000,
+        );
+        let ForwardOutcome::Refused(body) = outcome else {
+            panic!("expected a refusal")
+        };
+        assert_eq!(body.code, ErrorCode::PeerOffline);
+        assert_eq!(body.msg, PEER_OFFLINE_MSG);
+        assert!(f.s_handles.2.try_recv().is_err());
     }
 
     #[test]

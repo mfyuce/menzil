@@ -1625,7 +1625,7 @@ async fn a_send_with_no_common_roster_membership_is_forbidden() {
 }
 
 #[tokio::test]
-async fn a_send_to_a_destination_that_opted_out_of_peer_traffic_is_forbidden() {
+async fn a_send_to_a_destination_that_opted_out_of_peer_traffic_is_peer_offline() {
     let (relay, listener, cert, relay_x25519) = bind_test_relay().await;
     let addr = listener.local_addr().unwrap();
     let serve_relay = relay.clone();
@@ -1648,9 +1648,233 @@ async fn a_send_to_a_destination_that_opted_out_of_peer_traffic_is_forbidden() {
 
     client_a.send(send_record(node_b, vec![1, 2, 3])).await;
     match client_a.recv().await {
-        Some(Record::Error(body)) => assert_eq!(body.code, ErrorCode::Forbidden),
-        other => panic!("expected ERROR(Forbidden), got {other:?}"),
+        Some(Record::Error(body)) => assert_eq!(body.code, ErrorCode::PeerOffline),
+        other => panic!("expected ERROR(PeerOffline), got {other:?}"),
     }
+}
+
+/// Two tenants on one relay (isolation rule I4, attack A4): the owner of network X lists the
+/// sender `s` and also `d`, a node that really belongs to the other tenant's network Y and
+/// never joined X.
+struct ForeignListing {
+    relay: Relay,
+    addr: SocketAddr,
+    cert: CertificateDer<'static>,
+    relay_x25519: X25519PublicKey,
+    network_x: NetworkId,
+    network_y: NetworkId,
+    s: TestIdentity,
+    d: TestIdentity,
+}
+
+async fn foreign_listing() -> ForeignListing {
+    let (relay, listener, cert, relay_x25519) = bind_test_relay().await;
+    let addr = listener.local_addr().unwrap();
+    let owner_x = SigningKey::generate(&mut rand::rng());
+    let owner_y = SigningKey::generate(&mut rand::rng());
+    let network_x = NetworkId::from(owner_x.verifying_key().to_bytes());
+    let network_y = NetworkId::from(owner_y.verifying_key().to_bytes());
+    let (s, d) = (generate_identity(), generate_identity());
+    relay
+        .rosters()
+        .set(&evict_roster(
+            &owner_x,
+            network_x,
+            1,
+            &[(s.node_id, 1), (d.node_id, 1)],
+            &[],
+        ))
+        .unwrap();
+    relay
+        .rosters()
+        .set(&evict_roster(
+            &owner_y,
+            network_y,
+            1,
+            &[(d.node_id, 1)],
+            &[],
+        ))
+        .unwrap();
+    let serve_relay = relay.clone();
+    tokio::spawn(async move { serve_relay.serve(&listener).await });
+    ForeignListing {
+        relay,
+        addr,
+        cert,
+        relay_x25519,
+        network_x,
+        network_y,
+        s,
+        d,
+    }
+}
+
+impl ForeignListing {
+    /// Connects `who` claiming `networks`, attaches, and reads the catch-up Roster pushes.
+    async fn attach(
+        &self,
+        who: &TestIdentity,
+        networks: Vec<NetworkId>,
+        timestamp_byte: u8,
+    ) -> TestClient {
+        let (mut client, _) = TestClient::connect(
+            self.addr,
+            self.cert.clone(),
+            who,
+            self.relay_x25519,
+            networks.clone(),
+            HashMap::new(),
+            1,
+            timestamp_byte,
+        )
+        .await;
+        client.send(Record::Attach).await;
+        for _ in &networks {
+            let _ = client.recv_roster_doc().await;
+        }
+        client
+    }
+
+    /// `s` sends 100 reliable bytes to `d`; returns the ERROR it got, after checking that the
+    /// credit came back too (the refusal reimbursed it).
+    async fn refused_send(&self, s: &mut TestClient) -> menzil_proto::ErrorBody {
+        s.send(send_record(self.d.node_id, vec![7u8; 100])).await;
+        let (mut error, mut credit) = (None, None);
+        for _ in 0..2 {
+            match s.recv().await {
+                Some(Record::Error(body)) => error = Some(body),
+                Some(Record::Credit(body)) => credit = Some(body),
+                other => panic!("expected ERROR and CREDIT, got {other:?}"),
+            }
+        }
+        let credit = credit.expect("a refused reliable SEND must be reimbursed");
+        assert_eq!(credit.peer, self.d.node_id);
+        assert_eq!(credit.bytes, 100);
+        error.expect("an ERROR")
+    }
+}
+
+#[tokio::test]
+async fn a_foreign_owner_listing_a_node_gets_byte_identical_peer_offline_and_the_node_hears_nothing()
+ {
+    let f = foreign_listing().await;
+    let mut s = f.attach(&f.s, vec![f.network_x], 10).await;
+
+    // 1. d is offline.
+    let offline = f.refused_send(&mut s).await;
+    assert_eq!(offline.code, ErrorCode::PeerOffline);
+
+    // 2. d is online, but claims only Y.
+    let mut d = f.attach(&f.d, vec![f.network_y], 10).await;
+    assert!(f.relay.registry.is_attached(&f.d.node_id));
+    let online = f.refused_send(&mut s).await;
+
+    // 3. d is online, claims only Y, and takes no peer traffic.
+    d.send(Record::Advertise(AdvertiseBody {
+        v: PROTOCOL_VERSION,
+        shares: vec![],
+        accept_peers: false,
+    }))
+    .await;
+    match d.recv().await {
+        Some(Record::AdvertiseAck(_)) => {}
+        other => panic!("expected an ADVERTISE_ACK, got {other:?}"),
+    }
+    let closed = f.refused_send(&mut s).await;
+
+    assert_eq!(online, offline, "online must read exactly like offline");
+    assert_eq!(
+        closed, offline,
+        "closed to peers must read exactly like offline"
+    );
+    // Nothing reached d: its next record is the answer to its own PING.
+    ping_pong(&mut d, [3; 8]).await;
+    assert_eq!(
+        f.relay
+            .forwarding
+            .remaining_credit(&f.s.node_id, &f.d.node_id),
+        None,
+        "refusals reserve no pair credit"
+    );
+}
+
+#[tokio::test]
+async fn a_destination_that_reattaches_with_other_claims_is_judged_by_its_new_claims() {
+    let f = foreign_listing().await;
+    let mut s = f.attach(&f.s, vec![f.network_x], 10).await;
+
+    // d claims X (really joined it): forwarded.
+    let mut d1 = f.attach(&f.d, vec![f.network_x], 10).await;
+    s.send(send_record(f.d.node_id, vec![1u8; 100])).await;
+    match d1.recv().await {
+        Some(Record::Recv { src, payload, .. }) => {
+            assert_eq!(src, f.s.node_id);
+            assert_eq!(payload, vec![1u8; 100]);
+        }
+        other => panic!("expected RECV, got {other:?}"),
+    }
+    match s.recv().await {
+        Some(Record::Credit(_)) => {}
+        other => panic!("expected CREDIT, got {other:?}"),
+    }
+
+    // d re-attaches claiming only Y: the very next SEND is refused like an offline node.
+    let mut d2 = f.attach(&f.d, vec![f.network_y], 11).await;
+    let refused = f.refused_send(&mut s).await;
+    assert_eq!(refused.code, ErrorCode::PeerOffline);
+    ping_pong(&mut d2, [4; 8]).await;
+
+    // And claiming both again: forwarded again, both ways.
+    let mut d3 = f.attach(&f.d, vec![f.network_x, f.network_y], 12).await;
+    s.send(send_record(f.d.node_id, vec![2u8; 100])).await;
+    match d3.recv().await {
+        Some(Record::Recv { payload, .. }) => assert_eq!(payload, vec![2u8; 100]),
+        other => panic!("expected RECV, got {other:?}"),
+    }
+    match s.recv().await {
+        Some(Record::Credit(_)) => {}
+        other => panic!("expected CREDIT, got {other:?}"),
+    }
+    d3.send(send_record(f.s.node_id, vec![3u8; 100])).await;
+    match s.recv().await {
+        Some(Record::Recv { src, payload, .. }) => {
+            assert_eq!(src, f.d.node_id);
+            assert_eq!(payload, vec![3u8; 100]);
+        }
+        other => panic!("expected RECV, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn members_of_a_common_claimed_network_forward_both_ways() {
+    let (relay, listener, cert, relay_x25519) = bind_test_relay().await;
+    let addr = listener.local_addr().unwrap();
+    let serve_relay = relay.clone();
+    tokio::spawn(async move { serve_relay.serve(&listener).await });
+
+    let (mut client_a, node_a, mut client_b, node_b) =
+        two_attached_members(&relay, addr, cert, relay_x25519).await;
+
+    client_a.send(send_record(node_b, vec![1u8; 100])).await;
+    match client_b.recv().await {
+        Some(Record::Recv { src, .. }) => assert_eq!(src, node_a),
+        other => panic!("expected RECV, got {other:?}"),
+    }
+    client_b.send(send_record(node_a, vec![2u8; 100])).await;
+    // client_a first gets the CREDIT for its own SEND, then the RECV.
+    let mut got_recv = false;
+    for _ in 0..2 {
+        match client_a.recv().await {
+            Some(Record::Recv { src, payload, .. }) => {
+                assert_eq!(src, node_b);
+                assert_eq!(payload, vec![2u8; 100]);
+                got_recv = true;
+            }
+            Some(Record::Credit(_)) => {}
+            other => panic!("expected CREDIT or RECV, got {other:?}"),
+        }
+    }
+    assert!(got_recv);
 }
 
 #[tokio::test]

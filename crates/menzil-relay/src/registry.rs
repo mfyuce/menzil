@@ -55,6 +55,13 @@ struct Registration {
     forward: mpsc::UnboundedSender<ForwardItem>,
 }
 
+/// A snapshot of one attached session: see [`SessionRegistry::attachment_of`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Attachment {
+    pub(crate) session_id: u32,
+    pub(crate) claimed_networks: Vec<NetworkId>,
+}
+
 /// The relay's currently-attached sessions, at most one per NodeId.
 #[derive(Default)]
 pub struct SessionRegistry {
@@ -188,16 +195,46 @@ impl SessionRegistry {
             .is_some_and(|registration| registration.forward.send(item).is_ok())
     }
 
-    /// Whether `node_id` currently has an attached session (protocol.md
-    /// 4.2's forwarding rule: "dst is online and attached").
-    /// `crate::forward::ForwardTable::forward` checks this only *after*
-    /// confirming `src` is authorized to reach `dst` at all — never
-    /// before — so that an unauthorized sender can never use this to
-    /// learn whether an arbitrary NodeId is currently online (an opus red
-    /// team review's finding M2, fixed by reordering the checks; see
-    /// `crate::forward`'s module doc comment).
+    /// Whether `node_id` currently has an attached session. Forwarding does not use this (it
+    /// reads [`Self::attachment_of`], so the claims and the attachment come from one registration,
+    /// isolation rule I4); tests do.
+    #[cfg(test)]
     pub(crate) fn is_attached(&self, node_id: &NodeId) -> bool {
         self.by_node.read().unwrap().contains_key(node_id)
+    }
+
+    /// `node_id`'s current registration as one consistent snapshot: its session id and the
+    /// networks that session claimed, read under one registry read lock (isolation rule I4: the
+    /// claims that authorize a delivery and the attachment that will receive it must be the same
+    /// registration, or `dst` could re-attach with other claims between two separate reads).
+    /// `None` when nothing is attached.
+    pub(crate) fn attachment_of(&self, node_id: &NodeId) -> Option<Attachment> {
+        self.by_node
+            .read()
+            .unwrap()
+            .get(node_id)
+            .map(|registration| Attachment {
+                session_id: registration.session_id,
+                claimed_networks: registration.claimed_networks.clone(),
+            })
+    }
+
+    /// [`Self::deliver`], but only to `session_id`'s own registration: when `node_id` has
+    /// re-attached since [`Self::attachment_of`] read its claims, the item is not handed to the
+    /// new session (which was never checked against the claims the caller authorized on) and
+    /// `false` comes back. The check and the hand-off happen under one read lock.
+    pub(crate) fn deliver_to_session(
+        &self,
+        node_id: &NodeId,
+        session_id: u32,
+        item: ForwardItem,
+    ) -> bool {
+        self.by_node
+            .read()
+            .unwrap()
+            .get(node_id)
+            .filter(|registration| registration.session_id == session_id)
+            .is_some_and(|registration| registration.forward.send(item).is_ok())
     }
 
     /// Whether `session_id` is still `node_id`'s currently registered
@@ -277,6 +314,55 @@ mod tests {
             old_rx.try_recv().is_ok(),
             "the old registration's receiver must fire once superseded"
         );
+    }
+
+    #[test]
+    fn attachment_of_returns_the_session_id_and_claims_of_one_registration() {
+        let registry = SessionRegistry::new();
+        let node_id = NodeId::from([1u8; 32]);
+        let (x, y) = (NetworkId::from([0xa1; 32]), NetworkId::from([0xa2; 32]));
+        assert_eq!(registry.attachment_of(&node_id), None);
+        let _first = registry.attach(node_id, 1, vec![x]);
+        assert_eq!(
+            registry.attachment_of(&node_id),
+            Some(Attachment {
+                session_id: 1,
+                claimed_networks: vec![x]
+            })
+        );
+        let _second = registry.attach(node_id, 2, vec![y, x]);
+        assert_eq!(
+            registry.attachment_of(&node_id),
+            Some(Attachment {
+                session_id: 2,
+                claimed_networks: vec![y, x]
+            }),
+            "claims and session id always belong together"
+        );
+    }
+
+    #[test]
+    fn deliver_to_session_hands_over_only_to_the_session_that_was_checked() {
+        let registry = SessionRegistry::new();
+        let node_id = NodeId::from([1u8; 32]);
+        let item = || ForwardItem::Credit {
+            peer: NodeId::from([9u8; 32]),
+            bytes: 1,
+        };
+        let (_s1, _o1, mut old_forward) = registry.attach(node_id, 1, vec![]);
+        assert!(registry.deliver_to_session(&node_id, 1, item()));
+        assert!(old_forward.try_recv().is_ok());
+
+        // It re-attached between the claims read and the hand-off.
+        let (_s2, _o2, mut new_forward) = registry.attach(node_id, 2, vec![]);
+        assert!(!registry.deliver_to_session(&node_id, 1, item()));
+        assert!(
+            new_forward.try_recv().is_err(),
+            "the new session got nothing"
+        );
+        assert!(registry.deliver_to_session(&node_id, 2, item()));
+        assert!(new_forward.try_recv().is_ok());
+        assert!(!registry.deliver_to_session(&NodeId::from([5u8; 32]), 1, item()));
     }
 
     #[test]

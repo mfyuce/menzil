@@ -433,13 +433,20 @@ async fn an_expired_roster_on_disk_is_held_but_forwards_nothing() {
         .members[0]
         .node_id;
     let rosters = running.relay.rosters();
-    assert!(!rosters.grants_forwarding(&owner_node, &[id_a], &owner_node, clock()));
+    assert!(
+        rosters
+            .grants_forwarding(&owner_node, &[id_a], &owner_node, clock())
+            .is_empty()
+    );
     // A newer Roster (what a member pushes over DOC) replaces it, and then forwards.
     let renewed = crate::local::renew(&owner_a, None, clock()).unwrap();
     let pair = crate::token::decode_documents(&renewed.token).unwrap();
     assert!(rosters.adopt(pair.roster(), None, clock()).unwrap());
     assert_eq!(running.roster_seq(&id_a), Some(renewed.seq));
-    assert!(rosters.grants_forwarding(&owner_node, &[id_a], &owner_node, clock()));
+    assert_eq!(
+        rosters.grants_forwarding(&owner_node, &[id_a], &owner_node, clock()),
+        vec![id_a]
+    );
     running.stop();
 }
 
