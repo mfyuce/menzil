@@ -130,11 +130,20 @@ async fn the_relays_rejection_is_remembered_and_forgotten_after_a_good_attachmen
     assert_eq!(evicted.code, Some(ErrorCode::NotMember), "{evicted:?}");
     assert_eq!(evicted.goaway.as_deref(), Some("revoked"), "{evicted:?}");
     assert!(evicted.at >= first.at);
-    // The node adopted the Roster it was sent, so it reconnects without claiming network A: that
-    // attachment settles (a second, and then some), but it is not a good attach for A, and the
-    // reason stays.
-    tokio::time::sleep(Duration::from_secs(4)).await;
-    assert_eq!(notes.last_error(), Some(evicted.clone()));
+    // The node adopted the Roster it was sent, so it reconnects without claiming network A. Since
+    // decision D6 (multi tenant slice MT4) a relay refuses a HELLO that claims no network, so
+    // that reconnect is turned away too, with its own reason, which replaces the eviction's
+    // (before D6 the claim-less session attached and the eviction's reason stayed).
+    until("the claim-less reconnect to be turned away", || {
+        notes
+            .last_error()
+            .is_some_and(|error| error.message.contains("at least one network"))
+    })
+    .await;
+    let refused: RelayError = notes.last_error().unwrap();
+    assert_eq!(refused.code, Some(ErrorCode::NotMember), "{refused:?}");
+    assert_eq!(refused.goaway, None, "a refused HELLO has no GOAWAY");
+    assert!(refused.at >= evicted.at);
 
     stop_tx.send(true).unwrap();
     let _ = tokio::time::timeout(Duration::from_secs(10), task).await;

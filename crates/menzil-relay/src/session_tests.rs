@@ -92,13 +92,20 @@ async fn bind_test_relay_with_limits(
     let raw = generate_identity();
     let node_cert = node_cert_for(&raw, 1);
     let relay_x25519 = raw.x25519_public;
+    // Every test connects from 127.0.0.1, many of them a lot: the per address figures are
+    // lifted here and tested on their own (the MT4 section below).
     let relay = Relay::new(
         RelayIdentity {
             node_cert,
             x25519_private: raw.x25519_private,
         },
         limits,
-    );
+    )
+    .with_admission_limits(crate::admission::AdmissionLimits {
+        connections_per_ip_per_minute: 1_000_000,
+        max_unattached_per_ip: 1_000_000,
+        ..crate::admission::AdmissionLimits::default()
+    });
     (relay, listener, cert, relay_x25519)
 }
 
@@ -265,6 +272,40 @@ impl TestClient {
     }
 }
 
+/// Seeds `relay` with a fresh network listing `members`, and returns what a HELLO of one of them
+/// claims: the network, and a `roster_seq` that says the node already holds the Roster, so no
+/// DOC catch-up push follows its ATTACH. A HELLO that claims no network is refused (D6), so a
+/// test that only needs a session to exist claims one of these.
+fn seed_network(
+    relay: &Relay,
+    members: &[&TestIdentity],
+) -> (Vec<NetworkId>, HashMap<NetworkId, u64>) {
+    let owner = SigningKey::generate(&mut rand::rng());
+    let network_id = NetworkId::from(owner.verifying_key().to_bytes());
+    let body = RosterBody {
+        v: PROTOCOL_VERSION,
+        network_id,
+        seq: 1,
+        issued: 0,
+        expires: 4_000_000_000,
+        members: members
+            .iter()
+            .map(|identity| RosterMember {
+                node_id: identity.node_id,
+                min_serial: 1,
+            })
+            .collect(),
+        revoked: vec![],
+        stewards: vec![],
+        labels: vec![],
+    };
+    relay
+        .rosters()
+        .set(&Roster::sign(&owner, &body).unwrap())
+        .unwrap();
+    (vec![network_id], HashMap::from([(network_id, 1)]))
+}
+
 async fn ping_pong(client: &mut TestClient, nonce: [u8; 8]) {
     client.send(Record::Ping { nonce }).await;
     assert_eq!(client.recv().await, Some(Record::Pong { nonce }));
@@ -278,13 +319,14 @@ async fn attach_registers_the_session() {
     tokio::spawn(async move { serve_relay.serve(&listener).await });
 
     let client_identity = generate_identity();
+    let (networks, seq) = seed_network(&relay, &[&client_identity]);
     let (mut client, welcome) = TestClient::connect(
         addr,
         cert,
         &client_identity,
         relay_x25519,
-        vec![],
-        HashMap::new(),
+        networks,
+        seq,
         1,
         10,
     )
@@ -312,16 +354,18 @@ async fn attach_registers_the_session() {
 async fn a_second_attach_supersedes_the_first() {
     let (relay, listener, cert, relay_x25519) = bind_test_relay().await;
     let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move { relay.serve(&listener).await });
+    let serve_relay = relay.clone();
+    tokio::spawn(async move { serve_relay.serve(&listener).await });
 
     let client_identity = generate_identity();
+    let (networks, seq) = seed_network(&relay, &[&client_identity]);
     let (mut client1, _) = TestClient::connect(
         addr,
         cert.clone(),
         &client_identity,
         relay_x25519,
-        vec![],
-        HashMap::new(),
+        networks.clone(),
+        seq.clone(),
         1,
         10,
     )
@@ -337,8 +381,8 @@ async fn a_second_attach_supersedes_the_first() {
         cert,
         &client_identity,
         relay_x25519,
-        vec![],
-        HashMap::new(),
+        networks,
+        seq,
         1,
         20,
     )
@@ -745,16 +789,18 @@ async fn a_pending_base_does_not_outlive_its_session() {
 async fn rekey_from_the_client_is_applied_before_the_next_record() {
     let (relay, listener, cert, relay_x25519) = bind_test_relay().await;
     let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move { relay.serve(&listener).await });
+    let serve_relay = relay.clone();
+    tokio::spawn(async move { serve_relay.serve(&listener).await });
 
     let client_identity = generate_identity();
+    let (networks, seq) = seed_network(&relay, &[&client_identity]);
     let (mut client, _) = TestClient::connect(
         addr,
         cert,
         &client_identity,
         relay_x25519,
-        vec![],
-        HashMap::new(),
+        networks,
+        seq,
         1,
         10,
     )
@@ -1555,20 +1601,13 @@ async fn a_send_to_an_unauthorized_stranger_gets_forbidden_not_peer_offline() {
     // leak the target's online status to someone unauthorized to ask.
     let (relay, listener, cert, relay_x25519) = bind_test_relay().await;
     let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move { relay.serve(&listener).await });
+    let serve_relay = relay.clone();
+    tokio::spawn(async move { serve_relay.serve(&listener).await });
 
     let identity = generate_identity();
-    let (mut client, _) = TestClient::connect(
-        addr,
-        cert,
-        &identity,
-        relay_x25519,
-        vec![],
-        HashMap::new(),
-        1,
-        10,
-    )
-    .await;
+    let (networks, seq) = seed_network(&relay, &[&identity]);
+    let (mut client, _) =
+        TestClient::connect(addr, cert, &identity, relay_x25519, networks, seq, 1, 10).await;
     client.send(Record::Attach).await;
 
     let stranger = NodeId::from([0x77; 32]);
@@ -1584,19 +1623,22 @@ async fn a_send_to_an_unauthorized_stranger_gets_forbidden_not_peer_offline() {
 async fn a_send_with_no_common_roster_membership_is_forbidden() {
     let (relay, listener, cert, relay_x25519) = bind_test_relay().await;
     let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move { relay.serve(&listener).await });
+    let serve_relay = relay.clone();
+    tokio::spawn(async move { serve_relay.serve(&listener).await });
 
-    // Two independently attached nodes claiming no networks at all: no
+    // Two independently attached nodes, each member of a network of its own: no
     // Roster lists the two of them together.
     let identity_a = generate_identity();
     let identity_b = generate_identity();
+    let (networks_a, seq_a) = seed_network(&relay, &[&identity_a]);
+    let (networks_b, seq_b) = seed_network(&relay, &[&identity_b]);
     let (mut client_a, _) = TestClient::connect(
         addr,
         cert.clone(),
         &identity_a,
         relay_x25519,
-        vec![],
-        HashMap::new(),
+        networks_a,
+        seq_a,
         1,
         10,
     )
@@ -1607,8 +1649,8 @@ async fn a_send_with_no_common_roster_membership_is_forbidden() {
         cert,
         &identity_b,
         relay_x25519,
-        vec![],
-        HashMap::new(),
+        networks_b,
+        seq_b,
         1,
         10,
     )
@@ -2605,11 +2647,13 @@ async fn closed_by_relay(sock: &mut TcpStream, within: Duration) -> bool {
 /// A full session setup (TLS, WebSocket, Noise, WELCOME) plus a PING/PONG
 /// with a fresh identity: proof the relay really serves this client.
 async fn assert_served(
+    relay: &Relay,
     addr: SocketAddr,
     cert: &CertificateDer<'static>,
     relay_x25519: X25519PublicKey,
 ) -> TestClient {
     let identity = generate_identity();
+    let (networks, seq) = seed_network(relay, &[&identity]);
     let (mut client, _welcome) = tokio::time::timeout(
         Duration::from_secs(5),
         TestClient::connect(
@@ -2617,8 +2661,8 @@ async fn assert_served(
             cert.clone(),
             &identity,
             relay_x25519,
-            vec![],
-            HashMap::new(),
+            networks,
+            seq,
             1,
             10,
         ),
@@ -2633,14 +2677,15 @@ async fn assert_served(
 async fn an_idle_socket_does_not_block_other_clients() {
     let (relay, listener, cert, relay_x25519) = bind_test_relay().await;
     let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move { relay.serve(&listener).await });
+    let serve_relay = relay.clone();
+    tokio::spawn(async move { serve_relay.serve(&listener).await });
 
     // Connects and never says a word; kept open for the whole test.
     let _idle = TcpStream::connect(addr).await.unwrap();
     // Let the accept loop take it before the real client arrives.
     tokio::time::sleep(Duration::from_millis(50)).await;
 
-    let _served = assert_served(addr, &cert, relay_x25519).await;
+    let _served = assert_served(&relay, addr, &cert, relay_x25519).await;
 }
 
 #[tokio::test]
@@ -2674,7 +2719,8 @@ async fn handshakes_in_flight_are_limited_and_the_slot_is_freed_afterwards() {
         handshake_timeout: Duration::from_millis(1000),
         max_inflight_handshakes: 1,
     };
-    tokio::spawn(async move { relay.serve_with(&listener, config).await });
+    let serve_relay = relay.clone();
+    tokio::spawn(async move { serve_relay.serve_with(&listener, config).await });
 
     // The only slot is taken by a peer that never speaks.
     let mut stalled = TcpStream::connect(addr).await.unwrap();
@@ -2694,10 +2740,10 @@ async fn handshakes_in_flight_are_limited_and_the_slot_is_freed_afterwards() {
 
     // Once the stalled handshake times out, its slot is free again.
     assert!(closed_by_relay(&mut stalled, Duration::from_secs(5)).await);
-    let _third = assert_served(addr, &cert, relay_x25519).await;
+    let _third = assert_served(&relay, addr, &cert, relay_x25519).await;
     // The slot is for the handshake only, not for the session: with the
     // third session still running, a fourth client is served too.
-    let _fourth = assert_served(addr, &cert, relay_x25519).await;
+    let _fourth = assert_served(&relay, addr, &cert, relay_x25519).await;
 }
 
 // ---- WELCOME lists only what the peer proved (MT1, isolation rule I1) -----------------------
@@ -2784,15 +2830,17 @@ async fn a_stranger_with_a_fresh_key_sees_no_networks_in_welcome() {
     let three = three_networks([&[member.node_id], &[member.node_id], &[]]).await;
     let stranger = generate_identity();
 
-    // Claims nothing, which passes HELLO today.
+    // Claims nothing: refused (D6), and nothing listed.
     let (mut client, welcome) = three.connect_ik(&stranger, vec![], 10).await;
     assert!(
         welcome.rosters.is_empty(),
         "a stranger enumerated {:?}",
         welcome.rosters
     );
-    client.send(Record::Attach).await;
-    ping_pong(&mut client, [1; 8]).await;
+    match client.recv().await {
+        Some(Record::Error(body)) => assert_eq!(body.code, ErrorCode::NotMember),
+        other => panic!("expected ERROR(not_member), got {other:?}"),
+    }
 
     // Claims a network that exists: refused, still nothing listed.
     let (mut client, welcome) = three
@@ -2829,7 +2877,10 @@ async fn an_ik_welcome_lists_the_claimed_networks_not_every_network_the_node_is_
     assert_eq!(welcome.rosters, three.seeded(&[0, 2]));
 
     let (_, welcome) = three.connect_ik(&member, vec![], 30).await;
-    assert!(welcome.rosters.is_empty(), "listed but claiming nothing");
+    assert!(
+        welcome.rosters.is_empty(),
+        "listed but claiming nothing (refused, D6)"
+    );
 }
 
 #[tokio::test]
@@ -3154,5 +3205,360 @@ async fn a_hello_over_the_network_cap_is_refused_alike_for_served_and_unserved_n
     match client.recv().await {
         Some(Record::Error(body)) => assert_eq!(body.code, ErrorCode::NotMember),
         other => panic!("expected ERROR, got {other:?}"),
+    }
+}
+
+// --- MT4: session hygiene (threats A9 and A14) ------------------------------------------------
+
+use crate::admission::AdmissionLimits;
+use crate::session::{ATTACH_DEADLINE, NOISE_DEADLINE};
+
+const LOOPBACK: std::net::IpAddr = std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
+
+/// [`bind_test_relay`] with `admission` as the relay's caps (the default test relay lifts the
+/// per address ones).
+async fn bind_test_relay_admitting(
+    admission: AdmissionLimits,
+) -> (Relay, Listener, CertificateDer<'static>, X25519PublicKey) {
+    let (relay, listener, cert, relay_x25519) = bind_test_relay().await;
+    (
+        relay.with_admission_limits(admission),
+        listener,
+        cert,
+        relay_x25519,
+    )
+}
+
+/// Waits (real time, up to 3 s) until `condition` holds.
+async fn eventually(what: &str, condition: impl Fn() -> bool) {
+    for _ in 0..300 {
+        if condition() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("never became true: {what}");
+}
+
+/// Decision D6: a HELLO that claims no network is refused, for a listed member as for a
+/// stranger, in IK as in XX, with the ordinary ERROR after the linger, and no session exists.
+#[tokio::test]
+async fn a_hello_that_claims_no_network_is_refused_ik_and_xx() {
+    let (relay, listener, cert, relay_x25519) = bind_test_relay().await;
+    let addr = listener.local_addr().unwrap();
+    let serve_relay = relay.clone();
+    tokio::spawn(async move { serve_relay.serve(&listener).await });
+    let member = generate_identity();
+    let (_networks, _seq) = seed_network(&relay, &[&member]);
+
+    // IK, writing ATTACH right after WELCOME as a node does: the ERROR is still readable.
+    let (mut client, welcome) = TestClient::connect(
+        addr,
+        cert.clone(),
+        &member,
+        relay_x25519,
+        vec![],
+        HashMap::new(),
+        1,
+        10,
+    )
+    .await;
+    assert!(welcome.rosters.is_empty());
+    client.send(Record::Attach).await;
+    match client.recv().await {
+        Some(Record::Error(body)) => assert_eq!(body.code, ErrorCode::NotMember),
+        other => panic!("expected ERROR not_member, got {other:?}"),
+    }
+    assert_eq!(client.recv().await, None);
+
+    // XX (first contact), the same.
+    let (mut client, _welcome) = TestClient::connect_xx(addr, cert, &member, vec![], 20).await;
+    client.send(Record::Attach).await;
+    match client.recv().await {
+        Some(Record::Error(body)) => assert_eq!(body.code, ErrorCode::NotMember),
+        other => panic!("expected ERROR not_member, got {other:?}"),
+    }
+    assert_eq!(client.recv().await, None);
+    assert_eq!(relay.registry.attached_session_id(&member.node_id), None);
+}
+
+/// A9: a session that passed HELLO and never sends ATTACH is closed 10 s after the handshake,
+/// not before; PINGs in between do not move the deadline.
+#[tokio::test]
+async fn a_session_that_never_attaches_is_closed_after_10_seconds() {
+    assert_eq!(ATTACH_DEADLINE, Duration::from_secs(10));
+    let (relay, listener, cert, relay_x25519) = bind_test_relay().await;
+    let addr = listener.local_addr().unwrap();
+    let serve_relay = relay.clone();
+    tokio::spawn(async move { serve_relay.serve(&listener).await });
+    let member = generate_identity();
+    let (networks, seq) = seed_network(&relay, &[&member]);
+
+    let (mut client, _welcome) =
+        TestClient::connect(addr, cert, &member, relay_x25519, networks, seq, 1, 10).await;
+    // The relay is in its pre ATTACH loop once it has answered this (real time).
+    ping_pong(&mut client, [1; 8]).await;
+    assert_eq!(relay.admission.unattached_of_node(&member.node_id), 1);
+
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(9)).await;
+    assert_eq!(
+        relay.admission.unattached_of_node(&member.node_id),
+        1,
+        "closed before the deadline"
+    );
+    assert_eq!(relay.admission.unattached_of_peer(LOOPBACK), 1);
+
+    tokio::time::advance(Duration::from_millis(1_500)).await;
+    for _ in 0..5 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        relay.admission.unattached_of_node(&member.node_id),
+        0,
+        "still open past the deadline"
+    );
+    assert_eq!(relay.admission.unattached_of_peer(LOOPBACK), 0);
+    let closed = tokio::time::timeout(Duration::from_secs(30), client.recv()).await;
+    assert_eq!(closed.expect("the connection was never closed"), None);
+    assert_eq!(relay.registry.attached_session_id(&member.node_id), None);
+}
+
+/// A9: a connection that finishes the WebSocket upgrade and then never completes the Noise
+/// handshake is dropped after the Noise deadline (the TLS and upgrade steps have their own).
+#[tokio::test]
+async fn a_noise_handshake_that_never_completes_is_dropped_after_10_seconds() {
+    assert_eq!(NOISE_DEADLINE, Duration::from_secs(10));
+    let (relay, listener, cert, _relay_x25519) = bind_test_relay().await;
+    let addr = listener.local_addr().unwrap();
+    let serve_relay = relay.clone();
+    tokio::spawn(async move { serve_relay.serve(&listener).await });
+
+    let mut ws = test_client(addr, cert, "/_menzil/v1").await;
+    // The upgrade is done; give the relay's task a moment (real time) to enter its Noise phase.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(relay.admission.unattached_of_peer(LOOPBACK), 1);
+
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(9)).await;
+    assert_eq!(
+        relay.admission.unattached_of_peer(LOOPBACK),
+        1,
+        "dropped before the deadline"
+    );
+    tokio::time::advance(Duration::from_millis(1_500)).await;
+    for _ in 0..5 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        relay.admission.unattached_of_peer(LOOPBACK),
+        0,
+        "a silent peer still holds its slot past the deadline"
+    );
+    let ended = tokio::time::timeout(Duration::from_secs(30), ws.next())
+        .await
+        .expect("the connection was never closed");
+    assert!(
+        !matches!(ended, Some(Ok(Message::Binary(_)))),
+        "the relay sent something to a silent peer: {ended:?}"
+    );
+}
+
+/// A9: a NodeId may have two handshaken sessions waiting to ATTACH; the third is refused with
+/// `rate_limited` before its WELCOME lists anything, leaves no replay mark (the same HELLO is
+/// accepted once a slot is free), and an ATTACH gives its slot back.
+#[tokio::test]
+async fn a_third_unattached_session_of_a_node_is_refused() {
+    let (relay, listener, cert, relay_x25519) = bind_test_relay().await;
+    let addr = listener.local_addr().unwrap();
+    let serve_relay = relay.clone();
+    tokio::spawn(async move { serve_relay.serve(&listener).await });
+    let member = generate_identity();
+    let (networks, seq) = seed_network(&relay, &[&member]);
+    let connect = |timestamp: u8| {
+        TestClient::connect(
+            addr,
+            cert.clone(),
+            &member,
+            relay_x25519,
+            networks.clone(),
+            seq.clone(),
+            1,
+            timestamp,
+        )
+    };
+
+    let (first, w1) = connect(10).await;
+    let (_second, w2) = connect(11).await;
+    assert!(!w1.rosters.is_empty() && !w2.rosters.is_empty());
+    assert_eq!(relay.admission.unattached_of_node(&member.node_id), 2);
+
+    let (mut third, w3) = connect(12).await;
+    assert!(w3.rosters.is_empty(), "a refused HELLO is told nothing");
+    match third.recv().await {
+        Some(Record::Error(body)) => assert_eq!(body.code, ErrorCode::RateLimited),
+        other => panic!("expected ERROR rate_limited, got {other:?}"),
+    }
+    assert_eq!(third.recv().await, None);
+    assert_eq!(relay.admission.unattached_of_node(&member.node_id), 2);
+
+    // One of the two goes away; the refused HELLO (same timestamp 12) now passes.
+    drop(first);
+    eventually("the dropped session gives its slot back", || {
+        relay.admission.unattached_of_node(&member.node_id) == 1
+    })
+    .await;
+    let (mut fourth, w4) = connect(12).await;
+    assert!(!w4.rosters.is_empty());
+    fourth.send(Record::Attach).await;
+    ping_pong(&mut fourth, [4; 8]).await;
+    assert_eq!(
+        relay.admission.unattached_of_node(&member.node_id),
+        1,
+        "the attached session no longer counts as waiting to attach"
+    );
+    assert_eq!(relay.admission.attached(), 1);
+}
+
+/// A14: one peer address may hold only so many unattached sessions; a connection over it is
+/// closed at once, and the slot comes back when one of its connections ends.
+#[tokio::test]
+async fn a_peer_address_over_its_unattached_share_is_dropped_at_once() {
+    let (relay, listener, cert, relay_x25519) = bind_test_relay_admitting(AdmissionLimits {
+        max_unattached_per_ip: 3,
+        connections_per_ip_per_minute: 1_000,
+        ..AdmissionLimits::default()
+    })
+    .await;
+    let addr = listener.local_addr().unwrap();
+    let serve_relay = relay.clone();
+    tokio::spawn(async move { serve_relay.serve(&listener).await });
+
+    // Three peers that connect and say nothing hold the three slots.
+    let idle: Vec<TcpStream> = futures_util::future::join_all(
+        (0..3).map(|_| async { TcpStream::connect(addr).await.unwrap() }),
+    )
+    .await;
+    eventually("three slots taken", || {
+        relay.admission.unattached_of_peer(LOOPBACK) == 3
+    })
+    .await;
+
+    let mut fourth = TcpStream::connect(addr).await.unwrap();
+    assert!(
+        closed_by_relay(&mut fourth, Duration::from_millis(1500)).await,
+        "a connection over the per address share was not dropped at once"
+    );
+    // Another handshake in flight does not make the relay forget the share.
+    assert_eq!(relay.admission.unattached_of_peer(LOOPBACK), 3);
+
+    // One idle peer leaves: its slot is free, a real client is served.
+    let mut idle = idle;
+    drop(idle.pop());
+    eventually("a slot freed", || {
+        relay.admission.unattached_of_peer(LOOPBACK) == 2
+    })
+    .await;
+    let _served = assert_served(&relay, addr, &cert, relay_x25519).await;
+}
+
+/// A14: the 61st connection within a minute from one address gets HTTP 429 at the WebSocket
+/// upgrade (the first 60 upgrade); the window itself is exercised under paused time in
+/// `admission.rs`.
+#[tokio::test]
+async fn the_61st_connection_in_a_minute_gets_429_at_the_upgrade() {
+    let (relay, listener, cert, _relay_x25519) = bind_test_relay_admitting(AdmissionLimits {
+        max_unattached_per_ip: 10_000,
+        ..AdmissionLimits::default()
+    })
+    .await;
+    assert_eq!(AdmissionLimits::default().connections_per_ip_per_minute, 60);
+    let addr = listener.local_addr().unwrap();
+    let serve_relay = relay.clone();
+    tokio::spawn(async move { serve_relay.serve(&listener).await });
+
+    let mut held = Vec::new();
+    for n in 1..=60 {
+        match crate::tests_support::try_test_client(addr, cert.clone(), "/_menzil/v1").await {
+            Ok(ws) => held.push(ws),
+            Err(err) => panic!("connection {n} should upgrade: {err:?}"),
+        }
+    }
+    for n in [61, 62] {
+        match crate::tests_support::try_test_client(addr, cert.clone(), "/_menzil/v1").await {
+            Err(tokio_tungstenite::tungstenite::Error::Http(response)) => {
+                assert_eq!(response.status().as_u16(), 429, "connection {n}");
+            }
+            other => panic!("connection {n} should get 429, got {:?}", other.map(|_| ())),
+        }
+    }
+}
+
+/// Attached sessions are capped in all: an ATTACH over the cap is refused with `rate_limited`
+/// and does not disturb the attached one; a NodeId that is attached already may replace its
+/// own session at the cap.
+#[tokio::test]
+async fn an_attach_over_the_attached_cap_is_refused_but_a_replacement_is_not() {
+    let (relay, listener, cert, relay_x25519) = bind_test_relay_admitting(AdmissionLimits {
+        max_attached: 1,
+        max_unattached_per_ip: 10_000,
+        connections_per_ip_per_minute: 10_000,
+        ..AdmissionLimits::default()
+    })
+    .await;
+    let addr = listener.local_addr().unwrap();
+    let serve_relay = relay.clone();
+    tokio::spawn(async move { serve_relay.serve(&listener).await });
+    let (a, b) = (generate_identity(), generate_identity());
+    let (networks, seq) = seed_network(&relay, &[&a, &b]);
+
+    let (mut client_a, _) = TestClient::connect(
+        addr,
+        cert.clone(),
+        &a,
+        relay_x25519,
+        networks.clone(),
+        seq.clone(),
+        1,
+        10,
+    )
+    .await;
+    client_a.send(Record::Attach).await;
+    ping_pong(&mut client_a, [1; 8]).await;
+    assert_eq!(relay.admission.attached(), 1);
+    assert_eq!(
+        relay.admission.unattached_of_peer(LOOPBACK),
+        0,
+        "an attached session no longer holds a per address slot"
+    );
+
+    let (mut client_b, _) = TestClient::connect(
+        addr,
+        cert.clone(),
+        &b,
+        relay_x25519,
+        networks.clone(),
+        seq.clone(),
+        1,
+        10,
+    )
+    .await;
+    client_b.send(Record::Attach).await;
+    match client_b.recv().await {
+        Some(Record::Error(body)) => assert_eq!(body.code, ErrorCode::RateLimited),
+        other => panic!("expected ERROR rate_limited, got {other:?}"),
+    }
+    assert_eq!(client_b.recv().await, None);
+    assert_eq!(relay.registry.attached_session_id(&b.node_id), None);
+    ping_pong(&mut client_a, [2; 8]).await;
+
+    // A re-attaches from a second connection at the cap: let in, the first is superseded.
+    let (mut client_a2, _) =
+        TestClient::connect(addr, cert, &a, relay_x25519, networks, seq, 1, 20).await;
+    client_a2.send(Record::Attach).await;
+    ping_pong(&mut client_a2, [3; 8]).await;
+    match client_a.recv().await {
+        Some(Record::Goaway(body)) => assert_eq!(body.reason, "superseded"),
+        other => panic!("expected GOAWAY superseded, got {other:?}"),
     }
 }

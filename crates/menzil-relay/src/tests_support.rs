@@ -37,6 +37,19 @@ pub(crate) async fn test_client(
     cert: CertificateDer<'static>,
     path: &str,
 ) -> WebSocketStream<tokio_rustls::client::TlsStream<TcpStream>> {
+    try_test_client(addr, cert, path).await.unwrap()
+}
+
+/// [`test_client`] that hands back the upgrade's failure (an HTTP refusal such as 404 or 429)
+/// instead of panicking.
+pub(crate) async fn try_test_client(
+    addr: std::net::SocketAddr,
+    cert: CertificateDer<'static>,
+    path: &str,
+) -> Result<
+    WebSocketStream<tokio_rustls::client::TlsStream<TcpStream>>,
+    tokio_tungstenite::tungstenite::Error,
+> {
     let tcp = TcpStream::connect(addr).await.unwrap();
     let connector = test_tls_connector(cert);
     let tls = connector
@@ -50,8 +63,8 @@ pub(crate) async fn test_client(
         "Sec-WebSocket-Protocol",
         menzil_carrier::SUBPROTOCOL.parse().unwrap(),
     );
-    let (ws, _resp) = tokio_tungstenite::client_async(request, tls).await.unwrap();
-    ws
+    let (ws, _resp) = tokio_tungstenite::client_async(request, tls).await?;
+    Ok(ws)
 }
 
 /// A network with one steward, for the tests of steward signed Rosters (protocol.md 2.3): the

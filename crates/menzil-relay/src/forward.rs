@@ -1259,6 +1259,109 @@ mod tests {
         }
     }
 
+    /// Three networks A, B and C, owned by three owners. `s` and `d` are listed in A and in C,
+    /// `d` also in B. `s` claims `s_claims`; `d` is attached claiming `d_claims`. Returns the
+    /// outcome of one SEND from `s` to `d` and what `d`'s connection was handed.
+    fn send_across_claims(
+        s_claims: fn(&[NetworkId; 3]) -> Vec<NetworkId>,
+        d_claims: fn(&[NetworkId; 3]) -> Vec<NetworkId>,
+    ) -> (ForwardOutcome, Option<ForwardItem>) {
+        let owners: Vec<SigningKey> = (0..3)
+            .map(|_| SigningKey::generate(&mut rand::rng()))
+            .collect();
+        let nets: [NetworkId; 3] =
+            std::array::from_fn(|i| NetworkId::from(owners[i].verifying_key().to_bytes()));
+        let (s, d) = (NodeId::from([1u8; 32]), NodeId::from([2u8; 32]));
+        let rosters = RosterStore::new();
+        // A and C list both; B lists only d.
+        for (i, members) in [vec![s, d], vec![d], vec![s, d]].into_iter().enumerate() {
+            rosters
+                .set(&roster_with_members(
+                    &owners[i],
+                    nets[i],
+                    members,
+                    4_000_000_000,
+                ))
+                .unwrap();
+        }
+        let registry = SessionRegistry::new();
+        let _s = registry.attach(s, 1, s_claims(&nets));
+        let mut d_handles = registry.attach(d, 2, d_claims(&nets));
+        let (e2e, flags, payload) = reliable_send(10);
+        let outcome = ForwardTable::new().forward(
+            &rosters,
+            &registry,
+            &LabelRegistry::new(),
+            &test_limits(),
+            &s,
+            &s_claims(&nets),
+            &d,
+            e2e,
+            flags,
+            payload,
+            1_000,
+        );
+        (outcome, d_handles.2.try_recv().ok())
+    }
+
+    /// MT3 / round T2: the claims check of `forward` (`.any(|network| authorizing.contains(..))`).
+    /// A authorizes `s` -> `d` (both listed, `s` claims it), and `d` is attached claiming only B,
+    /// a network `s` has no part in: the answer is `peer_offline` and `d` is handed nothing.
+    /// Dropping the check delivers, inverting it refuses the legitimate cases below.
+    #[test]
+    fn a_destination_attached_with_only_a_network_that_does_not_authorize_gets_nothing() {
+        let (outcome, handed) = send_across_claims(|n| vec![n[0]], |n| vec![n[1]]);
+        match outcome {
+            ForwardOutcome::Refused(err) => {
+                assert_eq!(err.code, ErrorCode::PeerOffline);
+                assert_eq!(err.msg, PEER_OFFLINE_MSG);
+            }
+            _ => panic!("expected Refused(PeerOffline)"),
+        }
+        assert!(handed.is_none(), "the destination was handed a record");
+    }
+
+    #[test]
+    fn a_destination_claiming_the_authorizing_network_among_others_is_reached() {
+        // d claims B first and A second: one common claimed network is enough, wherever it is.
+        let (outcome, handed) = send_across_claims(|n| vec![n[0]], |n| vec![n[1], n[0]]);
+        assert!(
+            matches!(outcome, ForwardOutcome::Queued),
+            "{:?}",
+            outcome_name(&outcome)
+        );
+        assert!(matches!(handed, Some(ForwardItem::Recv { .. })));
+    }
+
+    #[test]
+    fn any_one_of_several_authorizing_networks_is_enough_not_only_the_first() {
+        // s claims A and C, both list both nodes (two authorizing networks); d claims only the
+        // last of them, then only the first.
+        let (outcome, handed) = send_across_claims(|n| vec![n[0], n[2]], |n| vec![n[2]]);
+        assert!(
+            matches!(outcome, ForwardOutcome::Queued),
+            "{:?}",
+            outcome_name(&outcome)
+        );
+        assert!(matches!(handed, Some(ForwardItem::Recv { .. })));
+        let (outcome, handed) = send_across_claims(|n| vec![n[0], n[2]], |n| vec![n[0]]);
+        assert!(
+            matches!(outcome, ForwardOutcome::Queued),
+            "{:?}",
+            outcome_name(&outcome)
+        );
+        assert!(matches!(handed, Some(ForwardItem::Recv { .. })));
+    }
+
+    fn outcome_name(outcome: &ForwardOutcome) -> &'static str {
+        match outcome {
+            ForwardOutcome::Queued => "Queued",
+            ForwardOutcome::Dropped => "Dropped",
+            ForwardOutcome::Refused(_) => "Refused",
+            ForwardOutcome::CreditViolation(_) => "CreditViolation",
+        }
+    }
+
     #[test]
     fn members_of_a_common_claimed_network_forward_both_ways() {
         let f = fixture(4_000_000_000);

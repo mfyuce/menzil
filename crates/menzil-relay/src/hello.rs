@@ -191,16 +191,28 @@ pub(crate) fn roster_standing(
 /// weakened), but it would quietly break that documented guarantee and
 /// needlessly cost a legitimate node's immediate retry a `stale_timestamp`
 /// rejection it did nothing to deserve.
-fn validate_against_rosters(
+fn validate_against_rosters<T>(
     hello: &HelloBody,
     node_id: NodeId,
     cert_serial: u32,
     rosters: &RosterStore,
     history: &NodeHistory,
-) -> Result<(), HelloRejection> {
+    admit: impl FnOnce(&NodeId) -> Result<T, HelloRejection>,
+) -> Result<T, HelloRejection> {
     // Repeats dropped and the count capped before the first look at the store: the work below
     // is then at most MAX_HELLO_NETWORKS lookups however the HELLO was padded.
     let claimed = dedup_networks(&hello.networks);
+    // Decision D6 (MT4): a HELLO that claims no network is refused. Its only legitimate use
+    // is redeeming an invitation, which is not built (phase 2), and until then it would give
+    // any key a session that lives as long as it answers PING. The code is `not_member`: the
+    // node is a member of none of the networks it named, and the answer says nothing about
+    // which networks this relay serves.
+    if claimed.is_empty() {
+        return Err(reject(
+            ErrorCode::NotMember,
+            "a HELLO must claim at least one network",
+        ));
+    }
     if claimed.len() > MAX_HELLO_NETWORKS {
         return Err(reject(
             ErrorCode::TooLarge,
@@ -209,8 +221,15 @@ fn validate_against_rosters(
     }
     roster_standing(&node_id, cert_serial, &claimed, rosters)?;
 
+    // The caller's admission caps (`crate::admission`) apply to a NodeId that is proven and in
+    // standing, and before the history is written: a refused HELLO leaves no mark, so the same
+    // node can retry at once.
+    let admitted = admit(&node_id)?;
+
     history
-        .check_and_record(node_id, cert_serial, hello.timestamp)
+        .check_and_record_retaining(node_id, cert_serial, hello.timestamp, |id| {
+            rosters.lists_node(id)
+        })
         .map_err(|violation| match violation {
             HistoryViolation::StaleSerial => reject(
                 ErrorCode::StaleSerial,
@@ -222,7 +241,7 @@ fn validate_against_rosters(
             ),
         })?;
 
-    Ok(())
+    Ok(admitted)
 }
 
 /// The single entry point: verifies `hello`'s NodeCert, then checks
@@ -236,9 +255,38 @@ pub fn check_hello(
     history: &NodeHistory,
     now: u64,
 ) -> Result<NodeId, HelloRejection> {
+    check_hello_admitting(hello, node_static, rosters, history, now, |_| Ok(()))
+        .map(|(node_id, ())| node_id)
+}
+
+/// [`check_hello`] with one more step: `admit` runs once the NodeId is proven and in standing
+/// (and before the history is written), and what it returns comes back with the NodeId. The
+/// session driver passes the per NodeId admission cap here, so that a HELLO refused for being
+/// over it leaves no replay mark.
+pub(crate) fn check_hello_admitting<T>(
+    hello: &HelloBody,
+    node_static: &X25519PublicKey,
+    rosters: &RosterStore,
+    history: &NodeHistory,
+    now: u64,
+    admit: impl FnOnce(&NodeId) -> Result<T, HelloRejection>,
+) -> Result<(NodeId, T), HelloRejection> {
     let cert_body = verify_node_cert(hello, node_static, now)?;
-    validate_against_rosters(hello, cert_body.node_id, cert_body.serial, rosters, history)?;
-    Ok(cert_body.node_id)
+    let admitted = validate_against_rosters(
+        hello,
+        cert_body.node_id,
+        cert_body.serial,
+        rosters,
+        history,
+        admit,
+    )?;
+    Ok((cert_body.node_id, admitted))
+}
+
+/// The refusal for a NodeId that has too many sessions waiting to ATTACH, or a relay with too
+/// many attached: `rate_limited` ("a limit in protocol.md section 10 was exceeded").
+pub(crate) fn over_limit(message: &str) -> HelloRejection {
+    reject(ErrorCode::RateLimited, message)
 }
 
 #[cfg(test)]
@@ -327,13 +375,27 @@ mod tests {
         Roster::sign(owner, &body).unwrap()
     }
 
+    /// Decision D6 (MT4): a HELLO that claims no network is refused, whatever the cert, and
+    /// leaves no replay mark (the same timestamp can be used by the retry that does claim one).
     #[test]
-    fn no_claimed_networks_succeeds_with_a_valid_cert() {
+    fn a_hello_that_claims_no_network_is_refused_and_leaves_no_replay_mark() {
         let fixture = fixture();
-        let hello = hello_with(&fixture, vec![], 1, 10);
+        let owner = SigningKey::generate(&mut rand::rng());
+        let network_id = NetworkId::from(owner.verifying_key().to_bytes());
         let rosters = RosterStore::new();
+        rosters
+            .set(&roster_for(&owner, network_id, fixture.node_id, false))
+            .unwrap();
         let history = NodeHistory::new();
-        let node_id = check_hello(&hello, &fixture.x25519_static, &rosters, &history, 500).unwrap();
+
+        let empty = hello_with(&fixture, vec![], 1, 10);
+        let err = check_hello(&empty, &fixture.x25519_static, &rosters, &history, 500).unwrap_err();
+        assert_eq!(err.code, ErrorCode::NotMember);
+        assert_eq!(err.network, None);
+        assert!(history.is_empty(), "a refused HELLO must not be recorded");
+
+        let retry = hello_with(&fixture, vec![network_id], 1, 10);
+        let node_id = check_hello(&retry, &fixture.x25519_static, &rosters, &history, 500).unwrap();
         assert_eq!(node_id, fixture.node_id);
     }
 
@@ -466,9 +528,14 @@ mod tests {
         assert_eq!(err.code, ErrorCode::StaleSerial);
         assert_eq!(err.network, Some(network_id));
 
-        // Claims no network: no Roster applies, so the floor does not either (round 12, M1:
-        // the floor is judged per claimed network).
-        let hello = hello_with(&fixture, vec![], 4, 11);
+        // Claims another network that lists the node with a low floor: the first network's
+        // floor does not apply (round 12, M1: the floor is judged per claimed network).
+        let owner_b = SigningKey::generate(&mut rand::rng());
+        let network_b = NetworkId::from(owner_b.verifying_key().to_bytes());
+        rosters
+            .set(&roster_for(&owner_b, network_b, fixture.node_id, false))
+            .unwrap();
+        let hello = hello_with(&fixture, vec![network_b], 4, 11);
         assert!(check_hello(&hello, &fixture.x25519_static, &rosters, &history, 500).is_ok());
     }
 
@@ -531,8 +598,131 @@ mod tests {
         // Retried with the exact same timestamp and no unknown network
         // this time: must still succeed. If the first attempt had
         // recorded its timestamp, this would fail as `StaleTimestamp`.
-        let retry = hello_with(&fixture, vec![], 1, 10);
+        let owner = SigningKey::generate(&mut rand::rng());
+        let network_id = NetworkId::from(owner.verifying_key().to_bytes());
+        rosters
+            .set(&roster_for(&owner, network_id, fixture.node_id, false))
+            .unwrap();
+        let retry = hello_with(&fixture, vec![network_id], 1, 10);
         assert!(check_hello(&retry, &fixture.x25519_static, &rosters, &history, 500).is_ok());
+    }
+
+    /// MT4: the admission step runs only for a proven NodeId in standing, and a HELLO it
+    /// refuses leaves no replay mark (the retry with the same timestamp is accepted).
+    #[test]
+    fn a_refused_admission_leaves_no_replay_mark_and_is_not_asked_of_a_node_out_of_standing() {
+        let fixture = fixture();
+        let owner = SigningKey::generate(&mut rand::rng());
+        let network_id = NetworkId::from(owner.verifying_key().to_bytes());
+        let rosters = RosterStore::new();
+        rosters
+            .set(&roster_for(&owner, network_id, fixture.node_id, false))
+            .unwrap();
+        let history = NodeHistory::new();
+        let hello = hello_with(&fixture, vec![network_id], 1, 10);
+
+        let refused: Result<(NodeId, ()), _> = check_hello_admitting(
+            &hello,
+            &fixture.x25519_static,
+            &rosters,
+            &history,
+            500,
+            |_| Err(over_limit("full")),
+        );
+        assert_eq!(refused.unwrap_err().code, ErrorCode::RateLimited);
+        assert!(history.is_empty());
+        assert!(
+            check_hello_admitting(
+                &hello,
+                &fixture.x25519_static,
+                &rosters,
+                &history,
+                500,
+                |_| { Ok(()) }
+            )
+            .is_ok(),
+            "the same HELLO is accepted once there is room"
+        );
+
+        // A node that claims a network that does not list it never reaches the admission step.
+        let stranger = self::fixture();
+        let hello = hello_with(&stranger, vec![network_id], 1, 10);
+        let mut asked = false;
+        let err = check_hello_admitting(
+            &hello,
+            &stranger.x25519_static,
+            &rosters,
+            &history,
+            500,
+            |_| {
+                asked = true;
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert_eq!(err.code, ErrorCode::NotMember);
+        assert!(!asked);
+    }
+
+    /// MT4: the history's eviction keeps the marks of NodeIds a held Roster lists. A tiny
+    /// history, a member recorded first (the oldest entry), then other nodes that leave their
+    /// Roster; further HELLOs push the table over its bound and the member's mark survives.
+    #[test]
+    fn eviction_keeps_the_replay_marks_of_nodes_a_held_roster_lists() {
+        let member = fixture();
+        let owner = SigningKey::generate(&mut rand::rng());
+        let network_id = NetworkId::from(owner.verifying_key().to_bytes());
+        let leavers: Vec<Fixture> = (0..20).map(|_| fixture()).collect();
+        let rosters = RosterStore::new();
+        let listing = |seq: u64, nodes: Vec<NodeId>| {
+            let body = RosterBody {
+                v: menzil_proto::PROTOCOL_VERSION,
+                network_id,
+                seq,
+                issued: 0,
+                expires: 1_000_000_000,
+                members: nodes
+                    .into_iter()
+                    .map(|node_id| RosterMember {
+                        node_id,
+                        min_serial: 1,
+                    })
+                    .collect(),
+                revoked: vec![],
+                stewards: vec![],
+                labels: vec![],
+            };
+            Roster::sign(&owner, &body).unwrap()
+        };
+        let mut everyone: Vec<NodeId> = leavers.iter().map(|f| f.node_id).collect();
+        everyone.push(member.node_id);
+        rosters.set(&listing(1, everyone)).unwrap();
+        let history = NodeHistory::with_capacity(8);
+        let hello = hello_with(&member, vec![network_id], 5, 10);
+        check_hello(&hello, &member.x25519_static, &rosters, &history, 500).unwrap();
+        for (n, leaver) in leavers.iter().enumerate() {
+            let hello = hello_with(leaver, vec![network_id], 1, 10 + n as u8);
+            check_hello(&hello, &leaver.x25519_static, &rosters, &history, 500).unwrap();
+        }
+        // Everyone was listed, so everyone is vouched for: the table grew past its bound of 8.
+        assert_eq!(history.len(), 21);
+        // The leavers leave the Roster; more HELLOs from the member's own network mates.
+        rosters.set(&listing(2, vec![member.node_id])).unwrap();
+        let late: Vec<Fixture> = (0..20).map(|_| fixture()).collect();
+        let mut with_late = vec![member.node_id];
+        with_late.extend(late.iter().map(|f| f.node_id));
+        rosters.set(&listing(3, with_late)).unwrap();
+        for (n, node) in late.iter().enumerate() {
+            let hello = hello_with(node, vec![network_id], 1, 10 + n as u8);
+            check_hello(&hello, &node.x25519_static, &rosters, &history, 500).unwrap();
+        }
+        let replay = hello_with(&member, vec![network_id], 4, 11);
+        let err = check_hello(&replay, &member.x25519_static, &rosters, &history, 500).unwrap_err();
+        assert_eq!(
+            err.code,
+            ErrorCode::StaleSerial,
+            "the member's mark was evicted"
+        );
     }
 
     #[test]
@@ -567,12 +757,17 @@ mod tests {
     #[test]
     fn a_stale_timestamp_on_reconnect_is_rejected() {
         let fixture = fixture();
+        let owner = SigningKey::generate(&mut rand::rng());
+        let network_id = NetworkId::from(owner.verifying_key().to_bytes());
         let rosters = RosterStore::new();
+        rosters
+            .set(&roster_for(&owner, network_id, fixture.node_id, false))
+            .unwrap();
         let history = NodeHistory::new();
-        let first = hello_with(&fixture, vec![], 1, 10);
+        let first = hello_with(&fixture, vec![network_id], 1, 10);
         check_hello(&first, &fixture.x25519_static, &rosters, &history, 500).unwrap();
 
-        let replay = hello_with(&fixture, vec![], 1, 10);
+        let replay = hello_with(&fixture, vec![network_id], 1, 10);
         let err =
             check_hello(&replay, &fixture.x25519_static, &rosters, &history, 500).unwrap_err();
         assert_eq!(err.code, ErrorCode::StaleTimestamp);

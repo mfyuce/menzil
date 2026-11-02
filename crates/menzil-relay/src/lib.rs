@@ -15,6 +15,7 @@
 
 #![forbid(unsafe_code)]
 
+mod admission;
 mod advertise;
 mod connection;
 mod doc;
@@ -34,13 +35,17 @@ mod session_tests;
 mod tests_support;
 mod tls;
 
+pub use admission::{
+    AdmissionLimits, CONNECTIONS_PER_IP_PER_MINUTE, MAX_ATTACHED, MAX_UNATTACHED_PER_IP,
+    MAX_UNATTACHED_PER_NODE, RATE_WINDOW,
+};
 pub use advertise::{DEFAULT_RESERVED_LABELS, LabelRegistry};
 pub use connection::InboundConnection;
 pub use error::RelayError;
 pub use hello::{HelloRejection, check_hello};
 pub use identity::RelayIdentity;
 pub use listener::Listener;
-pub use node_history::{HistoryViolation, NodeHistory};
+pub use node_history::{HistoryViolation, MAX_HISTORY_ENTRIES, NodeHistory};
 pub use registry::SessionRegistry;
 pub use relay::{AcceptConfig, HANDSHAKE_TIMEOUT, MAX_INFLIGHT_HANDSHAKES, Relay};
 pub use roster_store::RosterStore;

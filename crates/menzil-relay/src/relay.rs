@@ -14,6 +14,7 @@ use tokio::sync::Semaphore;
 
 use menzil_proto::Limits;
 
+use crate::admission::{Admission, AdmissionLimits};
 use crate::advertise::LabelRegistry;
 use crate::forward::ForwardTable;
 use crate::identity::RelayIdentity;
@@ -72,6 +73,7 @@ pub struct Relay {
     pub(crate) rosters: Arc<RosterStore>,
     pub(crate) history: Arc<NodeHistory>,
     pub(crate) registry: Arc<SessionRegistry>,
+    pub(crate) admission: Arc<Admission>,
     pub(crate) labels: Arc<LabelRegistry>,
     pub(crate) forwarding: Arc<ForwardTable>,
     pub(crate) limits: Limits,
@@ -125,11 +127,23 @@ impl Relay {
             rosters: Arc::new(RosterStore::new()),
             history: Arc::new(NodeHistory::new()),
             registry: Arc::new(SessionRegistry::new()),
+            admission: Arc::new(Admission::new(AdmissionLimits::default())),
             labels: Arc::new(LabelRegistry::new()),
             forwarding: Arc::new(ForwardTable::new()),
             limits,
             next_session_id: Arc::new(SessionIds::new()),
         }
+    }
+
+    /// This relay with `limits` as its admission caps (connections per address per minute,
+    /// unattached sessions per address and per NodeId, attached sessions in all) instead of
+    /// [`AdmissionLimits::default`]. Call it before [`Relay::serve`] and before cloning the
+    /// relay: it replaces the counters. A relay behind a reverse proxy sees one peer address
+    /// for everyone and must raise the per address figures (see `crate::admission`).
+    #[must_use]
+    pub fn with_admission_limits(mut self, limits: AdmissionLimits) -> Self {
+        self.admission = Arc::new(Admission::new(limits));
+        self
     }
 
     /// This relay's held Rosters. An operator or test harness seeds the
@@ -164,14 +178,21 @@ impl Relay {
         let slots = Arc::new(Semaphore::new(config.max_inflight_handshakes));
         let upgrader = listener.upgrader();
         loop {
-            let tcp = match listener.accept_tcp().await {
-                Ok(tcp) => tcp,
+            let (tcp, peer) = match listener.accept_tcp().await {
+                Ok(accepted) => accepted,
                 Err(err) => {
                     tracing::warn!(error = %err, "relay failed to accept a connection");
                     // A persistent error (no file descriptors left) must not spin the loop.
                     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                     continue;
                 }
+            };
+            // Per address caps first (MT4, threats A9 and A14): a peer over its unattached
+            // share is dropped without an answer, one over its connection rate is answered
+            // with 429 at the upgrade. The slot is held until the session attaches or ends.
+            let Some(admitted) = self.admission.admit_connection(peer.ip()) else {
+                tracing::debug!(peer = %peer.ip(), "peer holds too many unattached sessions; dropping a new connection");
+                continue;
             };
             let Ok(permit) = Arc::clone(&slots).try_acquire_owned() else {
                 tracing::debug!(
@@ -185,7 +206,9 @@ impl Relay {
             let upgrader = Arc::clone(&upgrader);
             let timeout = config.handshake_timeout;
             tokio::spawn(async move {
-                let handshake = tokio::time::timeout(timeout, upgrader.handshake(tcp)).await;
+                let handshake =
+                    tokio::time::timeout(timeout, upgrader.handshake(tcp, admitted.rate_limited))
+                        .await;
                 // The slot is for the handshake only: free it before the
                 // session starts, not when the session ends.
                 drop(permit);
@@ -200,7 +223,7 @@ impl Relay {
                         return;
                     }
                 };
-                session::handle_connection(conn, relay, session_id).await;
+                session::handle_connection(conn, relay, session_id, admitted.slot).await;
             });
         }
     }

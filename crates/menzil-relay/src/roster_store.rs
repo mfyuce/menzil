@@ -398,6 +398,17 @@ impl RosterStore {
             .unwrap_or_default()
     }
 
+    /// Whether any held Roster lists `node_id` as a member (revoked or not). One hash lookup per
+    /// held network. `crate::node_history` uses it to decide which replay marks must survive an
+    /// eviction.
+    pub(crate) fn lists_node(&self, node_id: &NodeId) -> bool {
+        self.by_network
+            .read()
+            .unwrap()
+            .values()
+            .any(|held| held.index.members.contains_key(node_id))
+    }
+
     /// How many standing lookups ran on this store so far (tests only).
     #[cfg(test)]
     pub(crate) fn lookup_count(&self) -> usize {

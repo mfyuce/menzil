@@ -56,11 +56,14 @@ use menzil_session::{
 };
 use tokio::sync::broadcast;
 
+use crate::admission::{IpSlot, NodeSlot};
 use crate::connection::InboundConnection;
 use crate::doc::{self, AcceptOutcome, PendingBases};
 use crate::error::RelayError;
 use crate::forward::{ForwardItem, ForwardOutcome};
-use crate::hello::{HelloRejection, check_hello, dedup_networks, roster_standing};
+use crate::hello::{
+    HelloRejection, check_hello_admitting, dedup_networks, over_limit, roster_standing,
+};
 use crate::relay::Relay;
 
 /// The exact byte length of a Noise `Xx` pattern's message 1: just the
@@ -100,6 +103,17 @@ fn detect_pattern(message1: &[u8]) -> HandshakePattern {
 /// sent (see `run_handshake_and_validate`).
 const REJECTION_LINGER: Duration = Duration::from_secs(1);
 
+/// How long a connection that finished its WebSocket upgrade has to complete the Noise
+/// handshake and have its HELLO accepted, from the first message to the end of the rejection
+/// linger. The TLS and upgrade steps have `AcceptConfig::handshake_timeout` of their own; this
+/// is the step after them, which a peer could otherwise stall for ever by upgrading and then
+/// saying nothing (MT4, threat A9).
+pub(crate) const NOISE_DEADLINE: Duration = Duration::from_secs(10);
+
+/// How long a session that passed HELLO has to send ATTACH, counted from the end of the
+/// handshake; then it is closed (MT4, threat A9; protocol.md 4.1).
+pub(crate) const ATTACH_DEADLINE: Duration = Duration::from_secs(10);
+
 fn unix_now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -121,6 +135,14 @@ fn build_welcome(relay: &Relay, session_id: u32, rosters: HashMap<NetworkId, u64
     }
 }
 
+/// The per NodeId admission cap, as a HELLO check (see `check_hello_admitting`): the slot lives
+/// until the session attaches or ends.
+fn admit_node(relay: &Relay, node_id: &NodeId) -> Result<NodeSlot, HelloRejection> {
+    relay.admission.admit_node(*node_id).ok_or_else(|| {
+        over_limit("too many sessions of this node are waiting to attach; try again shortly")
+    })
+}
+
 /// Runs the Noise handshake to completion (protocol.md 4.1), then checks
 /// HELLO. On a HELLO rejection, best-effort sends an ERROR record over
 /// the now-established transport before returning the error.
@@ -137,7 +159,7 @@ async fn run_handshake_and_validate(
     mut conn: InboundConnection,
     relay: &Relay,
     session_id: u32,
-) -> Result<(InboundConnection, Transport, NodeId, HelloBody), RelayError> {
+) -> Result<(InboundConnection, Transport, NodeId, HelloBody, NodeSlot), RelayError> {
     let message1 = conn.recv().await?;
     let pattern = detect_pattern(&message1);
     let prologue_bytes = prologue(
@@ -155,12 +177,13 @@ async fn run_handshake_and_validate(
     // `Ik` only: HELLO and the node's static key are both known after message 1. The check
     // runs exactly once per session (it records the HELLO's serial and timestamp).
     let early = match (relay_handshake.hello(), relay_handshake.remote_static()) {
-        (Some(hello), Some(node_static)) => Some(check_hello(
+        (Some(hello), Some(node_static)) => Some(check_hello_admitting(
             hello,
             &node_static,
             &relay.rosters,
             &relay.history,
             unix_now(),
+            |node_id| admit_node(relay, node_id),
         )),
         _ => None,
     };
@@ -181,19 +204,20 @@ async fn run_handshake_and_validate(
         RelayHandshakeStep::AwaitingHello(awaiting) => {
             let message3 = conn.recv().await?;
             let (transport, hello, node_static) = awaiting.finish(&message3)?;
-            let checked = check_hello(
+            let checked = check_hello_admitting(
                 &hello,
                 &node_static,
                 &relay.rosters,
                 &relay.history,
                 unix_now(),
+                |node_id| admit_node(relay, node_id),
             );
             (transport, hello, checked)
         }
     };
 
     match checked {
-        Ok(node_id) => Ok((conn, transport, node_id, hello)),
+        Ok((node_id, node_slot)) => Ok((conn, transport, node_id, hello, node_slot)),
         Err(rejection) => {
             let error_record = Record::Error(ErrorBody {
                 code: rejection.code,
@@ -550,6 +574,8 @@ async fn run_attached_loop(
     relay: &Relay,
     claimed_networks: Vec<NetworkId>,
     their_roster_seq: HashMap<NetworkId, u64>,
+    node_slot: NodeSlot,
+    ip_slot: IpSlot,
 ) {
     // Listening before judging, so a Roster adopted between the two is heard; HELLO was judged
     // against whatever was held then.
@@ -575,10 +601,17 @@ async fn run_attached_loop(
 
     // Phase 1: not yet routable, waiting for ATTACH as the node's first
     // transport record. Liveness and REKEY are already driven here too,
-    // so a node that never attaches at all still gets evicted rather
-    // than leaving this pre-attach window open forever.
+    // but a node that keeps answering PING must not hold this window open
+    // for ever: ATTACH has a hard deadline (MT4, threat A9), whatever else
+    // arrives meanwhile.
+    let attach_deadline = tokio::time::sleep(ATTACH_DEADLINE);
+    tokio::pin!(attach_deadline);
     loop {
         tokio::select! {
+            () = &mut attach_deadline => {
+                tracing::debug!(session_id, node_id = %node_id, "relay session did not ATTACH in time, closing");
+                return;
+            }
             incoming = conn.recv() => {
                 let outcome = dispatch(
                     &mut conn, &mut transport, &mut liveness, &mut doc_reassembler, &mut pending_bases, relay,
@@ -603,6 +636,24 @@ async fn run_attached_loop(
             }
         }
     }
+
+    // Attached sessions are capped in all. A NodeId that is attached already replaces its old
+    // session and is let in (the old one is told to leave right below).
+    let Some(_attached_slot) = relay
+        .admission
+        .admit_attached(relay.registry.attachment_of(&node_id).is_some())
+    else {
+        tracing::warn!(session_id, node_id = %node_id, "relay is at its attached session cap, refusing ATTACH");
+        let error = Record::Error(ErrorBody {
+            code: ErrorCode::RateLimited,
+            msg: "the relay has too many attached sessions; try again later".to_string(),
+        });
+        let _ = send_record(&mut conn, &mut transport, error).await;
+        return;
+    };
+    // From here on the session counts as attached, no longer as waiting to.
+    drop(node_slot);
+    drop(ip_slot);
 
     tracing::info!(session_id, node_id = %node_id, "relay session attached");
     let (mut supersede_rx, mut outbound_rx, mut forward_rx) =
@@ -755,9 +806,29 @@ async fn run_attached_loop(
 /// validation, then the attached loop. Never propagates an error or
 /// panics — [`Relay::serve`] fires this off with `tokio::spawn` and has
 /// no result to collect.
-pub(crate) async fn handle_connection(conn: InboundConnection, relay: Relay, session_id: u32) {
-    match run_handshake_and_validate(conn, &relay, session_id).await {
-        Ok((conn, transport, node_id, hello)) => {
+pub(crate) async fn handle_connection(
+    conn: InboundConnection,
+    relay: Relay,
+    session_id: u32,
+    ip_slot: IpSlot,
+) {
+    let handshake = tokio::time::timeout(
+        NOISE_DEADLINE,
+        run_handshake_and_validate(conn, &relay, session_id),
+    )
+    .await;
+    let handshake = match handshake {
+        Ok(result) => result,
+        Err(_elapsed) => {
+            tracing::debug!(
+                session_id,
+                "relay inbound handshake did not complete in time"
+            );
+            return;
+        }
+    };
+    match handshake {
+        Ok((conn, transport, node_id, hello, node_slot)) => {
             // The NodeCert was verified by `check_hello`; this reads the serial it judged.
             let Ok(cert) = hello.node_cert.decode() else {
                 tracing::warn!(
@@ -775,6 +846,8 @@ pub(crate) async fn handle_connection(conn: InboundConnection, relay: Relay, ses
                 &relay,
                 dedup_networks(&hello.networks),
                 hello.roster_seq,
+                node_slot,
+                ip_slot,
             )
             .await;
         }
