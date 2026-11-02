@@ -1274,7 +1274,9 @@ pub async fn run_session_observed(
                                 // A relay answers `not_member` for a network it does not
                                 // serve exactly as for one that does not list the node
                                 // (isolation rule I2), so it cannot say which. The node can
-                                // say that its own Roster disagrees, and names the likely
+                                // say that its own Rosters disagree (all of the networks it
+                                // claimed list it: the ERROR names none, so one it holds no
+                                // Roster of could be the refused one), and names the likely
                                 // causes without claiming one.
                                 let listed = body.code == menzil_proto::ErrorCode::NotMember
                                     && config.identity.get().node_cert.decode().is_ok_and(

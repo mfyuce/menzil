@@ -11,6 +11,8 @@
 //! (protocol.md 4.3) need against it.
 
 use std::collections::{HashMap, HashSet};
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 
 use ed25519_dalek::VerifyingKey;
@@ -35,6 +37,10 @@ pub struct RosterStore {
     on_adopted: RwLock<Option<AdoptedHook>>,
     /// Says which network got a newer Roster (see [`Self::subscribe`]).
     changes: broadcast::Sender<NetworkId>,
+    /// How many standing lookups ([`Self::standing_of`], [`Self::min_serial_in`]) ran, so a test
+    /// can assert that a HELLO's work is bounded without timing anything.
+    #[cfg(test)]
+    lookups: AtomicUsize,
 }
 
 impl Default for RosterStore {
@@ -43,6 +49,8 @@ impl Default for RosterStore {
             by_network: RwLock::default(),
             on_adopted: RwLock::default(),
             changes: broadcast::channel(CHANGE_BACKLOG).0,
+            #[cfg(test)]
+            lookups: AtomicUsize::new(0),
         }
     }
 }
@@ -59,12 +67,72 @@ struct Held {
     body: RosterBody,
     base: Option<Roster>,
     view: HeldRoster,
-    /// How many of the leading `members` carry a `min_serial` that counts: all of an owner
-    /// signed Roster's, and for a steward signed one only those of its base. A steward appends
-    /// members and cannot be checked against their certificates here (the relay holds Rosters
-    /// only), so the `min_serial` it writes for them binds nothing, least of all across networks
-    /// (the sixth red-team round, M4).
-    counted: usize,
+    /// What the standing checks of a HELLO and of a running session read, built once when the
+    /// Roster is adopted so that judging one claimed network costs one hash lookup however many
+    /// members the Roster has (the first multi tenant red-team round, M1 and M2).
+    index: StandingIndex,
+}
+
+/// The per node facts of one held Roster, so the standing check never scans `members` or
+/// `revoked`. Built by [`Held::new`], the only way a [`Held`] is made.
+struct StandingIndex {
+    /// Every NodeId listed in `members` (whatever its position), with the highest `min_serial`
+    /// among its entries within the first `counted` members, or `None` when none of its entries
+    /// is among them. A NodeId listed more than once counts at its highest `min_serial`.
+    members: HashMap<NodeId, Option<u32>>,
+    /// Every NodeId in `revoked`.
+    revoked: HashSet<NodeId>,
+}
+
+impl StandingIndex {
+    /// `counted` is how many of the leading `members` carry a `min_serial` that counts: all of an
+    /// owner signed Roster's, and for a steward signed one only those of its base. A steward
+    /// appends members and cannot be checked against their certificates here (the relay holds
+    /// Rosters only), so the `min_serial` it writes for them binds nothing, least of all across
+    /// networks (the sixth red-team round, M4).
+    fn build(body: &RosterBody, counted: usize) -> Self {
+        let mut members: HashMap<NodeId, Option<u32>> = HashMap::with_capacity(body.members.len());
+        for (position, member) in body.members.iter().enumerate() {
+            let slot = members.entry(member.node_id).or_insert(None);
+            if position < counted {
+                *slot = Some(slot.map_or(member.min_serial, |seen| seen.max(member.min_serial)));
+            }
+        }
+        Self {
+            members,
+            revoked: body.revoked.iter().map(|r| r.node_id).collect(),
+        }
+    }
+}
+
+impl Held {
+    fn new(
+        signed: Roster,
+        body: RosterBody,
+        base: Option<Roster>,
+        view: HeldRoster,
+        counted: usize,
+    ) -> Self {
+        let index = StandingIndex::build(&body, counted);
+        Self {
+            signed,
+            body,
+            base,
+            view,
+            index,
+        }
+    }
+}
+
+/// What one held Roster says about one NodeId (see [`RosterStore::standing_of`]). A network the
+/// relay does not serve gives the [`Default`], which is the standing of a node a served Roster
+/// does not list at all, so callers cannot tell the two apart (isolation rule I2).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct NodeStanding {
+    /// The NodeId is in the Roster's `revoked`.
+    pub(crate) revoked: bool,
+    /// The NodeId is in the Roster's `members`.
+    pub(crate) listed: bool,
 }
 
 impl RosterStore {
@@ -117,15 +185,10 @@ impl RosterStore {
             return Ok(false);
         }
         let view = HeldRoster::new(roster, None).map_err(RelayError::DocumentRejected)?;
+        let counted = body.members.len();
         guard.insert(
             body.network_id,
-            Held {
-                signed: roster.clone(),
-                counted: body.members.len(),
-                body,
-                base: None,
-                view,
-            },
+            Held::new(roster.clone(), body, None, view, counted),
         );
         drop(guard);
         let _ = self.changes.send(network_id);
@@ -205,13 +268,7 @@ impl RosterStore {
         };
         guard.insert(
             network_id,
-            Held {
-                signed: roster.clone(),
-                body,
-                base: base.cloned(),
-                view,
-                counted,
-            },
+            Held::new(roster.clone(), body, base.cloned(), view, counted),
         );
         drop(guard);
         // Before the hook, which may be slow: whoever hears this reads the new Roster.
@@ -316,17 +373,35 @@ impl RosterStore {
         networks
             .iter()
             .filter_map(|network_id| {
-                let held = guard.get(network_id)?;
-                held.body
-                    .members
-                    .iter()
-                    .take(held.counted)
-                    .filter(|member| &member.node_id == node_id)
-                    .map(|member| member.min_serial)
-                    .max()
-                    .map(|min_serial| (*network_id, min_serial))
+                #[cfg(test)]
+                self.lookups.fetch_add(1, Ordering::Relaxed);
+                let min_serial = (*guard.get(network_id)?.index.members.get(node_id)?)?;
+                Some((*network_id, min_serial))
             })
             .max_by_key(|&(_, min_serial)| min_serial)
+    }
+
+    /// What the held Roster of `network_id` says about `node_id`: one hash lookup, whatever the
+    /// Roster's size, with nothing cloned. A network not held gives the standing of a node the
+    /// Roster does not list, the same value, so that the answer never depends on whether the
+    /// network is served (isolation rule I2).
+    pub(crate) fn standing_of(&self, node_id: &NodeId, network_id: &NetworkId) -> NodeStanding {
+        #[cfg(test)]
+        self.lookups.fetch_add(1, Ordering::Relaxed);
+        let guard = self.by_network.read().unwrap();
+        guard
+            .get(network_id)
+            .map(|held| NodeStanding {
+                revoked: held.index.revoked.contains(node_id),
+                listed: held.index.members.contains_key(node_id),
+            })
+            .unwrap_or_default()
+    }
+
+    /// How many standing lookups ran on this store so far (tests only).
+    #[cfg(test)]
+    pub(crate) fn lookup_count(&self) -> usize {
+        self.lookups.load(Ordering::Relaxed)
     }
 
     /// Every name granted to `node_id` in the Roster of any of
@@ -1109,6 +1184,208 @@ mod tests {
             store.min_serial_in(&node(1), &both),
             Some((a.network_id, 1))
         );
+    }
+
+    /// The scan the standing index replaced, kept as the reference: `(revoked, listed,
+    /// min_serial over the first `counted` members at the highest entry)`.
+    fn scan(body: &RosterBody, counted: usize, who: &NodeId) -> (bool, bool, Option<u32>) {
+        (
+            body.revoked.iter().any(|r| &r.node_id == who),
+            body.members.iter().any(|m| &m.node_id == who),
+            body.members
+                .iter()
+                .take(counted)
+                .filter(|m| &m.node_id == who)
+                .map(|m| m.min_serial)
+                .max(),
+        )
+    }
+
+    /// The index answers exactly what the scan answered, for every NodeId of a Roster built to
+    /// hit each case, and a network that is not held answers like a node that is not listed.
+    fn assert_index_matches_scan(
+        store: &RosterStore,
+        network_id: &NetworkId,
+        body: &RosterBody,
+        counted: usize,
+    ) {
+        for n in 0..12u8 {
+            let who = node(n);
+            let (revoked, listed, min_serial) = scan(body, counted, &who);
+            assert_eq!(
+                store.standing_of(&who, network_id),
+                NodeStanding { revoked, listed },
+                "standing of node {n}"
+            );
+            assert_eq!(
+                store.min_serial_in(&who, &[*network_id]),
+                min_serial.map(|m| (*network_id, m)),
+                "min_serial of node {n}"
+            );
+            assert_eq!(
+                store.standing_of(&who, &NetworkId::from([0xEE; 32])),
+                NodeStanding::default(),
+                "an unserved network answers like an unlisted node"
+            );
+        }
+    }
+
+    fn standing_body(network_id: NetworkId, seq: u64) -> RosterBody {
+        let member = |n: u8, min_serial: u32| RosterMember {
+            node_id: node(n),
+            min_serial,
+        };
+        RosterBody {
+            v: menzil_proto::PROTOCOL_VERSION,
+            network_id,
+            seq,
+            issued: 0,
+            expires: 1_000_000_000,
+            // 1: duplicate entries, highest in the middle; 2: single; 3: listed and revoked;
+            // 5: listed once at a high serial; 4, 6 and above: not listed (4 revoked only).
+            members: vec![
+                member(1, 3),
+                member(2, 1),
+                member(1, 7),
+                member(3, 2),
+                member(1, 5),
+                member(5, 9),
+            ],
+            revoked: vec![
+                menzil_proto::RevokedMember {
+                    node_id: node(3),
+                    since: 0,
+                },
+                menzil_proto::RevokedMember {
+                    node_id: node(4),
+                    since: 0,
+                },
+            ],
+            stewards: vec![],
+            labels: vec![],
+        }
+    }
+
+    #[test]
+    fn the_standing_index_answers_like_the_scan_it_replaced() {
+        let owner = SigningKey::generate(&mut rand::rng());
+        let network_id = NetworkId::from(owner.verifying_key().to_bytes());
+        let body = standing_body(network_id, 1);
+        let store = RosterStore::new();
+        store.set(&Roster::sign(&owner, &body).unwrap()).unwrap();
+        assert_index_matches_scan(&store, &network_id, &body, body.members.len());
+        // Spelled out, so that the reference itself cannot drift: duplicates count at their
+        // highest entry, listed and revoked is both, revoked only is not listed.
+        assert_eq!(
+            store.min_serial_in(&node(1), &[network_id]),
+            Some((network_id, 7))
+        );
+        assert_eq!(
+            store.standing_of(&node(3), &network_id),
+            NodeStanding {
+                revoked: true,
+                listed: true
+            }
+        );
+        assert_eq!(
+            store.standing_of(&node(4), &network_id),
+            NodeStanding {
+                revoked: true,
+                listed: false
+            }
+        );
+        assert_eq!(
+            store.standing_of(&node(9), &network_id),
+            NodeStanding::default()
+        );
+    }
+
+    #[test]
+    fn the_standing_index_of_a_steward_roster_counts_only_the_base_min_serials() {
+        let now = crate::tests_support::real_now();
+        let net = StewardNet::new(10, now, node(1));
+        let store = RosterStore::new();
+        store.adopt(&net.base, None, now).unwrap();
+        let mut body = net.base.decode().unwrap();
+        body.seq = 11;
+        body.issued = now;
+        body.expires = now + 7 * crate::tests_support::DAY;
+        // A steward appends new members at the highest serial; it does not bind, but they are
+        // listed.
+        for n in [8, 9] {
+            body.members.push(RosterMember {
+                node_id: node(n),
+                min_serial: u32::MAX,
+            });
+        }
+        let steward_roster = Roster::sign(&net.steward, &body).unwrap();
+        assert!(store.adopt(&steward_roster, Some(&net.base), now).unwrap());
+        let counted = net.base.decode().unwrap().members.len();
+        assert_index_matches_scan(&store, &net.network_id, &body, counted);
+        assert_eq!(
+            store.min_serial_in(&node(1), &[net.network_id]),
+            Some((net.network_id, 1))
+        );
+        assert_eq!(store.min_serial_in(&node(8), &[net.network_id]), None);
+        assert!(store.standing_of(&node(8), &net.network_id).listed);
+        assert!(store.standing_of(&node(9), &net.network_id).listed);
+    }
+
+    #[test]
+    fn adopting_a_newer_roster_replaces_the_standing_index() {
+        let now = crate::tests_support::real_now();
+        let net = StewardNet::new(10, now, node(1));
+        let store = RosterStore::new();
+        store.adopt(&net.base, None, now).unwrap();
+        assert!(store.standing_of(&node(1), &net.network_id).listed);
+        assert!(!store.standing_of(&node(2), &net.network_id).listed);
+
+        // node 1 goes, node 2 comes, node 4 is revoked, at a higher serial.
+        let mut body = net.base.decode().unwrap();
+        body.seq = 11;
+        body.members = vec![RosterMember {
+            node_id: node(2),
+            min_serial: 6,
+        }];
+        body.revoked = vec![menzil_proto::RevokedMember {
+            node_id: node(4),
+            since: 0,
+        }];
+        let next = Roster::sign(&net.owner, &body).unwrap();
+        assert!(store.adopt(&next, None, now).unwrap());
+        assert_eq!(
+            store.standing_of(&node(1), &net.network_id),
+            NodeStanding::default()
+        );
+        assert_eq!(store.min_serial_in(&node(1), &[net.network_id]), None);
+        assert!(store.standing_of(&node(2), &net.network_id).listed);
+        assert_eq!(
+            store.min_serial_in(&node(2), &[net.network_id]),
+            Some((net.network_id, 6))
+        );
+        assert!(store.standing_of(&node(4), &net.network_id).revoked);
+
+        // A refused (older) Roster leaves the index of the held one alone.
+        let mut stale = body.clone();
+        stale.seq = 5;
+        stale.members = vec![RosterMember {
+            node_id: node(1),
+            min_serial: 1,
+        }];
+        let stale = Roster::sign(&net.owner, &stale).unwrap();
+        assert!(!store.adopt(&stale, None, now).unwrap());
+        assert!(!store.standing_of(&node(1), &net.network_id).listed);
+
+        // And `set` builds it the same way.
+        let owner = SigningKey::generate(&mut rand::rng());
+        let network_id = NetworkId::from(owner.verifying_key().to_bytes());
+        let mut first = standing_body(network_id, 1);
+        store.set(&Roster::sign(&owner, &first).unwrap()).unwrap();
+        assert!(store.standing_of(&node(5), &network_id).listed);
+        first.seq = 2;
+        first.members.retain(|m| m.node_id != node(5));
+        store.set(&Roster::sign(&owner, &first).unwrap()).unwrap();
+        assert!(!store.standing_of(&node(5), &network_id).listed);
     }
 
     #[test]

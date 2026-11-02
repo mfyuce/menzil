@@ -56,8 +56,9 @@ pub struct RelayError {
     pub goaway: Option<String>,
     /// When it came, Unix seconds.
     pub at: u64,
-    /// For `not_member`: this node's own Roster of a network it claimed lists it (and does not
-    /// revoke it). A relay answers `not_member` both for a network it does not serve and for
+    /// For `not_member`: this node's own Rosters of every network it claimed list it (and do not
+    /// revoke it); the ERROR names no network, so one claimed network the node holds no Roster
+    /// of keeps this `false`. A relay answers `not_member` both for a network it does not serve and for
     /// one that does not list the node (isolation rule I2), so the relay cannot say which; the
     /// node can only say that its own documents disagree with the relay, which points at the
     /// relay (it does not serve the network, or holds an older Roster) or at a removal the
@@ -65,22 +66,27 @@ pub struct RelayError {
     pub listed_in_own_roster: bool,
 }
 
-/// Whether the node's own Rosters list `node_id` (and do not revoke it) in at least one of
-/// `networks`: the case where a `not_member` from the relay contradicts what the node holds.
+/// Whether the node's own Rosters list `node_id` (and do not revoke it) in EVERY one of
+/// `networks`, and there is at least one: the case where a `not_member` from the relay
+/// contradicts what the node holds. An ERROR names no network, so the refusal may be about any
+/// claimed one; a claimed network the node holds no Roster of (or that does not list it) could
+/// be the one refused, and then the node's documents do not disagree with the relay (the first
+/// multi tenant red-team round, N1).
 pub fn listed_in_own_roster(
     rosters: &RosterStore,
     networks: &[NetworkId],
     node_id: &NodeId,
 ) -> bool {
-    networks.iter().any(|network_id| {
-        rosters.body(network_id).is_some_and(|body| {
-            body.members.iter().any(|member| &member.node_id == node_id)
-                && !body
-                    .revoked
-                    .iter()
-                    .any(|revoked| &revoked.node_id == node_id)
+    !networks.is_empty()
+        && networks.iter().all(|network_id| {
+            rosters.body(network_id).is_some_and(|body| {
+                body.members.iter().any(|member| &member.node_id == node_id)
+                    && !body
+                        .revoked
+                        .iter()
+                        .any(|revoked| &revoked.node_id == node_id)
+            })
         })
-    })
 }
 
 #[derive(Debug)]
@@ -468,7 +474,9 @@ mod tests {
             .set(&roster_of(&owner, network, &[me, other], &[]))
             .unwrap();
         assert!(listed_in_own_roster(&store, &[network], &me));
-        assert!(listed_in_own_roster(&store, &[unheld, network], &me));
+        // N1: a claimed network the node holds no Roster of could be the one refused.
+        assert!(!listed_in_own_roster(&store, &[unheld, network], &me));
+        assert!(!listed_in_own_roster(&store, &[network, unheld], &me));
         assert!(!listed_in_own_roster(&store, &[unheld], &me));
         assert!(!listed_in_own_roster(&store, &[], &me));
         assert!(!listed_in_own_roster(
@@ -496,6 +504,38 @@ mod tests {
         // The plain entry point never claims it.
         notes.note_error(&error(ErrorCode::NotMember, "x"), 4);
         assert!(!notes.last_error().unwrap().listed_in_own_roster);
+    }
+
+    /// First multi tenant round, N1: the node claims A (held, lists it) and B (no Roster held)
+    /// and is refused over B: the flag must be false, so that the node does not tell its owner
+    /// the relay is wrong about a network the node has no document of. When every claimed
+    /// network is held and lists it, a `not_member` does contradict the node's documents.
+    #[test]
+    fn a_not_member_over_a_network_the_node_holds_no_roster_of_is_not_called_a_contradiction() {
+        let me = NodeId::from([1u8; 32]);
+        let other = NodeId::from([2u8; 32]);
+        let owner_a = ed25519_dalek::SigningKey::generate(&mut rand::rng());
+        let owner_c = ed25519_dalek::SigningKey::generate(&mut rand::rng());
+        let a = NetworkId::from(owner_a.verifying_key().to_bytes());
+        let b = NetworkId::from([8u8; 32]);
+        let c = NetworkId::from(owner_c.verifying_key().to_bytes());
+        let store = RosterStore::new();
+        store.set(&roster_of(&owner_a, a, &[me], &[])).unwrap();
+        // C is held but does not list the node.
+        store.set(&roster_of(&owner_c, c, &[other], &[])).unwrap();
+
+        let claims = [a, b];
+        let listed = listed_in_own_roster(&store, &claims, &me);
+        assert!(!listed);
+        let notes = RelayNotes::new();
+        notes.begin_attachment();
+        notes.note_error_listed(&error(ErrorCode::NotMember, "x"), 1, listed);
+        assert!(!notes.last_error().unwrap().listed_in_own_roster);
+
+        // Held but not listing counts the same as not held.
+        assert!(!listed_in_own_roster(&store, &[a, c], &me));
+        // Every claimed network held and listing the node: the contradiction is real.
+        assert!(listed_in_own_roster(&store, &[a], &me));
     }
 
     /// Round 13 L1: the cut is by bytes, on a character boundary, never inside a character.

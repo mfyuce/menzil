@@ -43,7 +43,7 @@
 //! specially detected as such yet, just as unhandled as the rest) is
 //! decrypted, logged, and otherwise ignored.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use menzil_proto::{
@@ -60,7 +60,7 @@ use crate::connection::InboundConnection;
 use crate::doc::{self, AcceptOutcome, PendingBases};
 use crate::error::RelayError;
 use crate::forward::{ForwardItem, ForwardOutcome};
-use crate::hello::{HelloRejection, check_hello, roster_standing};
+use crate::hello::{HelloRejection, check_hello, dedup_networks, roster_standing};
 use crate::relay::Relay;
 
 /// The exact byte length of a Noise `Xx` pattern's message 1: just the
@@ -165,7 +165,7 @@ async fn run_handshake_and_validate(
         _ => None,
     };
     let proven_rosters = match (&early, relay_handshake.hello()) {
-        (Some(Ok(_)), Some(hello)) => relay.rosters.seqs_for(&hello.networks),
+        (Some(Ok(_)), Some(hello)) => relay.rosters.seqs_for(&dedup_networks(&hello.networks)),
         _ => HashMap::new(),
     };
     let welcome = build_welcome(relay, session_id, proven_rosters);
@@ -751,18 +751,6 @@ async fn run_attached_loop(
     }
 }
 
-/// Deduplicates HELLO's `networks` before it becomes this session's
-/// `claimed_networks`. `check_hello` validates each claim independently
-/// and never rejects a repeated one, but every entry here later drives
-/// its own catch-up lookup and, if triggered, its own full DOC resend
-/// (`crate::doc::catch_up_targets`); without this, one real NetworkId
-/// repeated many times in a single HELLO would get that network's whole
-/// Roster pushed once per repetition instead of once.
-fn dedup_networks(networks: Vec<NetworkId>) -> Vec<NetworkId> {
-    let mut seen = HashSet::with_capacity(networks.len());
-    networks.into_iter().filter(|id| seen.insert(*id)).collect()
-}
-
 /// The whole life of one accepted connection: handshake, HELLO
 /// validation, then the attached loop. Never propagates an error or
 /// panics — [`Relay::serve`] fires this off with `tokio::spawn` and has
@@ -785,7 +773,7 @@ pub(crate) async fn handle_connection(conn: InboundConnection, relay: Relay, ses
                 cert.serial,
                 session_id,
                 &relay,
-                dedup_networks(hello.networks),
+                dedup_networks(&hello.networks),
                 hello.roster_seq,
             )
             .await;

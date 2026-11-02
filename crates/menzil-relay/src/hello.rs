@@ -22,11 +22,32 @@
 //! message to report on failure. No I/O beyond what `RosterStore`/
 //! `NodeHistory` already do internally (a brief, non-blocking lock).
 
+use std::collections::HashSet;
+
 use ed25519_dalek::VerifyingKey;
 use menzil_proto::{ErrorCode, HelloBody, NetworkId, NodeCertBody, NodeId, X25519PublicKey};
 
 use crate::node_history::{HistoryViolation, NodeHistory};
 use crate::roster_store::RosterStore;
+
+/// The most distinct networks one HELLO may claim. A HELLO is read before the sender has proven
+/// anything, so what it makes the relay do must be bounded by something other than the size of
+/// the message (a Noise message 1 of 65,535 bytes holds about 1,800 NetworkIds). The owner design
+/// (D7) gives a friend 3 networks; 32 leaves room for an operator's own. The repeats of one
+/// NetworkId are dropped first and do not count; a HELLO with more distinct ones is refused with
+/// `too_large` and no `network` before the RosterStore is touched, an answer that does not
+/// depend on which networks the relay serves. protocol.md 4.1 states no limit of its own.
+pub const MAX_HELLO_NETWORKS: usize = 32;
+
+/// `networks` without its repeats, in the order of first appearance.
+pub(crate) fn dedup_networks(networks: &[NetworkId]) -> Vec<NetworkId> {
+    let mut seen = HashSet::with_capacity(networks.len());
+    networks
+        .iter()
+        .copied()
+        .filter(|id| seen.insert(*id))
+        .collect()
+}
 
 /// One HELLO check failed: the code and message a relay sends back in
 /// an ERROR record (protocol.md 4.2).
@@ -133,26 +154,18 @@ pub(crate) fn roster_standing(
         // likely cause itself from its own Roster. Nothing before this point in the check
         // order depends on whether the network is served: `min_serial_in` looks only at
         // Rosters that list this very node, so a stranger's key never reaches a different
-        // answer through it.
-        let standing = rosters.get(network_id);
-        if standing.as_ref().is_some_and(|roster| {
-            roster
-                .revoked
-                .iter()
-                .any(|revoked| &revoked.node_id == node_id)
-        }) {
+        // answer through it. `standing_of` is one hash lookup that clones nothing and answers
+        // an unserved network with the standing of an unlisted node, so the work does not tell
+        // them apart either (the first multi tenant red-team round, M1 and M2).
+        let standing = rosters.standing_of(node_id, network_id);
+        if standing.revoked {
             return Err(reject_in(
                 ErrorCode::Revoked,
                 format!("node is revoked from network {network_id}"),
                 *network_id,
             ));
         }
-        if !standing.as_ref().is_some_and(|roster| {
-            roster
-                .members
-                .iter()
-                .any(|member| &member.node_id == node_id)
-        }) {
+        if !standing.listed {
             return Err(reject_in(
                 ErrorCode::NotMember,
                 format!("node is not a member of network {network_id}"),
@@ -185,7 +198,16 @@ fn validate_against_rosters(
     rosters: &RosterStore,
     history: &NodeHistory,
 ) -> Result<(), HelloRejection> {
-    roster_standing(&node_id, cert_serial, &hello.networks, rosters)?;
+    // Repeats dropped and the count capped before the first look at the store: the work below
+    // is then at most MAX_HELLO_NETWORKS lookups however the HELLO was padded.
+    let claimed = dedup_networks(&hello.networks);
+    if claimed.len() > MAX_HELLO_NETWORKS {
+        return Err(reject(
+            ErrorCode::TooLarge,
+            format!("a HELLO may claim at most {MAX_HELLO_NETWORKS} networks"),
+        ));
+    }
+    roster_standing(&node_id, cert_serial, &claimed, rosters)?;
 
     history
         .check_and_record(node_id, cert_serial, hello.timestamp)
@@ -554,5 +576,109 @@ mod tests {
         let err =
             check_hello(&replay, &fixture.x25519_static, &rosters, &history, 500).unwrap_err();
         assert_eq!(err.code, ErrorCode::StaleTimestamp);
+    }
+    /// A relay holding one Roster per owner key that lists `member`; returns the store and the
+    /// networks in order.
+    fn rosters_listing(member: NodeId, count: usize) -> (RosterStore, Vec<NetworkId>) {
+        let rosters = RosterStore::new();
+        let networks = (0..count)
+            .map(|_| {
+                let owner = SigningKey::generate(&mut rand::rng());
+                let network_id = NetworkId::from(owner.verifying_key().to_bytes());
+                rosters
+                    .set(&roster_for(&owner, network_id, member, false))
+                    .unwrap();
+                network_id
+            })
+            .collect();
+        (rosters, networks)
+    }
+
+    fn unserved_networks(count: usize) -> Vec<NetworkId> {
+        (0..count)
+            .map(|i| NetworkId::from([(i as u8).wrapping_add(1); 32]))
+            .collect()
+    }
+
+    /// First multi tenant round, M1 and M2: a HELLO that repeats one NetworkId a couple of
+    /// thousand times costs the same few lookups as one that names it once, for a served and
+    /// for an unserved network alike.
+    #[test]
+    fn a_hello_repeating_one_network_is_judged_in_bounded_work() {
+        let fixture = fixture();
+        let history = NodeHistory::new();
+        let (rosters, networks) = rosters_listing(fixture.node_id, 1);
+        let unserved = unserved_networks(1)[0];
+
+        let hello = hello_with(&fixture, vec![networks[0]; 2000], 1, 10);
+        assert!(check_hello(&hello, &fixture.x25519_static, &rosters, &history, 500).is_ok());
+        let served_work = rosters.lookup_count();
+        assert!(served_work <= 2, "{served_work} lookups for one network");
+
+        let hello = hello_with(&fixture, vec![unserved; 2000], 1, 11);
+        let before = rosters.lookup_count();
+        let err = check_hello(&hello, &fixture.x25519_static, &rosters, &history, 500).unwrap_err();
+        assert_eq!(err.code, ErrorCode::NotMember);
+        assert_eq!(err.network, Some(unserved));
+        let unserved_work = rosters.lookup_count() - before;
+        assert_eq!(
+            unserved_work, served_work,
+            "an unserved network costs what a served one does"
+        );
+    }
+
+    #[test]
+    fn dropping_repeats_keeps_a_legitimate_multi_network_claim_working() {
+        let fixture = fixture();
+        let history = NodeHistory::new();
+        let (rosters, networks) = rosters_listing(fixture.node_id, 3);
+        let (a, b, c) = (networks[0], networks[1], networks[2]);
+        let hello = hello_with(&fixture, vec![a, b, a, c, b, c, a], 1, 10);
+        assert_eq!(
+            check_hello(&hello, &fixture.x25519_static, &rosters, &history, 500).unwrap(),
+            fixture.node_id
+        );
+        assert_eq!(dedup_networks(&[a, b, a, c, b, c, a]), vec![a, b, c]);
+
+        // A refusal still names the first claimed network that fails, in order of first
+        // appearance, not the repeat.
+        let stranger = unserved_networks(2);
+        let hello = hello_with(&fixture, vec![a, stranger[0], a, stranger[1]], 1, 11);
+        let err = check_hello(&hello, &fixture.x25519_static, &rosters, &history, 500).unwrap_err();
+        assert_eq!(err.code, ErrorCode::NotMember);
+        assert_eq!(err.network, Some(stranger[0]));
+    }
+
+    #[test]
+    fn more_than_the_cap_of_distinct_networks_is_refused_before_the_store_is_touched() {
+        let fixture = fixture();
+        let history = NodeHistory::new();
+        let (rosters, networks) = rosters_listing(fixture.node_id, MAX_HELLO_NETWORKS + 1);
+
+        // Exactly the cap passes, repeats beside it notwithstanding.
+        let mut at_cap = networks[..MAX_HELLO_NETWORKS].to_vec();
+        at_cap.extend_from_slice(&networks[..5]);
+        let hello = hello_with(&fixture, at_cap, 1, 10);
+        assert!(check_hello(&hello, &fixture.x25519_static, &rosters, &history, 500).is_ok());
+
+        let before = rosters.lookup_count();
+        let hello = hello_with(&fixture, networks.clone(), 1, 11);
+        let served =
+            check_hello(&hello, &fixture.x25519_static, &rosters, &history, 500).unwrap_err();
+        assert_eq!(
+            rosters.lookup_count(),
+            before,
+            "no lookup for an over cap HELLO"
+        );
+        assert_eq!(served.code, ErrorCode::TooLarge);
+        assert_eq!(served.network, None);
+
+        // The same number of networks the relay does not serve is refused identically, so the
+        // refusal says nothing about what is served.
+        let hello = hello_with(&fixture, unserved_networks(MAX_HELLO_NETWORKS + 1), 1, 12);
+        let unserved =
+            check_hello(&hello, &fixture.x25519_static, &rosters, &history, 500).unwrap_err();
+        assert_eq!(unserved, served);
+        assert_eq!(rosters.lookup_count(), before);
     }
 }

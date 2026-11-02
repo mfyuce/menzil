@@ -304,7 +304,7 @@ async fn attach_registers_the_session() {
 
     assert_eq!(
         relay.registry.attached_session_id(&client_identity.node_id),
-        Some(1)
+        Some(welcome.session)
     );
 }
 
@@ -417,7 +417,7 @@ async fn a_member_of_a_held_roster_attaches_successfully() {
     let serve_relay = relay.clone();
     tokio::spawn(async move { serve_relay.serve(&listener).await });
 
-    let (mut client, _) = TestClient::connect(
+    let (mut client, welcome) = TestClient::connect(
         addr,
         cert,
         &client_identity,
@@ -439,7 +439,7 @@ async fn a_member_of_a_held_roster_attaches_successfully() {
     ping_pong(&mut client, [3; 8]).await;
     assert_eq!(
         relay.registry.attached_session_id(&client_identity.node_id),
-        Some(1)
+        Some(welcome.session)
     );
 }
 
@@ -2808,4 +2808,127 @@ async fn a_doc_for_an_unserved_unclaimed_or_forged_roster_gets_no_record_back() 
     }
     ping_pong(&mut client, [5; 8]).await;
     assert_eq!(three.relay.rosters().seqs().get(&claimed), Some(&7));
+}
+
+/// First multi tenant round, L1: what a stranger reads as WELCOME `session` does not move with
+/// the connections other people open in between (bare TCP connects count too).
+#[tokio::test]
+async fn welcome_session_numbers_do_not_count_other_connections() {
+    let (relay, listener, cert, relay_x25519) = bind_test_relay().await;
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { relay.serve(&listener).await });
+
+    let mut seen: Vec<(u32, u32)> = Vec::new();
+    let mut parked = Vec::new();
+    for round in 0..50u32 {
+        // 0 to 4 other connections before each stranger.
+        let others = round % 5;
+        for _ in 0..others {
+            parked.push(tokio::net::TcpStream::connect(addr).await.unwrap());
+        }
+        let stranger = generate_identity();
+        let (_client, welcome) = TestClient::connect(
+            addr,
+            cert.clone(),
+            &stranger,
+            relay_x25519,
+            vec![],
+            HashMap::new(),
+            1,
+            10,
+        )
+        .await;
+        seen.push((welcome.session, others));
+    }
+    for pair in seen.windows(2) {
+        let step = pair[1].0.wrapping_sub(pair[0].0);
+        assert_ne!(
+            step,
+            pair[1].1 + 1,
+            "the step between two strangers must not equal the connections between them: {seen:?}"
+        );
+    }
+    assert!(
+        seen.windows(2).any(|pair| pair[1].0 < pair[0].0),
+        "the numbers must not rise with the connections: {seen:?}"
+    );
+    let distinct: std::collections::HashSet<_> = seen.iter().map(|(id, _)| id).collect();
+    assert_eq!(distinct.len(), seen.len());
+}
+
+/// First multi tenant round, M1 and M2: a HELLO naming more distinct networks than
+/// MAX_HELLO_NETWORKS is refused with the same ERROR whether or not the relay serves any of
+/// them, and a HELLO repeating one network 1800 times (about the most message 1 can hold) gets the ordinary `not_member`.
+#[tokio::test]
+async fn a_hello_over_the_network_cap_is_refused_alike_for_served_and_unserved_networks() {
+    let who = generate_identity();
+    let owner = SigningKey::generate(&mut rand::rng());
+    let served = NetworkId::from(owner.verifying_key().to_bytes());
+    let other_member = NodeId::from([0x77; 32]);
+    let over_cap = |first: NetworkId| -> Vec<NetworkId> {
+        std::iter::once(first)
+            .chain((1..=crate::hello::MAX_HELLO_NETWORKS as u8).map(|i| NetworkId::from([i; 32])))
+            .collect()
+    };
+
+    let mut errors = Vec::new();
+    for serving in [true, false] {
+        let (relay, listener, cert, relay_x25519) = bind_test_relay().await;
+        let addr = listener.local_addr().unwrap();
+        if serving {
+            relay
+                .rosters()
+                .set(&evict_roster(&owner, served, 1, &[(other_member, 1)], &[]))
+                .unwrap();
+        }
+        let rosters = relay.rosters().lookup_count();
+        let relay_for_count = relay.clone();
+        tokio::spawn(async move { relay.serve(&listener).await });
+        let (mut client, welcome) = TestClient::connect(
+            addr,
+            cert,
+            &who,
+            relay_x25519,
+            over_cap(served),
+            HashMap::new(),
+            1,
+            10,
+        )
+        .await;
+        assert!(welcome.rosters.is_empty());
+        let error = match client.recv().await {
+            Some(record @ Record::Error(_)) => record,
+            other => panic!("expected ERROR, got {other:?}"),
+        };
+        assert_eq!(relay_for_count.rosters().lookup_count(), rosters);
+        match &error {
+            Record::Error(body) => assert_eq!(body.code, ErrorCode::TooLarge),
+            _ => unreachable!(),
+        }
+        errors.push(error.encode());
+    }
+    assert_eq!(
+        errors[0], errors[1],
+        "the refusal must not tell what is served"
+    );
+
+    // The same repeat, 1800 times: the ordinary answer of a one network claim.
+    let (relay, listener, cert, relay_x25519) = bind_test_relay().await;
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { relay.serve(&listener).await });
+    let (mut client, _welcome) = TestClient::connect(
+        addr,
+        cert,
+        &who,
+        relay_x25519,
+        vec![served; 1800],
+        HashMap::new(),
+        1,
+        10,
+    )
+    .await;
+    match client.recv().await {
+        Some(Record::Error(body)) => assert_eq!(body.code, ErrorCode::NotMember),
+        other => panic!("expected ERROR, got {other:?}"),
+    }
 }

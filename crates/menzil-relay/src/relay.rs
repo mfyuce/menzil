@@ -5,6 +5,7 @@
 //! [`Listener::accept_tcp`] in a loop, spawning one task per connection
 //! that runs the handshake under a timeout and an in-flight limit.
 
+use std::hash::{BuildHasher, RandomState};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
@@ -22,6 +23,46 @@ use crate::registry::SessionRegistry;
 use crate::roster_store::RosterStore;
 use crate::session;
 
+/// The session numbers a relay hands out: WELCOME's `session` and the key of the registry's
+/// supersede and teardown rules (equality is all they use).
+///
+/// The number a stranger reads in WELCOME must not be a relay wide connection counter, which
+/// would show it how many connections every tenant opened in between (the first multi tenant
+/// red-team round, L1). The relay counts internally, one step per accepted socket, and sends
+/// that count through a keyed permutation of the 32 bit space: a four round Feistel network over
+/// two 16 bit halves whose round function is SipHash keyed from the process's random state (a
+/// pseudo random permutation by Luby and Rackoff). A permutation never repeats a value, so two
+/// live sessions cannot share a number (before 2^32 connections, as with the plain counter), and
+/// no collision handling or table of live ids is needed. The key is drawn at start and never
+/// leaves the process; logs and the registry carry the sent number, the counter is not kept.
+struct SessionIds {
+    counter: AtomicU32,
+    keys: RandomState,
+}
+
+impl SessionIds {
+    fn new() -> Self {
+        Self {
+            counter: AtomicU32::new(1),
+            keys: RandomState::new(),
+        }
+    }
+
+    /// The number for the next accepted socket.
+    fn next(&self) -> u32 {
+        self.permute(self.counter.fetch_add(1, Ordering::Relaxed))
+    }
+
+    fn permute(&self, value: u32) -> u32 {
+        let (mut left, mut right) = ((value >> 16) as u16, value as u16);
+        for round in 0u8..4 {
+            let mixed = self.keys.hash_one((round, right)) as u16;
+            (left, right) = (right, left ^ mixed);
+        }
+        (u32::from(left) << 16) | u32::from(right)
+    }
+}
+
 /// A relay's shared runtime state: cheap to clone (every field is an
 /// `Arc`, or `Copy`), so each accepted connection's spawned task gets
 /// its own handle without contending on anything but the state itself.
@@ -34,7 +75,7 @@ pub struct Relay {
     pub(crate) labels: Arc<LabelRegistry>,
     pub(crate) forwarding: Arc<ForwardTable>,
     pub(crate) limits: Limits,
-    next_session_id: Arc<AtomicU32>,
+    next_session_id: Arc<SessionIds>,
 }
 
 impl Relay {
@@ -87,7 +128,7 @@ impl Relay {
             labels: Arc::new(LabelRegistry::new()),
             forwarding: Arc::new(ForwardTable::new()),
             limits,
-            next_session_id: Arc::new(AtomicU32::new(1)),
+            next_session_id: Arc::new(SessionIds::new()),
         }
     }
 
@@ -139,7 +180,7 @@ impl Relay {
                 );
                 continue;
             };
-            let session_id = self.next_session_id.fetch_add(1, Ordering::Relaxed);
+            let session_id = self.next_session_id.next();
             let relay = self.clone();
             let upgrader = Arc::clone(&upgrader);
             let timeout = config.handshake_timeout;
@@ -190,5 +231,41 @@ impl Default for AcceptConfig {
             handshake_timeout: HANDSHAKE_TIMEOUT,
             max_inflight_handshakes: MAX_INFLIGHT_HANDSHAKES,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// First multi tenant round, L1: the numbers sent out are distinct, are not the plain
+    /// counter, never step by one, and do not rise with the connections.
+    #[test]
+    fn session_numbers_do_not_reveal_how_many_connections_came_between() {
+        let ids = SessionIds::new();
+        let drawn: Vec<u32> = (0..50).map(|_| ids.next()).collect();
+        let distinct: std::collections::HashSet<_> = drawn.iter().collect();
+        assert_eq!(distinct.len(), drawn.len(), "a number is never reused");
+        assert!(
+            drawn.windows(2).all(|w| w[1] != w[0].wrapping_add(1)),
+            "consecutive connections must not get consecutive numbers: {drawn:?}"
+        );
+        assert!(
+            drawn.windows(2).any(|w| w[1] < w[0]),
+            "the numbers must not rise with the connection count: {drawn:?}"
+        );
+        assert_ne!(drawn[0], 1, "the first number is not the bare counter");
+    }
+
+    #[test]
+    fn the_session_number_mapping_is_a_permutation_keyed_per_process() {
+        let a = SessionIds::new();
+        let b = SessionIds::new();
+        // Distinct inputs, distinct outputs (a sample; the Feistel shape guarantees it).
+        let outputs: std::collections::HashSet<u32> =
+            (0..20_000u32).map(|n| a.permute(n)).collect();
+        assert_eq!(outputs.len(), 20_000);
+        // Another key gives another mapping.
+        assert!((0..16u32).any(|n| a.permute(n) != b.permute(n)));
     }
 }
