@@ -43,9 +43,9 @@ struct Entry {
 struct State {
     seen: HashMap<NodeId, Entry>,
     clock: u64,
-    /// While the table is at or past its bound only because of vouched-for entries, the size at
-    /// which the next sweep is worth running (so a table full of members is not swept on every
-    /// insert). Zero when the table is under its bound.
+    /// While a sweep could not bring the table down to its target because of vouched-for
+    /// entries, the size at which the next sweep is worth running (so a table full of members is
+    /// not swept on every insert). Zero when the last sweep reached its target.
     sweep_at: usize,
 }
 
@@ -166,7 +166,11 @@ impl NodeHistory {
         for (_, id) in evictable.into_iter().take(excess) {
             state.seen.remove(&id);
         }
-        state.sweep_at = if state.seen.len() >= capacity {
+        // A sweep that did not reach its target (the rest is vouched for) waits for the table to
+        // grow by an eighth of the bound before the next one, wherever the table stands: just
+        // below the bound as much as at or above it (round T3, L1), or every fresh insert would
+        // scan the whole table under the write lock.
+        state.sweep_at = if state.seen.len() > target {
             state.seen.len() + capacity / 8
         } else {
             0
@@ -368,5 +372,44 @@ mod tests {
         // A sweep on every one of the 100 inserts would make about 11,400 retain calls (the sum
         // of the table sizes); one per 8 entries of growth makes about a tenth of that.
         assert!(swept.get() < 3_000, "{} retain calls", swept.get());
+    }
+
+    /// Round T3, L1: vouched entries just below the bound used to make every fresh insert a full
+    /// sweep (`sweep_at` was reset to zero whenever the sweep left the table under the bound).
+    #[test]
+    fn vouched_entries_just_below_the_bound_do_not_make_every_insert_a_sweep() {
+        let cap = 128usize;
+        let history = NodeHistory::with_capacity(cap);
+        let vouched: std::collections::HashSet<NodeId> = (0..cap as u32 - 1).map(key).collect();
+        for id in &vouched {
+            history
+                .check_and_record_retaining(*id, 1, ts(10), |_| true)
+                .unwrap();
+        }
+        let calls = std::cell::Cell::new(0u64);
+        let counting = |id: &NodeId| {
+            calls.set(calls.get() + 1);
+            vouched.contains(id)
+        };
+        for n in 0..400u32 {
+            history
+                .check_and_record_retaining(key(5_000_000 + n), 1, ts(10), counting)
+                .unwrap();
+            assert!(history.len() <= cap + cap / 8, "len {}", history.len());
+        }
+        // A sweep on every insert is about 400 * 128 = 51,000 calls; one per eighth of the
+        // bound of growth is about 400 / 16 * 143 = 3,600.
+        assert!(
+            calls.get() < 10_000,
+            "{} retain calls for 400 inserts",
+            calls.get()
+        );
+        for id in &vouched {
+            assert_eq!(
+                history.check_and_record_retaining(*id, 0, ts(11), |_| true),
+                Err(HistoryViolation::StaleSerial),
+                "a vouched entry was evicted"
+            );
+        }
     }
 }

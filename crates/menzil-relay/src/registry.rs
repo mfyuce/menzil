@@ -30,6 +30,7 @@ use std::sync::RwLock;
 use menzil_proto::{NetworkId, NodeId, Record};
 use tokio::sync::{mpsc, oneshot};
 
+use crate::admission::AttachedSlot;
 use crate::forward::ForwardItem;
 
 /// How many records [`SessionRegistry::send_to`] will queue for one
@@ -53,6 +54,12 @@ struct Registration {
     /// `crate::forward`), deliberately separate from `outbound` above —
     /// see this module's own doc comment.
     forward: mpsc::UnboundedSender<ForwardItem>,
+    /// This attachment's place in the relay wide count of attached sessions
+    /// (`crate::admission`). It lives and dies with the registration, so the count is the number
+    /// of registrations whatever the old sessions are still doing: a session that is superseded
+    /// gives its place up at once (the new registration replaces it), however long it takes to
+    /// notice and leave (round T3, M3).
+    _slot: Option<AttachedSlot>,
 }
 
 /// A snapshot of one attached session: see [`SessionRegistry::attachment_of`].
@@ -98,6 +105,7 @@ impl SessionRegistry {
     /// bookkeeping) with no reason to ever be nameable outside this
     /// crate — nothing external can reach a `SessionRegistry` to call
     /// this anyway, since `Relay::registry` is itself crate-visible only.
+    #[cfg(test)]
     pub(crate) fn attach(
         &self,
         node_id: NodeId,
@@ -108,11 +116,28 @@ impl SessionRegistry {
         mpsc::Receiver<Record>,
         mpsc::UnboundedReceiver<ForwardItem>,
     ) {
+        self.attach_counted(node_id, session_id, claimed_networks, None)
+    }
+
+    /// [`Self::attach`] that also hands the registration the session's place in the attached
+    /// count: the registry gives it back when the registration is replaced or removed, not when
+    /// the session task happens to finish.
+    pub(crate) fn attach_counted(
+        &self,
+        node_id: NodeId,
+        session_id: u32,
+        claimed_networks: Vec<NetworkId>,
+        slot: Option<AttachedSlot>,
+    ) -> (
+        oneshot::Receiver<()>,
+        mpsc::Receiver<Record>,
+        mpsc::UnboundedReceiver<ForwardItem>,
+    ) {
         let (supersede_tx, supersede_rx) = oneshot::channel();
         let (outbound_tx, outbound_rx) = mpsc::channel(OUTBOUND_CAPACITY);
         let (forward_tx, forward_rx) = mpsc::unbounded_channel();
         let mut guard = self.by_node.write().unwrap();
-        if let Some(previous) = guard.insert(
+        let previous = guard.insert(
             node_id,
             Registration {
                 session_id,
@@ -120,8 +145,13 @@ impl SessionRegistry {
                 supersede: supersede_tx,
                 outbound: outbound_tx,
                 forward: forward_tx,
+                _slot: slot,
             },
-        ) {
+        );
+        drop(guard);
+        // Dropping the old registration (after the registry lock is released: the count has a
+        // lock of its own) gives its place in the attached count back.
+        if let Some(previous) = previous {
             let _ = previous.supersede.send(());
         }
         (supersede_rx, outbound_rx, forward_rx)
@@ -162,8 +192,11 @@ impl SessionRegistry {
             .get(node_id)
             .is_some_and(|registration| registration.session_id == session_id)
         {
-            guard.remove(node_id);
+            let removed = guard.remove(node_id);
             on_detached();
+            drop(guard);
+            // Gives the registration's place in the attached count back.
+            drop(removed);
             true
         } else {
             false

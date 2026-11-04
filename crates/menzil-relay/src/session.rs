@@ -355,16 +355,20 @@ async fn dispatch(
                 &mut budget.docs,
                 relay.log.about(node_id),
             );
-            // A transfer the relay could not use (stale, invalid, for a network the session did
-            // not claim, over the rate) is counted; a session that keeps sending them is ended
-            // (MT5, threat A13), however it is answered, or not, one by one.
-            let unadopted = matches!(
-                outcome,
-                AcceptOutcome::Stale(_)
-                    | AcceptOutcome::Invalid
-                    | AcceptOutcome::Dropped(_)
-                    | AcceptOutcome::OverRate
-            );
+            // A transfer the relay could not use (invalid, forged, for a network the session did
+            // not claim or the relay does not serve, over the rate and not a claimed network's)
+            // is counted, and a session that keeps sending them is ended (MT5, threat A13),
+            // however it is answered, or not, one by one. A stale one is not counted: the node
+            // claimed the network and held an old copy, which is no misbehaviour (round T3, M1;
+            // TBD 44). A genuine Roster of a claimed network over the rate is the honest node's
+            // excess; it counts only towards a larger figure that bounds the decoding it costs.
+            let ends_session = match &outcome {
+                AcceptOutcome::Invalid | AcceptOutcome::Dropped(_) | AcceptOutcome::OverRate => {
+                    budget.note_unadopted()
+                }
+                AcceptOutcome::OverRateClaimed(_) => budget.note_over_rate(),
+                _ => false,
+            };
             match outcome {
                 AcceptOutcome::NewRoster(network_id) => {
                     if let Some(records) = doc::roster_doc_records(&relay.rosters, &network_id) {
@@ -385,10 +389,11 @@ async fn dispatch(
                 | AcceptOutcome::IgnoredDocType(_)
                 | AcceptOutcome::Stale(_)
                 | AcceptOutcome::OverRate
+                | AcceptOutcome::OverRateClaimed(_)
                 | AcceptOutcome::Dropped(_)
                 | AcceptOutcome::Invalid => {}
             }
-            if unadopted && budget.note_unadopted() {
+            if ends_session {
                 if let Some(held_back) = relay.log.admit_node("doc_session_ended", node_id) {
                     tracing::warn!(
                         session_id,
@@ -663,16 +668,24 @@ async fn run_attached_loop(
     // Bases sent ahead of a steward signed Roster; they live and die with this session.
     let mut pending_bases = PendingBases::new();
     // What this session may still send: ADVERTISE and DOC allowances (`crate::rate`).
-    let mut budget = SessionBudget::new(&relay.rates);
+    let mut budget = SessionBudget::new(&relay.rates, claimed_networks.len());
 
     // Phase 1: not yet routable, waiting for ATTACH as the node's first
     // transport record. Liveness and REKEY are already driven here too,
     // but a node that keeps answering PING must not hold this window open
     // for ever: ATTACH has a hard deadline (MT4, threat A9), whatever else
     // arrives meanwhile.
-    let attach_deadline = tokio::time::sleep(ATTACH_DEADLINE);
+    let attach_at = tokio::time::Instant::now() + relay.timeouts.attach;
+    let attach_deadline = tokio::time::sleep_until(attach_at);
     tokio::pin!(attach_deadline);
+    // A peer that never reads must not be able to park this task in a write past the deadline
+    // (round T3, M2): every send is bounded by it until ATTACH.
+    conn.limit_sends_until(Some(attach_at));
     loop {
+        if conn.is_broken() {
+            tracing::debug!(session_id, node_id = %node_id, "relay session closed, a send timed out");
+            return;
+        }
         tokio::select! {
             () = &mut attach_deadline => {
                 tracing::debug!(session_id, node_id = %node_id, "relay session did not ATTACH in time, closing");
@@ -703,9 +716,11 @@ async fn run_attached_loop(
         }
     }
 
+    conn.limit_sends_until(None);
     // Attached sessions are capped in all. A NodeId that is attached already replaces its old
-    // session and is let in (the old one is told to leave right below).
-    let Some(_attached_slot) = relay
+    // session and is let in (the old one is told to leave right below); the registry takes the
+    // place over, so the count is the number of registrations, not of session tasks.
+    let Some(attached_slot) = relay
         .admission
         .admit_attached(relay.registry.attachment_of(&node_id).is_some())
     else {
@@ -724,10 +739,12 @@ async fn run_attached_loop(
     drop(ip_slot);
 
     tracing::info!(session_id, node_id = %node_id, "relay session attached");
-    let (mut supersede_rx, mut outbound_rx, mut forward_rx) =
-        relay
-            .registry
-            .attach(node_id, session_id, claimed_networks.clone());
+    let (mut supersede_rx, mut outbound_rx, mut forward_rx) = relay.registry.attach_counted(
+        node_id,
+        session_id,
+        claimed_networks.clone(),
+        Some(attached_slot),
+    );
     // A freshly attached session starts with no inherited label claims
     // — see `crate::advertise::LabelRegistry::clear_for`'s doc comment
     // for why this runs here, before this session gets a chance to send
@@ -752,6 +769,10 @@ async fn run_attached_loop(
     // Phase 2: attached and routable; stay alive until idle, closed, or
     // superseded.
     loop {
+        if conn.is_broken() {
+            tracing::debug!(session_id, node_id = %node_id, "relay session closed, a send timed out");
+            break;
+        }
         tokio::select! {
             incoming = conn.recv() => {
                 let outcome = dispatch(
@@ -875,11 +896,12 @@ async fn run_attached_loop(
 /// panics — [`Relay::serve`] fires this off with `tokio::spawn` and has
 /// no result to collect.
 pub(crate) async fn handle_connection(
-    conn: InboundConnection,
+    mut conn: InboundConnection,
     relay: Relay,
     session_id: u32,
     ip_slot: IpSlot,
 ) {
+    conn.set_write_timeout(relay.timeouts.write);
     let ip_key = ip_slot.log_key();
     let handshake = tokio::time::timeout(
         NOISE_DEADLINE,

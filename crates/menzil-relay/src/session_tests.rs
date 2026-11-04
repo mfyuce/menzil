@@ -83,12 +83,31 @@ fn test_limits() -> Limits {
 async fn bind_test_relay_with_limits(
     limits: Limits,
 ) -> (Relay, Listener, CertificateDer<'static>, X25519PublicKey) {
+    bind_test_relay_sized(limits, None).await
+}
+
+/// [`bind_test_relay_with_limits`], optionally with a small send buffer on the listening socket
+/// (inherited by the accepted ones), for the tests of peers that never read.
+async fn bind_test_relay_sized(
+    limits: Limits,
+    send_buffer: Option<u32>,
+) -> (Relay, Listener, CertificateDer<'static>, X25519PublicKey) {
     let (chain, key) = self_signed_cert("localhost");
     let cert = chain[0].clone();
     let tls_config = crate::tls::server_config(chain, key).unwrap();
-    let listener = Listener::bind("127.0.0.1:0".parse().unwrap(), tls_config, "/_menzil/v1")
+    let listener = match send_buffer {
+        None => Listener::bind("127.0.0.1:0".parse().unwrap(), tls_config, "/_menzil/v1")
+            .await
+            .unwrap(),
+        Some(size) => Listener::bind_with_send_buffer(
+            "127.0.0.1:0".parse().unwrap(),
+            tls_config,
+            "/_menzil/v1",
+            size,
+        )
         .await
-        .unwrap();
+        .unwrap(),
+    };
     let raw = generate_identity();
     let node_cert = node_cert_for(&raw, 1);
     let relay_x25519 = raw.x25519_public;
@@ -104,6 +123,8 @@ async fn bind_test_relay_with_limits(
     .with_admission_limits(crate::admission::AdmissionLimits {
         connections_per_ip_per_minute: 1_000_000,
         max_unattached_per_ip: 1_000_000,
+        max_handshakes_per_ip: 1_000_000,
+        max_handshakes_per_v6_48: 1_000_000,
         ..crate::admission::AdmissionLimits::default()
     })
     // The per session allowances are lifted for the same reason (many tests send a lot of
@@ -114,6 +135,7 @@ async fn bind_test_relay_with_limits(
         doc_transfers_per_minute: 1_000_000,
         doc_burst: 1_000_000,
         unadopted_docs_to_end: 0,
+        over_rate_docs_to_end: 0,
     });
     (relay, listener, cert, relay_x25519)
 }
@@ -3477,11 +3499,50 @@ async fn a_peer_address_over_its_unattached_share_is_dropped_at_once() {
     let _served = assert_served(&relay, addr, &cert, relay_x25519).await;
 }
 
-/// A14: the 61st connection within a minute from one address gets HTTP 429 at the WebSocket
-/// upgrade (the first 60 upgrade); the window itself is exercised under paused time in
-/// `admission.rs`.
+/// Round T3, M4: the per address handshake cap (8) counts handshakes in flight, not sessions: ten
+/// sessions of one address that finished their handshakes and wait to ATTACH are all served,
+/// because `end_handshake` gives each count back when its handshake is over.
 #[tokio::test]
-async fn the_61st_connection_in_a_minute_gets_429_at_the_upgrade() {
+async fn finished_handshakes_do_not_count_against_the_handshake_cap() {
+    assert_eq!(crate::admission::MAX_HANDSHAKES_PER_IP, 8);
+    let (relay, listener, cert, relay_x25519) = bind_test_relay_admitting(AdmissionLimits {
+        max_unattached_per_ip: 10_000,
+        connections_per_ip_per_minute: 10_000,
+        ..AdmissionLimits::default()
+    })
+    .await;
+    let addr = listener.local_addr().unwrap();
+    let serve_relay = relay.clone();
+    tokio::spawn(async move { serve_relay.serve(&listener).await });
+    let mut clients = Vec::new();
+    for _ in 0..10 {
+        let member = generate_identity();
+        let (networks, seq) = seed_network(&relay, &[&member]);
+        let (client, _welcome) = tokio::time::timeout(
+            Duration::from_secs(5),
+            TestClient::connect(
+                addr,
+                cert.clone(),
+                &member,
+                relay_x25519,
+                networks,
+                seq,
+                1,
+                10,
+            ),
+        )
+        .await
+        .expect("a session after the eighth was not served: finished handshakes still counted");
+        clients.push(client);
+    }
+    assert_eq!(relay.admission.unattached_of_peer(LOOPBACK), 10);
+}
+
+/// A14, round T3 M4: the 61st connection within a minute from one address is dropped at once,
+/// before TLS and without an answer (the first 60 upgrade); the window itself is exercised under
+/// paused time in `admission.rs`.
+#[tokio::test]
+async fn the_61st_connection_in_a_minute_is_dropped_before_tls() {
     let (relay, listener, cert, _relay_x25519) = bind_test_relay_admitting(AdmissionLimits {
         max_unattached_per_ip: 10_000,
         ..AdmissionLimits::default()
@@ -3500,12 +3561,11 @@ async fn the_61st_connection_in_a_minute_gets_429_at_the_upgrade() {
         }
     }
     for n in [61, 62] {
-        match crate::tests_support::try_test_client(addr, cert.clone(), "/_menzil/v1").await {
-            Err(tokio_tungstenite::tungstenite::Error::Http(response)) => {
-                assert_eq!(response.status().as_u16(), 429, "connection {n}");
-            }
-            other => panic!("connection {n} should get 429, got {:?}", other.map(|_| ())),
-        }
+        let mut sock = TcpStream::connect(addr).await.unwrap();
+        assert!(
+            closed_by_relay(&mut sock, Duration::from_millis(1500)).await,
+            "connection {n} over the rate was not dropped at once"
+        );
     }
 }
 
@@ -3670,6 +3730,7 @@ fn rates(advertise: (u32, u32), doc: (u32, u32), to_end: u32) -> SessionRates {
         doc_transfers_per_minute: doc.0,
         doc_burst: doc.1,
         unadopted_docs_to_end: to_end,
+        over_rate_docs_to_end: 0,
     }
 }
 
@@ -3745,18 +3806,19 @@ async fn doc_transfers_beyond_the_burst_are_dropped_undecoded() {
     assert!(s.relay.registry.is_attached(&s.member.node_id));
 }
 
-/// The third transfer within a minute that the relay could not use (a stale resend, a forgery,
-/// a Roster of a network the session did not claim) ends the session: ERROR then GOAWAY
-/// `rate_limited` with a retry delay, then the connection closes. The first two are silent.
+/// The third transfer within a minute that the relay could not use (a forgery, a Roster of a
+/// network the session did not claim) ends the session: ERROR then GOAWAY `rate_limited` with a
+/// retry delay, then the connection closes. The first two are silent. (A stale resend of a
+/// claimed network is not one of them, see `stale_transfers_of_a_claimed_network_never_end_the_session`.)
 #[tokio::test]
 async fn the_third_unusable_doc_in_a_minute_ends_the_session() {
     let mut s = rated_member(rates((1_000_000, 1_000_000), (1_000_000, 1_000_000), 3)).await;
-    // 1: stale (the held seq again). 2: forged by another key. Both get no answer.
-    let stale = s.roster(1);
-    s.push(&stale).await;
+    // 1 and 2: forged by another key. Both get no answer.
     let impostor = SigningKey::generate(&mut rand::rng());
-    let forged = evict_roster(&impostor, s.network, 9, &[(s.member.node_id, 1)], &[]);
-    s.push(&forged).await;
+    for seq in [8, 9] {
+        let forged = evict_roster(&impostor, s.network, seq, &[(s.member.node_id, 1)], &[]);
+        s.push(&forged).await;
+    }
     ping_pong(&mut s.client, [2; 8]).await;
     assert!(s.relay.registry.is_attached(&s.member.node_id));
     // 3: a Roster of a network that was not claimed.
@@ -3775,6 +3837,37 @@ async fn the_third_unusable_doc_in_a_minute_ends_the_session() {
         other => panic!("expected ERROR then GOAWAY rate_limited, got {other:?}"),
     }
     wait_until_detached(&s.relay, &s.member.node_id).await;
+}
+
+/// Round T3, M1 (TBD 44): a stale transfer of a claimed network (the node holds an older copy
+/// than the relay) is no misbehaviour: any number of them, within the allowance, end nothing.
+/// Forgeries among them still count.
+#[tokio::test]
+async fn stale_transfers_of_a_claimed_network_never_end_the_session() {
+    let mut s = rated_member(rates((1_000_000, 1_000_000), (1_000_000, 1_000_000), 3)).await;
+    let stale = s.roster(1);
+    for _ in 0..8 {
+        s.push(&stale).await;
+    }
+    ping_pong(&mut s.client, [2; 8]).await;
+    assert!(
+        s.relay.registry.is_attached(&s.member.node_id),
+        "eight stale resends ended the session"
+    );
+    // Two forgeries on top of the stale ones are still forgiven; the third unusable one ends it.
+    let impostor = SigningKey::generate(&mut rand::rng());
+    for seq in [8, 9] {
+        let forged = evict_roster(&impostor, s.network, seq, &[(s.member.node_id, 1)], &[]);
+        s.push(&forged).await;
+    }
+    ping_pong(&mut s.client, [3; 8]).await;
+    let forged = evict_roster(&impostor, s.network, 10, &[(s.member.node_id, 1)], &[]);
+    s.push(&forged).await;
+    let records = s.drain().await;
+    assert!(
+        matches!(&records[..], [Record::Error(e), Record::Goaway(_)] if e.code == ErrorCode::RateLimited),
+        "got {records:?}"
+    );
 }
 
 /// Adopted transfers do not count: a session may renew its network's Roster again and again
@@ -3796,32 +3889,80 @@ async fn adopted_transfers_do_not_count_towards_the_ending_rule() {
     assert!(s.relay.registry.is_attached(&s.member.node_id));
 }
 
-/// A transfer dropped for being over the rate is itself unusable: a session that keeps
-/// sending past its allowance is ended on the third excess one.
+/// Round T3, M1: a genuine Roster of a claimed, served network that is over the rate is the
+/// honest node's excess, not misbehaviour: it does not count towards the unusable transfers
+/// that end a session (the third excess one used to), and nothing of it is adopted.
 #[tokio::test]
-async fn transfers_over_the_rate_count_towards_the_ending_rule() {
+async fn genuine_transfers_over_the_rate_do_not_end_the_session() {
     let mut s = rated_member(rates((1_000_000, 1_000_000), (1, 1), 3)).await;
     let first = s.roster(2);
     s.push(&first).await;
     ping_pong(&mut s.client, [2; 8]).await;
     assert_eq!(s.held_seq(), 2);
-    for seq in 3..=4 {
+    for seq in 3..=10 {
         let roster = s.roster(seq);
         s.push(&roster).await;
     }
     ping_pong(&mut s.client, [3; 8]).await;
     assert!(
         s.relay.registry.is_attached(&s.member.node_id),
-        "two excess ones are forgiven"
+        "eight genuine excess transfers ended the session"
     );
-    let third = s.roster(5);
-    s.push(&third).await;
+    assert_eq!(s.held_seq(), 2, "none of the excess transfers was adopted");
+}
+
+/// A transfer over the rate that is not a genuine Roster of a claimed network (here: of a
+/// network the session did not claim) is unusable: the third one ends the session.
+#[tokio::test]
+async fn garbage_over_the_rate_counts_towards_the_ending_rule() {
+    let mut s = rated_member(rates((1_000_000, 1_000_000), (1, 1), 3)).await;
+    let first = s.roster(2);
+    s.push(&first).await;
+    ping_pong(&mut s.client, [2; 8]).await;
+    let stranger_owner = SigningKey::generate(&mut rand::rng());
+    let stranger_net = NetworkId::from(stranger_owner.verifying_key().to_bytes());
+    for seq in 1..=2 {
+        let unclaimed = evict_roster(&stranger_owner, stranger_net, seq, &[], &[]);
+        s.push(&unclaimed).await;
+    }
+    ping_pong(&mut s.client, [3; 8]).await;
+    assert!(s.relay.registry.is_attached(&s.member.node_id));
+    let unclaimed = evict_roster(&stranger_owner, stranger_net, 3, &[], &[]);
+    s.push(&unclaimed).await;
     let records = s.drain().await;
     assert!(
         matches!(&records[..], [Record::Error(e), Record::Goaway(_)] if e.code == ErrorCode::RateLimited),
         "got {records:?}"
     );
-    assert_eq!(s.held_seq(), 2, "none of the excess transfers was adopted");
+    assert_eq!(s.held_seq(), 2);
+}
+
+/// The honest excess is bounded too: deciding that a transfer is one costs a decode, so the
+/// `over_rate_docs_to_end`th within a minute ends the session.
+#[tokio::test]
+async fn genuine_transfers_over_the_rate_end_the_session_at_the_larger_figure() {
+    let mut rates = rates((1_000_000, 1_000_000), (1, 1), 3);
+    rates.over_rate_docs_to_end = 5;
+    let mut s = rated_member(rates).await;
+    let first = s.roster(2);
+    s.push(&first).await;
+    ping_pong(&mut s.client, [2; 8]).await;
+    for seq in 3..=6 {
+        let roster = s.roster(seq);
+        s.push(&roster).await;
+    }
+    ping_pong(&mut s.client, [3; 8]).await;
+    assert!(
+        s.relay.registry.is_attached(&s.member.node_id),
+        "four are below the figure"
+    );
+    let fifth = s.roster(7);
+    s.push(&fifth).await;
+    let records = s.drain().await;
+    assert!(
+        matches!(&records[..], [Record::Error(e), Record::Goaway(_)] if e.code == ErrorCode::RateLimited),
+        "got {records:?}"
+    );
 }
 
 /// Isolation rule I7: the warn lines a hostile session can cause are throttled per key. Twenty
@@ -3864,4 +4005,386 @@ async fn failed_handshakes_from_one_address_are_logged_once_a_minute() {
         relay.log.held_back_for("failed_before_attach", loopback) == 3
     })
     .await;
+}
+
+// --- Round T3: honest pushes at the default rates, stalled writers ------------------------------
+
+/// An honest IK node at the design's default rates: it attaches claiming `claimed` networks, then
+/// sends every `(doc_type, roster)` of `pushes` (what `push_newer_rosters` of the node does right
+/// after ATTACH), then PINGs. Returns the records that came back up to the PONG.
+async fn honest_push(
+    relay: Relay,
+    listener: Listener,
+    cert: CertificateDer<'static>,
+    relay_x25519: X25519PublicKey,
+    member: &TestIdentity,
+    claimed: Vec<NetworkId>,
+    pushes: &[(DocType, Roster)],
+) -> Vec<Record> {
+    let addr = listener.local_addr().unwrap();
+    let serve_relay = relay.clone();
+    tokio::spawn(async move { serve_relay.serve(&listener).await });
+    let seqs: HashMap<NetworkId, u64> = claimed.iter().map(|id| (*id, 11)).collect();
+    let (mut client, welcome) =
+        TestClient::connect(addr, cert, member, relay_x25519, claimed, seqs, 1, 10).await;
+    assert!(welcome.rosters.values().all(|&seq| seq == 10 || seq == 1));
+    client.send(Record::Attach).await;
+    for (doc_type, roster) in pushes {
+        for record in doc_records_of(*doc_type, roster) {
+            client.send(record).await;
+        }
+    }
+    client.send(Record::Ping { nonce: [9; 8] }).await;
+    let mut got = Vec::new();
+    while let Ok(Some(record)) = tokio::time::timeout(Duration::from_secs(5), client.recv()).await {
+        let done = matches!(record, Record::Pong { .. });
+        got.push(record);
+        if done {
+            break;
+        }
+    }
+    got
+}
+
+/// Round T3, M1: an honest node holding renewals of `networks` steward signed networks (a base
+/// and a Roster each, as one pair) newer than the relay's pushes them right after ATTACH: at the
+/// default rates every one is adopted and the session is untouched. A base used to take a token
+/// of the burst of 3, so two networks lost the second renewal silently and three ended the
+/// session.
+async fn steward_push_at_default_rates(networks: usize) {
+    let (relay, listener, cert, relay_x25519) = bind_test_relay().await;
+    let relay = relay.with_session_rates(crate::rate::SessionRates::default());
+    let member = generate_identity();
+    let nets: Vec<StewardNet> = (0..networks)
+        .map(|_| StewardNet::new(10, real_now(), member.node_id))
+        .collect();
+    for net in &nets {
+        relay.rosters().set(&net.base).unwrap();
+    }
+    let claimed: Vec<NetworkId> = nets.iter().map(|n| n.network_id).collect();
+    let mut pushes = Vec::new();
+    for net in &nets {
+        pushes.push((DocType::BaseRoster, net.base.clone()));
+        pushes.push((DocType::Roster, net.renewal(&net.steward, 11)));
+    }
+    let got = honest_push(
+        relay.clone(),
+        listener,
+        cert,
+        relay_x25519,
+        &member,
+        claimed,
+        &pushes,
+    )
+    .await;
+    let held: Vec<u64> = nets
+        .iter()
+        .map(|n| relay.rosters().seq_of(&n.network_id).unwrap())
+        .collect();
+    assert_eq!(
+        held,
+        vec![11; networks],
+        "the renewals were not all adopted; records back: {got:?}"
+    );
+    assert!(
+        matches!(&got[..], [Record::Pong { .. }]),
+        "the honest session was answered with more than a PONG: {got:?}"
+    );
+    assert!(relay.registry.is_attached(&member.node_id));
+}
+
+#[tokio::test]
+async fn an_honest_node_with_two_steward_networks_gets_both_renewals_adopted() {
+    steward_push_at_default_rates(2).await;
+}
+
+#[tokio::test]
+async fn an_honest_node_with_three_steward_networks_keeps_its_session() {
+    steward_push_at_default_rates(3).await;
+}
+
+#[tokio::test]
+async fn an_honest_node_with_five_steward_networks_keeps_its_session() {
+    steward_push_at_default_rates(5).await;
+}
+
+/// Round T3, M1: four owner signed networks (no base), newer than the relay's: the burst follows
+/// the claimed networks, so all four are adopted at the default rates.
+#[tokio::test]
+async fn an_honest_node_with_four_owner_networks_gets_every_roster_adopted() {
+    let (relay, listener, cert, relay_x25519) = bind_test_relay().await;
+    let relay = relay.with_session_rates(crate::rate::SessionRates::default());
+    let member = generate_identity();
+    let mut claimed = Vec::new();
+    let mut pushes = Vec::new();
+    for _ in 0..4 {
+        let owner = SigningKey::generate(&mut rand::rng());
+        let network_id = NetworkId::from(owner.verifying_key().to_bytes());
+        relay
+            .rosters()
+            .set(&evict_roster(
+                &owner,
+                network_id,
+                1,
+                &[(member.node_id, 1)],
+                &[],
+            ))
+            .unwrap();
+        pushes.push((
+            DocType::Roster,
+            evict_roster(&owner, network_id, 2, &[(member.node_id, 1)], &[]),
+        ));
+        claimed.push(network_id);
+    }
+    let got = honest_push(
+        relay.clone(),
+        listener,
+        cert,
+        relay_x25519,
+        &member,
+        claimed.clone(),
+        &pushes,
+    )
+    .await;
+    let held: Vec<u64> = claimed
+        .iter()
+        .map(|id| relay.rosters().seq_of(id).unwrap())
+        .collect();
+    assert_eq!(held, vec![2; 4], "records back: {got:?}");
+    assert!(matches!(&got[..], [Record::Pong { .. }]), "{got:?}");
+    assert!(relay.registry.is_attached(&member.node_id));
+}
+
+/// A TLS and WebSocket connection whose client socket has tiny buffers, so that a relay writing
+/// to it while the client never reads is blocked after a few kilobytes.
+async fn small_buffer_ws(
+    addr: SocketAddr,
+    cert: CertificateDer<'static>,
+) -> WebSocketStream<TlsStream<TcpStream>> {
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    let socket = tokio::net::TcpSocket::new_v4().unwrap();
+    socket.set_recv_buffer_size(2048).unwrap();
+    socket.set_send_buffer_size(4096).unwrap();
+    let tcp = socket.connect(addr).await.unwrap();
+    let tls = crate::tests_support::test_tls_connector(cert)
+        .connect(
+            rustls::pki_types::ServerName::try_from("localhost").unwrap(),
+            tcp,
+        )
+        .await
+        .unwrap();
+    let mut request = "wss://localhost/_menzil/v1".into_client_request().unwrap();
+    request.headers_mut().insert(
+        "Sec-WebSocket-Protocol",
+        menzil_carrier::SUBPROTOCOL.parse().unwrap(),
+    );
+    tokio_tungstenite::client_async(request, tls)
+        .await
+        .unwrap()
+        .0
+}
+
+/// An IK session of `member` that never reads: it handshakes, sends ATTACH if `attach`, then
+/// floods PING until its own writes block, which they do once the relay, answering every PING
+/// with a PONG nobody reads, is itself blocked in a write and has stopped reading. Returns the
+/// connection (keep it open) once that point is reached.
+#[allow(clippy::too_many_arguments)]
+async fn stalled_session(
+    addr: SocketAddr,
+    cert: CertificateDer<'static>,
+    member: &TestIdentity,
+    relay_x25519: X25519PublicKey,
+    networks: Vec<NetworkId>,
+    seq: HashMap<NetworkId, u64>,
+    timestamp_byte: u8,
+    attach: bool,
+) -> WebSocketStream<TlsStream<TcpStream>> {
+    let mut ws = small_buffer_ws(addr, cert).await;
+    let pattern = HandshakePattern::Ik;
+    let prologue_bytes = prologue("menzil.v1", "menzil.v1", pattern);
+    let mut timestamp = [0u8; 12];
+    timestamp[7] = timestamp_byte;
+    let hello = HelloBody {
+        v: PROTOCOL_VERSION,
+        node_cert: node_cert_for(member, 1),
+        networks,
+        timestamp: Tai64N::from(timestamp),
+        roster_seq: seq,
+        caps: vec![],
+        e2e_protos: vec![0x01],
+    };
+    let (handshake, message1) = NodeHandshake::start(
+        pattern,
+        &member.x25519_private,
+        Some(&relay_x25519),
+        &prologue_bytes,
+        &hello,
+    )
+    .unwrap();
+    ws.send(Message::Binary(message1.into())).await.unwrap();
+    let message2 = match ws.next().await.unwrap().unwrap() {
+        Message::Binary(bytes) => bytes.to_vec(),
+        other => panic!("expected a binary message 2, got {other:?}"),
+    };
+    let (mut transport, _welcome, _, _) = handshake.finish(&message2).unwrap();
+    if attach {
+        let bytes = transport.encrypt_record(&Record::Attach).unwrap();
+        ws.send(Message::Binary(bytes.into())).await.unwrap();
+    }
+    let started = std::time::Instant::now();
+    let mut sent = 0u32;
+    loop {
+        let bytes = transport
+            .encrypt_record(&Record::Ping { nonce: [1; 8] })
+            .unwrap();
+        let step = async {
+            ws.feed(Message::Binary(bytes.into())).await?;
+            if sent % 256 == 255 {
+                ws.flush().await?;
+            }
+            Ok::<(), tokio_tungstenite::tungstenite::Error>(())
+        };
+        match tokio::time::timeout(Duration::from_millis(500), step).await {
+            Ok(Ok(())) => sent += 1,
+            // The relay closed the connection (its own timeout ran out first): also a stop.
+            Ok(Err(_)) | Err(_) => return ws,
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(60),
+            "the client never blocked after {sent} PINGs"
+        );
+    }
+}
+
+/// A relay for the stalled writer tests: small send buffers (so that a peer that never reads
+/// blocks it after a few kilobytes), the per address caps lifted, and the given time limits.
+async fn stalling_relay(
+    timeouts: crate::relay::SessionTimeouts,
+    max_attached: usize,
+) -> (Relay, SocketAddr, CertificateDer<'static>, X25519PublicKey) {
+    let (relay, listener, cert, relay_x25519) =
+        bind_test_relay_sized(test_limits(), Some(4096)).await;
+    let relay = relay
+        .with_admission_limits(AdmissionLimits {
+            connections_per_ip_per_minute: 1_000_000,
+            max_unattached_per_ip: 1_000_000,
+            max_handshakes_per_ip: 1_000_000,
+            max_handshakes_per_v6_48: 1_000_000,
+            max_attached,
+            ..AdmissionLimits::default()
+        })
+        .with_timeouts(timeouts);
+    let addr = listener.local_addr().unwrap();
+    let serve_relay = relay.clone();
+    tokio::spawn(async move { serve_relay.serve(&listener).await });
+    (relay, addr, cert, relay_x25519)
+}
+
+/// Waits (real time, up to `secs`) until `condition` holds.
+async fn within(secs: u64, what: &str, condition: impl Fn() -> bool) {
+    let started = std::time::Instant::now();
+    while started.elapsed() < Duration::from_secs(secs) {
+        if condition() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("not within {secs} s: {what}");
+}
+
+/// Round T3, M2: a member that passed HELLO, floods PING before ATTACH and never reads blocks the
+/// relay in a write. The ATTACH deadline (here 2 s; the write timeout is a long 60 s, so only the
+/// deadline can end it) must still close the session and give back its slots; before the fix the
+/// write had no timeout, the select that holds the deadline was never polled again, and the
+/// session lived on for as long as the peer kept its window shut.
+#[tokio::test]
+async fn a_peer_that_floods_ping_and_never_reads_is_closed_at_the_attach_deadline() {
+    let timeouts = crate::relay::SessionTimeouts {
+        attach: Duration::from_secs(2),
+        write: Duration::from_secs(60),
+    };
+    let (relay, addr, cert, relay_x25519) = stalling_relay(timeouts, 10_000).await;
+    let member = generate_identity();
+    let (networks, seq) = seed_network(&relay, &[&member]);
+
+    let _ws = stalled_session(addr, cert, &member, relay_x25519, networks, seq, 10, false).await;
+    within(
+        10,
+        "the stalled, never attaching session to be closed",
+        || {
+            relay.admission.unattached_of_node(&member.node_id) == 0
+                && relay.admission.unattached_of_peer(LOOPBACK) == 0
+        },
+    )
+    .await;
+}
+
+/// Round T3, M2: the same after ATTACH. An attached session whose peer stops reading is closed
+/// when a send has not completed within the write timeout (here 1 s; the ATTACH deadline is not
+/// in play any more) instead of living on parked in the write; it detaches and gives its place in
+/// the attached count back.
+#[tokio::test]
+async fn an_attached_peer_that_stops_reading_is_closed_after_the_write_timeout() {
+    use crate::connection::WRITE_TIMEOUT;
+    assert_eq!(WRITE_TIMEOUT, Duration::from_secs(5));
+    let timeouts = crate::relay::SessionTimeouts {
+        attach: Duration::from_secs(60),
+        write: Duration::from_secs(1),
+    };
+    let (relay, addr, cert, relay_x25519) = stalling_relay(timeouts, 10_000).await;
+    let member = generate_identity();
+    let (networks, seq) = seed_network(&relay, &[&member]);
+
+    let _ws = stalled_session(addr, cert, &member, relay_x25519, networks, seq, 10, true).await;
+    within(10, "the stalled attached session to be closed", || {
+        !relay.registry.is_attached(&member.node_id) && relay.admission.attached() == 0
+    })
+    .await;
+}
+
+/// Round T3, M3: one member key that re-attaches while each earlier session of it is parked in a
+/// write must not push the attached count above the number of live attachments (one), or past
+/// `max_attached` and lock every other node out. The registry holds the place of an attachment,
+/// so a superseded session gives it up at once, however long it takes to notice (here it would
+/// take 60 s: the write timeout is long, so the count must not wait for it).
+#[tokio::test]
+async fn re_attaching_one_key_never_raises_the_attached_count_past_its_attachments() {
+    let timeouts = crate::relay::SessionTimeouts {
+        attach: Duration::from_secs(60),
+        write: Duration::from_secs(60),
+    };
+    let (relay, addr, cert, relay_x25519) = stalling_relay(timeouts, 2).await;
+    let attacker = generate_identity();
+    let victim = generate_identity();
+    let (networks, seq) = seed_network(&relay, &[&attacker, &victim]);
+
+    let mut kept = Vec::new();
+    for round in 0..3u8 {
+        kept.push(
+            stalled_session(
+                addr,
+                cert.clone(),
+                &attacker,
+                relay_x25519,
+                networks.clone(),
+                seq.clone(),
+                10 + round,
+                true,
+            )
+            .await,
+        );
+        assert_eq!(
+            relay.admission.attached(),
+            1,
+            "after the attacker's attachment {round} the count is above the one live attachment"
+        );
+    }
+    // Another member is not locked out.
+    let (mut client, _) =
+        TestClient::connect(addr, cert, &victim, relay_x25519, networks, seq, 1, 10).await;
+    client.send(Record::Attach).await;
+    ping_pong(&mut client, [5; 8]).await;
+    assert!(relay.registry.is_attached(&victim.node_id));
+    assert_eq!(relay.admission.attached(), 2);
+    drop(kept);
 }

@@ -58,6 +58,29 @@ impl Listener {
         })
     }
 
+    /// [`Self::bind`] with the listening socket's send buffer set to `send_buffer` bytes, which
+    /// the accepted sockets inherit: a peer that never reads blocks the relay's writes after a
+    /// few kilobytes instead of a few megabytes (tests of stalled writers).
+    #[cfg(test)]
+    pub(crate) async fn bind_with_send_buffer(
+        addr: SocketAddr,
+        tls_config: Arc<rustls::ServerConfig>,
+        expected_path: impl Into<String>,
+        send_buffer: u32,
+    ) -> Result<Self, RelayError> {
+        let socket = tokio::net::TcpSocket::new_v4()?;
+        socket.set_send_buffer_size(send_buffer)?;
+        socket.bind(addr)?;
+        let tcp = socket.listen(1024)?;
+        Ok(Self {
+            tcp,
+            upgrader: Arc::new(Upgrader {
+                acceptor: TlsAcceptor::from(tls_config),
+                expected_path: expected_path.into(),
+            }),
+        })
+    }
+
     /// The address actually bound; useful when `addr` used an ephemeral
     /// port (`:0`).
     pub fn local_addr(&self) -> Result<SocketAddr, RelayError> {
@@ -88,7 +111,7 @@ impl Listener {
     /// the upgrade. There is no timeout in here: a peer that stalls
     /// stalls this future, so the caller must wrap it in one.
     pub async fn handshake(&self, tcp: TcpStream) -> Result<InboundConnection, RelayError> {
-        self.upgrader.handshake(tcp, false).await
+        self.upgrader.handshake(tcp).await
     }
 
     /// [`Listener::accept_tcp`] then [`Listener::handshake`] inline, with
@@ -117,15 +140,9 @@ fn websocket_config() -> WebSocketConfig {
 }
 
 impl Upgrader {
-    /// TLS, then the WebSocket upgrade. With `rate_limited` the upgrade is refused with
-    /// HTTP 429 whatever the request says (the peer is over its connection rate,
-    /// `crate::admission`): TLS has to be completed to speak HTTP at all, but nothing past the
-    /// request head is read.
-    pub(crate) async fn handshake(
-        &self,
-        tcp: TcpStream,
-        rate_limited: bool,
-    ) -> Result<InboundConnection, RelayError> {
+    /// TLS, then the WebSocket upgrade. (A peer over its connection rate is not answered at all:
+    /// refusing it with HTTP 429 would take the TLS handshake first, see `crate::admission`.)
+    pub(crate) async fn handshake(&self, tcp: TcpStream) -> Result<InboundConnection, RelayError> {
         let tls = self.acceptor.accept(tcp).await?;
         let expected_path = self.expected_path.clone();
         // `validate_upgrade` only has borrowed access to the request
@@ -147,9 +164,6 @@ impl Upgrader {
             // large-error case can't be avoided at this boundary the way
             // `validate_upgrade` avoids it internally by boxing.
             move |req: &Request, resp: Response| -> Result<Response, ErrorResponse> {
-                if rate_limited {
-                    return Err(too_many_requests());
-                }
                 let outcome = validate_upgrade(req, resp, &expected_path).map_err(|e| *e)?;
                 *offered_for_closure.lock().unwrap() = Some(outcome.offered_subprotocol);
                 Ok(outcome.response)
@@ -221,14 +235,6 @@ fn not_found() -> Box<ErrorResponse> {
             .body(None)
             .expect("a minimal 404 with no body always builds"),
     )
-}
-
-fn too_many_requests() -> ErrorResponse {
-    Response::builder()
-        .status(StatusCode::TOO_MANY_REQUESTS)
-        .header("Retry-After", "60")
-        .body(None)
-        .expect("a minimal 429 with no body always builds")
 }
 
 #[cfg(test)]
@@ -370,27 +376,5 @@ mod tests {
             ),
             "one byte over the limit must be a capacity error, got {over:?}"
         );
-    }
-
-    /// MT4: a peer over its connection rate is refused at the upgrade with HTTP 429, whatever
-    /// path it asks for, and a Retry-After says when to come back.
-    #[tokio::test]
-    async fn a_rate_limited_upgrade_gets_429() {
-        let (listener, cert) = bind_test_listener().await;
-        let addr = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move {
-            let tcp = listener.accept_tcp().await.unwrap().0;
-            listener.upgrader().handshake(tcp, true).await.map(|_| ())
-        });
-        let result = crate::tests_support::try_test_client(addr, cert, "/_menzil/v1").await;
-        match result {
-            Err(tokio_tungstenite::tungstenite::Error::Http(response)) => {
-                assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
-                assert_eq!(response.headers().get("Retry-After").unwrap(), "60");
-            }
-            Err(other) => panic!("expected an HTTP 429, got {other:?}"),
-            Ok(_) => panic!("a rate limited upgrade must not complete"),
-        }
-        assert!(server.await.unwrap().is_err());
     }
 }

@@ -6,9 +6,17 @@
 //! now: the first one is, then at most one per [`INTERVAL`] for the same (kind, subject). The
 //! answer carries how many were held back since the last written line, for the line to say so
 //! ("and 4000 more"). The subject is a NodeId or an address; once a tenant exists it is the
-//! tenant. Memory is bounded: past [`MAX_KEYS`] live keys, the expired ones are swept, and if
-//! the map is still full, new subjects of a kind share one overflow key per kind (so a flood
-//! of fresh subjects is throttled as one, never grows the map).
+//! tenant.
+//!
+//! Memory is bounded per kind (round T3, L2): each kind has a budget of [`MAX_KEYS`] live keys,
+//! so a flood of one kind (failed handshakes from fresh IPv6 prefixes, which needs no key at
+//! all) can never use up another kind's keys. Past its budget a kind's expired keys are swept
+//! (at most once a [`SWEEP_EVERY`]), and if it is still full, new subjects of an address keyed
+//! kind ([`LogThrottle::admit`]) share one overflow key of that kind, so a flood of fresh
+//! addresses is throttled as one and never grows the map. A kind keyed by NodeId
+//! ([`LogThrottle::admit_node`]) has no overflow key: a NodeId reaches these lines only after
+//! its HELLO passed, so the NodeIds are bounded by the Rosters the relay holds, and one peer
+//! cannot hide another's first warning behind a shared line.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -20,8 +28,12 @@ use tokio::time::Instant;
 /// At most one line per key in this time.
 pub(crate) const INTERVAL: Duration = Duration::from_secs(60);
 
-/// Live keys the map keeps before it sweeps and, if need be, falls back to the overflow key.
+/// Live keys one kind keeps before it sweeps and, if need be, falls back to its overflow key.
 pub(crate) const MAX_KEYS: usize = 4096;
+
+/// The shortest time between two sweeps of one kind that found it still full: sweeping on every
+/// new subject would make a flood cost a pass over the map each.
+pub(crate) const SWEEP_EVERY: Duration = Duration::from_secs(1);
 
 type Key = (&'static str, [u8; 32]);
 
@@ -30,23 +42,56 @@ struct Entry {
     held_back: u64,
 }
 
+#[derive(Default)]
+struct Kind {
+    /// Live keys of this kind, the overflow key included.
+    live: usize,
+    swept: Option<Instant>,
+}
+
+#[derive(Default)]
+struct State {
+    entries: HashMap<Key, Entry>,
+    kinds: HashMap<&'static str, Kind>,
+}
+
 /// The relay's log throttle, shared by every session.
 #[derive(Default)]
 pub(crate) struct LogThrottle {
-    entries: Mutex<HashMap<Key, Entry>>,
+    state: Mutex<State>,
 }
 
 impl LogThrottle {
-    /// `Some(n)` when a line of `kind` about `subject` may be written now, with `n` the number
-    /// of such lines held back since the last one that was; `None` when this one is held back.
+    /// `Some(n)` when a line of `kind` about `subject` (an address key) may be written now, with
+    /// `n` the number of such lines held back since the last one that was; `None` when this one
+    /// is held back. Past the kind's key budget, new subjects share one overflow key.
     pub(crate) fn admit(&self, kind: &'static str, subject: [u8; 32]) -> Option<u64> {
+        self.admit_with(kind, subject, true)
+    }
+
+    fn admit_with(&self, kind: &'static str, subject: [u8; 32], overflow: bool) -> Option<u64> {
         let now = Instant::now();
-        let mut entries = self.entries.lock().unwrap();
+        let mut state = self.state.lock().unwrap();
+        let State { entries, kinds } = &mut *state;
         let mut key = (kind, subject);
-        if !entries.contains_key(&key) && entries.len() >= MAX_KEYS {
-            entries.retain(|_, e| now.saturating_duration_since(e.last) < INTERVAL);
-            if entries.len() >= MAX_KEYS {
+        if !entries.contains_key(&key) {
+            let info = kinds.entry(kind).or_default();
+            if info.live >= MAX_KEYS
+                && info
+                    .swept
+                    .is_none_or(|at| now.saturating_duration_since(at) >= SWEEP_EVERY)
+            {
+                info.swept = Some(now);
+                entries.retain(|(k, _), e| {
+                    *k != kind || now.saturating_duration_since(e.last) < INTERVAL
+                });
+                info.live = entries.keys().filter(|(k, _)| *k == kind).count();
+            }
+            if info.live >= MAX_KEYS && overflow {
                 key = (kind, [0xff; 32]);
+            }
+            if !entries.contains_key(&key) {
+                info.live += 1;
             }
         }
         match entries.get_mut(&key) {
@@ -73,9 +118,9 @@ impl LogThrottle {
         }
     }
 
-    /// [`Self::admit`] for a NodeId.
+    /// [`Self::admit`] for a NodeId: the kind has no overflow key (see the module comment).
     pub(crate) fn admit_node(&self, kind: &'static str, node_id: &NodeId) -> Option<u64> {
-        self.admit(kind, <[u8; 32]>::from(*node_id))
+        self.admit_with(kind, <[u8; 32]>::from(*node_id), false)
     }
 
     /// This throttle, for lines about `node_id`.
@@ -95,9 +140,10 @@ impl LogThrottle {
     /// [`Self::held_back`] for any subject key (tests).
     #[cfg(test)]
     pub(crate) fn held_back_for(&self, kind: &'static str, subject: [u8; 32]) -> u64 {
-        self.entries
+        self.state
             .lock()
             .unwrap()
+            .entries
             .get(&(kind, subject))
             .map_or(0, |entry| entry.held_back)
     }
@@ -105,7 +151,7 @@ impl LogThrottle {
     /// Live keys (tests).
     #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
-        self.entries.lock().unwrap().len()
+        self.state.lock().unwrap().entries.len()
     }
 }
 
@@ -182,5 +228,82 @@ mod tests {
         tokio::time::advance(INTERVAL).await;
         assert_eq!(throttle.admit("doc", subject(9)), Some(0));
         assert!(throttle.len() <= 2);
+    }
+
+    fn fresh_subject(i: usize) -> [u8; 32] {
+        let mut s = [0u8; 32];
+        s[0] = 6;
+        s[1..9].copy_from_slice(&(i as u64).to_le_bytes());
+        s
+    }
+
+    /// Round T3, L2: a kind that has used up its keys (failed handshakes from fresh /64s need no
+    /// key at all) cannot take another kind's lines: the budget is per kind.
+    #[tokio::test(start_paused = true)]
+    async fn a_full_kind_does_not_hide_another_kinds_first_line() {
+        let throttle = LogThrottle::default();
+        for i in 0..MAX_KEYS + 10 {
+            throttle.admit("failed_before_attach", fresh_subject(i));
+        }
+        let attacker = NodeId::from([0xA1; 32]);
+        let victim = NodeId::from([0xB2; 32]);
+        assert_eq!(throttle.admit_node("doc_refused", &attacker), Some(0));
+        assert_eq!(
+            throttle.admit_node("doc_refused", &victim),
+            Some(0),
+            "the victim's first line was held back"
+        );
+        // An address keyed kind has a budget of its own too, not the full kind's overflow.
+        assert_eq!(throttle.admit("other_addr_kind", fresh_subject(1)), Some(0));
+        assert_eq!(throttle.admit("other_addr_kind", fresh_subject(2)), Some(0));
+    }
+
+    /// Round T3, L2: a kind keyed by NodeId has no shared overflow key: every NodeId gets its
+    /// own first line however many are live, and the kind is swept once its lines have expired.
+    #[tokio::test(start_paused = true)]
+    async fn node_keyed_kinds_never_share_an_overflow_key() {
+        let throttle = LogThrottle::default();
+        for i in 0..3 * MAX_KEYS {
+            let mut id = [0u8; 32];
+            id[..8].copy_from_slice(&(i as u64).to_le_bytes());
+            assert_eq!(
+                throttle.admit_node("doc_refused", &NodeId::from(id)),
+                Some(0),
+                "NodeId {i} shared a line"
+            );
+        }
+        assert_eq!(throttle.len(), 3 * MAX_KEYS);
+        // Expired, the next new NodeId sweeps them.
+        tokio::time::advance(INTERVAL).await;
+        assert_eq!(
+            throttle.admit_node("doc_refused", &NodeId::from([0xEE; 32])),
+            Some(0)
+        );
+        assert_eq!(throttle.len(), 1);
+    }
+
+    /// An address keyed kind past its budget still shares an overflow key of its own kind, and
+    /// does not sweep on every new subject (once a second at most).
+    #[tokio::test(start_paused = true)]
+    async fn an_address_keyed_kind_overflows_within_its_own_kind_only() {
+        let throttle = LogThrottle::default();
+        for i in 0..MAX_KEYS {
+            assert_eq!(
+                throttle.admit("failed_before_attach", fresh_subject(i)),
+                Some(0)
+            );
+        }
+        assert_eq!(
+            throttle.admit("failed_before_attach", fresh_subject(MAX_KEYS)),
+            Some(0),
+            "the first of the overflow"
+        );
+        assert_eq!(
+            throttle.admit("failed_before_attach", fresh_subject(MAX_KEYS + 1)),
+            None,
+            "the rest share it"
+        );
+        assert_eq!(throttle.admit("other_kind", fresh_subject(0)), Some(0));
+        assert!(throttle.len() <= MAX_KEYS + 2);
     }
 }

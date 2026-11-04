@@ -38,8 +38,9 @@ mod tests_support;
 mod tls;
 
 pub use admission::{
-    AdmissionLimits, CONNECTIONS_PER_IP_PER_MINUTE, MAX_ATTACHED, MAX_UNATTACHED_PER_IP,
-    MAX_UNATTACHED_PER_NODE, RATE_WINDOW,
+    AdmissionLimits, CONNECTIONS_PER_IP_PER_MINUTE, MAX_ATTACHED, MAX_HANDSHAKES_PER_IP,
+    MAX_HANDSHAKES_PER_V6_48, MAX_TRACKED_PEERS, MAX_UNATTACHED_PER_IP, MAX_UNATTACHED_PER_NODE,
+    RATE_WINDOW,
 };
 pub use advertise::{DEFAULT_RESERVED_LABELS, LabelRegistry};
 pub use connection::InboundConnection;
@@ -49,8 +50,8 @@ pub use identity::RelayIdentity;
 pub use listener::Listener;
 pub use node_history::{HistoryViolation, MAX_HISTORY_ENTRIES, NodeHistory};
 pub use rate::{
-    ADVERTISE_BURST, ADVERTISE_PER_MINUTE, DOC_BURST, DOC_TRANSFERS_PER_MINUTE, SessionRates,
-    UNADOPTED_DOCS_TO_END, UNADOPTED_WINDOW,
+    ADVERTISE_BURST, ADVERTISE_PER_MINUTE, DOC_BURST, DOC_TRANSFERS_PER_MINUTE, MAX_DOC_BURST,
+    OVER_RATE_DOCS_TO_END, SessionRates, UNADOPTED_DOCS_TO_END, UNADOPTED_WINDOW,
 };
 pub use registry::SessionRegistry;
 pub use relay::{AcceptConfig, HANDSHAKE_TIMEOUT, MAX_INFLIGHT_HANDSHAKES, Relay};

@@ -165,6 +165,11 @@ impl RelayNotes {
         self.inner().last.as_ref().map(|held| held.error.clone())
     }
 
+    /// How many attachments have begun so far (tests and diagnostics).
+    pub fn attachments(&self) -> u64 {
+        self.inner().attachment
+    }
+
     /// A new attachment begins (its WELCOME came): not yet known to be good.
     pub fn begin_attachment(&self) {
         let mut inner = self.inner();
@@ -200,7 +205,28 @@ impl RelayNotes {
     /// network lists it ([`listed_in_own_roster`]); only a `not_member` keeps that.
     pub fn note_error_listed(&self, body: &ErrorBody, now: u64, listed_in_own_roster: bool) {
         let mut inner = self.inner();
-        if !turns_away(body.code, inner.settled) {
+        Self::record(&mut inner, body, now, listed_in_own_roster, false);
+    }
+
+    /// [`Self::note_error_listed`] for the ERROR a relay answers to a HELLO that claimed no
+    /// network at all (a node that adopted a Roster dropping it leaves that network out of its
+    /// next HELLO, and a relay refuses a HELLO that claims none, decision D6). Such a refusal says
+    /// nothing about the node's standing, so it never replaces a reason already kept (the
+    /// eviction that caused the claim-less reconnect); with nothing kept, it is kept (round T3,
+    /// N3).
+    pub fn note_error_claimless(&self, body: &ErrorBody, now: u64) {
+        let mut inner = self.inner();
+        Self::record(&mut inner, body, now, false, true);
+    }
+
+    fn record(
+        inner: &mut Inner,
+        body: &ErrorBody,
+        now: u64,
+        listed_in_own_roster: bool,
+        keep_existing: bool,
+    ) {
+        if !turns_away(body.code, inner.settled) || (keep_existing && inner.last.is_some()) {
             return;
         }
         let attachment = inner.attachment;
@@ -269,6 +295,45 @@ mod tests {
                 listed_in_own_roster: false,
             })
         );
+    }
+
+    /// Round T3, N3: the refusal of a HELLO that claimed no network does not replace the reason
+    /// already kept (the eviction that made the node leave its network out); with nothing kept
+    /// it is kept.
+    #[test]
+    fn a_claimless_refusal_never_replaces_a_reason_already_kept() {
+        let notes = RelayNotes::new();
+        notes.begin_attachment();
+        notes.note_error_claimless(
+            &error(
+                ErrorCode::NotMember,
+                "a HELLO must claim at least one network",
+            ),
+            10,
+        );
+        assert_eq!(
+            notes.last_error().map(|e| e.message),
+            Some("a HELLO must claim at least one network".to_string()),
+            "with nothing kept the refusal is kept"
+        );
+
+        let notes = RelayNotes::new();
+        notes.begin_attachment();
+        notes.note_error(&error(ErrorCode::Revoked, "node is revoked"), 10);
+        notes.note_goaway("revoked", 10);
+        let before = notes.last_error();
+        notes.begin_attachment();
+        notes.note_error_claimless(
+            &error(
+                ErrorCode::NotMember,
+                "a HELLO must claim at least one network",
+            ),
+            20,
+        );
+        assert_eq!(notes.last_error(), before);
+        // An ordinary refusal still replaces it.
+        notes.note_error(&error(ErrorCode::NotMember, "not a member"), 30);
+        assert_eq!(notes.last_error().map(|e| e.at), Some(30));
     }
 
     #[test]

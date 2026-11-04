@@ -66,6 +66,25 @@ impl SessionIds {
     }
 }
 
+/// The time limits of a session once its connection is up: how long it has to ATTACH after
+/// HELLO, and how long one send may take (round T3, M2). The relay's own figures are
+/// [`crate::session::ATTACH_DEADLINE`] and [`crate::connection::WRITE_TIMEOUT`]; tests shorten
+/// them.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct SessionTimeouts {
+    pub(crate) attach: Duration,
+    pub(crate) write: Duration,
+}
+
+impl Default for SessionTimeouts {
+    fn default() -> Self {
+        Self {
+            attach: session::ATTACH_DEADLINE,
+            write: crate::connection::WRITE_TIMEOUT,
+        }
+    }
+}
+
 /// A relay's shared runtime state: cheap to clone (every field is an
 /// `Arc`, or `Copy`), so each accepted connection's spawned task gets
 /// its own handle without contending on anything but the state itself.
@@ -80,6 +99,7 @@ pub struct Relay {
     pub(crate) forwarding: Arc<ForwardTable>,
     pub(crate) limits: Limits,
     pub(crate) rates: SessionRates,
+    pub(crate) timeouts: SessionTimeouts,
     /// Throttles every warn line a peer's traffic can cause (isolation rule I7).
     pub(crate) log: Arc<LogThrottle>,
     next_session_id: Arc<SessionIds>,
@@ -137,6 +157,7 @@ impl Relay {
             forwarding: Arc::new(ForwardTable::new()),
             limits,
             rates: SessionRates::default(),
+            timeouts: SessionTimeouts::default(),
             log: Arc::new(LogThrottle::default()),
             next_session_id: Arc::new(SessionIds::new()),
         }
@@ -159,6 +180,14 @@ impl Relay {
     #[must_use]
     pub fn with_session_rates(mut self, rates: SessionRates) -> Self {
         self.rates = rates;
+        self
+    }
+
+    /// This relay with other session time limits (tests).
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn with_timeouts(mut self, timeouts: SessionTimeouts) -> Self {
+        self.timeouts = timeouts;
         self
     }
 
@@ -203,11 +232,13 @@ impl Relay {
                     continue;
                 }
             };
-            // Per address caps first (MT4, threats A9 and A14): a peer over its unattached
-            // share is dropped without an answer, one over its connection rate is answered
-            // with 429 at the upgrade. The slot is held until the session attaches or ends.
-            let Some(admitted) = self.admission.admit_connection(peer.ip()) else {
-                tracing::debug!(peer = %peer.ip(), "peer holds too many unattached sessions; dropping a new connection");
+            // Per address caps first (MT4, threats A9 and A14, round T3 M4): a peer over its
+            // unattached share, its handshakes in flight or its connection rate is dropped
+            // before TLS, without an answer and without a handshake permit (a permit is for a
+            // peer that may handshake; answering a rate limited one with HTTP 429 would cost
+            // the TLS handshake first). The slot is held until the session attaches or ends.
+            let Some(mut ip_slot) = self.admission.admit_connection(peer.ip()) else {
+                tracing::debug!(peer = %peer.ip(), "peer is over its admission share or connection rate; dropping a new connection");
                 continue;
             };
             let Ok(permit) = Arc::clone(&slots).try_acquire_owned() else {
@@ -222,12 +253,11 @@ impl Relay {
             let upgrader = Arc::clone(&upgrader);
             let timeout = config.handshake_timeout;
             tokio::spawn(async move {
-                let handshake =
-                    tokio::time::timeout(timeout, upgrader.handshake(tcp, admitted.rate_limited))
-                        .await;
-                // The slot is for the handshake only: free it before the
-                // session starts, not when the session ends.
+                let handshake = tokio::time::timeout(timeout, upgrader.handshake(tcp)).await;
+                // The permit (and the peer's handshake count) is for the handshake only: free
+                // it before the session starts, not when the session ends.
                 drop(permit);
+                ip_slot.end_handshake();
                 let conn = match handshake {
                     Ok(Ok(conn)) => conn,
                     Ok(Err(err)) => {
@@ -239,7 +269,7 @@ impl Relay {
                         return;
                     }
                 };
-                session::handle_connection(conn, relay, session_id, admitted.slot).await;
+                session::handle_connection(conn, relay, session_id, ip_slot).await;
             });
         }
     }

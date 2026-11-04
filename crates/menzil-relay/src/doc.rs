@@ -33,7 +33,7 @@ use menzil_proto::{
 };
 
 use crate::log_throttle::NodeLog;
-use crate::rate::TokenBucket;
+use crate::rate::DocBuckets;
 use crate::registry::SessionRegistry;
 use crate::roster_store::RosterStore;
 
@@ -85,8 +85,16 @@ pub(crate) enum AcceptOutcome {
     /// nothing further to do.
     Nothing,
     /// A transfer completed, but the session is over its allowance of completed transfers
-    /// (`crate::rate`): dropped without being decoded or verified, no answer.
+    /// (`crate::rate`), and it is not a Roster the session may send (it does not decode, or it
+    /// is for a network the session did not claim or the relay does not serve): dropped,
+    /// nothing verified, no answer.
     OverRate,
+    /// A transfer completed, but the session is over its allowance, and it decodes as a Roster
+    /// of a network the session claimed and the relay serves: the honest node's excess (a busy
+    /// minute, many networks). Dropped, nothing verified, no answer; it does not count towards
+    /// the unusable transfers that end a session, only towards the larger over-rate figure
+    /// (`SessionRates::over_rate_docs_to_end`).
+    OverRateClaimed(NetworkId),
     /// A transfer completed and decoded, for a claimed and served network, but the relay holds a
     /// Roster for it that is as new or newer (a stale or duplicate resend; no signature was
     /// checked). Nothing was stored.
@@ -147,9 +155,12 @@ pub(crate) enum AcceptOutcome {
 /// action (`Relay::rosters()`), never introduced by an untrusted wire
 /// record; DOC only ever *updates* a network already held.
 ///
-/// `transfers` is the session's allowance of completed transfers (`crate::rate`): one token is
-/// taken the moment a transfer completes, before it is decoded, so a session over its rate
-/// costs the relay the reassembly it already paid and nothing more ([`AcceptOutcome::OverRate`]).
+/// `buckets` is the session's allowance of completed transfers (`crate::rate`): one token (of
+/// the Roster bucket, or of the base bucket for a base Roster, so a base and its Roster are not
+/// charged to one token pool) is taken the moment a transfer completes, before it is verified.
+/// A session over its rate costs the relay the reassembly it already paid and one decode, to
+/// tell the honest excess ([`AcceptOutcome::OverRateClaimed`]) from the rest
+/// ([`AcceptOutcome::OverRate`]); no signature is checked.
 /// `log` throttles the warn lines a peer can cause (isolation rule I7); what a line would have
 /// said is still available at `debug` level in full.
 ///
@@ -169,7 +180,7 @@ pub(crate) fn accept_roster_chunk(
     rosters: &RosterStore,
     claimed: &[NetworkId],
     now: u64,
-    transfers: &mut TokenBucket,
+    buckets: &mut DocBuckets,
     log: NodeLog<'_>,
 ) -> AcceptOutcome {
     let (doc_type, bytes) = match reassembler.accept(body) {
@@ -183,14 +194,21 @@ pub(crate) fn accept_roster_chunk(
             return AcceptOutcome::Nothing;
         }
     };
-    if !transfers.try_take() {
+    let bucket = match doc_type {
+        DocType::BaseRoster => &mut buckets.bases,
+        _ => &mut buckets.rosters,
+    };
+    if !bucket.try_take() {
         if let Some(held_back) = log.admit("doc_over_rate") {
             tracing::warn!(
                 held_back,
-                "a session sends DOC transfers faster than allowed; dropping them undecoded"
+                "a session sends DOC transfers faster than allowed; dropping the excess unverified"
             );
         }
-        return AcceptOutcome::OverRate;
+        return match claimed_served_network(doc_type, &bytes, rosters, claimed) {
+            Some(network_id) => AcceptOutcome::OverRateClaimed(network_id),
+            None => AcceptOutcome::OverRate,
+        };
     }
     if !matches!(doc_type, DocType::Roster | DocType::BaseRoster) {
         tracing::debug!(?doc_type, "ignoring a non-Roster DOC transfer at L3");
@@ -248,6 +266,21 @@ pub(crate) fn accept_roster_chunk(
             AcceptOutcome::Invalid
         }
     }
+}
+
+/// The network of a transfer that decodes (no signature is looked at) as a Roster or base Roster
+/// of a network `claimed` and `rosters` serves; `None` for anything else.
+fn claimed_served_network(
+    doc_type: DocType,
+    bytes: &[u8],
+    rosters: &RosterStore,
+    claimed: &[NetworkId],
+) -> Option<NetworkId> {
+    if !matches!(doc_type, DocType::Roster | DocType::BaseRoster) {
+        return None;
+    }
+    let network_id = Roster::decode_strict(bytes).ok()?.decode().ok()?.network_id;
+    (claimed.contains(&network_id) && rosters.serves(&network_id)).then_some(network_id)
 }
 
 /// Builds the DOC chunk records for `network_id`'s currently held roster, or `None` if this
@@ -373,7 +406,7 @@ mod tests {
             records,
             rosters,
             claimed,
-            &mut TokenBucket::new(60_000, 1_000),
+            &mut DocBuckets::unlimited(),
         )
     }
 
@@ -383,7 +416,7 @@ mod tests {
         records: &[Record],
         rosters: &RosterStore,
         claimed: &[NetworkId],
-        transfers: &mut TokenBucket,
+        buckets: &mut DocBuckets,
     ) -> AcceptOutcome {
         let throttle = crate::log_throttle::LogThrottle::default();
         let log = throttle.about(&NodeId::from([7u8; 32]));
@@ -399,7 +432,7 @@ mod tests {
                 rosters,
                 claimed,
                 NOW,
-                transfers,
+                buckets,
                 log,
             );
         }
@@ -581,6 +614,158 @@ mod tests {
         assert!(rosters.seqs().is_empty());
     }
 
+    /// A bucket pair that allows one Roster and one base back to back and refills far slower
+    /// than a test runs.
+    fn one_each() -> DocBuckets {
+        let rates = crate::rate::SessionRates {
+            doc_transfers_per_minute: 1,
+            doc_burst: 1,
+            ..crate::rate::SessionRates::default()
+        };
+        DocBuckets::new(&rates, 1)
+    }
+
+    /// Round T3, M1: a base Roster is charged to a bucket of its own, so the base and the Roster
+    /// of one pair both pass on a burst of one; the next pair is over the rate and is told
+    /// apart from garbage by its network (claimed and served).
+    #[test]
+    fn a_base_and_its_roster_are_charged_to_buckets_of_their_own() {
+        let member = NodeId::from([1u8; 32]);
+        let net = StewardNet::new(10, NOW, member);
+        let rosters = RosterStore::new();
+        rosters.set(&net.base).unwrap();
+        let claimed = [net.network_id];
+        let mut buckets = one_each();
+        let mut reassembler = DocReassembler::new();
+        let mut pending = PendingBases::new();
+        let base = menzil_proto::split_into_doc_records(DocType::BaseRoster, &net.base.encode());
+        let renewal = net.renewal(&net.steward, 11);
+        let renewal_records =
+            menzil_proto::split_into_doc_records(DocType::Roster, &renewal.encode());
+        assert_eq!(
+            feed_limited(
+                &mut reassembler,
+                &mut pending,
+                &base,
+                &rosters,
+                &claimed,
+                &mut buckets
+            ),
+            AcceptOutcome::Nothing,
+            "the base is kept for its Roster"
+        );
+        assert_eq!(
+            feed_limited(
+                &mut reassembler,
+                &mut pending,
+                &renewal_records,
+                &rosters,
+                &claimed,
+                &mut buckets
+            ),
+            AcceptOutcome::NewRoster(net.network_id),
+            "the Roster still has its own token after the base took one"
+        );
+        // The second pair is over the rate in both buckets.
+        let renewal2 = net.renewal(&net.steward, 12);
+        let renewal2_records =
+            menzil_proto::split_into_doc_records(DocType::Roster, &renewal2.encode());
+        assert_eq!(
+            feed_limited(
+                &mut reassembler,
+                &mut pending,
+                &base,
+                &rosters,
+                &claimed,
+                &mut buckets
+            ),
+            AcceptOutcome::OverRateClaimed(net.network_id)
+        );
+        assert_eq!(
+            feed_limited(
+                &mut reassembler,
+                &mut pending,
+                &renewal2_records,
+                &rosters,
+                &claimed,
+                &mut buckets
+            ),
+            AcceptOutcome::OverRateClaimed(net.network_id)
+        );
+        assert_eq!(rosters.seq_of(&net.network_id), Some(11));
+    }
+
+    /// Round T3, M1: over the rate, only a transfer that decodes as a Roster of a claimed, served
+    /// network is the honest excess; garbage, and Rosters of other networks, stay `OverRate`
+    /// (which counts towards ending the session).
+    #[test]
+    fn over_the_rate_only_a_claimed_served_roster_is_the_honest_excess() {
+        let owner = SigningKey::generate(&mut rand::rng());
+        let network_id = NetworkId::from(owner.verifying_key().to_bytes());
+        let rosters = RosterStore::new();
+        rosters.set(&signed_roster(&owner, network_id, 1)).unwrap();
+        let other_owner = SigningKey::generate(&mut rand::rng());
+        let other = NetworkId::from(other_owner.verifying_key().to_bytes());
+        rosters.set(&signed_roster(&other_owner, other, 1)).unwrap();
+        let mut buckets = one_each();
+        // Spend the one Roster token on something.
+        let first = signed_roster(&owner, network_id, 2);
+        let records = menzil_proto::split_into_doc_records(DocType::Roster, &first.encode());
+        let mut reassembler = DocReassembler::new();
+        let claimed = [network_id];
+        let mut pending = PendingBases::new();
+        assert_eq!(
+            feed_limited(
+                &mut reassembler,
+                &mut pending,
+                &records,
+                &rosters,
+                &claimed,
+                &mut buckets
+            ),
+            AcceptOutcome::NewRoster(network_id)
+        );
+        let mut over = |roster: &Roster| {
+            let records = menzil_proto::split_into_doc_records(DocType::Roster, &roster.encode());
+            feed_limited(
+                &mut reassembler,
+                &mut pending,
+                &records,
+                &rosters,
+                &claimed,
+                &mut buckets,
+            )
+        };
+        assert_eq!(
+            over(&signed_roster(&owner, network_id, 3)),
+            AcceptOutcome::OverRateClaimed(network_id)
+        );
+        assert_eq!(
+            over(&signed_roster(&other_owner, other, 3)),
+            AcceptOutcome::OverRate,
+            "served but not claimed"
+        );
+        let unserved_owner = SigningKey::generate(&mut rand::rng());
+        let unserved = NetworkId::from(unserved_owner.verifying_key().to_bytes());
+        assert_eq!(
+            over(&signed_roster(&unserved_owner, unserved, 3)),
+            AcceptOutcome::OverRate
+        );
+        // Not a Roster at all.
+        let junk = menzil_proto::split_into_doc_records(DocType::Roster, &[1, 2, 3]);
+        assert_eq!(
+            feed_limited(
+                &mut reassembler,
+                &mut pending,
+                &junk,
+                &rosters,
+                &claimed,
+                &mut buckets
+            ),
+            AcceptOutcome::OverRate
+        );
+    }
+
     #[test]
     fn a_stale_resend_is_reported_as_stale() {
         let owner = SigningKey::generate(&mut rand::rng());
@@ -616,7 +801,7 @@ mod tests {
             &rosters,
             &[],
             NOW,
-            &mut TokenBucket::new(60_000, 1_000),
+            &mut DocBuckets::unlimited(),
             crate::log_throttle::LogThrottle::default().about(&NodeId::from([7u8; 32])),
         );
         assert_eq!(outcome, AcceptOutcome::IgnoredDocType(DocType::Policy));
@@ -671,7 +856,7 @@ mod tests {
                 &rosters,
                 &[],
                 NOW,
-                &mut TokenBucket::new(60_000, 1_000),
+                &mut DocBuckets::unlimited(),
                 crate::log_throttle::LogThrottle::default().about(&NodeId::from([7u8; 32])),
             );
             if outcome == AcceptOutcome::TooLarge {

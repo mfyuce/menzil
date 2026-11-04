@@ -40,6 +40,10 @@ pub enum RelayError {
     #[error("relay connection closed")]
     Closed,
 
+    /// A send did not complete in time: the peer is not reading. The connection is finished.
+    #[error("the peer did not take a record in time")]
+    WriteTimeout,
+
     /// A lower level I/O error (TCP accept, read, or write).
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),

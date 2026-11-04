@@ -1293,7 +1293,14 @@ pub async fn run_session_observed(
                                         "the relay says this node is not a member, but this node's own Roster lists it: the relay may not serve the network or may hold an older Roster, or the node was removed in a Roster it has not seen; ask the relay operator"
                                     );
                                 }
-                                notes.note_error_listed(body, unix_now(), listed);
+                                if session.claimed_networks().is_empty() {
+                                    // Turned away because the HELLO claimed no network (D6):
+                                    // that says nothing of the node's standing and must not
+                                    // replace the reason it left the network out for.
+                                    notes.note_error_claimless(body, unix_now());
+                                } else {
+                                    notes.note_error_listed(body, unix_now(), listed);
+                                }
                             }
                             pending.push_back(SessionEvent::Record {
                                 epoch,

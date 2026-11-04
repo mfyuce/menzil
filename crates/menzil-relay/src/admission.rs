@@ -1,16 +1,26 @@
 //! Admission caps for the relay (multi tenant slice MT4; threats A9 and A14 of
 //! `multitenant-design.md`): how many connections one peer address may open per minute, how
-//! many sessions one address or one NodeId may keep waiting to ATTACH, and how many sessions
-//! are attached in all.
+//! many handshakes and how many sessions one address may keep in flight, how many sessions one
+//! NodeId may keep waiting to ATTACH, and how many sessions are attached in all.
+//!
+//! The figures differ from the design's table in two places, on purpose: 32 unattached sessions
+//! per address (the design said 64) and 10,000 attached in all (the design said 4,096). The
+//! design's "10 HELLOs per NodeId per minute after the DH" is not built; what bounds a NodeId is
+//! its unattached cap ([`MAX_UNATTACHED_PER_NODE`]) and the per address connection rate.
 //!
 //! Three kinds of slot, each an RAII guard that gives the count back when dropped, so no
 //! error path or cancelled task can leak one:
 //!
 //! - [`IpSlot`] is taken at accept time, before any byte is read, and held until the session
 //!   attaches or ends. It bounds what one address can hold in the handshake and pre ATTACH
-//!   phases together. The connection rate limit lives here too: the connection that would be
-//!   the 61st within a minute from one address is still taken (it needs a slot while it is
-//!   answered) but is flagged so the WebSocket upgrade refuses it with HTTP 429.
+//!   phases together, and, for the TLS and WebSocket handshake alone, a smaller number
+//!   ([`MAX_HANDSHAKES_PER_IP`] per address, [`MAX_HANDSHAKES_PER_V6_48`] per IPv6 /48): the
+//!   relay has 256 handshake permits ([`crate::relay::MAX_INFLIGHT_HANDSHAKES`]) and a handful
+//!   of addresses must not be able to hold them all (round T3, M4). The connection rate limit
+//!   lives here too: the connection that would be the 61st within a minute from one address
+//!   gets no slot at all and is dropped before TLS. (Answering it with HTTP 429 needs a TLS
+//!   handshake first, which is exactly the work a peer over its rate has no right to; the 429
+//!   of the first MT4 build was given up for that.)
 //! - [`NodeSlot`] is taken once the HELLO is verified (the NodeId is then proven, so a
 //!   stranger cannot use up the slots of a NodeId it merely names) and held until ATTACH or the
 //!   end of the session. A third unattached session of one NodeId is refused.
@@ -20,8 +30,8 @@
 //!
 //! The address counted is the TCP peer address the relay sees. When the relay is placed behind
 //! a TLS terminating reverse proxy or a TCP load balancer without PROXY protocol support, every
-//! peer shares the proxy's address and the per address figures (60 connections a minute, 32
-//! unattached) become figures for the whole relay. Such a deployment must raise them through
+//! peer shares the proxy's address and the per address figures (60 connections a minute, 8
+//! handshakes in flight, 32 unattached) become figures for the whole relay. Such a deployment must raise them through
 //! [`AdmissionLimits`] (`Relay::with_admission_limits`). An IPv6 peer is counted by its /64
 //! prefix, because one subscriber commonly holds a whole /64 and a single host can pick any
 //! address in it.
@@ -40,28 +50,49 @@ pub const CONNECTIONS_PER_IP_PER_MINUTE: usize = 60;
 /// The window over which [`AdmissionLimits::connections_per_ip_per_minute`] counts.
 pub const RATE_WINDOW: Duration = Duration::from_secs(60);
 
-/// How many sessions one peer address may have in the handshake or pre ATTACH phase at once.
-/// An honest device holds such a slot for well under a second; the ATTACH deadline (10 s) and
-/// the handshake timeout bound a hostile one.
+/// How many sessions one peer address (an IPv6 /64) may have in the handshake or pre ATTACH
+/// phase at once. An honest device holds such a slot for well under a second; the ATTACH
+/// deadline (10 s) and the handshake timeout bound a hostile one. (The design said 64.)
 pub const MAX_UNATTACHED_PER_IP: usize = 32;
+
+/// How many TLS and WebSocket handshakes one peer address (an IPv6 /64) may have in flight at
+/// once: a quarter of [`MAX_UNATTACHED_PER_IP`], and 1/32 of the relay's 256 handshake permits,
+/// so it takes 32 addresses to hold them all.
+pub const MAX_HANDSHAKES_PER_IP: usize = 8;
+
+/// How many handshakes in flight one IPv6 /48 may have in all: a subscriber's /48 holds 65,536
+/// /64s, each of which counts as a peer of its own above. 1/16 of the permits.
+pub const MAX_HANDSHAKES_PER_V6_48: usize = 16;
+
+/// The most peers the connection rate table tracks. Past it the oldest are forgotten (their
+/// rate history with them), so a peer that rotates addresses cannot grow the table without
+/// bound. Each entry holds up to [`CONNECTIONS_PER_IP_PER_MINUTE`] times, so the table is at
+/// most a few tens of megabytes.
+pub const MAX_TRACKED_PEERS: usize = 65_536;
 
 /// How many handshaken but not yet attached sessions one NodeId may have. One is the normal
 /// case; the second covers a reconnect that races the first one's teardown.
 pub const MAX_UNATTACHED_PER_NODE: usize = 2;
 
-/// How many sessions may be attached at once, in all.
+/// How many sessions may be attached at once, in all. (The design said 4,096.)
 pub const MAX_ATTACHED: usize = 10_000;
 
 /// The caps [`Admission`] enforces. [`Default`] is the figures above. See the module comment
 /// for what to change behind a reverse proxy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AdmissionLimits {
-    /// Connections one peer address may open per minute; the next one gets HTTP 429 at the
-    /// WebSocket upgrade.
+    /// Connections one peer address may open per minute; the next one is closed at once,
+    /// before TLS.
     pub connections_per_ip_per_minute: usize,
     /// Sessions one peer address may have unattached (handshaking or waiting for ATTACH); a
     /// connection over it is closed at once.
     pub max_unattached_per_ip: usize,
+    /// Handshakes (TLS and WebSocket upgrade) one peer address may have in flight; a connection
+    /// over it is closed at once. An IPv6 peer is counted by its /64.
+    pub max_handshakes_per_ip: usize,
+    /// Handshakes in flight one IPv6 /48 may have in all; a connection over it is closed at
+    /// once. Has no effect on IPv4 peers.
+    pub max_handshakes_per_v6_48: usize,
     /// Verified but unattached sessions one NodeId may have; the next one is refused with
     /// ERROR `rate_limited`.
     pub max_unattached_per_node: usize,
@@ -74,6 +105,8 @@ impl Default for AdmissionLimits {
         Self {
             connections_per_ip_per_minute: CONNECTIONS_PER_IP_PER_MINUTE,
             max_unattached_per_ip: MAX_UNATTACHED_PER_IP,
+            max_handshakes_per_ip: MAX_HANDSHAKES_PER_IP,
+            max_handshakes_per_v6_48: MAX_HANDSHAKES_PER_V6_48,
             max_unattached_per_node: MAX_UNATTACHED_PER_NODE,
             max_attached: MAX_ATTACHED,
         }
@@ -100,6 +133,20 @@ impl PeerKey {
     }
 }
 
+impl PeerKey {
+    /// The IPv6 /48 this peer is in, for the handshake cap; `None` for an IPv4 peer.
+    fn prefix48(self) -> Option<[u8; 6]> {
+        match self {
+            PeerKey::V4(_) => None,
+            PeerKey::V6Prefix(prefix) => {
+                let mut short = [0u8; 6];
+                short.copy_from_slice(&prefix[..6]);
+                Some(short)
+            }
+        }
+    }
+}
+
 fn prefix64(ip: Ipv6Addr) -> [u8; 8] {
     let octets = ip.octets();
     let mut prefix = [0u8; 8];
@@ -115,21 +162,53 @@ struct State {
     /// The size of `recent` at which the next sweep of expired peers runs.
     sweep_at: usize,
     unattached_by_peer: HashMap<PeerKey, usize>,
+    /// Handshakes in flight, per peer and per IPv6 /48; see [`IpSlot::end_handshake`].
+    handshaking_by_peer: HashMap<PeerKey, usize>,
+    handshaking_by_v6_48: HashMap<[u8; 6], usize>,
     unattached_by_node: HashMap<NodeId, usize>,
     attached: usize,
 }
+
+impl State {
+    /// Keeps `recent` within bounds before an entry is added: expired peers are swept when the
+    /// table has doubled since the last sweep, and if that leaves it at [`MAX_TRACKED_PEERS`]
+    /// the oldest eighth is forgotten (so a flood of fresh addresses costs one pass per
+    /// eighth of the table, not one per connection).
+    fn make_room(&mut self, now: Instant) {
+        if self.recent.len() < self.sweep_at.max(SWEEP_FLOOR) {
+            return;
+        }
+        self.recent.retain(|_, times| {
+            while times
+                .front()
+                .is_some_and(|t| now.duration_since(*t) >= RATE_WINDOW)
+            {
+                times.pop_front();
+            }
+            !times.is_empty()
+        });
+        if self.recent.len() >= MAX_TRACKED_PEERS {
+            let mut newest: Vec<(Instant, PeerKey)> = self
+                .recent
+                .iter()
+                .filter_map(|(key, times)| times.back().map(|t| (*t, *key)))
+                .collect();
+            newest.sort_unstable_by_key(|(t, _)| *t);
+            for (_, key) in newest.into_iter().take(MAX_TRACKED_PEERS / 8) {
+                self.recent.remove(&key);
+            }
+        }
+        self.sweep_at = (self.recent.len() * 2).min(MAX_TRACKED_PEERS);
+    }
+}
+
+/// The table size below which the rate table is not swept.
+const SWEEP_FLOOR: usize = 1024;
 
 /// The relay's admission counters. Shared (`Arc`) by the accept loop and every session task.
 pub(crate) struct Admission {
     limits: AdmissionLimits,
     state: Mutex<State>,
-}
-
-/// The result of [`Admission::admit_connection`] for a connection that gets a slot.
-pub(crate) struct Admitted {
-    pub(crate) slot: IpSlot,
-    /// The peer is over its connection rate: answer the WebSocket upgrade with 429.
-    pub(crate) rate_limited: bool,
 }
 
 impl Admission {
@@ -141,12 +220,14 @@ impl Admission {
         }
     }
 
-    /// Counts a new connection from `ip`. `None` means the peer already holds its share of
-    /// unattached sessions and the connection is to be dropped without an answer. Otherwise
-    /// the slot is held until the session attaches or ends, and `rate_limited` says whether
-    /// this connection is over the per minute figure (it is then not counted towards it, so a
-    /// peer that keeps knocking can still get in once its older connections leave the window).
-    pub(crate) fn admit_connection(self: &Arc<Self>, ip: IpAddr) -> Option<Admitted> {
+    /// Counts a new connection from `ip`. `None` means the connection is to be dropped without
+    /// an answer: the peer already holds its share of unattached sessions or of handshakes in
+    /// flight (or its /48 does), or it is over its connection rate (such a connection takes no
+    /// slot, and is not counted towards the rate, so a peer that keeps knocking can still get in
+    /// once its older connections leave the window). Otherwise the slot is held until the
+    /// session attaches or ends, and counts as a handshake in flight until
+    /// [`IpSlot::end_handshake`].
+    pub(crate) fn admit_connection(self: &Arc<Self>, ip: IpAddr) -> Option<IpSlot> {
         let key = PeerKey::of(ip);
         let now = Instant::now();
         let mut state = self.state.lock().unwrap();
@@ -154,45 +235,49 @@ impl Admission {
         if held >= self.limits.max_unattached_per_ip {
             return None;
         }
-        *state.unattached_by_peer.entry(key).or_insert(0) += 1;
+        let shaking = state.handshaking_by_peer.get(&key).copied().unwrap_or(0);
+        if shaking >= self.limits.max_handshakes_per_ip {
+            return None;
+        }
+        let prefix48 = key.prefix48();
+        if let Some(prefix) = prefix48
+            && state
+                .handshaking_by_v6_48
+                .get(&prefix)
+                .copied()
+                .unwrap_or(0)
+                >= self.limits.max_handshakes_per_v6_48
+        {
+            return None;
+        }
 
-        let rate_limited = {
-            if state.recent.len() >= state.sweep_at.max(1024) {
-                state.recent.retain(|_, times| {
-                    while times
-                        .front()
-                        .is_some_and(|t| now.duration_since(*t) >= RATE_WINDOW)
-                    {
-                        times.pop_front();
-                    }
-                    !times.is_empty()
-                });
-                state.sweep_at = state.recent.len() * 2;
+        // The rate: the table of recent admissions has a hard bound (`MAX_TRACKED_PEERS`).
+        state.make_room(now);
+        let times = state.recent.entry(key).or_default();
+        while times
+            .front()
+            .is_some_and(|t| now.duration_since(*t) >= RATE_WINDOW)
+        {
+            times.pop_front();
+        }
+        if times.len() >= self.limits.connections_per_ip_per_minute {
+            if times.is_empty() {
+                state.recent.remove(&key);
             }
-            let times = state.recent.entry(key).or_default();
-            while times
-                .front()
-                .is_some_and(|t| now.duration_since(*t) >= RATE_WINDOW)
-            {
-                times.pop_front();
-            }
-            if times.len() >= self.limits.connections_per_ip_per_minute {
-                if times.is_empty() {
-                    state.recent.remove(&key);
-                }
-                true
-            } else {
-                times.push_back(now);
-                false
-            }
-        };
+            return None;
+        }
+        times.push_back(now);
+
+        *state.unattached_by_peer.entry(key).or_insert(0) += 1;
+        *state.handshaking_by_peer.entry(key).or_insert(0) += 1;
+        if let Some(prefix) = prefix48 {
+            *state.handshaking_by_v6_48.entry(prefix).or_insert(0) += 1;
+        }
         drop(state);
-        Some(Admitted {
-            slot: IpSlot {
-                admission: Arc::clone(self),
-                key,
-            },
-            rate_limited,
+        Some(IpSlot {
+            admission: Arc::clone(self),
+            key,
+            handshaking: true,
         })
     }
 
@@ -262,9 +347,35 @@ impl Admission {
 pub(crate) struct IpSlot {
     admission: Arc<Admission>,
     key: PeerKey,
+    /// Still counted as a handshake in flight.
+    handshaking: bool,
 }
 
 impl IpSlot {
+    /// The TLS and WebSocket handshake of this connection is over (done, failed or timed out):
+    /// it no longer counts against the peer's handshakes in flight, only against its unattached
+    /// sessions, until the session attaches or ends. Idempotent; dropping the slot does it too.
+    pub(crate) fn end_handshake(&mut self) {
+        if !std::mem::replace(&mut self.handshaking, false) {
+            return;
+        }
+        let mut state = self.admission.state.lock().unwrap();
+        if let Some(count) = state.handshaking_by_peer.get_mut(&self.key) {
+            *count -= 1;
+            if *count == 0 {
+                state.handshaking_by_peer.remove(&self.key);
+            }
+        }
+        if let Some(prefix) = self.key.prefix48()
+            && let Some(count) = state.handshaking_by_v6_48.get_mut(&prefix)
+        {
+            *count -= 1;
+            if *count == 0 {
+                state.handshaking_by_v6_48.remove(&prefix);
+            }
+        }
+    }
+
     /// The peer this slot counts, as a key for `crate::log_throttle` (never equal to a NodeId
     /// key by accident: the first byte tags the address family and the rest is zero padded).
     pub(crate) fn log_key(&self) -> [u8; 32] {
@@ -285,6 +396,7 @@ impl IpSlot {
 
 impl Drop for IpSlot {
     fn drop(&mut self) {
+        self.end_handshake();
         let mut state = self.admission.state.lock().unwrap();
         if let Some(count) = state.unattached_by_peer.get_mut(&self.key) {
             *count -= 1;
@@ -337,6 +449,8 @@ mod tests {
     fn roomy() -> AdmissionLimits {
         AdmissionLimits {
             max_unattached_per_ip: usize::MAX,
+            max_handshakes_per_ip: usize::MAX,
+            max_handshakes_per_v6_48: usize::MAX,
             ..AdmissionLimits::default()
         }
     }
@@ -345,9 +459,9 @@ mod tests {
     const IP_B: IpAddr = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 2));
 
     /// Admits one connection and drops its slot at once (the session is over), so only the
-    /// rate counts.
+    /// rate counts. True when the connection was refused (over its rate).
     fn knock(admission: &Arc<Admission>, ip: IpAddr) -> bool {
-        admission.admit_connection(ip).unwrap().rate_limited
+        admission.admit_connection(ip).is_none()
     }
 
     #[tokio::test(start_paused = true)]
@@ -476,5 +590,145 @@ mod tests {
         assert_eq!(admission.attached(), 3);
         drop(first);
         assert_eq!(admission.attached(), 2);
+    }
+
+    /// Round T3, M4: handshakes in flight are capped per address, well below the relay's 256
+    /// handshake permits; `end_handshake` gives the count back (once) while the unattached
+    /// session stays counted, and a dropped slot gives back whatever it still held.
+    #[tokio::test(start_paused = true)]
+    async fn handshakes_in_flight_are_capped_per_address_and_freed_when_they_end() {
+        let admission = admission(AdmissionLimits::default());
+        let mut slots: Vec<IpSlot> = (0..MAX_HANDSHAKES_PER_IP)
+            .map(|_| admission.admit_connection(IP_A).unwrap())
+            .collect();
+        assert!(
+            admission.admit_connection(IP_A).is_none(),
+            "the {}th handshake of one address",
+            MAX_HANDSHAKES_PER_IP + 1
+        );
+        assert!(admission.admit_connection(IP_B).is_some(), "per address");
+
+        slots[0].end_handshake();
+        slots[0].end_handshake();
+        assert_eq!(
+            admission.unattached_of_peer(IP_A),
+            MAX_HANDSHAKES_PER_IP,
+            "the finished handshake is still an unattached session"
+        );
+        let again = admission.admit_connection(IP_A).unwrap();
+        assert!(
+            admission.admit_connection(IP_A).is_none(),
+            "ending a handshake twice freed two places"
+        );
+        drop(again);
+        drop(slots);
+        let state = admission.state.lock().unwrap();
+        assert!(state.handshaking_by_peer.is_empty() && state.unattached_by_peer.len() <= 1);
+        assert!(state.handshaking_by_v6_48.is_empty());
+    }
+
+    /// Round T3, M4: the caps are a small part of the permits, so it takes dozens of addresses,
+    /// not eight, to hold the 256 (the arithmetic of the reviewer's probe).
+    #[tokio::test(start_paused = true)]
+    async fn a_few_addresses_cannot_hold_the_handshake_permits() {
+        use crate::relay::MAX_INFLIGHT_HANDSHAKES;
+        const { assert!(MAX_HANDSHAKES_PER_IP * 16 <= MAX_INFLIGHT_HANDSHAKES) };
+        const { assert!(MAX_HANDSHAKES_PER_V6_48 * 8 <= MAX_INFLIGHT_HANDSHAKES) };
+        let admission = admission(AdmissionLimits::default());
+        let mut held = Vec::new();
+        // Eight IPv6 /64s in eight different /48s, each knocking 32 times.
+        for p in 0..8u16 {
+            let ip: IpAddr = format!("2001:db8:{p:x}::1").parse().unwrap();
+            for _ in 0..MAX_UNATTACHED_PER_IP {
+                held.extend(admission.admit_connection(ip));
+            }
+        }
+        // Eight IPv4 addresses too.
+        for n in 0..8u8 {
+            let ip = IpAddr::V4(Ipv4Addr::new(198, 51, 100, n));
+            for _ in 0..MAX_UNATTACHED_PER_IP {
+                held.extend(admission.admit_connection(ip));
+            }
+        }
+        assert_eq!(held.len(), 16 * MAX_HANDSHAKES_PER_IP);
+        assert!(held.len() * 2 <= MAX_INFLIGHT_HANDSHAKES);
+    }
+
+    /// Round T3, M4: the /64s of one IPv6 /48 (a subscriber's whole allocation holds 65,536 of
+    /// them) share a cap of their own.
+    #[tokio::test(start_paused = true)]
+    async fn the_64s_of_one_ipv6_48_share_a_handshake_cap() {
+        let admission = admission(AdmissionLimits::default());
+        let mut held = Vec::new();
+        for n in 0..100u16 {
+            let ip: IpAddr = format!("2001:db8:7:{n:x}::1").parse().unwrap();
+            held.extend(admission.admit_connection(ip));
+        }
+        assert_eq!(held.len(), MAX_HANDSHAKES_PER_V6_48);
+        let elsewhere: IpAddr = "2001:db8:8::1".parse().unwrap();
+        assert!(admission.admit_connection(elsewhere).is_some());
+        // A finished handshake frees a place in the /48.
+        held[0].end_handshake();
+        let another: IpAddr = "2001:db8:7:ffff::1".parse().unwrap();
+        let _taken = admission.admit_connection(another).unwrap();
+        assert!(admission.admit_connection(another).is_none());
+    }
+
+    /// Round T3, M4: a connection over its rate gets no slot at all (it is dropped before TLS
+    /// and takes no handshake permit), and is not counted towards the rate.
+    #[tokio::test(start_paused = true)]
+    async fn a_connection_over_its_rate_takes_no_slot() {
+        let admission = admission(AdmissionLimits {
+            connections_per_ip_per_minute: 3,
+            ..AdmissionLimits::default()
+        });
+        let held: Vec<IpSlot> = (0..3)
+            .map(|_| admission.admit_connection(IP_A).unwrap())
+            .collect();
+        for _ in 0..5 {
+            assert!(admission.admit_connection(IP_A).is_none());
+        }
+        assert_eq!(admission.unattached_of_peer(IP_A), 3, "no slot was taken");
+        assert_eq!(
+            admission
+                .state
+                .lock()
+                .unwrap()
+                .handshaking_by_peer
+                .get(&PeerKey::of(IP_A)),
+            Some(&3)
+        );
+        drop(held);
+    }
+
+    /// Round T3, N2: the rate table has a hard bound whatever the addresses do; past it the
+    /// oldest peers are forgotten, the newest kept.
+    #[tokio::test(start_paused = true)]
+    async fn the_rate_table_never_holds_more_than_its_bound() {
+        let admission = admission(roomy());
+        let first = IpAddr::V4(Ipv4Addr::from(0x0a00_0000));
+        let mut last = first;
+        let mut peak = 0;
+        for n in 0..(2 * MAX_TRACKED_PEERS as u32 + 1_000) {
+            last = IpAddr::V4(Ipv4Addr::from(0x0a00_0000 + n));
+            knock(&admission, last);
+            peak = peak.max(admission.state.lock().unwrap().recent.len());
+            // Every address a distinct (paused) instant, so "oldest" is well defined.
+            tokio::time::advance(Duration::from_micros(1)).await;
+        }
+        assert!(
+            peak <= MAX_TRACKED_PEERS,
+            "{peak} peers tracked, bound {MAX_TRACKED_PEERS}"
+        );
+        let state = admission.state.lock().unwrap();
+        assert!(
+            state.recent.len() > MAX_TRACKED_PEERS / 2,
+            "not emptied wholesale"
+        );
+        assert!(
+            !state.recent.contains_key(&PeerKey::of(first)),
+            "oldest forgotten"
+        );
+        assert!(state.recent.contains_key(&PeerKey::of(last)), "newest kept");
     }
 }
