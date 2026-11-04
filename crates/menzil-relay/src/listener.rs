@@ -163,6 +163,7 @@ impl Upgrader {
             // over 100 bytes) — not a type this crate controls, so the
             // large-error case can't be avoided at this boundary the way
             // `validate_upgrade` avoids it internally by boxing.
+            #[allow(clippy::result_large_err)] // callback type fixed by tungstenite
             move |req: &Request, resp: Response| -> Result<Response, ErrorResponse> {
                 let outcome = validate_upgrade(req, resp, &expected_path).map_err(|e| *e)?;
                 *offered_for_closure.lock().unwrap() = Some(outcome.offered_subprotocol);

@@ -280,6 +280,8 @@ impl Proxy {
                 let Ok((mut client, _)) = listener.accept().await else {
                     return;
                 };
+                // try_update needs Rust 1.95, MSRV is 1.91
+                #[allow(deprecated)]
                 let refuse_now = refuse_first
                     .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
                     .is_ok();

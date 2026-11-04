@@ -1,7 +1,6 @@
 use std::io;
 use std::sync::Mutex;
 
-use futures_util::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use menzil_stream::{Inbound, Mode, OutboundFrames, StreamMux};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, duplex};
 use tokio::sync::mpsc;

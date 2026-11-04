@@ -79,6 +79,7 @@ mod tests {
             // Assert from inside the callback rather than capturing data
             // out of it by mutable reference: a failure here panics the
             // spawned task, which `server.await` below surfaces.
+            #[allow(clippy::result_large_err)] // callback type fixed by tungstenite
             let callback = |req: &Request, resp: Response| {
                 assert_eq!(req.uri().path(), "/_menzil/v1");
                 let subprotocol = req

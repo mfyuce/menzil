@@ -495,6 +495,8 @@ impl Revalidator {
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
                 .push(std::time::Instant::now());
+            // try_update needs Rust 1.95, MSRV is 1.91
+            #[allow(deprecated)]
             let counted = self
                 .panic_passes_left
                 .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
