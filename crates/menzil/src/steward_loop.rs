@@ -18,11 +18,12 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use menzil_admin::{Documents, StewardSecret};
-use menzil_node::{DocStore, Node, PolicyStore, RosterStore};
+use menzil_node::{DocStore, Holder, Node, PolicyStore, RosterStore};
 use menzil_proto::trust::DOC_MAX_LIFETIME;
-use menzil_proto::{NetworkId, Roster, StewardKey};
+use menzil_proto::{NetworkId, NodeCert, Roster, StewardKey};
 use tokio::task::JoinHandle;
 
+use crate::cert_renew::rotation_plan;
 use crate::home::Home;
 use crate::local::{load_documents, load_steward, save_documents};
 
@@ -58,6 +59,9 @@ pub struct EntryFacts {
     pub key: StewardKey,
     /// The entry holds the right `renew`.
     pub may_renew: bool,
+    /// The entry holds the right `admit` (with `renew`, what listing a member's renewed
+    /// certificate needs: cert-rotation design Q3).
+    pub may_admit: bool,
     /// The delegation ends here, Unix seconds.
     pub not_after: u64,
 }
@@ -88,6 +92,7 @@ impl Facts {
                 Some(EntryFacts {
                     key: body.steward_pub,
                     may_renew: body.may.iter().any(|right| right == "renew"),
+                    may_admit: body.may.iter().any(|right| right == "admit"),
                     not_after: body.not_after,
                 })
             }
@@ -222,6 +227,8 @@ pub fn warn_due(last: Option<u64>, now: u64) -> bool {
 pub struct NetState {
     last: Option<Tick>,
     last_warning: Option<u64>,
+    /// When a pair listing renewed certificates was last signed (or tried): at most one an hour.
+    last_rotation: Option<u64>,
 }
 
 /// What one look came to.
@@ -235,6 +242,14 @@ pub enum Outcome {
     Renewed {
         /// Its `seq`.
         seq: u64,
+    },
+    /// Listed members' renewed certificates (cert-rotation design Q7): the new pair is on disk
+    /// and in the stores.
+    Rotated {
+        /// Its `seq`.
+        seq: u64,
+        /// How many members' certificates it lists.
+        certs: usize,
     },
 }
 
@@ -374,6 +389,115 @@ fn renew_and_adopt(
     Ok(Outcome::Renewed { seq: next.seq() })
 }
 
+/// What this device is for `network_id`, as far as renewed certificates peers push are
+/// concerned (cert-rotation design Q7): the owner (it holds the owner key; the node only notes a
+/// candidate), a steward the held documents list with this device's key (the entry's rights and
+/// end say whether candidates are kept), or nothing (a plain member, or a steward key the
+/// documents do not list). A device that holds no key of the network reads nothing from disk.
+pub fn holder_of(
+    home: &Home,
+    rosters: &RosterStore,
+    policies: &PolicyStore,
+    network_id: &NetworkId,
+) -> Result<Option<Holder>> {
+    if home.owner_key_path(network_id).exists() {
+        return Ok(Some(Holder::Owner));
+    }
+    if !home.steward_key_path(network_id).exists() {
+        return Ok(None);
+    }
+    let key = load_steward(home, network_id)?;
+    let Some(held) = held_documents(home, rosters, policies, network_id)? else {
+        return Ok(None);
+    };
+    let stored = rosters.get_with_base(network_id);
+    let facts = Facts::of_newest(&held, stored.as_ref())?;
+    Ok(facts
+        .entry
+        .filter(|entry| entry.key == key.public())
+        .map(|entry| Holder::Steward {
+            admit: entry.may_admit,
+            renew: entry.may_renew,
+            not_after: entry.not_after,
+        }))
+}
+
+/// The certificates a steward node considers listing for `network_id`: those peers pushed to it
+/// ([`Node::cert_candidates`]) and its own current certificate, which no peer pushes to it (a
+/// node pushes to the peers of its sessions, and a steward is not its own peer). The plan
+/// ([`rotation_plan`]) drops what is listed already.
+pub fn candidates_of(node: &Node, network_id: NetworkId) -> Vec<NodeCert> {
+    let mut candidates = node.cert_candidates(network_id);
+    candidates.push(node.own_cert());
+    candidates
+}
+
+/// Lists the renewed certificates of members in one pair (cert-rotation design Q7): the
+/// candidates a peer pushed to this node ([`Node::cert_candidates`]) that
+/// [`rotation_plan`] accepts against the held pair, signed as the steward (the same operation
+/// `menzil cert accept` does by hand), written where the CLI writes and adopted into the stores,
+/// which tells the relay push. At most one pair an hour per network, and only while the entry is
+/// this device's, holds both `admit` and `renew` and is not over. A failure is returned; the
+/// next try is an hour later like after a success (`state`), so one bad candidate cannot make
+/// this retry every poll. Blocks (file lock, disk): run it where blocking is allowed.
+pub fn rotate_network(
+    home: &Home,
+    rosters: &RosterStore,
+    policies: &PolicyStore,
+    network_id: &NetworkId,
+    candidates: &[NodeCert],
+    now: u64,
+    state: &mut NetState,
+) -> Result<Outcome> {
+    if candidates.is_empty() || !home.steward_key_path(network_id).exists() {
+        return Ok(Outcome::Idle);
+    }
+    // Cheap first, without the lock: most looks find nothing that qualifies (the device's own
+    // certificate and the pushed ones are listed already, or extend too little).
+    let Some(early) = held_documents(home, rosters, policies, network_id)? else {
+        return Ok(Outcome::Idle);
+    };
+    if rotation_plan(candidates, &early, state.last_rotation, now).is_empty() {
+        return Ok(Outcome::Idle);
+    }
+    let key = load_steward(home, network_id)?;
+    // From reading the documents to writing the next ones, like every command that issues.
+    let _lock = home.lock_network(network_id)?;
+    let Some(held) = held_documents(home, rosters, policies, network_id)? else {
+        return Ok(Outcome::Idle);
+    };
+    let stored = rosters.get_with_base(network_id);
+    let facts = Facts::of_newest(&held, stored.as_ref())?;
+    let entitled = facts.entry.as_ref().is_some_and(|entry| {
+        entry.key == key.public() && entry.may_admit && entry.may_renew && now < entry.not_after
+    });
+    // The same wait as the renewal: a Roster the stores hold above this pair means a newer
+    // state this pair would be signed over.
+    let roster_ahead = rosters.seq(network_id).is_some_and(|seq| seq > held.seq());
+    if !entitled || roster_ahead {
+        return Ok(Outcome::Idle);
+    }
+    let batch = rotation_plan(candidates, &held, state.last_rotation, now);
+    if batch.is_empty() {
+        return Ok(Outcome::Idle);
+    }
+    state.last_rotation = Some(now);
+    let next = menzil_admin::steward_rotate(&key, &held, &batch, now)
+        .context("signing the pair that lists the renewed certificates as the steward")?;
+    save_documents(home, &next).context("writing the pair that lists the renewed certificates")?;
+    state.last = Some(Tick {
+        at: now,
+        seq: Some(next.seq()),
+    });
+    DocStore::new(rosters, policies)
+        .adopt(&next.bundle(), now)
+        .context("adopting the pair that lists the renewed certificates")?;
+    Ok(Outcome::Rotated {
+        seq: next.seq(),
+        certs: batch.len(),
+    })
+}
+
 /// Whether this device issues documents for the network (it holds the owner's or a steward's
 /// key): only such a device pushes what it finds on disk to the members (protocol.md 5.5); a
 /// member that merely took a newer token does not.
@@ -424,19 +548,39 @@ pub async fn run(
         for network_id in networks {
             let mut state = states.remove(&network_id).unwrap_or_default();
             let (home, rosters, policies) = (home.clone(), rosters.clone(), policies.clone());
+            let node_for_candidates = node.clone();
             let joined = tokio::task::spawn_blocking(move || {
-                let result = tick_network(
-                    &home,
-                    &rosters,
-                    &policies,
-                    &network_id,
-                    unix_now(),
-                    &mut state,
-                );
-                (result, state)
+                let now = unix_now();
+                let result = tick_network(&home, &rosters, &policies, &network_id, now, &mut state);
+                // What this device is for the network decides what the node does with the
+                // renewed certificates peers push; a look that failed leaves it as it was.
+                let rotated = match holder_of(&home, &rosters, &policies, &network_id) {
+                    Ok(holder) => {
+                        node_for_candidates.set_candidate_holder(network_id, holder);
+                        match holder {
+                            Some(Holder::Steward { .. }) => rotate_network(
+                                &home,
+                                &rosters,
+                                &policies,
+                                &network_id,
+                                &candidates_of(&node_for_candidates, network_id),
+                                now,
+                                &mut state,
+                            ),
+                            _ => Ok(Outcome::Idle),
+                        }
+                    }
+                    // A steward key or documents that cannot be read: said at debug level
+                    // (this runs every poll); the renewal's own failure is reported hourly.
+                    Err(error) => {
+                        tracing::debug!(network = %network_id, error = %format!("{error:#}"), "what this device is for the network could not be read");
+                        Ok(Outcome::Idle)
+                    }
+                };
+                (result, rotated, state)
             })
             .await;
-            let Ok((result, state)) = joined else {
+            let Ok((result, rotated, state)) = joined else {
                 tracing::warn!("the steward loop's check panicked");
                 continue;
             };
@@ -449,9 +593,22 @@ pub async fn run(
                     );
                     spawn_push(&node, network_id);
                 }
-                Ok(Outcome::Idle | Outcome::Checked) => {}
+                Ok(Outcome::Idle | Outcome::Checked | Outcome::Rotated { .. }) => {}
                 Err(error) => {
                     tracing::warn!(network = %network_id, error = %format!("{error:#}"), "the steward renewal failed; trying again in an hour");
+                }
+            }
+            match rotated {
+                Ok(Outcome::Rotated { seq, certs }) => {
+                    tracing::info!(network = %network_id, seq, certs, "listed members' renewed certificates as the network's steward");
+                    eprintln!(
+                        "menzil: listed {certs} renewed certificate(s) of network {network_id} as its steward (#{seq})"
+                    );
+                    spawn_push(&node, network_id);
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    tracing::warn!(network = %network_id, error = %format!("{error:#}"), "listing the renewed certificates failed; trying again in an hour");
                 }
             }
         }

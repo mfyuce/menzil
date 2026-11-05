@@ -126,6 +126,12 @@ enum Command {
         #[arg(long)]
         for_relay: bool,
     },
+    /// This device's certificate: show it (the default), renew it, print the token for it, or
+    /// (owner or steward) list a member's renewed one.
+    Cert {
+        #[command(subcommand)]
+        command: Option<CertCommand>,
+    },
     /// Show this device's identity, networks and members.
     Status,
     /// Run a relay, or tell it which networks it serves.
@@ -229,6 +235,27 @@ enum RelayCommand {
         /// The WebSocket path to answer on.
         #[arg(long, default_value = relay_cmd::DEFAULT_PATH)]
         path: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum CertCommand {
+    /// Show this device's certificate and what each network lists for it.
+    Show,
+    /// Renew this device's certificate: the same keys, a higher serial, valid for 400 days. A
+    /// running `menzil node` does it and switches at once; with none running the file is
+    /// written here. Prints the token for the owner of an owner-only network.
+    Renew,
+    /// Print the token for this device's current certificate, changing nothing.
+    Request,
+    /// On the owner's or a steward's device: list the renewed certificate a member's `menzil
+    /// cert renew` or `menzil cert request` printed.
+    Accept {
+        /// The token (`menzil1-cert:...`); `-` reads it from standard input.
+        token: String,
+        /// The network, when this device is in more than one.
+        #[arg(long, value_name = "ID")]
+        network: Option<String>,
     },
 }
 
@@ -528,15 +555,67 @@ async fn run(cli: Cli) -> Result<()> {
                 }
             );
         }
+        Command::Cert { command } => match command.unwrap_or(CertCommand::Show) {
+            CertCommand::Show => {
+                print!("{}", local::cert_show(&home()?)?.render(now()));
+            }
+            CertCommand::Request => println!("{}", local::cert_request(&home()?)?),
+            CertCommand::Renew => {
+                let home = home()?;
+                // A running node does it (it holds the identity and switches at once); only
+                // when none answers is the file written here, under the node lock.
+                let socket = node_cmd::agent_socket_path(&home, &Config::load(&home)?);
+                match agent::renew_cert(&socket).await {
+                    Ok(renewed) => {
+                        println!(
+                            "the running node renewed this device's certificate: serial {}, valid until {}",
+                            renewed.serial,
+                            local::relative(renewed.not_after, now())
+                        );
+                        println!(
+                            "it uses the new one from now on and offers it to the network's steward by itself; an owner-only network needs this token given to its owner (`menzil cert accept`):"
+                        );
+                        println!("{}", renewed.token);
+                    }
+                    Err(agent::RenewError::Failed(error)) => return Err(error),
+                    Err(agent::RenewError::NoAgent) => {
+                        let renewed = local::cert_renew(&home, now())?;
+                        println!(
+                            "renewed this device's certificate: serial {}, valid until {}",
+                            renewed.serial,
+                            local::relative(renewed.not_after, now())
+                        );
+                        println!(
+                            "no node is running; the next `menzil node` uses it. Give this token to the owner of each owner-only network (`menzil cert accept`); a steward lists it once the node reaches it:"
+                        );
+                        println!("{}", renewed.token);
+                    }
+                }
+            }
+            CertCommand::Accept { token, network } => {
+                let token = token_argument(token)?;
+                let issued = local::cert_accept(&home()?, network.as_deref(), &token, now())?;
+                println!(
+                    "listed the renewed certificate of {}: the network's documents are now #{}",
+                    issued.member.map(|m| m.to_string()).unwrap_or_default(),
+                    issued.seq
+                );
+                print_new_documents(&issued.token);
+            }
+        },
         Command::Status => {
             let home = home()?;
             print!("{}", local::status(&home)?.render(now()));
             // A running node knows what the files do not: whether the relay has it attached,
-            // and why it turned it away. No node, or one that says nothing, adds nothing.
+            // and why it turned it away, and which certificate it uses. No node, or one that
+            // says nothing, adds nothing.
             if let Ok(config) = Config::load(&home) {
                 let socket = node_cmd::agent_socket_path(&home, &config);
-                if let Ok(relay) = agent::query_status(&socket).await {
-                    print!("{}", relay.render(now()));
+                if let Ok(status) = agent::query_node_status(&socket).await {
+                    print!("{}", status.relay.render(now()));
+                    if let Some(cert) = status.cert {
+                        print!("{}", cert.render(now()));
+                    }
                 }
             }
         }

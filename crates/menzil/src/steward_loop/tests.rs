@@ -24,6 +24,7 @@ fn facts(expires: u64, not_after: u64, may_renew: bool) -> Facts {
         entry: Some(EntryFacts {
             key: key(),
             may_renew,
+            may_admit: true,
             not_after,
         }),
     }
@@ -689,4 +690,344 @@ fn a_steward_signed_pair_adopted_over_the_network_is_kept_with_its_bases() {
         kept.base().unwrap().0.decode().unwrap().seq,
         steward_pair.base().unwrap().0.decode().unwrap().seq
     );
+}
+
+// ---- listing members' renewed certificates (cert rotation S6, design Q7) ----
+
+/// Like [`fixture`], but both devices were made 380 days ago: their first certificates run out
+/// in 20 days, so a renewal made now extends them by far more than the 30 days a steward
+/// requires.
+fn aged_fixture(may: &[&str]) -> Fixture {
+    let born = clock() - 380 * DAY;
+    let owner_dir = tempfile::tempdir().unwrap();
+    let owner = Home::new(owner_dir.path());
+    init(&owner, born).unwrap();
+    let id = network_create(&owner, "laptop", clock()).unwrap();
+    let steward_dir = tempfile::tempdir().unwrap();
+    let steward = Home::new(steward_dir.path());
+    let request = init(&steward, born).unwrap().join_request;
+    let admitted = admit(&owner, None, &request, "steward", &[], clock()).unwrap();
+    join(&steward, &admitted.token, clock()).unwrap();
+    let asked = steward_request(&steward, None).unwrap();
+    let may: Vec<String> = may.iter().map(ToString::to_string).collect();
+    let listed = steward_add(&owner, None, &asked.token, &may, 30, clock()).unwrap();
+    join(&steward, &listed.issued.token, clock()).unwrap();
+    Fixture {
+        _dirs: vec![owner_dir, steward_dir],
+        owner,
+        steward,
+        id,
+    }
+}
+
+/// The renewed certificate of the owner's device, made `days` after the fixture.
+fn owners_renewal(f: &Fixture, days: u64) -> menzil_proto::NodeCert {
+    crate::local::cert_renew(&f.owner, clock() + days * DAY)
+        .unwrap()
+        .cert
+}
+
+fn serials_of(docs: &Documents, node: &menzil_proto::NodeId) -> Vec<u32> {
+    docs.policy_body()
+        .certs
+        .iter()
+        .map(|cert| cert.decode().unwrap())
+        .filter(|body| body.node_id == *node)
+        .map(|body| body.serial)
+        .collect()
+}
+
+#[test]
+fn a_steward_lists_a_pushed_renewal_writes_it_and_adopts_it() {
+    let f = aged_fixture(&["admit", "renew"]);
+    let (policies, rosters, _) = load_stores(&f.steward).unwrap();
+    let mut state = NetState::default();
+    let cert = owners_renewal(&f, 1);
+    let owner_id = cert.decode().unwrap().node_id;
+    let now = clock() + 2 * DAY;
+
+    let outcome = rotate_network(
+        &f.steward,
+        &rosters,
+        &policies,
+        &f.id,
+        std::slice::from_ref(&cert),
+        now,
+        &mut state,
+    )
+    .unwrap();
+    assert_eq!(outcome, Outcome::Rotated { seq: 4, certs: 1 });
+    // On disk and in the stores, as the steward's pair listing the renewal in its tail.
+    let disk = crate::local::load_documents(&f.steward, &f.id).unwrap();
+    assert_eq!(disk.seq(), 4);
+    assert!(disk.base().is_some());
+    assert_eq!(serials_of(&disk, &owner_id), vec![1, 2]);
+    assert_eq!(
+        (rosters.seq(&f.id), policies.seq(&f.id)),
+        (Some(4), Some(4))
+    );
+    assert!(policies.body(&f.id).unwrap().certs.contains(&cert));
+    // The owner's device takes the pair like any member.
+    let (member_policies, member_rosters, _) = load_stores(&f.owner).unwrap();
+    let adopted = DocStore::new(&member_rosters, &member_policies)
+        .adopt(&disk.bundle(), now)
+        .unwrap();
+    assert_eq!(
+        adopted,
+        Adopted {
+            roster: true,
+            policy: true
+        }
+    );
+    assert!(state.last_rotation == Some(now));
+}
+
+#[test]
+fn a_renewal_that_does_not_qualify_makes_no_pair_and_does_not_use_up_the_hour() {
+    let f = aged_fixture(&["admit", "renew"]);
+    let (policies, rosters, _) = load_stores(&f.steward).unwrap();
+    let mut state = NetState::default();
+    let now = clock() + 2 * DAY;
+    let short = {
+        // The owner device's certificate has 20 days left; a renewal that ends 5 days after it
+        // extends it by 5 only, under the 30 days a steward requires.
+        let (keys, current) = crate::local::load_identity(&f.owner).unwrap();
+        let listed_not_after = current.decode().unwrap().not_after;
+        keys.issue_cert(2, clock() - DAY, listed_not_after + 5 * DAY)
+            .unwrap()
+    };
+    let outcome = rotate_network(
+        &f.steward,
+        &rosters,
+        &policies,
+        &f.id,
+        std::slice::from_ref(&short),
+        now,
+        &mut state,
+    )
+    .unwrap();
+    assert_eq!(outcome, Outcome::Idle);
+    assert_eq!(rosters.seq(&f.id), Some(3), "no pair was made");
+    assert_eq!(state.last_rotation, None);
+    // A qualifying one right after is not held back by the earlier look.
+    let good = owners_renewal(&f, 1);
+    let outcome = rotate_network(
+        &f.steward,
+        &rosters,
+        &policies,
+        &f.id,
+        &[short, good],
+        now + 1,
+        &mut state,
+    )
+    .unwrap();
+    assert_eq!(outcome, Outcome::Rotated { seq: 4, certs: 1 });
+}
+
+#[test]
+fn at_most_one_rotation_pair_an_hour() {
+    let f = aged_fixture(&["admit", "renew"]);
+    let (policies, rosters, _) = load_stores(&f.steward).unwrap();
+    let mut state = NetState::default();
+    let owner = owners_renewal(&f, 1);
+    let now = clock() + 2 * DAY;
+    let first = rotate_network(
+        &f.steward,
+        &rosters,
+        &policies,
+        &f.id,
+        std::slice::from_ref(&owner),
+        now,
+        &mut state,
+    );
+    assert_eq!(first.unwrap(), Outcome::Rotated { seq: 4, certs: 1 });
+    // The steward's own device renews too (its own first certificate is listed as a member).
+    let other = crate::local::cert_renew(&f.steward, clock() + DAY)
+        .unwrap()
+        .cert;
+    let within = rotate_network(
+        &f.steward,
+        &rosters,
+        &policies,
+        &f.id,
+        std::slice::from_ref(&other),
+        now + crate::cert_renew::ROTATE_EVERY - 1,
+        &mut state,
+    );
+    assert_eq!(within.unwrap(), Outcome::Idle);
+    assert_eq!(rosters.seq(&f.id), Some(4));
+    let after = rotate_network(
+        &f.steward,
+        &rosters,
+        &policies,
+        &f.id,
+        std::slice::from_ref(&other),
+        now + crate::cert_renew::ROTATE_EVERY,
+        &mut state,
+    );
+    assert_eq!(after.unwrap(), Outcome::Rotated { seq: 5, certs: 1 });
+}
+
+#[test]
+fn only_a_steward_with_both_rights_and_time_left_rotates() {
+    let now = clock() + 2 * DAY;
+    // `admit` alone: the pair would be refused for want of `renew`, so none is attempted.
+    let f = aged_fixture(&["admit"]);
+    let (policies, rosters, _) = load_stores(&f.steward).unwrap();
+    let cert = owners_renewal(&f, 1);
+    let mut state = NetState::default();
+    let outcome = rotate_network(
+        &f.steward,
+        &rosters,
+        &policies,
+        &f.id,
+        std::slice::from_ref(&cert),
+        now,
+        &mut state,
+    );
+    assert_eq!(outcome.unwrap(), Outcome::Idle);
+    // `renew` alone.
+    let g = aged_fixture(&["renew"]);
+    let (policies, rosters, _) = load_stores(&g.steward).unwrap();
+    let cert = owners_renewal(&g, 1);
+    let outcome = rotate_network(
+        &g.steward,
+        &rosters,
+        &policies,
+        &g.id,
+        std::slice::from_ref(&cert),
+        now,
+        &mut state,
+    );
+    assert_eq!(outcome.unwrap(), Outcome::Idle);
+    assert_eq!(rosters.seq(&g.id), Some(3));
+    // Both rights, but the delegation is over.
+    let h = aged_fixture(&["admit", "renew"]);
+    let (policies, rosters, _) = load_stores(&h.steward).unwrap();
+    let cert = owners_renewal(&h, 1);
+    let outcome = rotate_network(
+        &h.steward,
+        &rosters,
+        &policies,
+        &h.id,
+        std::slice::from_ref(&cert),
+        clock() + 31 * DAY,
+        &mut state,
+    );
+    assert_eq!(outcome.unwrap(), Outcome::Idle);
+    assert_eq!(rosters.seq(&h.id), Some(3));
+    // The owner's device holds no steward key: nothing.
+    let (policies, rosters, _) = load_stores(&h.owner).unwrap();
+    let outcome = rotate_network(
+        &h.owner,
+        &rosters,
+        &policies,
+        &h.id,
+        std::slice::from_ref(&cert),
+        now,
+        &mut state,
+    );
+    assert_eq!(outcome.unwrap(), Outcome::Idle);
+    // And no candidates, no look at all.
+    let outcome = rotate_network(&h.steward, &rosters, &policies, &h.id, &[], now, &mut state);
+    assert_eq!(outcome.unwrap(), Outcome::Idle);
+}
+
+#[test]
+fn a_device_is_the_owner_a_listed_steward_or_nothing_for_the_candidates() {
+    let f = aged_fixture(&["admit", "renew"]);
+    let (policies, rosters, _) = load_stores(&f.steward).unwrap();
+    let (owner_policies, owner_rosters, _) = load_stores(&f.owner).unwrap();
+    assert_eq!(
+        holder_of(&f.owner, &owner_rosters, &owner_policies, &f.id).unwrap(),
+        Some(Holder::Owner)
+    );
+    assert_eq!(
+        holder_of(&f.steward, &rosters, &policies, &f.id).unwrap(),
+        Some(Holder::Steward {
+            admit: true,
+            renew: true,
+            not_after: clock() + 30 * DAY,
+        })
+    );
+    // The rights are the entry's.
+    let g = aged_fixture(&["admit"]);
+    let (policies, rosters, _) = load_stores(&g.steward).unwrap();
+    assert_eq!(
+        holder_of(&g.steward, &rosters, &policies, &g.id).unwrap(),
+        Some(Holder::Steward {
+            admit: true,
+            renew: false,
+            not_after: clock() + 30 * DAY,
+        })
+    );
+    let g = aged_fixture(&["renew"]);
+    let (policies, rosters, _) = load_stores(&g.steward).unwrap();
+    assert_eq!(
+        holder_of(&g.steward, &rosters, &policies, &g.id).unwrap(),
+        Some(Holder::Steward {
+            admit: false,
+            renew: true,
+            not_after: clock() + 30 * DAY,
+        })
+    );
+    // A steward key the documents do not list (the owner removed the steward) is nothing.
+    let removed = steward_remove(&f.owner, None, clock() + 1).unwrap();
+    join(&f.steward, &removed.token, clock() + 1).unwrap();
+    let (policies, rosters, _) = load_stores(&f.steward).unwrap();
+    assert_eq!(
+        holder_of(&f.steward, &rosters, &policies, &f.id).unwrap(),
+        None
+    );
+    // The documents list another steward than this device's key: nothing either.
+    let g = aged_fixture(&["admit", "renew"]);
+    let other = steward_request(&g.owner, None).unwrap();
+    let relisted = steward_add(
+        &g.owner,
+        None,
+        &other.token,
+        &["admit".into(), "renew".into()],
+        30,
+        clock() + 1,
+    )
+    .unwrap();
+    join(&g.steward, &relisted.issued.token, clock() + 1).unwrap();
+    let (policies, rosters, _) = load_stores(&g.steward).unwrap();
+    assert_eq!(
+        holder_of(&g.steward, &rosters, &policies, &g.id).unwrap(),
+        None
+    );
+    // A device with no key of the network reads nothing and is nothing.
+    std::fs::remove_file(f.steward.steward_key_path(&f.id)).unwrap();
+    assert_eq!(
+        holder_of(&f.steward, &rosters, &policies, &f.id).unwrap(),
+        None
+    );
+}
+
+#[test]
+fn a_look_with_nothing_to_list_does_not_take_the_network_lock() {
+    let f = aged_fixture(&["admit", "renew"]);
+    let (policies, rosters, _) = load_stores(&f.steward).unwrap();
+    let mut state = NetState::default();
+    let _held_elsewhere = f.steward.lock_network(&f.id).unwrap();
+    // A candidate that extends the listed certificate by too little: nothing to do, and the
+    // lock another command holds is not waited for.
+    let (keys, current) = crate::local::load_identity(&f.owner).unwrap();
+    let not_after = current.decode().unwrap().not_after;
+    let short = keys
+        .issue_cert(2, clock() - DAY, not_after + 5 * DAY)
+        .unwrap();
+    let started = std::time::Instant::now();
+    let outcome = rotate_network(
+        &f.steward,
+        &rosters,
+        &policies,
+        &f.id,
+        &[short],
+        clock() + 2 * DAY,
+        &mut state,
+    );
+    assert_eq!(outcome.unwrap(), Outcome::Idle);
+    assert!(started.elapsed() < std::time::Duration::from_secs(5));
 }

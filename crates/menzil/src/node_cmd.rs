@@ -27,6 +27,7 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::task::JoinHandle;
 
 use crate::agent::{self, Opener};
+use crate::cert_node::{self, CertRenewer};
 use crate::config::Config;
 use crate::home::{FileLock, Home};
 use crate::local::{keep_documents, load_documents, load_identity};
@@ -604,12 +605,24 @@ fn adopt_documents_as_issued(
 pub struct NodeOpener {
     node: Arc<Node>,
     directory: Arc<RwLock<Directory>>,
+    certs: Option<Arc<CertRenewer>>,
 }
 
 impl NodeOpener {
     /// An opener over a running node and the directory it resolves names in.
     pub fn new(node: Arc<Node>, directory: Arc<RwLock<Directory>>) -> Self {
-        Self { node, directory }
+        Self {
+            node,
+            directory,
+            certs: None,
+        }
+    }
+
+    /// Lets the agent answer `cert renew` and report the certificate in `status`, through
+    /// `certs`.
+    pub fn with_certs(mut self, certs: Arc<CertRenewer>) -> Self {
+        self.certs = Some(certs);
+        self
     }
 }
 
@@ -710,6 +723,17 @@ impl Opener for NodeOpener {
             rejected: self.node.last_relay_error().map(rejected_of),
         }
     }
+
+    async fn cert_status(&self) -> Option<agent::CertStatus> {
+        self.certs.as_ref()?.status(unix_now())
+    }
+
+    async fn renew_cert(&self) -> Result<agent::RenewedCert, String> {
+        match &self.certs {
+            Some(certs) => certs.renew(unix_now()).await,
+            None => Err("this node cannot renew its certificate".to_string()),
+        }
+    }
 }
 
 /// The clock in Unix seconds.
@@ -795,10 +819,17 @@ pub async fn start(home: &Home, config: &Config, socket: &Path) -> Result<Runnin
     );
     let directory = Arc::new(RwLock::new(Directory::load(home)?));
 
+    let renewer = Arc::new(CertRenewer::new(
+        home.clone(),
+        node.clone(),
+        policies.clone(),
+    ));
     let agent_task = tokio::spawn(agent::serve(
         listener,
-        Arc::new(NodeOpener::new(node.clone(), directory.clone())),
+        Arc::new(NodeOpener::new(node.clone(), directory.clone()).with_certs(renewer.clone())),
     ));
+    // The certificate: a check now and every six hours (renews 60 days before it runs out).
+    let cert_task = tokio::spawn(cert_node::run(renewer));
     let reload_task = {
         let (home, directory, node) = (home.clone(), directory.clone(), node.clone());
         let (policies, rosters) = (policies.clone(), rosters.clone());
@@ -841,7 +872,7 @@ pub async fn start(home: &Home, config: &Config, socket: &Path) -> Result<Runnin
         socket: socket.to_path_buf(),
         socket_identity,
         directory,
-        tasks: vec![agent_task, reload_task, steward_task],
+        tasks: vec![agent_task, reload_task, steward_task, cert_task],
         keeper,
         _instance: instance,
     })

@@ -26,12 +26,13 @@ use menzil_proto::{
 };
 use zeroize::Zeroizing;
 
+use crate::cert_renew::{self as rules, Listed};
 use crate::home::{Home, parse_hex32};
 use crate::text;
 use crate::token::{
-    decode_documents, decode_join_request, decode_steward_request, documents_from_bytes,
-    documents_to_bytes, encode_documents, encode_join_request, encode_roster,
-    encode_steward_request,
+    decode_cert_request, decode_documents, decode_join_request, decode_steward_request,
+    documents_from_bytes, documents_to_bytes, encode_cert_request, encode_documents,
+    encode_join_request, encode_roster, encode_steward_request,
 };
 
 /// Seconds in a day.
@@ -559,6 +560,169 @@ pub fn renew(home: &Home, network: Option<&str>, now: u64) -> Result<Issued> {
     };
     save_documents(home, &next)?;
     Ok(issued(&next, None))
+}
+
+/// What [`cert_renew`] made.
+#[derive(Debug, Clone)]
+pub struct CertRenewed {
+    /// The new certificate.
+    pub cert: NodeCert,
+    /// Its serial.
+    pub serial: u32,
+    /// When it expires, Unix seconds.
+    pub not_after: u64,
+    /// The token that carries it to an owner or steward (`menzil cert accept`).
+    pub token: String,
+}
+
+/// The token for this device's current certificate (`menzil cert request`): changes nothing.
+pub fn cert_request(home: &Home) -> Result<String> {
+    Ok(encode_cert_request(&load_identity(home)?.1))
+}
+
+/// Renews this device's certificate with no node running (cert-rotation design Q9): the same
+/// keys, a serial one above the file's and above every serial of this device that any held
+/// Policy lists, `not_before` a day ago, 400 days. Only `identity.cert` is written, atomically;
+/// `identity.key` is never touched. Holds the node lock for the whole operation, so it refuses
+/// while a `menzil node` runs on this home (that node renews through the agent socket, and
+/// swaps to the new certificate at once: a file changed under it would only be found at the
+/// next start).
+pub fn cert_renew(home: &Home, now: u64) -> Result<CertRenewed> {
+    let _node = home.lock_node().context(
+        "a `menzil node` is running on this home, or the agent socket is not where `menzil` looks: \
+the node renews through its agent socket",
+    )?;
+    let (keys, current) = load_identity(home)?;
+    let me = keys.node_id();
+    let mut listed_max = None;
+    for network_id in home.networks()? {
+        // A network whose documents cannot be read lists nothing we can see; the serial rule
+        // then rests on the file's own serial, which is at worst one more renewal later.
+        if let Ok(docs) = load_documents(home, &network_id) {
+            listed_max = listed_max.max(rules::listed_max_serial([docs.policy_body()], &me));
+        }
+    }
+    let next = keys.next_cert(&current, listed_max, now)?;
+    home.write_public(&home.identity_cert_path(), &next.encode())?;
+    let body = next.decode()?;
+    Ok(CertRenewed {
+        token: encode_cert_request(&next),
+        serial: body.serial,
+        not_after: body.not_after,
+        cert: next,
+    })
+}
+
+/// Lists a member's renewed certificate in a network this device owns or is a steward of
+/// (`menzil cert accept <token>`; design Q4, Q7 a). The owner's operation replaces the member's
+/// earlier certificates; a steward's appends it as a rotation, which is the same operation a
+/// steward node performs by itself for a certificate a peer pushed.
+pub fn cert_accept(home: &Home, network: Option<&str>, token: &str, now: u64) -> Result<Issued> {
+    let network_id = resolve_network(home, network)?;
+    let _lock = home.lock_network(&network_id)?;
+    let signing = signing_key(home, &network_id)?;
+    let current = load_documents(home, &network_id)?;
+    let cert = decode_cert_request(token)?;
+    let member = cert.decode()?.node_id;
+    let next = match signing {
+        Signing::Owner(owner) => menzil_admin::accept_cert(&owner, &current, &cert, now)?,
+        Signing::Steward(steward) => {
+            menzil_admin::steward_rotate(&steward, &current, std::slice::from_ref(&cert), now)?
+        }
+    };
+    save_documents(home, &next)?;
+    Ok(issued(&next, Some(member)))
+}
+
+/// One network as `cert show` shows it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NetworkCert {
+    /// The network.
+    pub network_id: NetworkId,
+    /// The highest certificate of this device the held Policy lists; `None` when it lists none
+    /// (this device is not a member there) or the documents cannot be read.
+    pub listed: Option<Listed>,
+}
+
+/// What `menzil cert` shows: this device's certificate and, per network, what the documents it
+/// holds list for it.
+#[derive(Debug, Clone)]
+pub struct CertReport {
+    /// This device.
+    pub node_id: NodeId,
+    /// The serial of the certificate in the file.
+    pub serial: u32,
+    /// Its window.
+    pub not_before: u64,
+    /// Its end.
+    pub not_after: u64,
+    /// The networks the device holds documents for.
+    pub networks: Vec<NetworkCert>,
+}
+
+/// The state of this device's certificate and of what its networks list for it.
+pub fn cert_show(home: &Home) -> Result<CertReport> {
+    let (keys, cert) = load_identity(home)?;
+    let body = cert.decode()?;
+    let me = keys.node_id();
+    let mut networks = Vec::new();
+    for network_id in home.networks()? {
+        let listed = load_documents(home, &network_id)
+            .ok()
+            .and_then(|docs| rules::listed_cert(docs.policy_body(), &me));
+        networks.push(NetworkCert { network_id, listed });
+    }
+    Ok(CertReport {
+        node_id: me,
+        serial: body.serial,
+        not_before: body.not_before,
+        not_after: body.not_after,
+        networks,
+    })
+}
+
+impl CertReport {
+    /// The report as text, with times relative to `now`.
+    pub fn render(&self, now: u64) -> String {
+        let mut out = format!(
+            "this device: {}\n  certificate serial {}, {} {}\n",
+            self.node_id,
+            self.serial,
+            if self.not_after <= now {
+                "EXPIRED"
+            } else {
+                "expires"
+            },
+            relative(self.not_after, now)
+        );
+        if rules::renew_due(self.not_after, now) {
+            out.push_str("  it is due for renewal: `menzil node` renews it by itself, or run `menzil cert renew`\n");
+        }
+        for network in &self.networks {
+            out.push_str(&format!("network {}\n", network.network_id));
+            match network.listed {
+                None => out.push_str("  lists no certificate of this device\n"),
+                Some(listed) => {
+                    let state = if listed.not_after <= now {
+                        "EXPIRED"
+                    } else {
+                        "expires"
+                    };
+                    out.push_str(&format!(
+                        "  lists serial {}, {state} {}; the current certificate is {}\n",
+                        listed.serial,
+                        relative(listed.not_after, now),
+                        if listed.serial >= self.serial {
+                            "listed".to_string()
+                        } else {
+                            "NOT listed: hand `menzil cert request` to the network's owner (`menzil cert accept`), or a steward lists it when this device's node reaches it".to_string()
+                        }
+                    ));
+                }
+            }
+        }
+        out
+    }
 }
 
 /// The token for the documents this device holds now, to hand to a member again.

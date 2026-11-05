@@ -951,7 +951,10 @@ mod tests {
         assert_eq!(deadline_of(&f, &peers, 100), Some(401));
         // One that started already is not ahead.
         let mut started = fixture(400);
-        started.policy.certs.push(peer_cert(&started, 2, 9, (50, 900)));
+        started
+            .policy
+            .certs
+            .push(peer_cert(&started, 2, 9, (50, 900)));
         assert_eq!(
             deadline_of(&started, &[(started.peer, started.peer_static)], 100),
             Some(5_000),

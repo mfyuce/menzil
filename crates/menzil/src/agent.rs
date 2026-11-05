@@ -33,6 +33,26 @@
 //!                   "no word from the node".
 //! ```
 //!
+//! The status reply may carry the node's certificate too (cert rotation S6):
+//!
+//! ```text
+//!                     cert_serial <n>                 the serial of the certificate in use
+//!                     cert_not_after <Unix seconds>   when it expires
+//!                     cert_unlisted <network> <days>  a network whose held Policy lists an
+//!                                                     older certificate of this node, with the
+//!                                                     days that listed one has left (repeated)
+//! ```
+//!
+//! A third request asks the node to renew its certificate (same keys, serial + 1, written to
+//! `identity.cert`, in use at once) and answers one line, then lines:
+//!
+//! ```text
+//! client -> agent   cert renew\n
+//! agent  -> client  error <message>\n      or
+//!                   ok\n, then   cert_serial <n>, cert_not_after <Unix seconds>,
+//!                   cert_token <menzil1-cert:...>   (one per line), then the connection ends
+//! ```
+//!
 //! Both directions are framed because a clean end and an abnormal one must stay apart all the
 //! way to the program that uses the stream (protocol.md 5.2, "never with a clean end of
 //! file"), and a Unix socket cannot say it: closing it looks the same whether the program
@@ -60,6 +80,7 @@ use tokio::sync::Semaphore;
 use tokio::time::timeout;
 
 use crate::text;
+use crate::token::decode_cert_request;
 
 /// The longest request line, newline included.
 pub const MAX_REQUEST_BYTES: usize = 512;
@@ -83,6 +104,8 @@ const FRAME_RESET: u8 = 2;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long the agent spends getting a stream open (the session handshake and the OPEN).
 const OPEN_TIMEOUT: Duration = Duration::from_secs(60);
+/// How long the agent spends renewing the node's certificate.
+const RENEW_TIMEOUT: Duration = Duration::from_secs(10);
 /// How many connections the agent serves at once.
 const MAX_CONNECTIONS: usize = 256;
 
@@ -98,6 +121,140 @@ pub trait Opener: Send + Sync + 'static {
     fn status(&self) -> impl Future<Output = RelayStatus> + Send {
         async { RelayStatus::default() }
     }
+
+    /// The node's certificate and what its networks list for it, for the `status` request. An
+    /// opener that knows nothing says nothing.
+    fn cert_status(&self) -> impl Future<Output = Option<CertStatus>> + Send {
+        async { None }
+    }
+
+    /// Renews the node's certificate for the `cert renew` request. The error is a message for
+    /// the person at the other end of the socket.
+    fn renew_cert(&self) -> impl Future<Output = Result<RenewedCert, String>> + Send {
+        async { Err("this agent does not renew certificates".to_string()) }
+    }
+}
+
+/// What a `cert renew` request came to: the certificate now in use.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RenewedCert {
+    /// Its serial.
+    pub serial: u32,
+    /// When it expires, Unix seconds.
+    pub not_after: u64,
+    /// The `menzil1-cert:` token that carries it to an owner or steward.
+    pub token: String,
+}
+
+/// A network whose held Policy lists an older certificate of this node than the one in use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UnlistedCert {
+    /// The network.
+    pub network: menzil_proto::NetworkId,
+    /// Whole days the listed certificate has left (0: expired).
+    pub days: u64,
+}
+
+/// The node's certificate, as the `status` request carries it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CertStatus {
+    /// The serial in use.
+    pub serial: u32,
+    /// When it expires, Unix seconds.
+    pub not_after: u64,
+    /// Networks that do not list it yet.
+    pub unlisted: Vec<UnlistedCert>,
+}
+
+/// The most `cert_unlisted` lines a reply carries (the client reads 32 lines in all).
+const MAX_UNLISTED_LINES: usize = 16;
+
+impl CertStatus {
+    fn to_lines(&self) -> String {
+        let mut out = format!(
+            "cert_serial {}\ncert_not_after {}\n",
+            self.serial, self.not_after
+        );
+        for unlisted in self.unlisted.iter().take(MAX_UNLISTED_LINES) {
+            out.push_str(&format!(
+                "cert_unlisted {} {}\n",
+                unlisted.network, unlisted.days
+            ));
+        }
+        out
+    }
+
+    /// The certificate part of a status reply; `None` when it carries none.
+    fn from_lines(lines: &[String]) -> Option<Self> {
+        let mut status = Self::default();
+        let (mut serial, mut not_after) = (false, false);
+        for line in lines {
+            let (key, value) = line.split_once(' ').unwrap_or((line.as_str(), ""));
+            match key {
+                "cert_serial" => {
+                    if let Ok(n) = value.trim().parse() {
+                        status.serial = n;
+                        serial = true;
+                    }
+                }
+                "cert_not_after" => {
+                    if let Ok(t) = value.trim().parse() {
+                        status.not_after = t;
+                        not_after = true;
+                    }
+                }
+                "cert_unlisted" => {
+                    let Some((network, days)) = value.split_once(' ') else {
+                        continue;
+                    };
+                    let (Some(network), Ok(days)) = (
+                        crate::home::parse_hex32(network.trim()),
+                        days.trim().parse(),
+                    ) else {
+                        continue;
+                    };
+                    if status.unlisted.len() < MAX_UNLISTED_LINES {
+                        status.unlisted.push(UnlistedCert {
+                            network: menzil_proto::NetworkId::from(network),
+                            days,
+                        });
+                    }
+                }
+                _ => {}
+            }
+        }
+        (serial && not_after).then_some(status)
+    }
+
+    /// What `menzil status` adds about the certificate, as text, with times relative to `now`.
+    pub fn render(&self, now: u64) -> String {
+        let mut out = format!(
+            "node certificate: serial {}, {} {}\n",
+            self.serial,
+            if self.not_after <= now {
+                "EXPIRED"
+            } else {
+                "expires"
+            },
+            crate::local::relative(self.not_after, now)
+        );
+        for unlisted in &self.unlisted {
+            out.push_str(&format!(
+                "  network {} does not list it yet (it lists an older one, {} day(s) left): `menzil cert request` prints the token for the owner's `menzil cert accept`\n",
+                unlisted.network, unlisted.days
+            ));
+        }
+        out
+    }
+}
+
+/// What a `status` reply says: the relay part and the certificate part.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct NodeStatus {
+    /// How the node stands with its relay.
+    pub relay: RelayStatus,
+    /// Its certificate, when the agent said.
+    pub cert: Option<CertStatus>,
 }
 
 /// What the node knows about its relay, as the `status` request carries it. Every part is
@@ -430,9 +587,23 @@ async fn handle<O: Opener>(connection: UnixStream, opener: &O) -> Result<()> {
         .context("the request did not arrive in time")??
         .ok_or_else(|| anyhow!("the client sent nothing"))?;
     if line.trim_end_matches(['\r', '\n']) == "status" {
-        write
-            .write_all(opener.status().await.to_lines().as_bytes())
-            .await?;
+        let mut reply = opener.status().await.to_lines();
+        if let Some(cert) = opener.cert_status().await {
+            reply.push_str(&cert.to_lines());
+        }
+        write.write_all(reply.as_bytes()).await?;
+        return Ok(());
+    }
+    if line.trim_end_matches(['\r', '\n']) == "cert renew" {
+        let reply = match timeout(RENEW_TIMEOUT, opener.renew_cert()).await {
+            Ok(Ok(renewed)) => format!(
+                "ok\ncert_serial {}\ncert_not_after {}\ncert_token {}\n",
+                renewed.serial, renewed.not_after, renewed.token
+            ),
+            Ok(Err(message)) => format!("error {}\n", error_line(&message)),
+            Err(_) => "error the node did not renew the certificate in time\n".to_string(),
+        };
+        write.write_all(reply.as_bytes()).await?;
         return Ok(());
     }
     let target = match parse_request(&line) {
@@ -667,14 +838,19 @@ const MAX_STATUS_LINES: usize = 32;
 /// agent to ask (none is listening, another user serves the socket, it did not answer, or it
 /// predates the request), which a caller takes as "no word from the node".
 pub async fn query_status(socket: &Path) -> Result<RelayStatus> {
+    Ok(query_node_status(socket).await?.relay)
+}
+
+/// [`query_status`], and the node's certificate too when the agent says it.
+pub async fn query_node_status(socket: &Path) -> Result<NodeStatus> {
     let uid = current_uid()
         .await
         .context("finding out which user this is")?;
-    query_status_as(socket, uid).await
+    query_node_status_as(socket, uid).await
 }
 
-/// [`query_status`] for a client that expects the agent to run as `uid`.
-async fn query_status_as(socket: &Path, uid: u32) -> Result<RelayStatus> {
+/// [`query_node_status`] for a client that expects the agent to run as `uid`.
+async fn query_node_status_as(socket: &Path, uid: u32) -> Result<NodeStatus> {
     crate::node_cmd::check_socket_path_length(socket)?;
     timeout(STATUS_TIMEOUT, async {
         let connection = UnixStream::connect(socket)
@@ -720,10 +896,126 @@ async fn query_status_as(socket: &Path, uid: u32) -> Result<RelayStatus> {
                 break;
             }
         }
-        Ok(RelayStatus::from_lines(&lines))
+        Ok(NodeStatus {
+            relay: RelayStatus::from_lines(&lines),
+            cert: CertStatus::from_lines(&lines),
+        })
     })
     .await
     .context("the agent did not answer in time")?
+}
+
+/// [`query_status_as`] for the tests that predate the certificate part.
+#[cfg(test)]
+async fn query_status_as(socket: &Path, uid: u32) -> Result<RelayStatus> {
+    Ok(query_node_status_as(socket, uid).await?.relay)
+}
+
+/// Why a `cert renew` request did not get an answer from an agent.
+#[derive(Debug)]
+pub enum RenewError {
+    /// Nothing listens at the socket (no node runs): the caller may renew the file itself.
+    NoAgent,
+    /// An agent answered and said no, or something went wrong after it was reached; the
+    /// certificate must not be renewed behind the node's back.
+    Failed(anyhow::Error),
+}
+
+impl std::fmt::Display for RenewError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoAgent => write!(f, "no agent is listening"),
+            Self::Failed(error) => write!(f, "{error:#}"),
+        }
+    }
+}
+
+/// Asks the node behind `socket` to renew its certificate (`menzil cert renew`). The node
+/// writes `identity.cert`, switches to the new certificate at once and offers it to its peers;
+/// the answer says which. [`RenewError::NoAgent`] when nothing listens there.
+pub async fn renew_cert(socket: &Path) -> Result<RenewedCert, RenewError> {
+    let uid = current_uid()
+        .await
+        .context("finding out which user this is")
+        .map_err(RenewError::Failed)?;
+    renew_cert_as(socket, uid).await
+}
+
+/// [`renew_cert`] for a client that expects the agent to run as `uid`.
+async fn renew_cert_as(socket: &Path, uid: u32) -> Result<RenewedCert, RenewError> {
+    crate::node_cmd::check_socket_path_length(socket).map_err(RenewError::Failed)?;
+    let connection = match UnixStream::connect(socket).await {
+        Ok(connection) => connection,
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
+            ) =>
+        {
+            return Err(RenewError::NoAgent);
+        }
+        Err(error) => {
+            return Err(RenewError::Failed(
+                anyhow::Error::new(error).context(format!("connecting to {}", socket.display())),
+            ));
+        }
+    };
+    timeout(RENEW_TIMEOUT + Duration::from_secs(5), async {
+        let served_by = connection
+            .peer_cred()
+            .context("asking who runs the agent")?
+            .uid();
+        if served_by != uid {
+            bail!(
+                "the socket {} is served by another user; nothing was sent to it",
+                socket.display()
+            );
+        }
+        let (read, mut write) = connection.into_split();
+        let mut read = BufReader::new(read);
+        write.write_all(b"cert renew\n").await?;
+        let first = read_line(&mut read, MAX_REPLY_BYTES)
+            .await?
+            .ok_or_else(|| anyhow!("the agent closed the connection without answering"))?;
+        let first = first.trim_end();
+        if let Some(message) = first.strip_prefix("error ") {
+            bail!("{}", error_line(message));
+        }
+        if first != "ok" {
+            bail!("the agent answered something this client does not understand (an older node that predates `cert renew`?)");
+        }
+        let (mut serial, mut not_after, mut token) = (None, None, None);
+        for _ in 0..8 {
+            let Some(line) = read_line(&mut read, MAX_REPLY_BYTES).await? else {
+                break;
+            };
+            let line = line.trim_end();
+            match line.split_once(' ') {
+                Some(("cert_serial", value)) => serial = value.trim().parse::<u32>().ok(),
+                Some(("cert_not_after", value)) => not_after = value.trim().parse::<u64>().ok(),
+                Some(("cert_token", value)) => token = Some(value.trim().to_string()),
+                _ => {}
+            }
+        }
+        let (Some(serial), Some(not_after), Some(token)) = (serial, not_after, token) else {
+            bail!("the agent's answer to `cert renew` is incomplete");
+        };
+        // What is shown to the person is checked: it must be a certificate token whose serial
+        // is the one said.
+        let cert = decode_cert_request(&token).context("the agent sent a damaged token")?;
+        let body = cert.decode()?;
+        if body.serial != serial || body.not_after != not_after {
+            bail!("the agent's token does not match the serial it reported");
+        }
+        Ok(RenewedCert {
+            serial,
+            not_after,
+            token,
+        })
+    })
+    .await
+    .map_err(|_| RenewError::Failed(anyhow!("the agent did not answer in time")))?
+    .map_err(RenewError::Failed)
 }
 
 /// How the input side of [`connect_and_bridge`] ended.

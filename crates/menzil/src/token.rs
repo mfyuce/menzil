@@ -4,6 +4,12 @@
 //!
 //! * `menzil1-join:` + base64url of a NodeCert: what `menzil init` prints, what the owner pastes
 //!   into `menzil admit`.
+//! * `menzil1-cert:` + base64url of a NodeCert: what `menzil cert renew` and `menzil cert request`
+//!   print for a certificate that was renewed (same keys, higher serial), what the owner or a
+//!   steward pastes into `menzil cert accept` (cert rotation, design Q7 a). The payload is the
+//!   same as a join request's, but the prefix keeps the two apart: pasting a renewal into
+//!   `menzil admit` (it would be refused as an already admitted member anyway) or a first
+//!   certificate into `menzil cert accept` is told, not guessed.
 //! * `menzil1-docs:` + base64url of a Roster and a Policy ([`documents_to_bytes`]): what `menzil
 //!   admit` prints, what the new member pastes into `menzil join`. Documents a steward signed
 //!   come with the owner signed pair they were made from, the base (protocol.md 2.3; payload
@@ -35,6 +41,8 @@ pub const DOCS_PREFIX: &str = "menzil1-docs:";
 pub const ROSTER_PREFIX: &str = "menzil1-roster:";
 /// Prefix of a steward request: the public half of a steward key and the network it is for.
 pub const STEWARD_PREFIX: &str = "menzil1-steward:";
+/// Prefix of a renewed certificate, the token `menzil cert accept` takes.
+pub const CERT_PREFIX: &str = "menzil1-cert:";
 
 /// The longest token text accepted: four documents (a pair and its base) at the size verifiers
 /// allow, base64 encoded, with room for the framing. Checked before any decoding.
@@ -122,6 +130,34 @@ pub fn decode_join_request(token: &str) -> Result<NodeCert, TokenError> {
         token,
         JOIN_PREFIX,
         &[
+            (DOCS_PREFIX, OTHER_KIND),
+            (ROSTER_PREFIX, OTHER_KIND),
+            (STEWARD_PREFIX, OTHER_KIND),
+            (
+                CERT_PREFIX,
+                " (this is a renewed certificate, for `menzil cert accept`)",
+            ),
+        ],
+    )?)?;
+    NodeCert::decode_strict(&bytes).map_err(|_| TokenError::Malformed("node certificate"))
+}
+
+/// A renewed certificate as a token: what `menzil cert renew` and `menzil cert request` print.
+pub fn encode_cert_request(cert: &NodeCert) -> String {
+    format!("{CERT_PREFIX}{}", URL_SAFE_NO_PAD.encode(cert.encode()))
+}
+
+/// The certificate in a `menzil1-cert:` token. Its signature is not checked here (the issuer's
+/// operation does). A join request is refused with a pointer to the right command.
+pub fn decode_cert_request(token: &str) -> Result<NodeCert, TokenError> {
+    let bytes = decode_base64(strip(
+        token,
+        CERT_PREFIX,
+        &[
+            (
+                JOIN_PREFIX,
+                " (this is a join request, for `menzil admit`; a renewed certificate comes from `menzil cert renew` or `menzil cert request`)",
+            ),
             (DOCS_PREFIX, OTHER_KIND),
             (ROSTER_PREFIX, OTHER_KIND),
             (STEWARD_PREFIX, OTHER_KIND),
@@ -228,6 +264,7 @@ pub fn decode_documents(token: &str) -> Result<Documents, TokenError> {
             (JOIN_PREFIX, OTHER_KIND),
             (ROSTER_PREFIX, OTHER_KIND),
             (STEWARD_PREFIX, OTHER_KIND),
+            (CERT_PREFIX, OTHER_KIND),
         ],
     )?)?)
 }
@@ -281,6 +318,7 @@ pub fn decode_roster(token: &str) -> Result<(Roster, Option<Roster>), TokenError
             (DOCS_PREFIX, FULL_TOKEN),
             (JOIN_PREFIX, OTHER_KIND),
             (STEWARD_PREFIX, OTHER_KIND),
+            (CERT_PREFIX, OTHER_KIND),
         ],
     )?)?;
     roster_from_bytes(&bytes)
@@ -304,6 +342,7 @@ pub fn decode_steward_request(token: &str) -> Result<(NetworkId, StewardKey), To
             (JOIN_PREFIX, OTHER_KIND),
             (DOCS_PREFIX, OTHER_KIND),
             (ROSTER_PREFIX, OTHER_KIND),
+            (CERT_PREFIX, OTHER_KIND),
         ],
     )?)?;
     let [1, rest @ ..] = bytes.as_slice() else {
@@ -641,5 +680,50 @@ mod tests {
             decode_roster(&token),
             Err(TokenError::WrongKind { hint, .. }) if hint.contains("other kind")
         ));
+    }
+    #[test]
+    fn a_renewed_certificate_token_round_trips_and_only_under_its_own_prefix() {
+        let (cert, docs) = documents();
+        let token = encode_cert_request(&cert);
+        assert!(token.starts_with(CERT_PREFIX) && !token.contains(char::is_whitespace));
+        assert_eq!(decode_cert_request(&token).unwrap(), cert);
+        assert_eq!(
+            decode_cert_request(&format!("  {token}\n")).unwrap(),
+            cert,
+            "pasting brings a newline along"
+        );
+        // A join request carries the same certificate, and is still the wrong kind here.
+        match decode_cert_request(&encode_join_request(&cert)) {
+            Err(TokenError::WrongKind { expected, hint }) => {
+                assert_eq!(expected, CERT_PREFIX);
+                assert!(hint.contains("menzil admit"), "{hint}");
+            }
+            other => panic!("expected WrongKind, got {other:?}"),
+        }
+        for other in [encode_documents(&docs), encode_roster(docs.roster(), None)] {
+            assert!(matches!(
+                decode_cert_request(&other),
+                Err(TokenError::WrongKind { .. })
+            ));
+        }
+        assert!(matches!(
+            decode_cert_request("hello"),
+            Err(TokenError::WrongKind { .. })
+        ));
+        // And the other kinds name this one when it is pasted into them.
+        for result in [
+            decode_join_request(&token).map(|_| ()),
+            decode_documents(&token).map(|_| ()),
+            decode_roster(&token).map(|_| ()),
+            decode_steward_request(&token).map(|_| ()),
+        ] {
+            assert!(matches!(result, Err(TokenError::WrongKind { .. })));
+        }
+        // Damage is damage.
+        assert_eq!(
+            decode_cert_request(&format!("{CERT_PREFIX}!!!")),
+            Err(TokenError::BadBase64)
+        );
+        assert!(decode_cert_request(&token[..token.len() - 7]).is_err());
     }
 }

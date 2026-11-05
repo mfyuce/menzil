@@ -1716,3 +1716,232 @@ fn only_the_owner_ungrants() {
     );
     assert!(error.contains("does not own"), "{error}");
 }
+
+// ---- certificate rotation (cert-rotation design S6) ----
+
+/// The owner, and a member that has joined: the member's own files are what a renewal changes.
+fn joined_member() -> Two {
+    let two = two_devices();
+    let admitted = admit(&two.owner, None, &two.join_request, "phone", &[], NOW).unwrap();
+    join(&two.member, &admitted.token, NOW).unwrap();
+    two
+}
+
+fn serial_of(home: &Home) -> u32 {
+    load_identity(home).unwrap().1.decode().unwrap().serial
+}
+
+#[test]
+fn a_renewal_without_a_node_writes_the_certificate_and_leaves_the_key_file_as_it_was() {
+    let two = joined_member();
+    let key_before = fs::read(two.member.identity_key_path()).unwrap();
+    let (keys_before, cert_before) = load_identity(&two.member).unwrap();
+
+    let renewed = cert_renew(&two.member, NOW + DAY).unwrap();
+    assert_eq!(renewed.serial, 2);
+
+    // The key file is byte for byte what it was; the certificate is the next one for the same
+    // keys, valid from a day ago for 400 days, and the token carries it.
+    assert_eq!(
+        fs::read(two.member.identity_key_path()).unwrap(),
+        key_before
+    );
+    let (keys_after, cert_after) = load_identity(&two.member).unwrap();
+    assert_eq!(keys_after.node_id(), keys_before.node_id());
+    assert_eq!(cert_after, renewed.cert);
+    let (old, new) = (cert_before.decode().unwrap(), cert_after.decode().unwrap());
+    assert_eq!((new.serial, new.node_id), (old.serial + 1, old.node_id));
+    assert_eq!(new.x25519_pub, old.x25519_pub);
+    assert_eq!(new.not_before, NOW);
+    assert_eq!(new.not_after - new.not_before, 400 * DAY);
+    assert_eq!(renewed.not_after, new.not_after);
+    assert_eq!(decode_cert_request(&renewed.token).unwrap(), cert_after);
+    assert_eq!(cert_request(&two.member).unwrap(), renewed.token);
+    // And again: one more.
+    assert_eq!(cert_renew(&two.member, NOW + 2 * DAY).unwrap().serial, 3);
+}
+
+#[test]
+fn a_renewal_gets_above_every_serial_the_held_documents_list() {
+    let two = joined_member();
+    // The owner lists a serial 4 certificate of the member (a cert the member's file lost: a
+    // restored backup is the usual way to get here).
+    let (keys, cert) = load_identity(&two.member).unwrap();
+    let four = keys.next_cert(&cert, Some(3), NOW).unwrap();
+    assert_eq!(four.decode().unwrap().serial, 4);
+    let listed = cert_accept(&two.owner, None, &encode_cert_request(&four), NOW + DAY).unwrap();
+    join(&two.member, &listed.token, NOW + DAY).unwrap();
+    assert_eq!(serial_of(&two.member), 1);
+
+    let renewed = cert_renew(&two.member, NOW + 2 * DAY).unwrap();
+    assert_eq!(
+        renewed.serial, 5,
+        "one above the highest serial any held Policy lists"
+    );
+}
+
+#[test]
+fn a_renewal_is_refused_while_a_node_runs_and_changes_nothing() {
+    let two = joined_member();
+    let _node = two.member.lock_node().unwrap();
+    let key_before = fs::read(two.member.identity_key_path()).unwrap();
+    let cert_before = fs::read(two.member.identity_cert_path()).unwrap();
+    let error = format!("{:#}", cert_renew(&two.member, NOW + DAY).unwrap_err());
+    assert!(error.contains("`menzil node` is running"), "{error}");
+    assert_eq!(
+        fs::read(two.member.identity_key_path()).unwrap(),
+        key_before
+    );
+    assert_eq!(
+        fs::read(two.member.identity_cert_path()).unwrap(),
+        cert_before
+    );
+}
+
+#[test]
+fn the_token_for_the_current_certificate_changes_nothing() {
+    let two = joined_member();
+    let before = fs::read(two.member.identity_cert_path()).unwrap();
+    let token = cert_request(&two.member).unwrap();
+    assert!(token.starts_with(crate::token::CERT_PREFIX));
+    assert_eq!(
+        decode_cert_request(&token).unwrap(),
+        load_identity(&two.member).unwrap().1
+    );
+    assert_eq!(fs::read(two.member.identity_cert_path()).unwrap(), before);
+    // No identity: says what to do.
+    let (_dir, none) = device();
+    assert!(format!("{:#}", cert_request(&none).unwrap_err()).contains("menzil init"));
+}
+
+#[test]
+fn the_owner_lists_a_members_renewed_certificate_from_its_token() {
+    let two = joined_member();
+    let renewed = cert_renew(&two.member, NOW + DAY).unwrap();
+    let member_id = renewed.cert.decode().unwrap().node_id;
+
+    let issued = cert_accept(&two.owner, None, &renewed.token, NOW + 2 * DAY).unwrap();
+    assert_eq!(issued.member, Some(member_id));
+    let docs = load_documents(&two.owner, &two.network_id).unwrap();
+    assert_eq!(docs.seq(), issued.seq);
+    let serials: Vec<u32> = docs
+        .policy_body()
+        .certs
+        .iter()
+        .map(|cert| cert.decode().unwrap())
+        .filter(|body| body.node_id == member_id)
+        .map(|body| body.serial)
+        .collect();
+    assert_eq!(
+        serials,
+        vec![2],
+        "the owner's operation replaces the older certificate"
+    );
+
+    // The member takes the token and sees its certificate listed.
+    join(&two.member, &issued.token, NOW + 2 * DAY).unwrap();
+    let report = cert_show(&two.member).unwrap();
+    assert_eq!(report.serial, 2);
+    assert_eq!(
+        report.networks[0].listed.map(|listed| listed.serial),
+        Some(2)
+    );
+    let text = report.render(NOW + 2 * DAY);
+    assert!(text.contains("the current certificate is listed"), "{text}");
+}
+
+#[test]
+fn a_steward_only_device_lists_a_renewal_as_a_rotation() {
+    let s = stewarded();
+    // The steward admits the phone; the phone joins and renews.
+    let admitted = admit(
+        &s.two.member,
+        None,
+        &s.phone_request,
+        "phone",
+        &[],
+        NOW + 20,
+    )
+    .unwrap();
+    join(&s.phone, &admitted.token, NOW + 20).unwrap();
+    let renewed = cert_renew(&s.phone, NOW + DAY).unwrap();
+    let phone_id = renewed.cert.decode().unwrap().node_id;
+    assert!(!s.two.member.owner_key_path(&s.two.network_id).exists());
+
+    let issued = cert_accept(&s.two.member, None, &renewed.token, NOW + 2 * DAY).unwrap();
+    assert_eq!(issued.member, Some(phone_id));
+    let docs = load_documents(&s.two.member, &s.two.network_id).unwrap();
+    assert!(docs.base().is_some(), "a steward's pair carries its base");
+    let serials: Vec<u32> = docs
+        .policy_body()
+        .certs
+        .iter()
+        .map(|cert| cert.decode().unwrap())
+        .filter(|body| body.node_id == phone_id)
+        .map(|body| body.serial)
+        .collect();
+    // The phone was admitted by this steward, so its first certificate is in the tail: the
+    // rotation replaces it in place (one tail certificate per member).
+    assert_eq!(serials, vec![2]);
+    // The phone adopts it.
+    join(&s.phone, &issued.token, NOW + 2 * DAY).unwrap();
+    assert_eq!(
+        cert_show(&s.phone).unwrap().networks[0]
+            .listed
+            .map(|listed| listed.serial),
+        Some(2)
+    );
+}
+
+#[test]
+fn accepting_a_certificate_takes_only_its_own_kind_of_token() {
+    let two = joined_member();
+    let join_token = cert_request(&two.member)
+        .map(|t| t.replace(crate::token::CERT_PREFIX, crate::token::JOIN_PREFIX));
+    let error = format!(
+        "{:#}",
+        cert_accept(&two.owner, None, &join_token.unwrap(), NOW + DAY).unwrap_err()
+    );
+    assert!(
+        error.contains("menzil1-cert:") && error.contains("join request"),
+        "{error}"
+    );
+    // A membership token is no certificate either.
+    let docs_token = token(&two.owner, None).unwrap();
+    assert!(cert_accept(&two.owner, None, &docs_token, NOW + DAY).is_err());
+    // Nothing was issued.
+    assert_eq!(
+        load_documents(&two.owner, &two.network_id).unwrap().seq(),
+        2
+    );
+    // A certificate that is not newer is refused by the operation, not listed twice.
+    let current = cert_request(&two.member).unwrap();
+    let error = format!(
+        "{:#}",
+        cert_accept(&two.owner, None, &current, NOW + DAY).unwrap_err()
+    );
+    assert!(!error.is_empty());
+    assert_eq!(
+        load_documents(&two.owner, &two.network_id).unwrap().seq(),
+        2
+    );
+}
+
+#[test]
+fn the_certificate_report_says_when_a_network_does_not_list_the_current_one() {
+    let two = joined_member();
+    cert_renew(&two.member, NOW + DAY).unwrap();
+    let report = cert_show(&two.member).unwrap();
+    assert_eq!(report.serial, 2);
+    let text = report.render(NOW + DAY);
+    assert!(text.contains("certificate serial 2"), "{text}");
+    assert!(text.contains("lists serial 1"), "{text}");
+    assert!(text.contains("NOT listed"), "{text}");
+    // Far from expiry: not due for renewal yet.
+    assert!(!text.contains("due for renewal"), "{text}");
+    // Near expiry it says so.
+    let late = report.render(report.not_after - 59 * DAY);
+    assert!(late.contains("due for renewal"), "{late}");
+    let expired = report.render(report.not_after + 1);
+    assert!(expired.contains("EXPIRED"), "{expired}");
+}

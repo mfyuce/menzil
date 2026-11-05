@@ -1160,3 +1160,232 @@ fn a_rejection_with_a_huge_time_renders_without_overflow() {
     let text = status.render(1_700_000_000);
     assert!(text.contains("just now"), "{text}");
 }
+
+// ---- the certificate (cert rotation S6): `cert renew`, and the certificate in `status` ----
+
+fn a_cert(serial: u32) -> menzil_proto::NodeCert {
+    menzil_admin::NodeKeys::generate()
+        .issue_cert(serial, 1_700_000_000, 1_700_000_000 + 1000)
+        .unwrap()
+}
+
+/// An opener that renews to a prepared answer and reports a prepared certificate status.
+struct Certs {
+    renewal: Result<RenewedCert, String>,
+    status: Option<CertStatus>,
+    asked: std::sync::atomic::AtomicUsize,
+}
+
+impl Opener for Certs {
+    async fn open(&self, _target: &str) -> Result<Stream, String> {
+        Err("no streams here".to_string())
+    }
+    async fn cert_status(&self) -> Option<CertStatus> {
+        self.status.clone()
+    }
+    async fn renew_cert(&self) -> Result<RenewedCert, String> {
+        self.asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.renewal.clone()
+    }
+}
+
+fn certs(renewal: Result<RenewedCert, String>, status: Option<CertStatus>) -> Arc<Certs> {
+    Arc::new(Certs {
+        renewal,
+        status,
+        asked: std::sync::atomic::AtomicUsize::new(0),
+    })
+}
+
+async fn with_agent<O: Opener, T>(opener: Arc<O>, client: impl AsyncFnOnce(&Path, u32) -> T) -> T {
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("agent.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let uid = current_uid().await.unwrap();
+    let agent = tokio::spawn(serve_user(listener, opener, uid));
+    let got = timeout(WAIT, client(&socket, uid)).await.unwrap();
+    agent.abort();
+    got
+}
+
+fn renewed_of(cert: &menzil_proto::NodeCert) -> RenewedCert {
+    let body = cert.decode().unwrap();
+    RenewedCert {
+        serial: body.serial,
+        not_after: body.not_after,
+        token: crate::token::encode_cert_request(cert),
+    }
+}
+
+#[tokio::test]
+async fn a_cert_renew_request_gets_the_serial_and_the_token_the_node_made() {
+    let cert = a_cert(7);
+    let opener = certs(Ok(renewed_of(&cert)), None);
+    let got = with_agent(opener.clone(), async |socket, uid| {
+        renew_cert_as(socket, uid).await
+    })
+    .await
+    .unwrap();
+    assert_eq!(got, renewed_of(&cert));
+    assert_eq!(crate::token::decode_cert_request(&got.token).unwrap(), cert);
+    assert_eq!(opener.asked.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn a_node_that_refuses_to_renew_says_why_and_is_not_bypassed() {
+    let opener = certs(
+        Err("the node did not take it\nsecond line".to_string()),
+        None,
+    );
+    let error = with_agent(opener, async |socket, uid| renew_cert_as(socket, uid).await)
+        .await
+        .unwrap_err();
+    match error {
+        RenewError::Failed(error) => {
+            let shown = format!("{error:#}");
+            assert!(shown.contains("the node did not take it"), "{shown}");
+            assert!(!shown.contains('\n'), "{shown:?}");
+        }
+        RenewError::NoAgent => panic!("an agent answered; that is not 'no agent'"),
+    }
+    // An agent that predates the request, or has no renewer, refuses in words.
+    struct Plain;
+    impl Opener for Plain {
+        async fn open(&self, _target: &str) -> Result<Stream, String> {
+            Err("no".to_string())
+        }
+    }
+    let error = with_agent(Arc::new(Plain), async |socket, uid| {
+        renew_cert_as(socket, uid).await
+    })
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(error, RenewError::Failed(ref e) if format!("{e:#}").contains("does not renew")),
+        "{error}"
+    );
+}
+
+#[tokio::test]
+async fn nothing_listening_is_no_agent_and_anything_else_is_a_failure() {
+    let dir = tempfile::tempdir().unwrap();
+    let uid = current_uid().await.unwrap();
+    // No socket file at all, and a stale one nobody listens at.
+    let missing = dir.path().join("none.sock");
+    assert!(matches!(
+        renew_cert_as(&missing, uid).await,
+        Err(RenewError::NoAgent)
+    ));
+    let stale = dir.path().join("stale.sock");
+    drop(UnixListener::bind(&stale).unwrap());
+    assert!(matches!(
+        renew_cert_as(&stale, uid).await,
+        Err(RenewError::NoAgent)
+    ));
+}
+
+#[tokio::test]
+async fn the_token_in_a_cert_renew_answer_is_checked_before_it_is_shown() {
+    // A token for serial 7 under a reported serial of 8.
+    let cert = a_cert(7);
+    let mut lie = renewed_of(&cert);
+    lie.serial = 8;
+    let error = with_agent(certs(Ok(lie), None), async |socket, uid| {
+        renew_cert_as(socket, uid).await
+    })
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(error, RenewError::Failed(ref e) if format!("{e:#}").contains("does not match")),
+        "{error}"
+    );
+    // A token that is not a certificate token (a join request has the wrong prefix).
+    let mut wrong = renewed_of(&cert);
+    wrong.token = crate::token::encode_join_request(&cert);
+    let error = with_agent(certs(Ok(wrong), None), async |socket, uid| {
+        renew_cert_as(socket, uid).await
+    })
+    .await
+    .unwrap_err();
+    assert!(matches!(error, RenewError::Failed(_)), "{error}");
+}
+
+#[tokio::test]
+async fn the_status_reply_carries_the_certificate_and_the_networks_that_do_not_list_it() {
+    let sent = CertStatus {
+        serial: 3,
+        not_after: 1_800_000_000,
+        unlisted: vec![
+            UnlistedCert {
+                network: menzil_proto::NetworkId::from([7u8; 32]),
+                days: 12,
+            },
+            UnlistedCert {
+                network: menzil_proto::NetworkId::from([8u8; 32]),
+                days: 0,
+            },
+        ],
+    };
+    let opener = certs(Err("unused".into()), Some(sent.clone()));
+    let got = with_agent(opener, async |socket, uid| {
+        query_node_status_as(socket, uid).await
+    })
+    .await
+    .unwrap();
+    assert_eq!(got.cert, Some(sent.clone()));
+    // The relay part is untouched by the certificate lines, and an agent without a certificate
+    // says none.
+    assert_eq!(got.relay, RelayStatus::default());
+    let none = with_agent(certs(Err("unused".into()), None), async |socket, uid| {
+        query_node_status_as(socket, uid).await
+    })
+    .await
+    .unwrap();
+    assert_eq!(none.cert, None);
+    // The older call still works against such an agent.
+    let relay = with_agent(
+        certs(Err("unused".into()), Some(sent.clone())),
+        async |socket, uid| query_status_as(socket, uid).await,
+    )
+    .await
+    .unwrap();
+    assert_eq!(relay, RelayStatus::default());
+
+    let text = sent.render(1_800_000_000 - 3 * 24 * 60 * 60);
+    assert!(
+        text.contains("serial 3") && text.contains("expires in 3 days"),
+        "{text}"
+    );
+    assert!(
+        text.contains(&"07".repeat(32)) && text.contains("12 day(s)"),
+        "{text}"
+    );
+    assert!(text.contains("menzil cert request"), "{text}");
+}
+
+#[test]
+fn a_certificate_status_line_that_is_off_is_skipped_not_believed() {
+    let lines: Vec<String> = [
+        "cert_serial 4",
+        "cert_not_after 99",
+        "cert_unlisted nothex 5",
+        "cert_unlisted",
+        &format!("cert_unlisted {} notanumber", "ab".repeat(32)),
+        &format!("cert_unlisted {} 6", "ab".repeat(32)),
+        "cert_future x",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+    let status = CertStatus::from_lines(&lines).unwrap();
+    assert_eq!(
+        status.unlisted,
+        vec![UnlistedCert {
+            network: menzil_proto::NetworkId::from([0xab; 32]),
+            days: 6
+        }]
+    );
+    // Without a serial and an end there is no certificate part.
+    assert_eq!(CertStatus::from_lines(&["cert_serial 4".to_string()]), None);
+    assert_eq!(CertStatus::from_lines(&[]), None);
+}
