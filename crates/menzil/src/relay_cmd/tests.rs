@@ -785,8 +785,9 @@ async fn a_roster_adopted_over_doc_does_not_replace_a_newer_file() {
 
 // ---- round 10: the keeper updates and never creates; a clean stop flushes ----
 
-/// Round 10, L2: a Roster file the operator deleted while the relay ran (there is no
-/// `remove-network`) is not written back by the next Roster adopted over DOC.
+/// Round 10, L2: a Roster file the operator deleted by hand while the relay ran (the running relay
+/// holds the network until its next reload; `relay remove-network` is the supported way, and is
+/// tested below) is not written back by the next Roster adopted over DOC.
 #[tokio::test]
 async fn a_removed_roster_file_is_not_brought_back_by_an_adopted_roster() {
     let (_o, owner, id, _) = token_of_a_network();
@@ -1039,4 +1040,499 @@ async fn a_stop_with_a_live_relay_task_is_ok_some_and_flushes() {
             .seq,
         seq
     );
+}
+
+// ---- MT6: tenants (multi tenant design 2.1) ----
+
+use super::tenants::{
+    add_network_to, load_book, read_specs, remove_network, remove_tenant, render_tenants,
+    tenants_dir,
+};
+use menzil_relay::TenantId;
+
+/// A relay machine's home, initialised.
+fn relay_machine() -> (tempfile::TempDir, Home) {
+    let (dir, relay) = home();
+    init(&relay, clock()).unwrap();
+    (dir, relay)
+}
+
+/// A new network with its own owner: the owner's home (to renew from), the network and a relay
+/// token.
+fn another_network() -> (tempfile::TempDir, Home, NetworkId, String) {
+    let (dir, owner, id, _) = token_of_a_network();
+    let token = relay_token(&owner);
+    (dir, owner, id, token)
+}
+
+fn tenant_file(relay: &Home, slug: &str) -> PathBuf {
+    tenants_dir(relay).join(format!("{slug}.toml"))
+}
+
+fn read_tenant_file(relay: &Home, slug: &str) -> String {
+    fs::read_to_string(tenant_file(relay, slug)).unwrap()
+}
+
+/// A relay running on `relay`'s directory, with the reload driven by hand (`reload_once`).
+async fn running_on(dir: &Path, relay: &Home) -> RunningRelay {
+    start(relay, &run_options(dir)).await.unwrap()
+}
+
+#[test]
+fn a_directory_without_tenant_files_is_one_default_tenant_with_flat_names() {
+    let (_a, _oa, id_a, token_a) = another_network();
+    let (_b, _ob, id_b, token_b) = another_network();
+    let (_d, relay) = relay_machine();
+    add_network(&relay, &token_a, clock()).unwrap();
+    add_network(&relay, &token_b, clock()).unwrap();
+    assert!(
+        !tenants_dir(&relay).exists(),
+        "an add without a tenant makes no tenant file"
+    );
+    let (specs, refused) = read_specs(&relay).unwrap();
+    assert!(specs.is_empty() && refused.is_empty());
+
+    let rosters = load_rosters(&relay).unwrap();
+    let book = load_book(&relay, &rosters).unwrap();
+    assert_eq!(book.named_count(), 0);
+    assert_eq!(book.tenants().count(), 1);
+    for id in [id_a, id_b] {
+        assert_eq!(book.id_of(&id), &TenantId::Default);
+        assert!(!book.is_held_back(&id));
+    }
+    assert_eq!(book.default_tenant().class, menzil_relay::Class::Personal);
+    assert_eq!(book.default_tenant().figures, None);
+
+    let listing = render_tenants(&relay, clock()).unwrap();
+    assert!(
+        listing.contains("tenant (default)  class personal  networks 2"),
+        "{listing}"
+    );
+    assert_eq!(listing.matches("tenant ").count(), 1, "{listing}");
+    assert!(listing.contains(&format!("network {id_a}  Roster #1")));
+}
+
+#[tokio::test]
+async fn a_relay_without_tenant_files_starts_with_the_default_tenant_only() {
+    let (_a, _oa, id, token) = another_network();
+    let (dir, relay) = relay_machine();
+    add_network(&relay, &token, clock()).unwrap();
+    let running = running_on(dir.path(), &relay).await;
+    assert_eq!(running.networks, vec![id]);
+    assert_eq!(running.tenants().named_count(), 0);
+    assert_eq!(running.tenants().id_of(&id), &TenantId::Default);
+    running.stop();
+}
+
+#[test]
+fn add_network_with_a_tenant_writes_its_file_and_the_book_follows() {
+    let (_a, owner_a, id_a, token_a) = another_network();
+    let (_b, _ob, id_b, token_b) = another_network();
+    let (_c, _oc, id_c, token_c) = another_network();
+    let (_d, relay) = relay_machine();
+
+    let added = add_network_to(&relay, &token_a, clock(), Some("ali")).unwrap();
+    assert_eq!(
+        (added.network_id, added.seq, added.tenant.as_deref()),
+        (id_a, 1, Some("ali"))
+    );
+    assert!(
+        added.warnings.is_empty(),
+        "the first tenant of an empty relay needs no warning"
+    );
+    let text = read_tenant_file(&relay, "ali");
+    assert!(text.contains(&id_a.to_hex()) && text.contains("class = \"friend\""));
+    assert_eq!(
+        add_network_to(&relay, &token_b, clock(), Some("ali"))
+            .unwrap()
+            .seq,
+        1
+    );
+    // The default tenant's network stays outside.
+    let default = add_network_to(&relay, &token_c, clock(), None).unwrap();
+    assert_eq!(default.tenant, None);
+    let two_networks = read_tenant_file(&relay, "ali");
+
+    let rosters = load_rosters(&relay).unwrap();
+    let book = load_book(&relay, &rosters).unwrap();
+    assert_eq!(book.id_of(&id_a).slug(), Some("ali"));
+    assert_eq!(book.id_of(&id_b).slug(), Some("ali"));
+    assert_eq!(book.id_of(&id_c), &TenantId::Default);
+    assert_eq!(
+        book.named("ali").unwrap().figures,
+        Some(menzil_relay::Figures::friend())
+    );
+
+    // A newer token without --tenant renews the Roster and leaves the network where it is.
+    crate::local::renew(&owner_a, None, clock() + DAY).unwrap();
+    let renewed = add_network_to(&relay, &relay_token(&owner_a), clock() + DAY, None).unwrap();
+    assert_eq!((renewed.seq, renewed.tenant.as_deref()), (2, Some("ali")));
+    assert_eq!(
+        read_tenant_file(&relay, "ali"),
+        two_networks,
+        "a renewal rewrites no tenant file"
+    );
+
+    // It cannot be moved by naming another tenant.
+    let error = add_network_to(&relay, &relay_token(&owner_a), clock() + DAY, Some("veli"))
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("already in tenant ali"), "{error}");
+    assert!(!tenant_file(&relay, "veli").exists());
+
+    let listing = render_tenants(&relay, clock()).unwrap();
+    assert!(
+        listing.contains("tenant ali  class friend  networks 2/3"),
+        "{listing}"
+    );
+    assert!(
+        listing.contains("tenant (default)  class personal  networks 1"),
+        "{listing}"
+    );
+}
+
+#[test]
+fn the_second_tenant_is_warned_about_once() {
+    let (_a, _oa, _ia, token_a) = another_network();
+    let (_b, _ob, _ib, token_b) = another_network();
+    let (_c, _oc, _ic, token_c) = another_network();
+    let (_d, relay) = relay_machine();
+    // A default tenant network plus a first tenant: two tenants.
+    add_network(&relay, &token_a, clock()).unwrap();
+    let first = add_network_to(&relay, &token_b, clock(), Some("ali")).unwrap();
+    assert_eq!(first.warnings.len(), 1, "{:?}", first.warnings);
+    assert!(first.warnings[0].contains("Public Suffix List"));
+    // The same tenant again: nothing new to say.
+    let again = add_network_to(&relay, &token_c, clock(), Some("ali")).unwrap();
+    assert!(again.warnings.is_empty());
+}
+
+#[test]
+fn a_fourth_network_for_a_friend_is_refused_and_nothing_is_written() {
+    let nets: Vec<_> = (0..4).map(|_| another_network()).collect();
+    let (_d, relay) = relay_machine();
+    for (_, _, _, token) in &nets[..3] {
+        add_network_to(&relay, token, clock(), Some("ali")).unwrap();
+    }
+    let before = read_tenant_file(&relay, "ali");
+    let (_, _, id4, token4) = &nets[3];
+    let error = add_network_to(&relay, token4, clock(), Some("ali"))
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("may have 3 network"), "{error}");
+    assert_eq!(read_tenant_file(&relay, "ali"), before);
+    assert!(
+        !roster_path(&relay, id4).exists(),
+        "the Roster was not kept either"
+    );
+
+    // The operator raises the figure in the file; then it fits.
+    fs::write(
+        tenant_file(&relay, "ali"),
+        format!("{before}max_networks = 4\n"),
+    )
+    .unwrap();
+    add_network_to(&relay, token4, clock(), Some("ali")).unwrap();
+    assert!(roster_path(&relay, id4).exists());
+}
+
+#[test]
+fn bad_tenant_names_are_refused_before_anything_is_written() {
+    let (_a, _oa, id, token) = another_network();
+    let (_d, relay) = relay_machine();
+    for bad in [
+        "Ab",
+        "ab",
+        "www",
+        "a_b",
+        "-abc",
+        "abc-",
+        "a.b",
+        &"x".repeat(33),
+        "t",
+    ] {
+        let error = add_network_to(&relay, &token, clock(), Some(bad)).unwrap_err();
+        assert!(!format!("{error:#}").is_empty());
+        assert!(!tenants_dir(&relay).exists(), "{bad}");
+        assert!(!roster_path(&relay, &id).exists(), "{bad}");
+    }
+}
+
+#[test]
+fn a_token_the_relay_refuses_leaves_no_tenant_behind() {
+    let (_a, _oa, _ia, token_a) = another_network();
+    let (_b, _ob, id_b, token_b) = another_network();
+    let (_d, relay) = relay_machine();
+    // A new tenant whose first token is refused (expired at that time): no tenant file.
+    let way_later = clock() + 400 * DAY;
+    assert!(add_network_to(&relay, &token_b, way_later, Some("veli")).is_err());
+    assert!(!tenant_file(&relay, "veli").exists());
+    // An existing tenant whose second network is refused: the file is as it was.
+    add_network_to(&relay, &token_a, clock(), Some("ali")).unwrap();
+    let before = read_tenant_file(&relay, "ali");
+    assert!(add_network_to(&relay, &token_b, way_later, Some("ali")).is_err());
+    assert_eq!(read_tenant_file(&relay, "ali"), before);
+    assert!(!before.contains(&id_b.to_hex()));
+}
+
+#[test]
+fn an_extra_name_two_tenants_share_refuses_the_newer_file_and_holds_its_networks_back() {
+    let (_a, _oa, id_a, token_a) = another_network();
+    let (_b, _ob, id_b, token_b) = another_network();
+    let (_c, _oc, id_c, token_c) = another_network();
+    let (_d, relay) = relay_machine();
+    for token in [&token_a, &token_b, &token_c] {
+        add_network(&relay, token, clock()).unwrap();
+    }
+    fs::create_dir_all(tenants_dir(&relay)).unwrap();
+    let file = |network: NetworkId, added: u64| {
+        format!(
+            "networks = [\"{}\"]\nextra_names = [\"blog\"]\nadded = {added}\n",
+            network.to_hex()
+        )
+    };
+    fs::write(tenant_file(&relay, "ali"), file(id_a, 10)).unwrap();
+    fs::write(tenant_file(&relay, "veli"), file(id_b, 20)).unwrap();
+
+    let rosters = load_rosters(&relay).unwrap();
+    let book = load_book(&relay, &rosters).unwrap();
+    assert!(book.named("ali").is_some());
+    assert!(book.named("veli").is_none(), "the newer file is refused");
+    assert!(book.is_held_back(&id_b));
+    assert_eq!(book.id_of(&id_a).slug(), Some("ali"));
+    assert_eq!(book.id_of(&id_c), &TenantId::Default);
+
+    let listing = render_tenants(&relay, clock()).unwrap();
+    assert!(listing.contains("not used: veli.toml"), "{listing}");
+    assert!(listing.contains("blog"), "{listing}");
+}
+
+#[tokio::test]
+async fn a_network_in_a_refused_tenant_file_is_not_served_and_serves_again_once_fixed() {
+    let (_a, _oa, id_a, token_a) = another_network();
+    let (_b, _ob, id_b, token_b) = another_network();
+    let (dir, relay) = relay_machine();
+    add_network(&relay, &token_a, clock()).unwrap();
+    add_network(&relay, &token_b, clock()).unwrap();
+    // A typo in the class: the file is wrong, its network must not fall to the default tenant.
+    fs::create_dir_all(tenants_dir(&relay)).unwrap();
+    let wrong = format!("networks = [\"{}\"]\nclass = \"gold\"\n", id_b.to_hex());
+    fs::write(tenant_file(&relay, "veli"), &wrong).unwrap();
+
+    let running = running_on(dir.path(), &relay).await;
+    assert_eq!(running.networks, vec![id_a], "{:?}", running.networks);
+    assert_eq!(running.roster_seq(&id_b), None);
+    assert!(running.tenants().is_held_back(&id_b));
+
+    // Fixed: the next reload serves it, in its tenant.
+    fs::write(
+        tenant_file(&relay, "veli"),
+        format!("networks = [\"{}\"]\n", id_b.to_hex()),
+    )
+    .unwrap();
+    reload_once(&running.relay, &relay, &mut Vec::new());
+    assert_eq!(running.roster_seq(&id_b), Some(1));
+    assert_eq!(running.tenants().id_of(&id_b).slug(), Some("veli"));
+
+    // Broken again: the network goes out of service at the next reload.
+    fs::write(tenant_file(&relay, "veli"), &wrong).unwrap();
+    reload_once(&running.relay, &relay, &mut Vec::new());
+    assert_eq!(running.roster_seq(&id_b), None);
+    assert_eq!(running.roster_seq(&id_a), Some(1));
+    running.stop();
+}
+
+#[tokio::test]
+async fn tenant_files_that_are_not_toml_stop_a_start_and_a_reload_keeps_the_tenants_it_had() {
+    let (_a, _oa, id, token) = another_network();
+    let (dir, relay) = relay_machine();
+    add_network_to(&relay, &token, clock(), Some("ali")).unwrap();
+    let good = read_tenant_file(&relay, "ali");
+
+    fs::write(tenant_file(&relay, "ali"), "networks = [[[ nonsense").unwrap();
+    let error = start(&relay, &run_options(dir.path())).await.err().unwrap();
+    assert!(format!("{error:#}").contains("ali.toml"), "{error:#}");
+
+    fs::write(tenant_file(&relay, "ali"), &good).unwrap();
+    let running = running_on(dir.path(), &relay).await;
+    assert_eq!(running.tenants().id_of(&id).slug(), Some("ali"));
+    fs::write(tenant_file(&relay, "ali"), "networks = [[[ nonsense").unwrap();
+    reload_once(&running.relay, &relay, &mut Vec::new());
+    assert_eq!(
+        running.tenants().id_of(&id).slug(),
+        Some("ali"),
+        "the reload keeps the tenants it had"
+    );
+    assert_eq!(running.roster_seq(&id), Some(1), "and keeps serving");
+    running.stop();
+}
+
+#[test]
+fn remove_network_deletes_the_roster_and_the_listing_and_nothing_else() {
+    let (_a, _oa, id_a, token_a) = another_network();
+    let (_b, _ob, id_b, token_b) = another_network();
+    let (_c, _oc, id_c, token_c) = another_network();
+    let (_d, relay) = relay_machine();
+    add_network_to(&relay, &token_a, clock(), Some("ali")).unwrap();
+    add_network_to(&relay, &token_b, clock(), Some("ali")).unwrap();
+    add_network(&relay, &token_c, clock()).unwrap();
+
+    let removed = remove_network(&relay, &id_a.to_hex().to_uppercase()).unwrap();
+    assert_eq!(
+        (removed.network_id, removed.tenant.as_deref()),
+        (id_a, Some("ali"))
+    );
+    assert!(!roster_path(&relay, &id_a).exists());
+    assert!(roster_path(&relay, &id_b).exists() && roster_path(&relay, &id_c).exists());
+    let text = read_tenant_file(&relay, "ali");
+    assert!(!text.contains(&id_a.to_hex()) && text.contains(&id_b.to_hex()));
+
+    // The default tenant's network has no listing to edit.
+    let removed = remove_network(&relay, &id_c.to_hex()).unwrap();
+    assert_eq!(removed.tenant, None);
+    assert!(!roster_path(&relay, &id_c).exists());
+
+    // Not served, not a network id, nothing there at all.
+    assert!(remove_network(&relay, &id_a.to_hex()).is_err());
+    assert!(remove_network(&relay, "nonsense").is_err());
+    let (_e, empty) = home();
+    assert!(remove_network(&empty, &id_a.to_hex()).is_err());
+
+    // The last network of a tenant leaves the tenant in place, empty.
+    remove_network(&relay, &id_b.to_hex()).unwrap();
+    assert!(tenant_file(&relay, "ali").exists());
+    let listing = render_tenants(&relay, clock()).unwrap();
+    assert!(
+        listing.contains("tenant ali  class friend  networks 0/3"),
+        "{listing}"
+    );
+}
+
+#[tokio::test]
+async fn a_running_relay_drops_a_removed_network_and_the_keeper_does_not_write_it_back() {
+    let (_a, owner_a, id_a, token_a) = another_network();
+    let (_b, _ob, id_b, token_b) = another_network();
+    let (dir, relay) = relay_machine();
+    add_network_to(&relay, &token_a, clock(), Some("ali")).unwrap();
+    add_network(&relay, &token_b, clock()).unwrap();
+    let running = running_on(dir.path(), &relay).await;
+    assert_eq!(running.roster_seq(&id_a), Some(1));
+    let mut notices = running.relay.rosters().subscribe();
+
+    remove_network(&relay, &id_a.to_hex()).unwrap();
+    // Until the reload the relay holds it (the CLI is another process).
+    assert_eq!(running.roster_seq(&id_a), Some(1));
+    reload_once(&running.relay, &relay, &mut Vec::new());
+    assert_eq!(running.roster_seq(&id_a), None, "dropped at the reload");
+    assert_eq!(
+        running.roster_seq(&id_b),
+        Some(1),
+        "the other network stays"
+    );
+    // The sessions of the network hear of it as they hear of a new Roster (they end `not_member`).
+    assert_eq!(notices.try_recv().unwrap(), id_a);
+
+    // A Roster for the removed network that was already on its way (a member's push that won
+    // the race with the reload) is held for a moment, never written to disk, and the next reload
+    // drops it again.
+    let renewed = crate::local::renew(&owner_a, None, clock() + 60).unwrap();
+    let pair = crate::token::decode_documents(&renewed.token).unwrap();
+    assert!(
+        running
+            .relay
+            .rosters()
+            .adopt(pair.roster(), None, clock() + 60)
+            .unwrap()
+    );
+    assert!(running.flush_rosters(FLUSH));
+    assert!(
+        !roster_path(&relay, &id_a).exists(),
+        "the keeper must not make the file"
+    );
+    reload_once(&running.relay, &relay, &mut Vec::new());
+    assert_eq!(running.roster_seq(&id_a), None);
+    assert!(!roster_path(&relay, &id_a).exists());
+    running.stop();
+    assert_eq!(
+        load_rosters(&relay).unwrap().len(),
+        1,
+        "a restart serves the other only"
+    );
+}
+
+#[tokio::test]
+async fn a_relay_whose_directory_cannot_be_seen_keeps_serving_its_networks() {
+    let (_a, _oa, id, token) = another_network();
+    let (dir, relay) = relay_machine();
+    add_network(&relay, &token, clock()).unwrap();
+    let running = running_on(dir.path(), &relay).await;
+    fs::remove_dir_all(relay_dir(&relay)).unwrap();
+    reload_once(&running.relay, &relay, &mut Vec::new());
+    assert_eq!(
+        running.roster_seq(&id),
+        Some(1),
+        "a directory that is not there is no removal order"
+    );
+    running.stop();
+}
+
+#[tokio::test]
+async fn a_damaged_roster_file_is_not_a_removal() {
+    let (_a, _oa, id, token) = another_network();
+    let (dir, relay) = relay_machine();
+    add_network(&relay, &token, clock()).unwrap();
+    let running = running_on(dir.path(), &relay).await;
+    fs::write(roster_path(&relay, &id), b"damaged").unwrap();
+    reload_once(&running.relay, &relay, &mut Vec::new());
+    assert_eq!(running.roster_seq(&id), Some(1));
+    running.stop();
+}
+
+#[tokio::test]
+async fn remove_tenant_removes_its_networks_and_keeps_its_name_back() {
+    let (_a, _oa, id_a, token_a) = another_network();
+    let (_b, _ob, id_b, token_b) = another_network();
+    let (_c, _oc, id_c, token_c) = another_network();
+    let (dir, relay) = relay_machine();
+    add_network_to(&relay, &token_a, clock(), Some("ali")).unwrap();
+    add_network_to(&relay, &token_b, clock(), Some("ali")).unwrap();
+    add_network(&relay, &token_c, clock()).unwrap();
+    let running = running_on(dir.path(), &relay).await;
+
+    let mut removed = remove_tenant(&relay, "ali", clock()).unwrap();
+    removed.sort_by_key(NetworkId::to_hex);
+    let mut expected = vec![id_a, id_b];
+    expected.sort_by_key(NetworkId::to_hex);
+    assert_eq!(removed, expected);
+    assert!(!tenant_file(&relay, "ali").exists());
+    assert!(!roster_path(&relay, &id_a).exists() && !roster_path(&relay, &id_b).exists());
+    assert!(
+        roster_path(&relay, &id_c).exists(),
+        "the default tenant is untouched"
+    );
+
+    reload_once(&running.relay, &relay, &mut Vec::new());
+    assert_eq!(running.roster_seq(&id_a), None);
+    assert_eq!(running.roster_seq(&id_b), None);
+    assert_eq!(running.roster_seq(&id_c), Some(1));
+    running.stop();
+
+    // The name is not given to anyone for 180 days.
+    let (_e, _oe, _ie, token_e) = another_network();
+    let error = add_network_to(&relay, &token_e, clock() + DAY, Some("ali"))
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("removed"), "{error}");
+    assert!(!tenant_file(&relay, "ali").exists());
+    let listing = render_tenants(&relay, clock() + DAY).unwrap();
+    assert!(listing.contains("quarantine: ali"), "{listing}");
+    let later = render_tenants(&relay, clock() + 181 * DAY).unwrap();
+    assert!(!later.contains("quarantine"), "{later}");
+    let still = render_tenants(&relay, clock() + 179 * DAY).unwrap();
+    assert!(still.contains("quarantine: ali"), "{still}");
+
+    // No such tenant, a name that is not a tenant name.
+    assert!(remove_tenant(&relay, "ali", clock()).is_err());
+    assert!(remove_tenant(&relay, "nobody", clock()).is_err());
+    assert!(remove_tenant(&relay, "Not A Name", clock()).is_err());
 }

@@ -9,6 +9,7 @@
 //! Rosters to the relay when they attach (protocol.md 4.3), so the file only has to be good
 //! enough to start from.
 
+use std::collections::HashSet;
 use std::fs;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -17,7 +18,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result, anyhow, bail};
 use menzil_proto::trust::{DOC_MAX_LIFETIME, HeldRoster, HeldView, Reason, Verdict, check_bundle};
 use menzil_proto::{Limits, NetworkId, Roster};
-use menzil_relay::{Listener, Relay, RelayError, RelayIdentity};
+use menzil_relay::{Listener, Relay, RelayError, RelayIdentity, TenantBook};
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use tokio::task::JoinHandle;
@@ -25,7 +26,9 @@ use tokio::task::JoinHandle;
 use crate::home::{Home, parse_hex32};
 use crate::local::load_identity;
 use crate::persist::Worker;
-use crate::token::{decode_roster, roster_from_bytes, roster_to_bytes};
+use crate::token::{roster_from_bytes, roster_to_bytes};
+
+pub mod tenants;
 
 /// The WebSocket path nodes ask for unless the operator picks another (protocol.md 3.1).
 pub const DEFAULT_PATH: &str = "/_menzil/v1";
@@ -60,10 +63,12 @@ pub struct StoredRoster {
 /// acceptance predicate of protocol.md 2.3 (`menzil_proto::trust`: signed by the network's own
 /// key, or by the steward its base lists, and not expired), and a Roster no newer than the one
 /// kept is left alone. Returns the network and the sequence number now kept.
+///
+/// A network the relay already serves for a tenant stays with it; a new one goes to the default
+/// tenant. [`tenants::add_network_to`] is the same with a tenant to put it in.
 pub fn add_network(home: &Home, token: &str, now: u64) -> Result<(NetworkId, u64)> {
-    let (roster, base) = decode_roster(token)?;
-    keep_roster(home, &roster, base.as_ref(), now, Keep::Create)?
-        .ok_or_else(|| anyhow!("the Roster was not kept"))
+    let added = tenants::add_network_to(home, token, now, None)?;
+    Ok((added.network_id, added.seq))
 }
 
 /// Whether [`keep_roster`] may bring a network into the relay's directory.
@@ -91,12 +96,6 @@ fn keep_roster(
     now: u64,
     keep: Keep,
 ) -> Result<Option<(NetworkId, u64)>> {
-    let body = roster.decode()?;
-    let bundle = menzil_proto::trust::Bundle {
-        base_roster: base.cloned(),
-        roster: Some(roster.clone()),
-        ..Default::default()
-    };
     // From the look at what is held to the write: two runs at once could each see the older
     // Roster and the slower write would put it over the newer, so the judgement is made under
     // the lock.
@@ -106,6 +105,23 @@ fn keep_roster(
             Some(lock) => lock,
             None => return Ok(None),
         },
+    };
+    keep_roster_locked(home, roster, base, now, keep)
+}
+
+/// [`keep_roster`] for a caller that holds the relay lock already (`home.lock_relay()`).
+fn keep_roster_locked(
+    home: &Home,
+    roster: &Roster,
+    base: Option<&Roster>,
+    now: u64,
+    keep: Keep,
+) -> Result<Option<(NetworkId, u64)>> {
+    let body = roster.decode()?;
+    let bundle = menzil_proto::trust::Bundle {
+        base_roster: base.cloned(),
+        roster: Some(roster.clone()),
+        ..Default::default()
     };
     let path = roster_path(home, &body.network_id);
     // Judge the token again against what is kept (protocol.md 2.3): a newer `seq` alone is not
@@ -301,6 +317,11 @@ impl RunningRelay {
         (&mut self.task).await
     }
 
+    /// The tenants the relay knows now (the tenant files as of the last reload).
+    pub fn tenants(&self) -> Arc<TenantBook> {
+        self.relay.tenants()
+    }
+
     /// The sequence number of the Roster the relay holds for `network_id` now.
     pub fn roster_seq(&self, network_id: &NetworkId) -> Option<u64> {
         self.relay.rosters().get(network_id).map(|body| body.seq)
@@ -371,7 +392,24 @@ fn unix_now() -> u64 {
 /// Binds, loads the Rosters and starts serving.
 pub async fn start(home: &Home, options: &RunOptions) -> Result<RunningRelay> {
     let identity = relay_identity(home)?;
-    let rosters = load_rosters(home)?;
+    let all_rosters = load_rosters(home)?;
+    // The tenant files, before anything is served: a network a tenant file refuses is held
+    // back, and one that cannot be told apart from the operator's intent stops the start (its
+    // networks would otherwise be served as the default tenant's).
+    let book = tenants::load_book(home, &all_rosters)?;
+    for note in tenants::book_notes(&book, &all_rosters) {
+        tracing::warn!("{note}");
+        eprintln!("warning: {note}");
+    }
+    let rosters: Vec<StoredRoster> = all_rosters
+        .into_iter()
+        .filter(|stored| {
+            stored
+                .roster
+                .decode()
+                .is_ok_and(|body| !book.is_held_back(&body.network_id))
+        })
+        .collect();
     if rosters.is_empty() {
         bail!("this relay serves no network: run `menzil relay add-network <token>` first");
     }
@@ -385,6 +423,7 @@ pub async fn start(home: &Home, options: &RunOptions) -> Result<RunningRelay> {
         &identity,
     )?;
     let relay = Relay::new(identity, LIMITS);
+    relay.set_tenants(book);
     let mut networks = Vec::new();
     for stored in &rosters {
         let network_id = stored.roster.decode()?.network_id;
@@ -476,29 +515,10 @@ pub async fn start(home: &Home, options: &RunOptions) -> Result<RunningRelay> {
     let reload = {
         let (relay, home, every) = (relay.clone(), home.clone(), options.reload_every);
         tokio::spawn(async move {
+            let mut announced = Vec::new();
             loop {
                 tokio::time::sleep(every).await;
-                match load_rosters_each(&home) {
-                    Ok((rosters, failures)) => {
-                        for failure in &failures {
-                            tracing::warn!(error = %format!("{failure:#}"), "a Roster file cannot be read");
-                        }
-                        for stored in &rosters {
-                            if let Err(error) = relay.rosters().adopt(
-                                &stored.roster,
-                                stored.base.as_ref(),
-                                unix_now(),
-                            ) {
-                                let network =
-                                    stored.roster.decode().map(|body| body.network_id).ok();
-                                tracing::warn!(?network, %error, "a Roster on disk was refused");
-                            }
-                        }
-                    }
-                    Err(error) => {
-                        tracing::warn!(error = %format!("{error:#}"), "reading the Rosters failed");
-                    }
-                }
+                reload_once(&relay, &home, &mut announced);
             }
         })
     };
@@ -511,6 +531,98 @@ pub async fn start(home: &Home, options: &RunOptions) -> Result<RunningRelay> {
         reload,
         keeper,
     })
+}
+
+/// The ids of the Roster files in the relay directory, readable or not: a damaged file is
+/// still the operator's file for its network. A directory that is not there is an error here,
+/// not "no files": a relay must not drop every network because its directory cannot be seen.
+fn roster_file_ids(home: &Home) -> Result<HashSet<NetworkId>> {
+    let dir = relay_dir(home);
+    let mut ids = HashSet::new();
+    for entry in fs::read_dir(&dir).with_context(|| format!("reading {}", dir.display()))? {
+        let path = entry?.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("roster") {
+            continue;
+        }
+        if let Some(id) = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .and_then(parse_hex32)
+        {
+            ids.insert(NetworkId::from(id));
+        }
+    }
+    Ok(ids)
+}
+
+/// One pass of the reload: the tenant files, the Rosters on disk that are newer than the ones
+/// held, and the networks the operator removed. A network the relay holds that has no Roster
+/// file any more (`relay remove-network`, `remove-tenant`), or that a tenant file the book
+/// refuses now lists, is dropped from the store, which ends the sessions that claimed it. A
+/// directory that cannot be read, or tenant files that cannot be read, change nothing: the relay
+/// keeps serving what it has. `announced` holds the notes printed last time, so that a standing
+/// problem is said once and not at every pass.
+fn reload_once(relay: &Relay, home: &Home, announced: &mut Vec<String>) {
+    let (rosters, failures) = match load_rosters_each(home) {
+        Ok(read) => read,
+        Err(error) => {
+            tracing::warn!(error = %format!("{error:#}"), "reading the Rosters failed");
+            return;
+        }
+    };
+    for failure in &failures {
+        tracing::warn!(error = %format!("{failure:#}"), "a Roster file cannot be read");
+    }
+    let mut notes = Vec::new();
+    match tenants::load_book(home, &rosters) {
+        Ok(book) => {
+            notes = tenants::book_notes(&book, &rosters);
+            relay.set_tenants(book);
+        }
+        Err(error) => {
+            notes.push(format!(
+                "the tenant files cannot be read ({error:#}): the relay keeps the tenants it had"
+            ));
+        }
+    }
+    if *announced != notes {
+        for note in &notes {
+            tracing::warn!("{note}");
+        }
+        *announced = notes;
+    }
+    let book = relay.tenants();
+    for stored in &rosters {
+        let Ok(body) = stored.roster.decode() else {
+            continue;
+        };
+        if book.is_held_back(&body.network_id) {
+            continue;
+        }
+        if let Err(error) = relay
+            .rosters()
+            .adopt(&stored.roster, stored.base.as_ref(), unix_now())
+        {
+            tracing::warn!(network = ?body.network_id, %error, "a Roster on disk was refused");
+        }
+    }
+    match roster_file_ids(home) {
+        Ok(present) => {
+            for network in relay.rosters().networks() {
+                let held_back = book.is_held_back(&network);
+                if (held_back || !present.contains(&network)) && relay.rosters().remove(&network) {
+                    tracing::warn!(
+                        %network,
+                        held_back,
+                        "the network is no longer served (its Roster file is gone, or its tenant file is not used): the sessions that claimed it end"
+                    );
+                }
+            }
+        }
+        Err(error) => {
+            tracing::warn!(error = %format!("{error:#}"), "the Roster files cannot be listed; no network is dropped");
+        }
+    }
 }
 
 #[cfg(test)]

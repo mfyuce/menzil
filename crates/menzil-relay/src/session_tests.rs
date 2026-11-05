@@ -4388,3 +4388,150 @@ async fn re_attaching_one_key_never_raises_the_attached_count_past_its_attachmen
     assert_eq!(relay.admission.attached(), 2);
     drop(kept);
 }
+
+// ---- MT6: removing a network (multi tenant design 2.1, "Removal") ----
+
+/// Network A has `x` (attached) and `y` (not attached yet); network B has `z`. The relay stops
+/// serving A (`RosterStore::remove`, what the operator's `remove-network` does to a running
+/// relay): both of A's sessions are told `not_member` and ended, the Roster of A is gone, B's
+/// session is untouched, and a new HELLO for A is refused like any unserved network.
+#[tokio::test]
+async fn removing_a_network_ends_the_sessions_that_claimed_it_and_no_others() {
+    let (relay, listener, cert, relay_x25519) = bind_test_relay().await;
+    let addr = listener.local_addr().unwrap();
+    let (x, y, z) = (
+        generate_identity(),
+        generate_identity(),
+        generate_identity(),
+    );
+    let owner_a = SigningKey::generate(&mut rand::rng());
+    let network_a = NetworkId::from(owner_a.verifying_key().to_bytes());
+    let owner_b = SigningKey::generate(&mut rand::rng());
+    let network_b = NetworkId::from(owner_b.verifying_key().to_bytes());
+    relay
+        .rosters()
+        .set(&evict_roster(
+            &owner_a,
+            network_a,
+            1,
+            &[(x.node_id, 1), (y.node_id, 1)],
+            &[],
+        ))
+        .unwrap();
+    relay
+        .rosters()
+        .set(&evict_roster(
+            &owner_b,
+            network_b,
+            1,
+            &[(z.node_id, 1)],
+            &[],
+        ))
+        .unwrap();
+    let serve_relay = relay.clone();
+    tokio::spawn(async move { serve_relay.serve(&listener).await });
+    let seen = |network_id| HashMap::from([(network_id, 1u64)]);
+    let (mut client_x, _) = TestClient::connect(
+        addr,
+        cert.clone(),
+        &x,
+        relay_x25519,
+        vec![network_a],
+        seen(network_a),
+        1,
+        10,
+    )
+    .await;
+    let (mut client_y, _) = TestClient::connect(
+        addr,
+        cert.clone(),
+        &y,
+        relay_x25519,
+        vec![network_a],
+        seen(network_a),
+        1,
+        10,
+    )
+    .await;
+    let (mut client_z, _) = TestClient::connect(
+        addr,
+        cert.clone(),
+        &z,
+        relay_x25519,
+        vec![network_b],
+        seen(network_b),
+        1,
+        10,
+    )
+    .await;
+    client_x.send(Record::Attach).await;
+    client_z.send(Record::Attach).await;
+    ping_pong(&mut client_x, [1; 8]).await;
+    ping_pong(&mut client_z, [3; 8]).await;
+
+    assert!(relay.rosters().remove(&network_a));
+    assert!(!relay.rosters().serves(&network_a));
+    assert!(relay.rosters().serves(&network_b));
+
+    for client in [&mut client_x, &mut client_y] {
+        let records = read_to_end(client).await;
+        assert!(
+            records
+                .iter()
+                .any(|r| matches!(r, Record::Error(body) if body.code == ErrorCode::NotMember)),
+            "expected ERROR not_member among {records:?}"
+        );
+        match records.last() {
+            Some(Record::Goaway(body)) => assert_eq!(body.reason, "revoked"),
+            other => panic!("expected GOAWAY last, got {other:?}"),
+        }
+    }
+    assert!(!relay.registry.is_attached(&x.node_id));
+    ping_pong(&mut client_z, [5; 8]).await;
+    assert!(relay.registry.is_attached(&z.node_id));
+
+    // The removed network is refused at HELLO like any network the relay does not serve.
+    let (mut again, _) = TestClient::connect(
+        addr,
+        cert,
+        &x,
+        relay_x25519,
+        vec![network_a],
+        HashMap::new(),
+        1,
+        10,
+    )
+    .await;
+    match again.recv().await {
+        Some(Record::Error(body)) => assert_eq!(body.code, ErrorCode::NotMember),
+        other => panic!("expected ERROR not_member, got {other:?}"),
+    }
+}
+
+/// A relay starts with only the default tenant; `set_tenants` swaps the book for every clone.
+#[tokio::test]
+async fn a_relay_has_the_default_tenant_until_a_book_is_set() {
+    let (relay, _listener, _cert, _key) = bind_test_relay().await;
+    assert_eq!(relay.tenants().named_count(), 0);
+    let network = NetworkId::from([5; 32]);
+    assert_eq!(
+        relay.tenants().id_of(&network),
+        &crate::tenant::TenantId::Default
+    );
+    let clone = relay.clone();
+    let spec = crate::tenant::TenantSpec {
+        slug: crate::tenant::Slug::parse("ali").unwrap(),
+        networks: vec![network],
+        class: crate::tenant::Class::Friend,
+        overrides: Default::default(),
+        terminated: false,
+        extra_names: vec![],
+        added: 1,
+    };
+    relay.set_tenants(crate::tenant::TenantBook::build(
+        vec![spec],
+        vec![],
+        &Default::default(),
+    ));
+    assert_eq!(clone.tenants().id_of(&network).slug(), Some("ali"));
+}

@@ -6,8 +6,8 @@
 //! that runs the handshake under a timeout and an in-flight limit.
 
 use std::hash::{BuildHasher, RandomState};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use tokio::sync::Semaphore;
@@ -25,6 +25,7 @@ use crate::rate::SessionRates;
 use crate::registry::SessionRegistry;
 use crate::roster_store::RosterStore;
 use crate::session;
+use crate::tenant::TenantBook;
 
 /// The session numbers a relay hands out: WELCOME's `session` and the key of the registry's
 /// supersede and teardown rules (equality is all they use).
@@ -102,6 +103,9 @@ pub struct Relay {
     pub(crate) timeouts: SessionTimeouts,
     /// Throttles every warn line a peer's traffic can cause (isolation rule I7).
     pub(crate) log: Arc<LogThrottle>,
+    /// Which tenant owns which network (MT6). Read by the enforcing slices; nothing refuses on
+    /// it yet.
+    tenants: Arc<RwLock<Arc<TenantBook>>>,
     next_session_id: Arc<SessionIds>,
 }
 
@@ -159,6 +163,7 @@ impl Relay {
             rates: SessionRates::default(),
             timeouts: SessionTimeouts::default(),
             log: Arc::new(LogThrottle::default()),
+            tenants: Arc::new(RwLock::new(Arc::new(TenantBook::default()))),
             next_session_id: Arc::new(SessionIds::new()),
         }
     }
@@ -189,6 +194,18 @@ impl Relay {
     pub(crate) fn with_timeouts(mut self, timeouts: SessionTimeouts) -> Self {
         self.timeouts = timeouts;
         self
+    }
+
+    /// The tenants this relay knows now: a snapshot, one tenant (the default) until
+    /// [`Relay::set_tenants`] is called.
+    pub fn tenants(&self) -> Arc<TenantBook> {
+        Arc::clone(&self.tenants.read().unwrap())
+    }
+
+    /// Replaces the tenants (the operator's tenant files, read at start and at each reload).
+    /// Every clone of this relay sees the new book.
+    pub fn set_tenants(&self, book: TenantBook) {
+        *self.tenants.write().unwrap() = Arc::new(book);
     }
 
     /// This relay's held Rosters. An operator or test harness seeds the

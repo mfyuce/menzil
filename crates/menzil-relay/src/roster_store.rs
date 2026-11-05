@@ -336,6 +336,30 @@ impl RosterStore {
         }
     }
 
+    /// Stops serving `network_id`: forgets its Roster and announces the change like a stored
+    /// Roster, so that every session that claimed the network judges itself again and, finding
+    /// the network unserved (the standing of a node it does not list, isolation rule I2), is
+    /// ended `not_member` (multi tenant design 2.1, "Removal"; the operator's `relay
+    /// remove-network` and `remove-tenant`). Whether a Roster was held. The `on_adopted` hook is
+    /// not called: what the relay keeps on disk is the operator's to delete.
+    pub fn remove(&self, network_id: &NetworkId) -> bool {
+        let removed = self
+            .by_network
+            .write()
+            .unwrap()
+            .remove(network_id)
+            .is_some();
+        if removed {
+            let _ = self.changes.send(*network_id);
+        }
+        removed
+    }
+
+    /// Every network this store holds a Roster for.
+    pub fn networks(&self) -> Vec<NetworkId> {
+        self.by_network.read().unwrap().keys().copied().collect()
+    }
+
     /// Whether this store holds a Roster for `network_id`: no clone, one hash lookup.
     pub fn serves(&self, network_id: &NetworkId) -> bool {
         self.by_network.read().unwrap().contains_key(network_id)
@@ -666,6 +690,46 @@ mod tests {
         assert!(store.adopt(&fresh(2), None, NOW).unwrap());
         assert_eq!(changes.try_recv().unwrap(), network_id);
         assert!(changes.try_recv().is_err());
+    }
+
+    #[test]
+    fn remove_forgets_the_network_announces_it_and_a_second_remove_is_nothing() {
+        let owner = SigningKey::generate(&mut rand::rng());
+        let network_id = NetworkId::from(owner.verifying_key().to_bytes());
+        let other_owner = SigningKey::generate(&mut rand::rng());
+        let other = NetworkId::from(other_owner.verifying_key().to_bytes());
+        let store = RosterStore::new();
+        store.set(&signed_roster(&owner, network_id, 1)).unwrap();
+        store.set(&signed_roster(&other_owner, other, 1)).unwrap();
+        let mut changes = store.subscribe();
+        assert_eq!(store.networks().len(), 2);
+
+        assert!(store.remove(&network_id));
+        assert_eq!(changes.try_recv().unwrap(), network_id);
+        assert!(!store.serves(&network_id));
+        assert!(store.get(&network_id).is_none() && store.signed(&network_id).is_none());
+        assert_eq!(store.networks(), vec![other], "the other network stays");
+        // A removed network is judged like any unserved one.
+        assert_eq!(
+            store.standing_of(&NodeId::from([9u8; 32]), &network_id),
+            NodeStanding::default()
+        );
+        assert!(
+            store
+                .grants_forwarding(&node(9), &[network_id], &node(9), 0)
+                .is_empty()
+        );
+
+        assert!(!store.remove(&network_id), "nothing was held");
+        assert!(!store.remove(&NetworkId::from([0x77; 32])));
+        assert!(
+            changes.try_recv().is_err(),
+            "no notice for a network not held"
+        );
+
+        // The network can be served again.
+        assert!(store.set(&signed_roster(&owner, network_id, 1)).unwrap());
+        assert!(store.serves(&network_id));
     }
 
     #[test]

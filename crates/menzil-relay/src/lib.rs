@@ -33,6 +33,7 @@ mod roster_store;
 mod session;
 #[cfg(test)]
 mod session_tests;
+mod tenant;
 #[cfg(test)]
 mod tests_support;
 mod tls;
@@ -56,4 +57,8 @@ pub use rate::{
 pub use registry::SessionRegistry;
 pub use relay::{AcceptConfig, HANDSHAKE_TIMEOUT, MAX_INFLIGHT_HANDSHAKES, Relay};
 pub use roster_store::RosterStore;
+pub use tenant::{
+    Class, Figures, LABEL_MAX_LEN, QUARANTINE_DAYS, Refusal, SLUG_MAX_LEN, SLUG_MIN_LEN, Slug,
+    SlugError, Tenant, TenantBook, TenantId, TenantSpec, check_flat_name,
+};
 pub use tls::server_config;

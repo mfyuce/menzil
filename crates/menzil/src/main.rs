@@ -191,7 +191,27 @@ enum RelayCommand {
         /// device; `-` reads it from standard input. A full membership token is refused: it
         /// carries the Policy, which a relay must not get.
         token: String,
+        /// Put the network in this tenant (made if it is new), whose shares will be named
+        /// under its own zone and counted against its own allowance. Without it a new network
+        /// belongs to the default tenant, and one the relay already serves for a tenant stays
+        /// there. The tenant name is 3 to 32 lowercase letters, digits or hyphens.
+        #[arg(long, value_name = "NAME")]
+        tenant: Option<String>,
     },
+    /// Stop serving a network: delete its Roster here and take it out of its tenant. A running
+    /// relay drops it at its next reload and ends the sessions of its members.
+    RemoveNetwork {
+        /// The network id (64 hex digits).
+        network: String,
+    },
+    /// Stop serving a tenant: remove it and all its networks. Its name cannot be given to
+    /// another tenant for 180 days.
+    RemoveTenant {
+        /// The tenant name.
+        name: String,
+    },
+    /// List the tenants of this relay, their networks and what the relay makes of their files.
+    Tenants,
     /// Run the relay until interrupted and print the connection information for nodes.
     Run {
         /// Where to listen.
@@ -521,12 +541,51 @@ async fn run(cli: Cli) -> Result<()> {
             }
         }
         Command::Relay {
-            command: RelayCommand::AddNetwork { token },
+            command: RelayCommand::AddNetwork { token, tenant },
         } => {
-            let (network_id, seq) =
-                relay_cmd::add_network(&home()?, &token_argument(token)?, now())?;
-            println!("this relay serves network {network_id} (Roster #{seq})");
+            let added = relay_cmd::tenants::add_network_to(
+                &home()?,
+                &token_argument(token)?,
+                now(),
+                tenant.as_deref(),
+            )?;
+            match &added.tenant {
+                Some(tenant) => println!(
+                    "this relay serves network {} (Roster #{}) for tenant {tenant}",
+                    added.network_id, added.seq
+                ),
+                None => println!(
+                    "this relay serves network {} (Roster #{})",
+                    added.network_id, added.seq
+                ),
+            }
+            for warning in &added.warnings {
+                eprintln!("warning: {warning}");
+            }
         }
+        Command::Relay {
+            command: RelayCommand::RemoveNetwork { network },
+        } => {
+            let removed = relay_cmd::tenants::remove_network(&home()?, &network)?;
+            println!("this relay no longer serves network {}", removed.network_id);
+            for warning in &removed.warnings {
+                eprintln!("warning: {warning}");
+            }
+            eprintln!("a running relay drops it at its next reload");
+        }
+        Command::Relay {
+            command: RelayCommand::RemoveTenant { name },
+        } => {
+            let networks = relay_cmd::tenants::remove_tenant(&home()?, &name, now())?;
+            println!(
+                "removed tenant {name} and its {} network(s); the name is kept back for 180 days",
+                networks.len()
+            );
+            eprintln!("a running relay drops them at its next reload");
+        }
+        Command::Relay {
+            command: RelayCommand::Tenants,
+        } => print!("{}", relay_cmd::tenants::render_tenants(&home()?, now())?),
         Command::Relay {
             command:
                 RelayCommand::Run {
