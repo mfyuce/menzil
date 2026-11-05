@@ -21,7 +21,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
-use menzil_proto::NetworkId;
+use menzil_proto::{NetworkId, NodeId};
 
 use crate::advertise::DEFAULT_RESERVED_LABELS;
 use crate::rate::TokenBucket;
@@ -225,10 +225,28 @@ macro_rules! figures {
                         _ => unreachable!("the key was found in KEYS"),
                     }
                 }
-                Ok(self)
+                self.floor_within_bandwidth(overrides)
             }
         }
     };
+}
+
+impl Figures {
+    /// The floor rate must not exceed the sustained rate (round T4, N4): above it, using up the
+    /// volume would speed a tenant up. A floor the file sets above the bandwidth is an error; a
+    /// default floor above a bandwidth the file lowered follows the bandwidth down.
+    fn floor_within_bandwidth(mut self, overrides: &BTreeMap<String, u64>) -> Result<Self, String> {
+        if self.floor_mbit > self.bandwidth_mbit {
+            if overrides.contains_key("floor_mbit") {
+                return Err(format!(
+                    "floor_mbit ({}) cannot exceed bandwidth_mbit ({})",
+                    self.floor_mbit, self.bandwidth_mbit
+                ));
+            }
+            self.floor_mbit = self.bandwidth_mbit;
+        }
+        Ok(self)
+    }
 }
 
 figures! {
@@ -370,10 +388,16 @@ impl TenantBook {
     /// equal to a default tenant name. A network a tenant already owns is dropped from a later
     /// file with a warning. More networks than the class's `max_networks` figure is a warning only
     /// (the CLI refuses to add past it; the relay keeps serving what the operator wrote).
+    ///
+    /// `quarantined` are the slugs of removed tenants still in quarantine (design 2.2, rule 1):
+    /// a file whose slug is one of them is refused and its networks are held back, so that a
+    /// hand written file cannot bring a removed tenant's name back before the quarantine ends
+    /// (round T4, N5).
     pub fn build(
         mut specs: Vec<TenantSpec>,
         refused: Vec<Refusal>,
         default_names: &HashSet<String>,
+        quarantined: &HashSet<String>,
     ) -> Self {
         specs.sort_by(|a, b| (a.added, &a.slug).cmp(&(b.added, &b.slug)));
         let slugs: HashSet<Slug> = specs.iter().map(|spec| spec.slug.clone()).collect();
@@ -383,6 +407,16 @@ impl TenantBook {
         };
         let mut granted: HashMap<String, Slug> = HashMap::new();
         for spec in specs {
+            if quarantined.contains(spec.slug.as_str()) {
+                book.refuse(
+                    &spec,
+                    format!(
+                        "the name {} belonged to a tenant that was removed and is in quarantine; it cannot be used again until the quarantine ends",
+                        spec.slug
+                    ),
+                );
+                continue;
+            }
             match book.judge(&spec, &slugs, default_names, &granted) {
                 Err(reason) => book.refuse(&spec, reason),
                 Ok(mut tenant) => {
@@ -629,7 +663,19 @@ pub(crate) struct TenantUsage {
     /// is ever charged ([`RosterQuota`]'s caller checks that first), so the table is bounded by
     /// the networks served.
     adoptions: Mutex<HashMap<NetworkId, AdoptionBucket>>,
+    /// One bucket per NodeId that sent a Roster that failed verification (round T4, the
+    /// adoption bucket drain): what a member may spend of the relay's signature checking on
+    /// transfers that do not verify, across all its sessions. Bounded by [`MAX_FAILED_SUBMITTERS`].
+    failed: Mutex<HashMap<NodeId, TokenBucket>>,
 }
+
+/// Roster transfers that fail verification one NodeId may send per hour, once its burst is spent.
+pub(crate) const FAILED_VERIFICATIONS_PER_HOUR: u32 = 12;
+/// Roster transfers that fail verification a NodeId may send back to back.
+pub(crate) const FAILED_VERIFICATION_BURST: u32 = 3;
+/// The most NodeIds the failed verification table remembers; when it is full of NodeIds that are
+/// still being limited, a further one is refused verification until one has recovered.
+const MAX_FAILED_SUBMITTERS: usize = 4_096;
 
 impl TenantUsage {
     /// Counters all at zero.
@@ -642,7 +688,15 @@ impl TenantUsage {
     }
 
     /// Counts a handshaken, not yet attached session that claimed `claimed`, against every
-    /// tenant of those networks (one count each, design 2.1). Refused when any of them has its
+    /// tenant of those networks (one count each, design 2.1).
+    ///
+    /// Accepted limit (round T4, L2; TBD 47): a NodeId listed by two tenants' networks is refused
+    /// entirely when ANY of its tenants is at a figure, so a hostile owner who invites a victim's
+    /// device into its own network and fills its own tenant keeps that device from attaching
+    /// (the victim's network included) for as long as it likes. The design counts a session
+    /// against every tenant it claimed on purpose; the alternative (admit it with the networks
+    /// whose tenants have room and tell the node through WELCOME) is open for the owner to decide.
+    /// Refused when any of them has its
     /// `unattached_sessions`, or its `attached_sessions` already attached and this NodeId is not
     /// one of them. `attached_before` is the claims of the NodeId's current registration, if it
     /// has one: a NodeId that is attached in a tenant already replaces its own session there, so
@@ -765,6 +819,67 @@ impl TenantUsage {
         slot.bucket.try_take()
     }
 
+    /// Whether the bucket of `network_id` holds an adoption now, taking none (a tenant without
+    /// figures always has one). A transfer is let through to the signature check only when it
+    /// does; the token is taken after the check succeeds ([`Self::try_adopt`]), so a transfer
+    /// that does not verify costs the network nothing (round T4).
+    fn adoption_available(&self, book: &TenantBook, network_id: &NetworkId) -> bool {
+        let Some(figures) = book.tenant_of(network_id).figures else {
+            return true;
+        };
+        let key = (
+            figures.roster_adoptions_per_hour,
+            figures.roster_adoption_burst,
+        );
+        let mut buckets = self
+            .adoptions
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let slot = buckets
+            .entry(*network_id)
+            .or_insert_with(|| AdoptionBucket {
+                figures: key,
+                bucket: Self::adoption_bucket(key),
+            });
+        if slot.figures != key {
+            *slot = AdoptionBucket {
+                figures: key,
+                bucket: Self::adoption_bucket(key),
+            };
+        }
+        slot.bucket.has_token()
+    }
+
+    /// Whether `node_id` may still send a Roster to the signature check: it has not used up its
+    /// allowance of transfers that failed it.
+    fn may_verify(&self, node_id: &NodeId) -> bool {
+        let mut failed = self.failed.lock().unwrap_or_else(PoisonError::into_inner);
+        failed
+            .get_mut(node_id)
+            .is_none_or(|bucket| bucket.has_token())
+    }
+
+    /// Charges `node_id` for a Roster that failed the signature check (or was otherwise refused
+    /// by it) to its own bucket.
+    fn note_failed_verification(&self, node_id: &NodeId) {
+        let mut failed = self.failed.lock().unwrap_or_else(PoisonError::into_inner);
+        if !failed.contains_key(node_id) && failed.len() >= MAX_FAILED_SUBMITTERS {
+            // Forget the NodeIds that have recovered; if all are still limited, this one is not
+            // remembered (and so not limited): the table's size is the bound, and each entry
+            // took a failed verification by a member of a served network.
+            failed.retain(|_, bucket| !bucket.is_full());
+            if failed.len() >= MAX_FAILED_SUBMITTERS {
+                return;
+            }
+        }
+        failed
+            .entry(*node_id)
+            .or_insert_with(|| {
+                TokenBucket::per_hour(FAILED_VERIFICATIONS_PER_HOUR, FAILED_VERIFICATION_BURST)
+            })
+            .try_take();
+    }
+
     fn adoption_bucket((per_hour, burst): (u64, u64)) -> TokenBucket {
         // The figures' ranges (1 to 100,000) fit a u32.
         TokenBucket::per_hour(
@@ -829,15 +944,49 @@ pub(crate) trait RosterQuota {
     /// bytes.
     fn max_roster_bytes(&self, network_id: &NetworkId) -> usize;
 
-    /// Takes one adoption from the network's bucket. Asked only for a transfer that will reach a
-    /// signature check, and before it; false means refuse it undecoded further.
-    fn try_adopt(&self, network_id: &NetworkId) -> bool;
+    /// Whether the network's bucket holds an adoption. Asked only for a transfer that is newer
+    /// than the held Roster and will reach a signature check, and before it; false means refuse
+    /// it undecoded further. Takes nothing: the adoption is paid for by [`Self::adopted`] once
+    /// the Roster has verified, so a transfer that does not verify cannot drain the owner's
+    /// allowance (round T4).
+    fn adoption_available(&self, network_id: &NetworkId) -> bool;
+
+    /// A Roster of the network verified and was adopted: takes its adoption from the bucket.
+    fn adopted(&self, network_id: &NetworkId);
+
+    /// Whether the session's NodeId may still send a Roster to the signature check (it has not
+    /// used up what its own bucket allows of transfers that failed it).
+    fn may_verify(&self) -> bool;
+
+    /// A Roster of this session's NodeId did not verify: charged to that NodeId's own bucket,
+    /// not to the network's.
+    fn failed_verification(&self);
 }
 
 /// The quota of a relay's tenants as of one moment: the book that was current when it was made.
 pub(crate) struct RelayQuota<'a> {
     pub(crate) book: Arc<TenantBook>,
     pub(crate) usage: &'a TenantUsage,
+    /// The NodeId of the session that sends the transfer.
+    pub(crate) submitter: NodeId,
+}
+
+#[cfg(test)]
+impl RelayQuota<'_> {
+    /// Takes an adoption from the network's bucket whatever the verification says (tests).
+    pub(crate) fn try_adopt(&self, network_id: &NetworkId) -> bool {
+        self.usage.try_adopt(&self.book, network_id)
+    }
+
+    /// [`RosterQuota::adoption_available`] for tests of other modules.
+    pub(crate) fn adoption_available_for_test(&self, network_id: &NetworkId) -> bool {
+        self.adoption_available(network_id)
+    }
+
+    /// [`RosterQuota::may_verify`] for tests of other modules.
+    pub(crate) fn may_verify_for_test(&self) -> bool {
+        self.may_verify()
+    }
 }
 
 impl RosterQuota for RelayQuota<'_> {
@@ -852,8 +1001,20 @@ impl RosterQuota for RelayQuota<'_> {
             })
     }
 
-    fn try_adopt(&self, network_id: &NetworkId) -> bool {
-        self.usage.try_adopt(&self.book, network_id)
+    fn adoption_available(&self, network_id: &NetworkId) -> bool {
+        self.usage.adoption_available(&self.book, network_id)
+    }
+
+    fn adopted(&self, network_id: &NetworkId) {
+        let _ = self.usage.try_adopt(&self.book, network_id);
+    }
+
+    fn may_verify(&self) -> bool {
+        self.usage.may_verify(&self.submitter)
+    }
+
+    fn failed_verification(&self) {
+        self.usage.note_failed_verification(&self.submitter);
     }
 }
 
@@ -867,9 +1028,17 @@ impl RosterQuota for Unlimited {
         menzil_proto::MAX_DOC_BYTES
     }
 
-    fn try_adopt(&self, _: &NetworkId) -> bool {
+    fn adoption_available(&self, _: &NetworkId) -> bool {
         true
     }
+
+    fn adopted(&self, _: &NetworkId) {}
+
+    fn may_verify(&self) -> bool {
+        true
+    }
+
+    fn failed_verification(&self) {}
 }
 
 #[cfg(test)]
@@ -903,7 +1072,7 @@ mod tests {
     }
 
     fn build(specs: Vec<TenantSpec>) -> TenantBook {
-        TenantBook::build(specs, Vec::new(), &no_names())
+        TenantBook::build(specs, Vec::new(), &no_names(), &HashSet::new())
     }
 
     #[test]
@@ -1100,7 +1269,7 @@ mod tests {
         let mut grant = spec("ali", &[1]);
         grant.extra_names = vec!["blog".into()];
         let held: HashSet<String> = ["blog".to_string()].into();
-        let book = TenantBook::build(vec![grant], vec![], &held);
+        let book = TenantBook::build(vec![grant], vec![], &held, &HashSet::new());
         assert!(book.named("ali").is_none());
         assert!(book.is_held_back(&net(1)));
 
@@ -1113,7 +1282,7 @@ mod tests {
     #[test]
     fn a_slug_equal_to_a_default_tenant_flat_name_is_refused() {
         let held: HashSet<String> = ["ali".to_string()].into();
-        let book = TenantBook::build(vec![spec("ali", &[1])], vec![], &held);
+        let book = TenantBook::build(vec![spec("ali", &[1])], vec![], &held, &HashSet::new());
         assert!(book.named("ali").is_none());
         assert!(book.is_held_back(&net(1)));
     }
@@ -1307,6 +1476,7 @@ mod tests {
         let quota = RelayQuota {
             book: Arc::clone(&book),
             usage: &usage,
+            submitter: NodeId::from([0u8; 32]),
         };
         for _ in 0..5 {
             assert!(quota.try_adopt(&net(1)));
@@ -1332,9 +1502,88 @@ mod tests {
         let reloaded = RelayQuota {
             book: Arc::new(build(vec![ali])),
             usage: &usage,
+            submitter: NodeId::from([0u8; 32]),
         };
         assert!(reloaded.try_adopt(&net(1)) && reloaded.try_adopt(&net(1)));
         assert!(!reloaded.try_adopt(&net(1)));
+    }
+
+    /// Round T4: the failed verification bucket is per NodeId, across sessions, refills with time
+    /// and has a bounded table.
+    #[tokio::test(start_paused = true)]
+    async fn a_node_that_keeps_failing_verification_is_limited_on_its_own_account() {
+        let usage = TenantUsage::new();
+        let (bad, good) = (NodeId::from([1u8; 32]), NodeId::from([2u8; 32]));
+        for _ in 0..FAILED_VERIFICATION_BURST {
+            assert!(usage.may_verify(&bad));
+            usage.note_failed_verification(&bad);
+        }
+        assert!(!usage.may_verify(&bad), "the burst is used up");
+        assert!(usage.may_verify(&good), "another node is unaffected");
+        // 12 an hour: one more after five minutes.
+        tokio::time::advance(std::time::Duration::from_secs(299)).await;
+        assert!(!usage.may_verify(&bad));
+        tokio::time::advance(std::time::Duration::from_secs(1)).await;
+        assert!(usage.may_verify(&bad));
+        // The table is bounded: it cannot be grown past its size by failing NodeIds.
+        for n in 0..(MAX_FAILED_SUBMITTERS as u32 + 100) {
+            let mut id = [0u8; 32];
+            id[..4].copy_from_slice(&(n + 10).to_be_bytes());
+            usage.note_failed_verification(&NodeId::from(id));
+        }
+        assert!(usage.failed.lock().unwrap().len() <= MAX_FAILED_SUBMITTERS);
+    }
+
+    /// Round T4, N4: a floor above the bandwidth would speed a tenant up once it used its volume.
+    #[test]
+    fn a_floor_above_the_bandwidth_is_refused_and_a_default_floor_follows_a_lowered_bandwidth() {
+        let mut bad = spec("ali", &[1]);
+        bad.overrides = BTreeMap::from([
+            ("bandwidth_mbit".to_string(), 2),
+            ("floor_mbit".to_string(), 3),
+        ]);
+        let book = build(vec![bad]);
+        assert!(book.named("ali").is_none());
+        assert!(book.refused()[0].reason.contains("floor_mbit"));
+        assert!(book.is_held_back(&net(1)));
+
+        // Only the floor set, above the default bandwidth of 100: refused too.
+        let figures =
+            Figures::friend().with_overrides(&BTreeMap::from([("floor_mbit".to_string(), 101)]));
+        assert!(figures.is_err());
+        // The bandwidth lowered below the default floor of 5: the floor follows it down.
+        let mut low = spec("veli", &[2]);
+        low.overrides = BTreeMap::from([("bandwidth_mbit".to_string(), 1)]);
+        let book = build(vec![low]);
+        let figures = book.named("veli").unwrap().figures.unwrap();
+        assert_eq!((figures.bandwidth_mbit, figures.floor_mbit), (1, 1));
+        // Equal is fine.
+        let equal = Figures::friend().with_overrides(&BTreeMap::from([
+            ("bandwidth_mbit".to_string(), 7),
+            ("floor_mbit".to_string(), 7),
+        ]));
+        assert!(equal.is_ok());
+    }
+
+    /// Round T4, N5 (design 2.2, rule 1): a tenant file whose slug is in quarantine is refused and
+    /// its networks held back.
+    #[test]
+    fn a_file_with_a_quarantined_slug_is_refused_and_its_networks_held_back() {
+        let removed: HashSet<String> = ["ali".to_string()].into();
+        let book = TenantBook::build(
+            vec![spec("ali", &[1]), spec("veli", &[2])],
+            vec![],
+            &no_names(),
+            &removed,
+        );
+        assert!(book.named("ali").is_none());
+        assert!(book.named("veli").is_some());
+        assert!(book.is_held_back(&net(1)));
+        assert!(!book.is_held_back(&net(2)));
+        let refusal = &book.refused()[0];
+        assert_eq!(refusal.name, "ali");
+        assert!(refusal.reason.contains("quarantine"), "{}", refusal.reason);
+        assert_eq!(refusal.networks, vec![net(1)]);
     }
 
     #[test]
@@ -1346,6 +1595,7 @@ mod tests {
         let quota = RelayQuota {
             book,
             usage: &usage,
+            submitter: NodeId::from([0u8; 32]),
         };
         assert_eq!(quota.max_roster_bytes(&net(1)), 4 * 1024);
         assert_eq!(
@@ -1363,6 +1613,7 @@ mod tests {
         let quota = RelayQuota {
             book: Arc::new(build(vec![big])),
             usage: &usage,
+            submitter: NodeId::from([0u8; 32]),
         };
         assert_eq!(quota.max_roster_bytes(&net(1)), menzil_proto::MAX_DOC_BYTES);
     }

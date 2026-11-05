@@ -135,7 +135,7 @@ impl World {
                 added: 1,
             })
             .collect();
-        let book = TenantBook::build(specs, vec![], &Default::default());
+        let book = TenantBook::build(specs, vec![], &Default::default(), &Default::default());
         assert!(book.refused().is_empty(), "{:?}", book.refused());
         *self.tenants.write().unwrap() = Arc::new(book);
     }
@@ -472,7 +472,8 @@ fn an_evicted_senders_queued_items_are_marked_to_be_dropped() {
         true,
         100
     )));
-    w.table.revoke_sender(&net.nodes[0]);
+    let session = w.registry.attached_session_id(&net.nodes[0]).unwrap();
+    w.table.revoke_sender(&net.nodes[0], session);
     let mut revoked = HashMap::new();
     while let Ok(item) = w.handles.get_mut(&net.nodes[1]).unwrap().2.try_recv() {
         if let ForwardItem::Recv { src, shared, .. } = item {
@@ -577,11 +578,17 @@ async fn over_the_bandwidth_credit_is_delayed_and_never_lost() {
     );
     assert_eq!(w.table.shaper_of(&ali()).unwrap().held(), 2 * BURST as u64);
 
+    // The debt is paid off at 125,000 bytes a second and the CREDIT follows it as it is paid
+    // (in parts, never ahead of the bucket): about 1.25 MB at 10 s, not yet all 2 MiB.
     tokio::time::sleep(Duration::from_secs(10)).await;
-    assert_eq!(w.credit_total(src), 0, "still in debt at 10 s: nothing yet");
+    let part = w.credit_total(src);
+    assert!(
+        (1_100_000..=1_250_000).contains(&part),
+        "{part} bytes of CREDIT at 10 s"
+    );
 
     tokio::time::sleep(Duration::from_secs(8)).await;
-    let later = w.credit_total(src);
+    let later = w.credit_total(src) + part;
     assert_eq!(
         at_once + later,
         consumed,
@@ -641,9 +648,13 @@ async fn the_floor_slows_a_tenant_that_used_its_volume() {
     );
     // About (1 MiB - 125,000) / 125,000 = 7.4 s of debt.
     tokio::time::sleep(Duration::from_secs(5)).await;
-    assert_eq!(w.credit_total(net.nodes[0]), 0);
+    let part = w.credit_total(net.nodes[0]);
+    assert!(
+        part <= 625_000,
+        "{part} bytes of CREDIT after 5 s at 125,000 B/s"
+    );
     tokio::time::sleep(Duration::from_secs(4)).await;
-    assert_eq!(at_once + w.credit_total(net.nodes[0]), consumed);
+    assert_eq!(at_once + part + w.credit_total(net.nodes[0]), consumed);
 }
 
 #[tokio::test(start_paused = true)]
@@ -769,4 +780,201 @@ fn a_pair_is_counted_for_the_first_network_both_sides_claimed() {
     let bob = TenantId::Named(Slug::parse("bob").unwrap());
     assert_eq!(w.table.tenant_counts(&bob), (1, 0));
     assert_eq!(w.table.tenant_counts(&ali()), (0, 0));
+}
+
+// --- Round T4 -------------------------------------------------------------------------------
+
+/// M1: droppable bytes are paid from the tenant's bucket at admission. A flood of droppable
+/// records is dropped once the bucket is empty, never takes it below zero, and so never delays
+/// the CREDIT of an honest reliable sender of the same tenant (it waited 59 s before the fix).
+#[tokio::test(start_paused = true)]
+async fn a_droppable_flood_is_dropped_at_the_bucket_and_never_delays_reliable_credit() {
+    let mut w = World::new(1024);
+    let net = w.network(34);
+    w.tenant("ali", &[&net], &[("bandwidth_mbit", 1), ("burst_mib", 1)]);
+    let flooder = net.nodes[0];
+    let mut admitted = 0u64;
+    let mut dropped = 0u64;
+    for to in 1..33 {
+        for _ in 0..4 {
+            match w.send_with(&net, flooder, net.nodes[to], false, 65_000) {
+                ForwardOutcome::Queued => admitted += 65_000,
+                ForwardOutcome::Dropped => dropped += 1,
+                other => panic!("unexpected {other:?}"),
+            }
+            w.drain(net.nodes[to]);
+        }
+    }
+    // The bucket held 1 MiB and no time passed: no more than that was admitted.
+    assert!(
+        admitted <= 1 << 20,
+        "{admitted} bytes admitted past the bucket"
+    );
+    assert!(dropped > 0, "the flood past the bucket is dropped");
+    assert_eq!(
+        w.table.shaper_of(&ali()).unwrap().volume_used(),
+        admitted,
+        "droppable bytes are counted once, at admission"
+    );
+    assert_eq!(
+        w.table.shaper_of(&ali()).unwrap().held(),
+        0,
+        "droppable traffic holds no CREDIT"
+    );
+    // An honest member of the same tenant sends one reliable 64 KiB record.
+    let (honest, peer) = (net.nodes[33], net.nodes[1]);
+    assert!(queued(&w.send_with(&net, honest, peer, true, 65_536)));
+    w.drain(peer);
+    let start = tokio::time::Instant::now();
+    let mut waited = None;
+    for _ in 0..200 {
+        if w.credit_total(honest) > 0 {
+            waited = Some(start.elapsed());
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let waited = waited.expect("the honest sender's CREDIT came back");
+    assert!(
+        waited < Duration::from_secs(3),
+        "the honest sender's CREDIT waited {waited:?}"
+    );
+}
+
+/// M1: the bucket is never taken below zero by a droppable record, and a record that would is
+/// dropped (the bucket in debt from reliable traffic drops every droppable record too).
+#[tokio::test(start_paused = true)]
+async fn droppable_records_are_dropped_while_the_bucket_is_in_debt_from_reliable_traffic() {
+    let mut w = World::new(1024);
+    let net = w.network(2);
+    w.tenant("ali", &[&net], &[("bandwidth_mbit", 1), ("burst_mib", 1)]);
+    // 2 MiB of reliable traffic: the bucket is 1 MiB in debt.
+    pump(&mut w, &net, 2 * BURST);
+    assert!(matches!(
+        w.send_with(&net, net.nodes[0], net.nodes[1], false, 100),
+        ForwardOutcome::Dropped
+    ));
+    // Time pays the debt (1 MiB at 125,000 B/s is about 8.4 s) and then the bucket refills.
+    tokio::time::sleep(Duration::from_secs(10)).await;
+    assert!(queued(&w.send_with(
+        &net,
+        net.nodes[0],
+        net.nodes[1],
+        false,
+        100
+    )));
+}
+
+/// M2: the eviction of a superseded session marks only the pairs that session made. The pairs of
+/// the new session of the same NodeId are never marked (they were all black-holed before the fix).
+#[test]
+fn a_superseded_sessions_eviction_does_not_revoke_the_new_sessions_pairs() {
+    let mut w = World::new(1024);
+    let net = w.network(2);
+    let (n, d) = (net.nodes[0], net.nodes[1]);
+    let old = w.registry.attached_session_id(&n).unwrap();
+    assert!(queued(&w.send(&net, 1, 100)));
+    // N reconnects: session 2 replaces session 1 and starts fresh pairs.
+    let fresh = w.registry.attach(n, 500, vec![net.id]);
+    w.handles.insert(n, fresh);
+    w.table.clear_for(&n);
+    assert!(queued(&w.send(&net, 1, 100)));
+    // The superseded session 1 now handles a standing change and revokes its own pairs.
+    w.table.revoke_sender(&n, old);
+    // Session 2 keeps sending: every record is delivered, none is marked.
+    for _ in 0..10 {
+        assert!(queued(&w.send(&net, 1, 1000)));
+    }
+    let (mut revoked, mut total) = (0, 0);
+    while let Ok(item) = w.handles.get_mut(&d).unwrap().2.try_recv() {
+        if let ForwardItem::Recv { shared, .. } = item {
+            total += 1;
+            revoked += usize::from(shared.is_revoked());
+        }
+    }
+    assert_eq!(total, 12, "one old record and eleven of the new session");
+    assert_eq!(revoked, 0, "the new session's RECVs are not marked");
+    assert_eq!(w.table.pair_count_for(&n), 1);
+}
+
+/// M2: the pairs of the evicted session itself are marked and removed with their counts, and the
+/// mark cannot outlive them: a later pair of the same sender is fresh.
+#[test]
+fn the_evicted_sessions_pairs_are_marked_and_removed_and_the_mark_does_not_outlive_them() {
+    let mut w = World::new(1024);
+    let net = w.network(3);
+    w.tenant("ali", &[&net], &[]);
+    let n = net.nodes[0];
+    let session = w.registry.attached_session_id(&n).unwrap();
+    assert!(queued(&w.send(&net, 1, 100)));
+    assert!(queued(&w.send_with(&net, n, net.nodes[2], false, 1000)));
+    assert_eq!(w.table.tenant_counts(&ali()), (2, 1000));
+    w.table.revoke_sender(&n, session);
+    assert!(
+        w.table.counts_are_empty(),
+        "the pairs and their counts are gone"
+    );
+    let marked = |w: &mut World, to: usize| {
+        let mut all = Vec::new();
+        while let Ok(item) = w.handles.get_mut(&net.nodes[to]).unwrap().2.try_recv() {
+            if let ForwardItem::Recv { shared, .. } = item {
+                all.push(shared.is_revoked());
+            }
+        }
+        all
+    };
+    assert_eq!(marked(&mut w, 1), vec![true]);
+    assert_eq!(marked(&mut w, 2), vec![true]);
+    // The same session sends again (it was not really ending): a fresh, unmarked pair.
+    assert!(queued(&w.send(&net, 1, 100)));
+    assert_eq!(marked(&mut w, 1), vec![false]);
+}
+
+/// M3: the CREDIT held for one member's windows does not hold another member's CREDIT for the
+/// whole tenant's debt: at the floor, a hub that spent 32 MiB (53 s of debt) delays an honest
+/// member's 64 KiB by a fair share of the rate (it was 53 s before the fix).
+#[tokio::test(start_paused = true)]
+async fn one_members_windows_do_not_hold_another_members_credit_at_the_floor() {
+    let mut w = World::new(1024);
+    let net = w.network(34);
+    w.tenant("ali", &[&net], &[("volume_gib", 1)]);
+    let figures = *w.tenants.read().unwrap().figures_of(&ali()).unwrap();
+    w.table.use_up_volume(&ali(), &figures);
+    let hub = net.nodes[0];
+    let mut spent = 0u64;
+    for to in 1..33 {
+        for _ in 0..16 {
+            assert!(queued(&w.send_with(&net, hub, net.nodes[to], true, 65_536)));
+            spent += w.drain(net.nodes[to]);
+        }
+    }
+    let (honest, peer) = (net.nodes[33], net.nodes[1]);
+    assert!(queued(&w.send_with(&net, honest, peer, true, 65_536)));
+    let honest_spent = w.drain(peer);
+    let start = tokio::time::Instant::now();
+    let (mut waited, mut hub_back, mut honest_back) = (None, 0u64, 0u64);
+    for _ in 0..800 {
+        let got = w.credit_total(honest);
+        if got > 0 && waited.is_none() {
+            waited = Some(start.elapsed());
+        }
+        honest_back += got;
+        hub_back += w.credit_total(hub);
+        if honest_back == honest_spent && hub_back + 125_000 >= spent {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    let waited = waited.expect("the honest member's CREDIT came back");
+    assert!(
+        waited < Duration::from_secs(5),
+        "the honest member's CREDIT waited {waited:?} (35 s is a node's give up time)"
+    );
+    // Delay is never loss: everything consumed is granted, the hub's after its own debt.
+    tokio::time::sleep(Duration::from_secs(120)).await;
+    hub_back += w.credit_total(hub);
+    honest_back += w.credit_total(honest);
+    assert_eq!(honest_back, honest_spent);
+    assert_eq!(hub_back, spent, "sum granted equals sum consumed");
+    assert_eq!(w.table.shaper_of(&ali()).unwrap().held(), 0);
 }

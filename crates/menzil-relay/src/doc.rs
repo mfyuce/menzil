@@ -171,8 +171,10 @@ pub(crate) enum AcceptOutcome {
 /// `quota` is what the network's tenant allows (`crate::tenant`, design 2.3), asked only once the
 /// network is known to be claimed and served: a transfer whose encoded size is over the tenant's
 /// Roster size figure is [`AcceptOutcome::TooLarge`] (a base Roster too), and a Roster newer than
-/// the held one takes a token of the network's adoption bucket before its signature is looked at,
-/// or is [`AcceptOutcome::OverQuota`].
+/// the held one needs a token in the network's adoption bucket before its signature is looked at
+/// (the token is taken only once the Roster verified; without one it is [`AcceptOutcome::OverQuota`]),
+/// and the submitter must not have used up its own bucket of transfers that failed verification
+/// (charged when one does; without one the transfer is [`AcceptOutcome::Invalid`], unverified).
 /// `log` throttles the warn lines a peer can cause (isolation rule I7); what a line would have
 /// said is still available at `debug` level in full.
 ///
@@ -286,7 +288,23 @@ pub(crate) fn accept_roster_chunk(
     let newer = rosters
         .seq_of(&decoded.network_id)
         .is_none_or(|held| decoded.seq > held);
-    if newer && !quota.try_adopt(&decoded.network_id) {
+    // The signature check is paid for in two places (round T4): the network's adoption bucket,
+    // whose token is taken only when the Roster verified (a forgery cannot drain the owner's
+    // allowance), and the submitter's own bucket of transfers that failed, which bounds the
+    // checks a NodeId can make the relay waste across all its sessions.
+    if newer && !quota.may_verify() {
+        // Refused unverified and unanswered, like any transfer the relay cannot use: a node that
+        // keeps sending Rosters that fail has no use for an oracle on its own allowance.
+        if let Some(held_back) = log.admit("doc_refused") {
+            tracing::warn!(
+                held_back,
+                network_id = %decoded.network_id,
+                "a node's Roster transfers keep failing verification; refusing one unverified"
+            );
+        }
+        return AcceptOutcome::Invalid;
+    }
+    if newer && !quota.adoption_available(&decoded.network_id) {
         if let Some(held_back) = log.admit("doc_over_quota") {
             tracing::warn!(
                 held_back,
@@ -297,9 +315,15 @@ pub(crate) fn accept_roster_chunk(
         return AcceptOutcome::OverQuota(decoded.network_id);
     }
     match rosters.adopt(&roster, base.as_ref(), now) {
-        Ok(true) => AcceptOutcome::NewRoster(decoded.network_id),
+        Ok(true) => {
+            quota.adopted(&decoded.network_id);
+            AcceptOutcome::NewRoster(decoded.network_id)
+        }
         Ok(false) => AcceptOutcome::Stale(decoded.network_id),
         Err(err) => {
+            if newer {
+                quota.failed_verification();
+            }
             tracing::debug!(error = %err, "reassembled DOC was not adopted as a Roster");
             if let Some(held_back) = log.admit("doc_refused") {
                 tracing::warn!(held_back, error = %err, "a session sent a DOC that was not adopted as a Roster");
@@ -854,6 +878,7 @@ mod tests {
     struct Quota {
         max_bytes: usize,
         adoptions: std::cell::Cell<u32>,
+        failures: std::cell::Cell<u32>,
     }
 
     impl RosterQuota for Quota {
@@ -861,10 +886,20 @@ mod tests {
             self.max_bytes
         }
 
-        fn try_adopt(&self, _: &NetworkId) -> bool {
-            let left = self.adoptions.get();
-            self.adoptions.set(left.saturating_sub(1));
-            left > 0
+        fn adoption_available(&self, _: &NetworkId) -> bool {
+            self.adoptions.get() > 0
+        }
+
+        fn adopted(&self, _: &NetworkId) {
+            self.adoptions.set(self.adoptions.get().saturating_sub(1));
+        }
+
+        fn may_verify(&self) -> bool {
+            self.failures.get() < 3
+        }
+
+        fn failed_verification(&self) {
+            self.failures.set(self.failures.get() + 1);
         }
     }
 
@@ -914,6 +949,7 @@ mod tests {
         let quota = Quota {
             max_bytes: size - 1,
             adoptions: std::cell::Cell::new(5),
+            failures: std::cell::Cell::new(0),
         };
         let two = records(&signed_roster(&owner, network_id, 2));
         assert_eq!(
@@ -931,6 +967,7 @@ mod tests {
         let quota = Quota {
             max_bytes: size,
             adoptions: std::cell::Cell::new(1),
+            failures: std::cell::Cell::new(0),
         };
         assert_eq!(
             feed_quota(&two, &rosters, &claimed, &quota),
@@ -947,6 +984,71 @@ mod tests {
             feed_quota(&two, &rosters, &claimed, &quota),
             AcceptOutcome::Stale(network_id)
         );
+    }
+
+    /// Round T4 (the adoption bucket drain): the network's adoption is taken only when a Roster
+    /// verified. Forgeries for a served network, which fail the signature check, are charged to
+    /// the submitter's own bucket and leave the network's allowance whole; a submitter that has
+    /// used up its own allowance is refused unverified (even with a genuine Roster).
+    #[test]
+    fn forged_rosters_cost_the_submitter_not_the_network() {
+        let owner = SigningKey::generate(&mut rand::rng());
+        let impostor = SigningKey::generate(&mut rand::rng());
+        let network_id = NetworkId::from(owner.verifying_key().to_bytes());
+        let rosters = RosterStore::new();
+        rosters.set(&signed_roster(&owner, network_id, 1)).unwrap();
+        let claimed = [network_id];
+        let records = |roster: &Roster| {
+            menzil_proto::split_into_doc_records(DocType::Roster, &roster.encode())
+        };
+        let quota = Quota {
+            max_bytes: usize::MAX,
+            adoptions: std::cell::Cell::new(2),
+            failures: std::cell::Cell::new(0),
+        };
+        for seq in 2..5 {
+            let forged = records(&signed_roster(&impostor, network_id, seq));
+            assert_eq!(
+                feed_quota(&forged, &rosters, &claimed, &quota),
+                AcceptOutcome::Invalid
+            );
+        }
+        assert_eq!(
+            quota.adoptions.get(),
+            2,
+            "forgeries took nothing from the network"
+        );
+        assert_eq!(
+            quota.failures.get(),
+            3,
+            "they were charged to the submitter"
+        );
+        // The submitter has used its allowance: a genuine Roster is refused unverified.
+        let genuine = records(&signed_roster(&owner, network_id, 6));
+        assert_eq!(
+            feed_quota(&genuine, &rosters, &claimed, &quota),
+            AcceptOutcome::Invalid
+        );
+        assert_eq!(rosters.seq_of(&network_id), Some(1));
+        assert_eq!(
+            quota.failures.get(),
+            3,
+            "a refused one is not a further failure"
+        );
+
+        // Another submitter (a fresh allowance) gets its genuine Roster adopted, and that one
+        // takes the network's adoption.
+        let other = Quota {
+            max_bytes: usize::MAX,
+            adoptions: std::cell::Cell::new(2),
+            failures: std::cell::Cell::new(0),
+        };
+        assert_eq!(
+            feed_quota(&genuine, &rosters, &claimed, &other),
+            AcceptOutcome::NewRoster(network_id)
+        );
+        assert_eq!(other.adoptions.get(), 1);
+        assert_eq!(other.failures.get(), 0);
     }
 
     #[test]

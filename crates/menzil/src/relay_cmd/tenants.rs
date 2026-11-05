@@ -146,23 +146,28 @@ impl TenantFile {
 }
 
 /// The networks a tenant file lists, as far as they can be read from a file whose other fields
-/// may be wrong: so that a file the book refuses still holds its networks back.
-fn salvage_networks(text: &str) -> Vec<NetworkId> {
-    let Ok(table) = text.parse::<toml::Table>() else {
-        return Vec::new();
+/// may be wrong: so that a file the book refuses still holds its networks back. A file whose
+/// `networks` cannot be read at all (not TOML, `networks` not an array, an element that is not
+/// 64 hex digits) is an error: its networks are unknown, and a caller that carried on would let
+/// them fall to the default tenant, the most generous class (round T4, L1). No `networks` key is
+/// no networks.
+fn salvage_networks(text: &str) -> Result<Vec<NetworkId>> {
+    let table: toml::Table = text.parse().context("not valid TOML")?;
+    let Some(value) = table.get("networks") else {
+        return Ok(Vec::new());
     };
-    table
-        .get("networks")
-        .and_then(toml::Value::as_array)
-        .map(|items| {
-            items
-                .iter()
-                .filter_map(toml::Value::as_str)
-                .filter_map(parse_hex32)
+    let items = value
+        .as_array()
+        .ok_or_else(|| anyhow!("`networks` is not a list of network ids"))?;
+    items
+        .iter()
+        .map(|item| {
+            item.as_str()
+                .and_then(parse_hex32)
                 .map(NetworkId::from)
-                .collect()
+                .ok_or_else(|| anyhow!("`networks` has an entry that is not a network id: {item}"))
         })
-        .unwrap_or_default()
+        .collect()
 }
 
 /// The tenant files of the relay directory: the ones that make a [`TenantSpec`], and the ones
@@ -209,7 +214,12 @@ pub fn read_specs(home: &Home) -> Result<(Vec<TenantSpec>, Vec<Refusal>)> {
             Err(error) => refused.push(Refusal {
                 name,
                 reason: format!("{error:#}"),
-                networks: salvage_networks(&text),
+                networks: salvage_networks(&text).with_context(|| {
+                    format!(
+                        "{} cannot be used and its networks cannot be told",
+                        path.display()
+                    )
+                })?,
             }),
         }
     }
@@ -246,7 +256,10 @@ fn listed_networks(specs: &[TenantSpec], refused: &[Refusal]) -> HashSet<Network
 pub fn load_book(home: &Home, rosters: &[StoredRoster]) -> Result<TenantBook> {
     let (specs, refused) = read_specs(home)?;
     let names = default_names(rosters, &listed_networks(&specs, &refused));
-    Ok(TenantBook::build(specs, refused, &names))
+    // Removed slugs still in quarantine: a file that brings one back is refused (design 2.2,
+    // rule 1; round T4, N5).
+    let removed: HashSet<String> = quarantined(home, super::unix_now())?.into_keys().collect();
+    Ok(TenantBook::build(specs, refused, &names, &removed))
 }
 
 /// What the operator should hear about the book: refused files, conflicts, and tenants that list
@@ -408,7 +421,7 @@ pub fn add_network_to(home: &Home, token: &str, now: u64, tenant: Option<&str>) 
                     .decode()
                     .is_ok_and(|b| !listed_networks(&specs, &refused).contains(&b.network_id))
             });
-            let trial = TenantBook::build(specs.clone(), refused, &names);
+            let trial = TenantBook::build(specs.clone(), refused, &names, &HashSet::new());
             if let Some(refusal) = trial.refused().iter().find(|r| r.name == slug.as_str()) {
                 bail!("tenant {slug} cannot take it: {}", refusal.reason);
             }
@@ -542,7 +555,9 @@ fn tenant_files_listing(home: &Home, id: &NetworkId) -> Result<Vec<(String, Tena
         }
         let text =
             fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
-        if !salvage_networks(&text).contains(id) {
+        let listed = salvage_networks(&text)
+            .with_context(|| format!("{} cannot be read", path.display()))?;
+        if !listed.contains(id) {
             continue;
         }
         let file: TenantFile = toml::from_str(&text)
@@ -566,7 +581,14 @@ pub fn remove_tenant(home: &Home, slug: &str, now: u64) -> Result<Vec<NetworkId>
         Err(e) if e.kind() == ErrorKind::NotFound => bail!("this relay has no tenant {slug}"),
         Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
     };
-    let networks = salvage_networks(&text);
+    // A file whose networks cannot be told is not deleted: its Rosters would stay and be served
+    // by the default tenant at the next reload (round T4, L1). The operator repairs or moves it.
+    let networks = salvage_networks(&text).with_context(|| {
+        format!(
+            "{} cannot be read, so tenant {slug} is not removed: repair the file (or delete it and the Roster files by hand)",
+            path.display()
+        )
+    })?;
     for network in &networks {
         remove_if_there(&roster_path(home, network))?;
     }

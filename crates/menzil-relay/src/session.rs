@@ -130,6 +130,11 @@ fn unix_now() -> u64 {
 /// `limits.max_peers` is the relay's figure, lowered to the `destinations_per_node` figure of
 /// every tenant with figures among the networks listed (MT8, design 2.3): the node is told the
 /// number the relay will enforce for it. An `Xx` session lists none and hears the relay's figure.
+///
+/// Accepted limit (round T4, N3): an `Xx` session's WELCOME is written before its HELLO exists,
+/// so it carries the relay's `max_peers` while the tenant's `destinations_per_node` is what is
+/// enforced once the session attaches. Nodes ignore `max_peers` today; if one starts to rely on
+/// it, an `Xx` node learns the lower figure only by a refused first SEND (ERROR `over_quota`).
 fn build_welcome(relay: &Relay, session_id: u32, rosters: HashMap<NetworkId, u64>) -> WelcomeBody {
     let mut limits = relay.limits;
     if !rosters.is_empty() {
@@ -442,7 +447,7 @@ async fn dispatch(
                 claimed_networks,
                 unix_now(),
                 &mut budget.docs,
-                &relay.roster_quota(),
+                &relay.roster_quota(*node_id),
                 relay.log.about(node_id),
             );
             // A transfer the relay could not use (invalid, forged, for a network the session did
@@ -937,7 +942,7 @@ async fn run_attached_loop(
                     // delivered (round T2, N2): the destinations' drain loops drop it. Only an
                     // attached session has pairs; a session still attaching must not mark the
                     // pairs of an older session of the same NodeId.
-                    relay.forwarding.revoke_sender(&node_id);
+                    relay.forwarding.revoke_sender(&node_id, session_id);
                     send_eviction(&mut conn, &mut transport, relay, rejection, session_id, &node_id).await;
                     break;
                 }

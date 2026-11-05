@@ -126,12 +126,21 @@
 //! are, so a quota reached by abuse never cuts a legitimate conversation. Bandwidth is not a
 //! refusal at all: [`ForwardTable::drained`] charges the tenant's bucket and volume counter
 //! (`crate::shaping`) and, while the tenant is over its rate, the CREDIT that goes back to the
-//! sender is held and released later by a timer, so the sender only waits. A tenant without
+//! sender is held and released later by a timer, fairly among the tenant's senders
+//! (`crate::shaping`), so the sender only waits. Droppable bytes are paid from the same bucket at
+//! admission and dropped when the bucket is empty or in debt, so droppable traffic never delays
+//! reliable CREDIT (T4 M1). A tenant without
 //! figures (the default tenant, the `personal` class) is never shaped and never counted out.
 //!
-//! A sender evicted from a network ([`ForwardTable::revoke_sender`]) has its pairs marked; the
-//! RECVs it had queued toward destinations are dropped unsent by the destination's drain loop
-//! (a revocation is not delayed by what was already queued; T2 N2).
+//! Accepted limit (round T4, N2): a pair keeps the tenant it was attributed to when it was made.
+//! A tenant file edited by hand to move a network to another tenant (or to the default) leaves
+//! the live pairs shaped, or unshaped, by the old tenant until a node reconnects (every pair of a
+//! node goes with its session). Only an operator edit can cause it.
+//!
+//! A session evicted from a network ([`ForwardTable::revoke_sender`]) has the pairs IT made marked
+//! and removed (a newer session of the same NodeId has pairs of its own, which are left alone;
+//! T4 M2); the RECVs it had queued toward destinations are dropped unsent by the destination's
+//! drain loop (a revocation is not delayed by what was already queued; T2 N2).
 //!
 //! Not built, real gaps: the
 //! sender-side output ordering protocol.md 4.2 states ("control records,
@@ -274,13 +283,22 @@ struct PairState {
     generation: u64,
     /// The droppable part of `queued_bytes`, also counted in the tenant's droppable total.
     droppable_bytes: usize,
+    /// The session of `src` that made this pair, so that the eviction of that session marks and
+    /// removes only its own pairs ([`ForwardTable::revoke_sender`], round T4 M2).
+    src_session: u32,
     /// What the queued items of this pair carry with them: the tenant to charge and whether the
     /// sender was evicted.
     shared: Arc<PairShared>,
 }
 
 impl PairState {
-    fn new(initial_credit: u32, now: Instant, generation: u64, tenant: TenantId) -> Self {
+    fn new(
+        initial_credit: u32,
+        now: Instant,
+        generation: u64,
+        tenant: TenantId,
+        src_session: u32,
+    ) -> Self {
         let initial_credit = initial_credit.min(MAX_QUEUE_BYTES as u32);
         Self {
             credit: CreditLedger::new(initial_credit),
@@ -289,6 +307,7 @@ impl PairState {
             dgram_bucket: TokenBucket::new(now),
             generation,
             droppable_bytes: 0,
+            src_session,
             shared: Arc::new(PairShared::new(tenant)),
         }
     }
@@ -695,12 +714,22 @@ impl ForwardTable {
             .find(|network| target.claimed_networks.contains(network))
             .unwrap_or(&authorizing[0]);
 
+        // `src` is necessarily attached right now — this call is
+        // processing a SEND it just sent — so `None` here would mean it
+        // detached in the instant between; using a sentinel rather than
+        // panicking, `is_current` then correctly reports `false` for it
+        // regardless (no registration at all is no more "current" than a
+        // mismatched id), which is the same fail-safe direction
+        // `ForwardTable::drained` already needs for a genuine reconnect.
+        let src_session_id = registry.attached_session_id(src).unwrap_or(u32::MAX);
+
         let book = self.book();
         let admitted = self.admit(
             &book,
             limits,
             src,
             dst,
+            src_session_id,
             pair_network,
             reliable,
             charge,
@@ -722,15 +751,6 @@ impl ForwardTable {
                 };
             }
         };
-
-        // `src` is necessarily attached right now — this call is
-        // processing a SEND it just sent — so `None` here would mean it
-        // detached in the instant between; using a sentinel rather than
-        // panicking, `is_current` then correctly reports `false` for it
-        // regardless (no registration at all is no more "current" than a
-        // mismatched id), which is the same fail-safe direction
-        // `ForwardTable::drained` already needs for a genuine reconnect.
-        let src_session_id = registry.attached_session_id(src).unwrap_or(u32::MAX);
 
         let delivered = registry.deliver_to_session(
             dst,
@@ -907,7 +927,11 @@ impl ForwardTable {
         // Whether `src` is owed a CREDIT record now: its session is still the one that spent the
         // charge (see `ForwardItem::Recv::src_session_id`). Bandwidth may postpone it.
         let mut grant_now = reliable && registry.is_current(src, src_session_id);
-        if sent && let Some(figures) = self.book().figures_of(&shared.tenant).copied() {
+        // Droppable bytes were paid at admission (`Shaper::try_take`), reliable ones are paid here.
+        if sent
+            && reliable
+            && let Some(figures) = self.book().figures_of(&shared.tenant).copied()
+        {
             let shaper = self.shapers.of(&shared.tenant, &figures);
             let owed = grant_now.then_some((*src, *dst, src_session_id));
             match shaper.charge(&figures, charge, owed, tokio::time::Instant::now()) {
@@ -949,6 +973,7 @@ impl ForwardTable {
         limits: &Limits,
         src: &NodeId,
         dst: &NodeId,
+        src_session: u32,
         pair_network: &NetworkId,
         reliable: bool,
         charge: u32,
@@ -969,9 +994,10 @@ impl ForwardTable {
             }
             table.count(&tenant, src);
             let generation = self.next_generation.fetch_add(1, Ordering::Relaxed);
-            table
-                .pairs
-                .insert(key, PairState::new(limits.credit, now, generation, tenant));
+            table.pairs.insert(
+                key,
+                PairState::new(limits.credit, now, generation, tenant, src_session),
+            );
         }
         let PairTable {
             pairs, per_tenant, ..
@@ -1011,6 +1037,18 @@ impl ForwardTable {
             {
                 return Err(Early::Dropped);
             }
+            // The tenant's bandwidth (round T4, M1): droppable bytes are paid from the bucket
+            // now, never on credit; a bucket that is empty or in debt drops the record. Last, so
+            // a record refused above takes nothing from the tenant.
+            if let Some(figures) = book.figures_of(&shared.tenant)
+                && !self.shapers.of(&shared.tenant, figures).try_take(
+                    figures,
+                    charge,
+                    tokio::time::Instant::now(),
+                )
+            {
+                return Err(Early::Dropped);
+            }
             pair.droppable_bytes += charge as usize;
             if let Some(held) = per_tenant.get_mut(&shared.tenant) {
                 held.droppable_bytes += charge as usize;
@@ -1020,13 +1058,25 @@ impl ForwardTable {
         Ok((generation, shared))
     }
 
-    /// Marks every pair `src` sends in as revoked: `src` has been evicted from a network (its
-    /// session is ending), and what it already queued toward destinations must not be delivered
-    /// there (T2 N2). The destinations' drain loops check [`PairShared::is_revoked`].
-    pub(crate) fn revoke_sender(&self, src: &NodeId) {
-        for ((from, _), pair) in &self.table().pairs {
-            if from == src {
+    /// `src`'s session `session_id` has been evicted from a network (it is ending): what that
+    /// session already queued toward destinations must not be delivered there (T2 N2), so the
+    /// pairs it made are marked ([`PairShared::is_revoked`], checked by the destinations' drain
+    /// loops) and removed, with their counts. Only pairs made by this session are touched: a
+    /// newer session of the same NodeId has pairs of its own (round T4 M2), and the mark cannot
+    /// outlive the pair it is on, so a later pair of `src` never inherits it. Items already
+    /// queued keep the marked [`PairShared`] and are dropped unsent.
+    pub(crate) fn revoke_sender(&self, src: &NodeId, session_id: u32) {
+        let mut guard = self.table();
+        let keys: Vec<(NodeId, NodeId)> = guard
+            .pairs
+            .iter()
+            .filter(|((from, _), pair)| from == src && pair.src_session == session_id)
+            .map(|(key, _)| *key)
+            .collect();
+        for key in keys {
+            if let Some(pair) = guard.pairs.remove(&key) {
                 pair.shared.revoked.store(true, Ordering::Release);
+                guard.uncount(&key.0, &pair);
             }
         }
     }
@@ -1073,7 +1123,7 @@ impl ForwardTable {
         table.count(&TenantId::Default, src);
         table.pairs.insert(
             (*src, *dst),
-            PairState::new(1024, Instant::now(), generation, TenantId::Default),
+            PairState::new(1024, Instant::now(), generation, TenantId::Default, 0),
         );
     }
 

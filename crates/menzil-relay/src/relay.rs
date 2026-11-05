@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use tokio::sync::Semaphore;
 
-use menzil_proto::Limits;
+use menzil_proto::{Limits, NodeId};
 
 use crate::admission::{Admission, AdmissionLimits};
 use crate::advertise::LabelRegistry;
@@ -213,10 +213,11 @@ impl Relay {
     }
 
     /// What the tenants allow of a DOC(roster) transfer now (Roster size, adoptions per network).
-    pub(crate) fn roster_quota(&self) -> RelayQuota<'_> {
+    pub(crate) fn roster_quota(&self, submitter: NodeId) -> RelayQuota<'_> {
         RelayQuota {
             book: self.tenants(),
             usage: &self.usage,
+            submitter,
         }
     }
 

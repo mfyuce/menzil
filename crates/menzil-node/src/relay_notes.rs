@@ -99,6 +99,9 @@ struct Held {
 #[derive(Debug, Default)]
 struct Inner {
     last: Option<Held>,
+    /// The latest ERROR `over_quota` of the current attachment, not yet known to have turned the
+    /// node away: it becomes `last` when GOAWAY `over_quota` follows in the same attachment.
+    tentative: Option<Held>,
     /// Counts attachments; the current one is the last begun.
     attachment: u64,
     settled: bool,
@@ -122,11 +125,13 @@ impl Default for RelayNotes {
 /// record. `UnknownNetwork` counts only before the attachment settled: later it is the answer to
 /// a document sent for a network the relay does not serve, and the session goes on.
 /// `UnknownE2e` never counts: protocol.md 4.2 makes it the refusal of one SEND, after which the
-/// session goes on (round 13 N3). `OverQuota` is the same kind of case as `UnknownNetwork`: a
-/// tenant at a figure turns a session away at HELLO or ATTACH (before the attachment settles),
-/// and later it is the answer to one Roster update the tenant's rate refused, with the session
-/// going on (multi tenant design 2.3). A build from before the code existed reads it as
-/// `Unknown(27)`, which is never kept.
+/// session goes on (round 13 N3). `OverQuota` never counts by itself (round T4, N1): a tenant at
+/// a figure turns a session away at HELLO or ATTACH with ERROR `over_quota` followed by GOAWAY
+/// `over_quota`, but the same ERROR is also the answer to one pair the tenant's figures refuse or
+/// one Roster update its rate refused, with the session going on, and a node pushes Rosters and
+/// opens peers right after ATTACH. The ERROR is therefore held back ([`Inner::tentative`]) and
+/// kept only when the GOAWAY `over_quota` of the same attachment confirms the turn-away. A build
+/// from before the code existed reads it as `Unknown(27)`, which is never kept.
 fn turns_away(code: ErrorCode, settled: bool) -> bool {
     match code {
         ErrorCode::BadCert
@@ -135,7 +140,7 @@ fn turns_away(code: ErrorCode, settled: bool) -> bool {
         | ErrorCode::NotMember
         | ErrorCode::Revoked
         | ErrorCode::RosterExpired => true,
-        ErrorCode::UnknownNetwork | ErrorCode::OverQuota => !settled,
+        ErrorCode::UnknownNetwork => !settled,
         _ => false,
     }
 }
@@ -230,11 +235,15 @@ impl RelayNotes {
         listed_in_own_roster: bool,
         keep_existing: bool,
     ) {
-        if !turns_away(body.code, inner.settled) || (keep_existing && inner.last.is_some()) {
+        let over_quota = body.code == ErrorCode::OverQuota;
+        if !over_quota && !turns_away(body.code, inner.settled) {
+            return;
+        }
+        if keep_existing && inner.last.is_some() {
             return;
         }
         let attachment = inner.attachment;
-        inner.last = Some(Held {
+        let held = Held {
             error: RelayError {
                 code: Some(body.code),
                 message: cut_bytes(&body.msg, MAX_MESSAGE_BYTES),
@@ -243,7 +252,12 @@ impl RelayNotes {
                 listed_in_own_roster: body.code == ErrorCode::NotMember && listed_in_own_roster,
             },
             attachment,
-        });
+        };
+        if over_quota {
+            inner.tentative = Some(held);
+        } else {
+            inner.last = Some(held);
+        }
     }
 
     /// A GOAWAY arrived at `now`. It joins the ERROR of the same attachment (a relay that evicts
@@ -252,6 +266,14 @@ impl RelayNotes {
         let mut inner = self.inner();
         let attachment = inner.attachment;
         let reason = cut_bytes(reason, MAX_MESSAGE_BYTES);
+        if reason == "over_quota"
+            && let Some(mut held) = inner.tentative.take()
+            && held.attachment == attachment
+        {
+            held.error.goaway = Some(reason);
+            inner.last = Some(held);
+            return;
+        }
         if let Some(held) = inner.last.as_mut()
             && held.attachment == attachment
             && held.error.goaway.is_none()
@@ -384,6 +406,11 @@ mod tests {
         let notes = RelayNotes::new();
         notes.begin_attachment();
         notes.note_error(&error(ErrorCode::OverQuota, "tenant full"), 10);
+        assert_eq!(
+            notes.last_error(),
+            None,
+            "the ERROR alone is not a turn-away (round T4, N1)"
+        );
         notes.note_goaway("over_quota", 11);
         assert_eq!(
             notes.last_error(),
@@ -401,6 +428,21 @@ mod tests {
         settled.settle(true);
         settled.note_error(&error(ErrorCode::OverQuota, "no more Roster updates"), 12);
         assert_eq!(settled.last_error(), None);
+
+        // Round T4, N1: a pair or document refusal in the first seconds of an attachment (the
+        // session goes on, no GOAWAY follows) is not a turn-away, and a GOAWAY of a later
+        // attachment does not adopt it.
+        let notes = RelayNotes::new();
+        notes.begin_attachment();
+        notes.note_error(&error(ErrorCode::OverQuota, "no more pairs"), 14);
+        assert_eq!(notes.last_error(), None);
+        notes.begin_attachment();
+        notes.note_goaway("over_quota", 15);
+        assert_eq!(
+            notes.last_error().map(|e| (e.code, e.message)),
+            Some((None, String::new())),
+            "a GOAWAY of another attachment adopts no earlier ERROR"
+        );
 
         // What a node built before MT7 decodes from the wire number 27.
         let old = ErrorCode::from(u16::from(ErrorCode::OverQuota));

@@ -1536,3 +1536,88 @@ async fn remove_tenant_removes_its_networks_and_keeps_its_name_back() {
     assert!(remove_tenant(&relay, "nobody", clock()).is_err());
     assert!(remove_tenant(&relay, "Not A Name", clock()).is_err());
 }
+
+// --- Round T4 -------------------------------------------------------------------------------
+
+/// L1: a tenant file whose `networks` cannot be read at all must never send its networks to the
+/// default tenant: every way to read the book fails, `remove-tenant` refuses and keeps the file
+/// and the Rosters (the file stays quarantined by the error until the operator repairs it).
+#[test]
+fn a_tenant_file_whose_networks_cannot_be_read_is_an_error_not_the_default_tenant() {
+    let (_a, _oa, id, token) = another_network();
+    let (_d, relay) = relay_machine();
+    add_network_to(&relay, &token, clock(), Some("ali")).unwrap();
+    let rosters = load_rosters(&relay).unwrap();
+    let ali = TenantId::Named(menzil_relay::Slug::parse("ali").unwrap());
+    assert_eq!(load_book(&relay, &rosters).unwrap().id_of(&id), &ali);
+
+    // A hand edit: the id written as a string instead of a list; a list with an entry that is
+    // not an id; a list nested in a table; text that is not TOML.
+    for broken in [
+        format!("networks = \"{}\"\nclass = \"friend\"\n", id.to_hex()),
+        format!("networks = [\"{}\", 7]\n", id.to_hex()),
+        format!("networks = [\"{}x\"]\n", id.to_hex()),
+        "networks = [\n".to_string(),
+    ] {
+        fs::write(tenant_file(&relay, "ali"), &broken).unwrap();
+        assert!(
+            load_book(&relay, &rosters).is_err(),
+            "the book is not built from {broken:?}"
+        );
+        assert!(read_specs(&relay).is_err());
+        assert!(render_tenants(&relay, clock()).is_err());
+        // remove-tenant refuses and deletes nothing.
+        let error = remove_tenant(&relay, "ali", clock()).unwrap_err();
+        assert!(format!("{error:#}").contains("not removed"), "{error:#}");
+        assert!(tenant_file(&relay, "ali").exists());
+        assert!(roster_path(&relay, &id).exists());
+        assert!(
+            !tenants_dir(&relay).join(".quarantine").exists(),
+            "a refused removal quarantines nothing"
+        );
+    }
+
+    // A file that is fine apart from another field is still held back with its networks.
+    fs::write(
+        tenant_file(&relay, "ali"),
+        format!("networks = [\"{}\"]\nclass = \"nonsense\"\n", id.to_hex()),
+    )
+    .unwrap();
+    let book = load_book(&relay, &rosters).unwrap();
+    assert!(book.is_held_back(&id));
+    assert_eq!(book.refused()[0].networks, vec![id]);
+
+    // Repaired, the file is removed as usual.
+    fs::write(
+        tenant_file(&relay, "ali"),
+        format!("networks = [\"{}\"]\n", id.to_hex()),
+    )
+    .unwrap();
+    assert_eq!(remove_tenant(&relay, "ali", clock()).unwrap(), vec![id]);
+    assert!(!tenant_file(&relay, "ali").exists() && !roster_path(&relay, &id).exists());
+}
+
+/// N5 (design 2.2, rule 1): a hand written file whose slug is in quarantine is refused by the
+/// book the relay loads, and its networks are held back.
+#[test]
+fn a_hand_written_file_with_a_quarantined_slug_is_refused_by_the_relays_book() {
+    let (_a, _oa, id_a, token_a) = another_network();
+    let (_b, _ob, id_b, token_b) = another_network();
+    let (_d, relay) = relay_machine();
+    add_network_to(&relay, &token_a, clock(), Some("ali")).unwrap();
+    remove_tenant(&relay, "ali", clock()).unwrap();
+    // The operator keeps a second network, then writes a file bringing the name back by hand.
+    add_network_to(&relay, &token_b, clock(), Some("veli")).unwrap();
+    fs::write(
+        tenant_file(&relay, "ali"),
+        format!("networks = [\"{}\"]\n", id_b.to_hex()),
+    )
+    .unwrap();
+    let rosters = load_rosters(&relay).unwrap();
+    let book = load_book(&relay, &rosters).unwrap();
+    assert!(book.named("ali").is_none());
+    assert!(book.is_held_back(&id_b), "the listed network is not served");
+    let refusal = book.refused().iter().find(|r| r.name == "ali").unwrap();
+    assert!(refusal.reason.contains("quarantine"), "{}", refusal.reason);
+    assert!(!roster_path(&relay, &id_a).exists());
+}

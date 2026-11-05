@@ -4532,6 +4532,7 @@ async fn a_relay_has_the_default_tenant_until_a_book_is_set() {
         vec![spec],
         vec![],
         &Default::default(),
+        &Default::default(),
     ));
     assert_eq!(clone.tenants().id_of(&network).slug(), Some("ali"));
 }
@@ -4561,7 +4562,7 @@ fn friend_book(tenants: &[FriendSpec<'_>]) -> TenantBook {
             added: 1 + i as u64,
         })
         .collect();
-    TenantBook::build(specs, vec![], &Default::default())
+    TenantBook::build(specs, vec![], &Default::default(), &Default::default())
 }
 
 fn tenant(slug: &str) -> TenantId {
@@ -4864,6 +4865,48 @@ async fn roster_adoptions_beyond_the_networks_bucket_are_refused_over_quota() {
     assert_eq!(s.held_seq(), 3, "the refused Roster was not adopted");
     ping_pong(&mut s.client, [4; 8]).await;
     assert!(s.relay.registry.is_attached(&s.member.node_id));
+}
+
+/// Round T4 (the adoption bucket drain): forged "newer" Rosters of a member fail the signature
+/// check and are charged to that member's own bucket, not to the network's. With a network
+/// allowance of one adoption, the owner's genuine Roster is still adopted after three forgeries;
+/// from the fourth on, the forger's further transfers are refused unverified (not answered) and
+/// the owner's allowance is still whole for its genuine Roster, pushed by another session.
+#[tokio::test]
+async fn forged_rosters_do_not_drain_the_networks_adoption_bucket() {
+    let mut s = rated_member(rates((1_000_000, 1_000_000), (1_000_000, 1_000_000), 0)).await;
+    s.relay.set_tenants(friend_book(&[(
+        "ali",
+        &[s.network],
+        &[
+            ("roster_adoptions_per_hour", 1),
+            ("roster_adoption_burst", 1),
+        ],
+    )]));
+    let impostor = SigningKey::generate(&mut rand::rng());
+    for seq in 2..8 {
+        let forged = evict_roster(&impostor, s.network, seq, &[(s.member.node_id, 1)], &[]);
+        s.push(&forged).await;
+    }
+    ping_pong(&mut s.client, [2; 8]).await;
+    assert_eq!(s.held_seq(), 1, "no forgery was adopted");
+    assert!(
+        s.relay
+            .roster_quota(s.member.node_id)
+            .adoption_available_for_test(&s.network),
+        "six forgeries left the network's allowance whole"
+    );
+    // The forger's allowance is used up: even the owner's genuine Roster pushed on this session is
+    // refused unverified (the owner pushes from its own device, which has its own allowance).
+    let genuine = s.roster(2);
+    s.push(&genuine).await;
+    ping_pong(&mut s.client, [3; 8]).await;
+    assert_eq!(s.held_seq(), 1);
+    // The network's one adoption is available to a submitter that has not failed.
+    let other = NodeId::from([0x77; 32]);
+    let quota = s.relay.roster_quota(other);
+    assert!(quota.may_verify_for_test());
+    assert!(quota.adoption_available_for_test(&s.network));
 }
 
 /// The tenant's Roster size figure: a Roster over it is answered ERROR `too_large` and not

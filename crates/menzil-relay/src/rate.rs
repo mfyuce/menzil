@@ -137,6 +137,24 @@ impl TokenBucket {
         }
     }
 
+    /// Whether a token is there now, taking none.
+    pub(crate) fn has_token(&mut self) -> bool {
+        let now = Instant::now();
+        let elapsed = now.saturating_duration_since(self.last).as_micros();
+        self.last = now;
+        self.units = (self.units + elapsed * self.per_period).min(self.cap);
+        self.units >= self.token
+    }
+
+    /// Whether the bucket is full (nothing was taken from it that has not come back).
+    pub(crate) fn is_full(&mut self) -> bool {
+        let now = Instant::now();
+        let elapsed = now.saturating_duration_since(self.last).as_micros();
+        self.last = now;
+        self.units = (self.units + elapsed * self.per_period).min(self.cap);
+        self.units >= self.cap
+    }
+
     /// Takes one token if there is one.
     pub(crate) fn try_take(&mut self) -> bool {
         let now = Instant::now();
