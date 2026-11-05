@@ -194,7 +194,8 @@ macro_rules! figures {
     ($($(#[$doc:meta])* $field:ident = $default:expr, max $max:expr;)*) => {
         /// The per tenant figures of a class (design 2.3), in the units the tenant file uses
         /// (the key names say which). Enforced so far: the session figures and the Roster figures
-        /// (MT7); the forwarding, bandwidth and name figures follow (MT8, MT9).
+        /// (MT7) and the data plane figures (MT8: pairs, destinations, droppable bytes, bandwidth,
+        /// burst, volume, floor); the name figures follow (MT9).
         #[derive(Debug, Clone, Copy, PartialEq, Eq)]
         pub struct Figures {
             $($(#[$doc])* pub $field: u64,)*

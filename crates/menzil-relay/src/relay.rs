@@ -152,6 +152,7 @@ impl Relay {
         limits.max_record = limits
             .max_record
             .min(menzil_carrier::MAX_MESSAGE_BYTES as u32);
+        let tenants = Arc::new(RwLock::new(Arc::new(TenantBook::default())));
         Self {
             identity: Arc::new(identity),
             rosters: Arc::new(RosterStore::new()),
@@ -159,12 +160,13 @@ impl Relay {
             registry: Arc::new(SessionRegistry::new()),
             admission: Arc::new(Admission::new(AdmissionLimits::default())),
             labels: Arc::new(LabelRegistry::new()),
-            forwarding: Arc::new(ForwardTable::new()),
+            // The data plane judges tenants by the same book the relay swaps (MT8).
+            forwarding: Arc::new(ForwardTable::with_tenants(Arc::clone(&tenants))),
             limits,
             rates: SessionRates::default(),
             timeouts: SessionTimeouts::default(),
             log: Arc::new(LogThrottle::default()),
-            tenants: Arc::new(RwLock::new(Arc::new(TenantBook::default()))),
+            tenants,
             usage: TenantUsage::new(),
             next_session_id: Arc::new(SessionIds::new()),
         }

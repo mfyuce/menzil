@@ -25,7 +25,7 @@
 //!   individually matter, arriving in a burst).
 
 use std::collections::HashMap;
-use std::sync::RwLock;
+use std::sync::{Arc, RwLock};
 
 use menzil_proto::{NetworkId, NodeId, Record};
 use tokio::sync::{mpsc, oneshot};
@@ -73,10 +73,11 @@ pub(crate) struct Attachment {
     pub(crate) claimed_networks: Vec<NetworkId>,
 }
 
-/// The relay's currently-attached sessions, at most one per NodeId.
-#[derive(Default)]
+/// The relay's currently-attached sessions, at most one per NodeId. A clone is another handle on
+/// the same registrations (the delayed CREDIT timer of `crate::shaping` holds one).
+#[derive(Default, Clone)]
 pub struct SessionRegistry {
-    by_node: RwLock<HashMap<NodeId, Registration>>,
+    by_node: Arc<RwLock<HashMap<NodeId, Registration>>>,
 }
 
 impl SessionRegistry {
@@ -505,6 +506,7 @@ mod tests {
             reliable: true,
             generation: 0,
             src_session_id: 0,
+            shared: Arc::new(crate::forward::PairShared::untracked()),
         }
     }
 

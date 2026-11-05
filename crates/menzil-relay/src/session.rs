@@ -126,13 +126,28 @@ fn unix_now() -> u64 {
 /// WELCOME for one session. `rosters` is what this session may learn about the relay's
 /// networks (isolation rule I1): never the relay's whole list, only networks the peer's own
 /// HELLO claimed and passed.
+///
+/// `limits.max_peers` is the relay's figure, lowered to the `destinations_per_node` figure of
+/// every tenant with figures among the networks listed (MT8, design 2.3): the node is told the
+/// number the relay will enforce for it. An `Xx` session lists none and hears the relay's figure.
 fn build_welcome(relay: &Relay, session_id: u32, rosters: HashMap<NetworkId, u64>) -> WelcomeBody {
+    let mut limits = relay.limits;
+    if !rosters.is_empty() {
+        let book = relay.tenants();
+        let claimed: Vec<NetworkId> = rosters.keys().copied().collect();
+        for tenant in book.session_tenants(&claimed) {
+            if let Some(figures) = book.figures_of(tenant) {
+                let own = u32::try_from(figures.destinations_per_node).unwrap_or(u32::MAX);
+                limits.max_peers = limits.max_peers.min(own);
+            }
+        }
+    }
     WelcomeBody {
         v: menzil_proto::PROTOCOL_VERSION,
         relay_cert: relay.identity.node_cert.clone(),
         session: session_id,
         time: unix_now(),
-        limits: relay.limits,
+        limits,
         rosters,
     }
 }
@@ -570,6 +585,21 @@ async fn dispatch(
                         let _ = send_record(conn, transport, Record::Error(error)).await;
                         Dispatch::End
                     }
+                    ForwardOutcome::OverQuota {
+                        error,
+                        tenant,
+                        quota,
+                    } => {
+                        // The operator hears, once a minute per node; the sender is told
+                        // `over_quota` without a tenant or a number.
+                        if let Some(held_back) =
+                            relay.log.admit_node("tenant_over_quota_pairs", node_id)
+                        {
+                            tracing::warn!(node_id = %node_id, tenant = %tenant, ?quota, held_back, "a tenant is at its limit, refusing a new pair");
+                        }
+                        let _ = send_record(conn, transport, Record::Error(error)).await;
+                        Dispatch::Continue
+                    }
                 }
             } else {
                 tracing::debug!(
@@ -658,6 +688,7 @@ async fn send_eviction(
         reason = %rejection.message,
         "relay session ended, the node is out of standing in a claimed network"
     );
+
     if let Some(network_id) = rejection.network
         && let Some(records) = doc::roster_doc_records(&relay.rosters, &network_id)
     {
@@ -902,6 +933,11 @@ async fn run_attached_loop(
             }
             () = watch.changed(&claimed_networks) => {
                 if let Some(rejection) = out_of_standing(relay, &node_id, cert_serial, &claimed_networks) {
+                    // What this attached session already queued toward other nodes is not
+                    // delivered (round T2, N2): the destinations' drain loops drop it. Only an
+                    // attached session has pairs; a session still attaching must not mark the
+                    // pairs of an older session of the same NodeId.
+                    relay.forwarding.revoke_sender(&node_id);
                     send_eviction(&mut conn, &mut transport, relay, rejection, session_id, &node_id).await;
                     break;
                 }
@@ -911,7 +947,7 @@ async fn run_attached_loop(
             }
             Some(item) = forward_rx.recv() => {
                 match item {
-                    ForwardItem::Recv { record, src, charge, reliable, generation, src_session_id } => {
+                    ForwardItem::Recv { record, src, charge, reliable, generation, src_session_id, shared } => {
                         // Only now — once this RECV record has actually
                         // been handed to this (destination) connection to
                         // send, not merely admitted into `ForwardTable`
@@ -922,8 +958,15 @@ async fn run_attached_loop(
                         // own doc comment for why that record travels
                         // this same reliable channel, not `send_to`'s
                         // lossy one).
-                        let _ = send_record(&mut conn, &mut transport, *record).await;
-                        relay.forwarding.drained(&relay.registry, &src, &node_id, charge, reliable, generation, src_session_id);
+                        if shared.is_revoked() {
+                            // `src` was evicted from a network while this was queued: it is
+                            // not delivered, and nothing is charged for it.
+                            tracing::debug!(session_id, "dropping a queued RECV of an evicted sender");
+                            relay.forwarding.released(&relay.registry, &src, &node_id, charge, reliable, generation, src_session_id, &shared);
+                        } else {
+                            let _ = send_record(&mut conn, &mut transport, *record).await;
+                            relay.forwarding.drained(&relay.registry, &src, &node_id, charge, reliable, generation, src_session_id, &shared);
+                        }
                     }
                     ForwardItem::Credit { peer, bytes } => {
                         let _ = send_record(
@@ -960,10 +1003,11 @@ async fn run_attached_loop(
             reliable,
             generation,
             src_session_id,
+            shared,
             ..
         } = item
         {
-            relay.forwarding.drained(
+            relay.forwarding.released(
                 &relay.registry,
                 &src,
                 &node_id,
@@ -971,6 +1015,7 @@ async fn run_attached_loop(
                 reliable,
                 generation,
                 src_session_id,
+                &shared,
             );
         }
     }

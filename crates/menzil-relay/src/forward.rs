@@ -116,6 +116,23 @@
 //! attaches or detaches; and `drained` for a pair that is already gone
 //! is a deliberate no-op.
 //!
+//! Tenant quotas (multi tenant design 2.3, slice MT8; threat A8). A pair counts against the
+//! tenant of the network that authorized it, the first network of the sender's HELLO list that
+//! the destination's registration also claimed. A tenant with figures is held to its number of
+//! live pairs, to the destinations of one sending NodeId, and to the droppable bytes queued over
+//! all its pairs; the relay as a whole is held to `Limits::max_peers` destinations per sending
+//! NodeId. Only the creation of a NEW pair is ever refused (ERROR `over_quota`, credit
+//! reimbursed, the session kept): a pair that exists keeps working whatever the tenant's counts
+//! are, so a quota reached by abuse never cuts a legitimate conversation. Bandwidth is not a
+//! refusal at all: [`ForwardTable::drained`] charges the tenant's bucket and volume counter
+//! (`crate::shaping`) and, while the tenant is over its rate, the CREDIT that goes back to the
+//! sender is held and released later by a timer, so the sender only waits. A tenant without
+//! figures (the default tenant, the `personal` class) is never shaped and never counted out.
+//!
+//! A sender evicted from a network ([`ForwardTable::revoke_sender`]) has its pairs marked; the
+//! RECVs it had queued toward destinations are dropped unsent by the destination's drain loop
+//! (a revocation is not delayed by what was already queued; T2 N2).
+//!
 //! Not built, real gaps: the
 //! sender-side output ordering protocol.md 4.2 states ("control records,
 //! then reliable SEND, then droppable SEND") is a node's own outgoing
@@ -142,8 +159,8 @@
 //! its forwarding immediately, only on its next HELLO.
 
 use std::collections::HashMap;
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock};
 use std::time::Instant;
 
 use menzil_proto::{ErrorBody, ErrorCode, Limits, NetworkId, NodeId, Record};
@@ -152,6 +169,8 @@ use menzil_session::CreditLedger;
 use crate::advertise::LabelRegistry;
 use crate::registry::SessionRegistry;
 use crate::roster_store::RosterStore;
+use crate::shaping::{Credit, Shapers};
+use crate::tenant::{Figures, TenantBook, TenantId};
 
 /// protocol.md 10: "Per destination queue: 4 MiB" (protocol.md 4.2: "one
 /// bounded queue per (source session, destination session)"). `pub(crate)`
@@ -183,6 +202,11 @@ const DGRAM_BUCKET_BURST_BYTES: f64 = 256.0 * 1024.0;
 /// destination offline, online without a claimed network in common, closed to peers, or gone
 /// before delivery all read the same.
 const PEER_OFFLINE_MSG: &str = "destination is not attached";
+
+/// What a sender is told when a new pair would exceed a tenant or relay figure (design 2.3). It
+/// names no tenant, figure or number: the sender knows its own networks, the rest is the
+/// operator's.
+const OVER_QUOTA_MSG: &str = "this relay's limit on devices talking to each other for your network is reached; try again later";
 
 const MIN_FORWARD_CHARGE_BYTES: u32 = menzil_proto::MIN_SEND_CHARGE_BYTES;
 
@@ -248,10 +272,15 @@ struct PairState {
     /// from [`ForwardTable`]'s own monotonic counter; never compared for
     /// ordering, only equality.
     generation: u64,
+    /// The droppable part of `queued_bytes`, also counted in the tenant's droppable total.
+    droppable_bytes: usize,
+    /// What the queued items of this pair carry with them: the tenant to charge and whether the
+    /// sender was evicted.
+    shared: Arc<PairShared>,
 }
 
 impl PairState {
-    fn new(initial_credit: u32, now: Instant, generation: u64) -> Self {
+    fn new(initial_credit: u32, now: Instant, generation: u64, tenant: TenantId) -> Self {
         let initial_credit = initial_credit.min(MAX_QUEUE_BYTES as u32);
         Self {
             credit: CreditLedger::new(initial_credit),
@@ -259,6 +288,147 @@ impl PairState {
             queued_bytes: 0,
             dgram_bucket: TokenBucket::new(now),
             generation,
+            droppable_bytes: 0,
+            shared: Arc::new(PairShared::new(tenant)),
+        }
+    }
+}
+
+/// What every queued [`ForwardItem::Recv`] of one pair shares with the pair: which tenant its
+/// bytes are charged to when they leave, and whether its sender has been evicted (T2 N2). It
+/// outlives the pair itself (an item holds a reference), so a pair reset by a reconnect still
+/// knows whom to charge and whether to drop.
+#[derive(Debug)]
+pub(crate) struct PairShared {
+    tenant: TenantId,
+    revoked: AtomicBool,
+}
+
+impl PairShared {
+    fn new(tenant: TenantId) -> Self {
+        Self {
+            tenant,
+            revoked: AtomicBool::new(false),
+        }
+    }
+
+    /// A pair of no tenant, for tests that build items by hand.
+    #[cfg(test)]
+    pub(crate) fn untracked() -> Self {
+        Self::new(TenantId::Default)
+    }
+
+    /// Whether the sender of this pair was evicted: the destination's drain loop does not send
+    /// what it queued.
+    pub(crate) fn is_revoked(&self) -> bool {
+        self.revoked.load(Ordering::Acquire)
+    }
+}
+
+/// Which data plane figure refused a new pair.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DataQuota {
+    /// The tenant's live pairs.
+    Pairs,
+    /// The tenant's destinations of one sending NodeId.
+    DestinationsPerNode,
+    /// The relay's `max_peers` destinations of one sending NodeId, announced in WELCOME.
+    MaxPeers,
+}
+
+/// The counts behind the pair figures, kept with the pairs themselves so that creating and
+/// removing a pair move them in the same critical section (nothing leaks on any path).
+#[derive(Default)]
+struct PairTable {
+    pairs: HashMap<(NodeId, NodeId), PairState>,
+    /// Per tenant: live pairs and queued droppable bytes. An entry exists while it has pairs.
+    per_tenant: HashMap<TenantId, TenantPairs>,
+    /// Per (tenant, sending NodeId): its live pairs, which are its distinct destinations.
+    per_sender: HashMap<(TenantId, NodeId), usize>,
+    /// Per sending NodeId over all tenants, for `max_peers`.
+    per_src: HashMap<NodeId, usize>,
+}
+
+#[derive(Default)]
+struct TenantPairs {
+    pairs: usize,
+    droppable_bytes: usize,
+}
+
+impl PairTable {
+    /// Which figure, if any, a NEW pair of `src` in `tenant` would exceed.
+    fn quota_for_new_pair(
+        &self,
+        tenant: &TenantId,
+        src: &NodeId,
+        figures: Option<&Figures>,
+        max_peers: u32,
+    ) -> Option<DataQuota> {
+        if let Some(figures) = figures {
+            let held = self.per_tenant.get(tenant).map_or(0, |t| t.pairs);
+            if held as u64 >= figures.forwarding_pairs {
+                return Some(DataQuota::Pairs);
+            }
+            let sender = self
+                .per_sender
+                .get(&(tenant.clone(), *src))
+                .copied()
+                .unwrap_or(0);
+            if sender as u64 >= figures.destinations_per_node {
+                return Some(DataQuota::DestinationsPerNode);
+            }
+        }
+        let total = self.per_src.get(src).copied().unwrap_or(0);
+        if total >= max_peers as usize {
+            return Some(DataQuota::MaxPeers);
+        }
+        None
+    }
+
+    /// Takes a pair's place in the counts.
+    fn count(&mut self, tenant: &TenantId, src: &NodeId) {
+        self.per_tenant.entry(tenant.clone()).or_default().pairs += 1;
+        *self.per_sender.entry((tenant.clone(), *src)).or_default() += 1;
+        *self.per_src.entry(*src).or_default() += 1;
+    }
+
+    /// Gives a removed pair's place back, with the droppable bytes it still had queued.
+    fn uncount(&mut self, src: &NodeId, pair: &PairState) {
+        let tenant = &pair.shared.tenant;
+        if let Some(held) = self.per_tenant.get_mut(tenant) {
+            held.pairs = held.pairs.saturating_sub(1);
+            held.droppable_bytes = held.droppable_bytes.saturating_sub(pair.droppable_bytes);
+            if held.pairs == 0 {
+                self.per_tenant.remove(tenant);
+            }
+        }
+        let sender = (tenant.clone(), *src);
+        if let Some(held) = self.per_sender.get_mut(&sender) {
+            *held = held.saturating_sub(1);
+            if *held == 0 {
+                self.per_sender.remove(&sender);
+            }
+        }
+        if let Some(held) = self.per_src.get_mut(src) {
+            *held = held.saturating_sub(1);
+            if *held == 0 {
+                self.per_src.remove(src);
+            }
+        }
+    }
+
+    /// Removes every pair `node_id` is in, in either role.
+    fn remove_involving(&mut self, node_id: &NodeId) {
+        let keys: Vec<(NodeId, NodeId)> = self
+            .pairs
+            .keys()
+            .filter(|(src, dst)| src == node_id || dst == node_id)
+            .copied()
+            .collect();
+        for key in keys {
+            if let Some(pair) = self.pairs.remove(&key) {
+                self.uncount(&key.0, &pair);
+            }
         }
     }
 }
@@ -315,6 +485,8 @@ pub(crate) enum ForwardItem {
         /// for items that were in flight at the time, even though `src`
         /// itself never reconnected and had every right to be reimbursed).
         src_session_id: u32,
+        /// The pair's tenant and eviction mark (see [`PairShared`]).
+        shared: Arc<PairShared>,
     },
     /// Send this CREDIT record as-is (protocol.md 4.2).
     Credit { peer: NodeId, bytes: u32 },
@@ -336,24 +508,68 @@ pub(crate) enum ForwardOutcome {
     /// violation (protocol.md 4.2). The caller should send `.0` back to
     /// `src` and then end the session.
     CreditViolation(ErrorBody),
+    /// A NEW pair would exceed a tenant or relay figure (design 2.3): refused like
+    /// [`ForwardOutcome::Refused`] (the caller sends `error` and keeps the session; credit was
+    /// reimbursed), and the caller also tells the operator, throttled, which tenant is full.
+    OverQuota {
+        error: ErrorBody,
+        tenant: TenantId,
+        quota: DataQuota,
+    },
+}
+
+/// What admitting one SEND to its pair decided, before anything is told to a session (the pair
+/// table's lock is never held while the registry is used: `SessionRegistry::detach_then` takes
+/// the registry's lock first and the pair table's second).
+enum Early {
+    Dropped,
+    CreditViolation(ErrorBody),
+    OverQuota(TenantId, DataQuota),
 }
 
 /// Per-(source,destination) credit ledgers, queue budgets, and droppable
 /// token buckets (protocol.md 4.2's flow-control paragraph; TODO.md L3h).
-#[derive(Default)]
 pub(crate) struct ForwardTable {
-    pairs: Mutex<HashMap<(NodeId, NodeId), PairState>>,
+    pairs: Mutex<PairTable>,
     /// Source of [`PairState::generation`] values: incremented every time
     /// a `PairState` is actually constructed, never reset, never reused —
     /// uniqueness across the table's lifetime is all `drained`'s
     /// equality check needs.
     next_generation: AtomicU64,
+    /// The relay's tenants, shared with `Relay` (a reload is seen by the next SEND).
+    tenants: Arc<RwLock<Arc<TenantBook>>>,
+    /// The bandwidth bucket and volume counter of each tenant that has figures.
+    shapers: Shapers,
+}
+
+impl Default for ForwardTable {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl ForwardTable {
-    /// No pairs seen yet.
+    /// No pairs seen yet, one default tenant without figures.
     pub(crate) fn new() -> Self {
-        Self::default()
+        Self::with_tenants(Arc::new(RwLock::new(Arc::new(TenantBook::default()))))
+    }
+
+    /// No pairs seen yet, judging tenants by `tenants` (the handle the relay swaps its book in).
+    pub(crate) fn with_tenants(tenants: Arc<RwLock<Arc<TenantBook>>>) -> Self {
+        Self {
+            pairs: Mutex::new(PairTable::default()),
+            next_generation: AtomicU64::new(0),
+            tenants,
+            shapers: Shapers::default(),
+        }
+    }
+
+    fn book(&self) -> Arc<TenantBook> {
+        Arc::clone(&self.tenants.read().unwrap_or_else(PoisonError::into_inner))
+    }
+
+    fn table(&self) -> MutexGuard<'_, PairTable> {
+        self.pairs.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Validates and, if accepted, forwards one SEND from `src` (an
@@ -417,7 +633,7 @@ impl ForwardTable {
     ) -> ForwardOutcome {
         let reliable = flags & 0x01 == 0;
         let charge = (payload.len() as u32).max(MIN_FORWARD_CHARGE_BYTES);
-        let refuse = |code: ErrorCode, msg: String| {
+        let reimburse = || {
             if reliable {
                 registry.deliver(
                     src,
@@ -427,6 +643,9 @@ impl ForwardTable {
                     },
                 );
             }
+        };
+        let refuse = |code: ErrorCode, msg: String| {
+            reimburse();
             ForwardOutcome::Refused(ErrorBody { code, msg })
         };
 
@@ -469,40 +688,40 @@ impl ForwardTable {
             return refuse(ErrorCode::PeerOffline, PEER_OFFLINE_MSG.to_string());
         };
 
-        let now = Instant::now();
-        let generation;
-        {
-            let mut pairs = self.pairs.lock().unwrap();
-            let pair = pairs.entry((*src, *dst)).or_insert_with(|| {
-                let generation = self.next_generation.fetch_add(1, Ordering::Relaxed);
-                PairState::new(limits.credit, now, generation)
-            });
-            generation = pair.generation;
+        // The pair's tenant: the first network of the sender's HELLO list that the destination
+        // also claimed (design 2.1). The filter above guarantees there is one.
+        let pair_network = authorizing
+            .iter()
+            .find(|network| target.claimed_networks.contains(network))
+            .unwrap_or(&authorizing[0]);
 
-            if reliable {
-                if let Err(err) = pair.credit.consume(charge) {
-                    return ForwardOutcome::CreditViolation(ErrorBody {
-                        code: ErrorCode::CreditExceeded,
-                        msg: err.to_string(),
-                    });
-                }
-            } else {
-                // Droppable admission reserves `initial_credit` worth of
-                // headroom for reliable's own worst case up front, rather
-                // than comparing against the raw `MAX_QUEUE_BYTES` — see
-                // this module's own doc comment (finding L1) for why
-                // comparing against the raw cap let the two classes
-                // combine past the documented bound.
-                let droppable_ceiling =
-                    MAX_QUEUE_BYTES.saturating_sub(pair.initial_credit as usize);
-                if pair.queued_bytes + charge as usize > droppable_ceiling
-                    || !pair.dgram_bucket.try_take(charge as usize, now)
-                {
-                    return ForwardOutcome::Dropped;
-                }
+        let book = self.book();
+        let admitted = self.admit(
+            &book,
+            limits,
+            src,
+            dst,
+            pair_network,
+            reliable,
+            charge,
+            Instant::now(),
+        );
+        let (generation, shared) = match admitted {
+            Ok(admitted) => admitted,
+            Err(Early::Dropped) => return ForwardOutcome::Dropped,
+            Err(Early::CreditViolation(error)) => return ForwardOutcome::CreditViolation(error),
+            Err(Early::OverQuota(tenant, quota)) => {
+                reimburse();
+                return ForwardOutcome::OverQuota {
+                    error: ErrorBody {
+                        code: ErrorCode::OverQuota,
+                        msg: OVER_QUOTA_MSG.to_string(),
+                    },
+                    tenant,
+                    quota,
+                };
             }
-            pair.queued_bytes += charge as usize;
-        }
+        };
 
         // `src` is necessarily attached right now — this call is
         // processing a SEND it just sent — so `None` here would mean it
@@ -528,6 +747,7 @@ impl ForwardTable {
                 reliable,
                 generation,
                 src_session_id,
+                shared: Arc::clone(&shared),
             },
         );
         if delivered {
@@ -542,7 +762,7 @@ impl ForwardTable {
         // guards: the pair may have been reset (a reconnect of `src` or
         // `dst`) since the reservation, and then the new pair's ledger and
         // the new session of `src` must not be touched.
-        self.drained(
+        self.released(
             registry,
             src,
             dst,
@@ -550,6 +770,7 @@ impl ForwardTable {
             reliable,
             generation,
             src_session_id,
+            &shared,
         );
         ForwardOutcome::Refused(ErrorBody {
             code: ErrorCode::PeerOffline,
@@ -604,19 +825,109 @@ impl ForwardTable {
         reliable: bool,
         generation: u64,
         src_session_id: u32,
+        shared: &PairShared,
+    ) {
+        self.settle(
+            registry,
+            src,
+            dst,
+            charge,
+            reliable,
+            generation,
+            src_session_id,
+            shared,
+            true,
+        );
+    }
+
+    /// [`Self::drained`] for an item that was never sent to `dst`: the destination went away, or
+    /// the sender was evicted and its queued data is dropped. Everything is released as for a
+    /// sent one, except that the bytes are not charged to the tenant's bandwidth or volume (they
+    /// did not travel) and the sender's CREDIT, if it is still owed, is not delayed.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn released(
+        &self,
+        registry: &SessionRegistry,
+        src: &NodeId,
+        dst: &NodeId,
+        charge: u32,
+        reliable: bool,
+        generation: u64,
+        src_session_id: u32,
+        shared: &PairShared,
+    ) {
+        self.settle(
+            registry,
+            src,
+            dst,
+            charge,
+            reliable,
+            generation,
+            src_session_id,
+            shared,
+            false,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn settle(
+        &self,
+        registry: &SessionRegistry,
+        src: &NodeId,
+        dst: &NodeId,
+        charge: u32,
+        reliable: bool,
+        generation: u64,
+        src_session_id: u32,
+        shared: &PairShared,
+        sent: bool,
     ) {
         {
-            let mut pairs = self.pairs.lock().unwrap();
+            let mut guard = self.table();
+            let PairTable {
+                pairs, per_tenant, ..
+            } = &mut *guard;
             if let Some(pair) = pairs.get_mut(&(*src, *dst))
                 && pair.generation == generation
             {
                 pair.queued_bytes = pair.queued_bytes.saturating_sub(charge as usize);
                 if reliable {
                     pair.credit.grant(charge);
+                } else {
+                    // The droppable bytes admitted for this pair and not yet released, also in
+                    // the tenant's total.
+                    let freed = pair.droppable_bytes.min(charge as usize);
+                    pair.droppable_bytes -= freed;
+                    if let Some(held) = per_tenant.get_mut(&shared.tenant) {
+                        held.droppable_bytes = held.droppable_bytes.saturating_sub(freed);
+                    }
                 }
             }
         }
-        if reliable && registry.is_current(src, src_session_id) {
+        // Whether `src` is owed a CREDIT record now: its session is still the one that spent the
+        // charge (see `ForwardItem::Recv::src_session_id`). Bandwidth may postpone it.
+        let mut grant_now = reliable && registry.is_current(src, src_session_id);
+        if sent && let Some(figures) = self.book().figures_of(&shared.tenant).copied() {
+            let shaper = self.shapers.of(&shared.tenant, &figures);
+            let owed = grant_now.then_some((*src, *dst, src_session_id));
+            match shaper.charge(&figures, charge, owed, tokio::time::Instant::now()) {
+                Credit::Now | Credit::None => {}
+                Credit::Held { start_timer } => {
+                    grant_now = false;
+                    if start_timer {
+                        match tokio::runtime::Handle::try_current() {
+                            Ok(runtime) => {
+                                runtime.spawn(shaper.flush(registry.clone()));
+                            }
+                            // No runtime, no timer: grant what is held rather than keep it for
+                            // ever (delay is never loss).
+                            Err(_) => shaper.release_all(registry),
+                        }
+                    }
+                }
+            }
+        }
+        if grant_now {
             registry.deliver(
                 src,
                 ForwardItem::Credit {
@@ -624,6 +935,99 @@ impl ForwardTable {
                     bytes: charge,
                 },
             );
+        }
+    }
+
+    /// Admits one SEND of `charge` bytes from `src` to `dst` into its pair, creating the pair
+    /// if it is new. A NEW pair is refused when its tenant (or the relay) is at a figure
+    /// ([`PairTable::quota_for_new_pair`]); an existing pair is never refused for a count. Runs
+    /// under the pair table's lock and touches nothing else.
+    #[allow(clippy::too_many_arguments)]
+    fn admit(
+        &self,
+        book: &TenantBook,
+        limits: &Limits,
+        src: &NodeId,
+        dst: &NodeId,
+        pair_network: &NetworkId,
+        reliable: bool,
+        charge: u32,
+        now: Instant,
+    ) -> Result<(u64, Arc<PairShared>), Early> {
+        let mut guard = self.table();
+        let table = &mut *guard;
+        let key = (*src, *dst);
+        if !table.pairs.contains_key(&key) {
+            let tenant = book
+                .pair_tenant(std::slice::from_ref(pair_network))
+                .cloned()
+                .unwrap_or(TenantId::Default);
+            if let Some(quota) =
+                table.quota_for_new_pair(&tenant, src, book.figures_of(&tenant), limits.max_peers)
+            {
+                return Err(Early::OverQuota(tenant, quota));
+            }
+            table.count(&tenant, src);
+            let generation = self.next_generation.fetch_add(1, Ordering::Relaxed);
+            table
+                .pairs
+                .insert(key, PairState::new(limits.credit, now, generation, tenant));
+        }
+        let PairTable {
+            pairs, per_tenant, ..
+        } = table;
+        let Some(pair) = pairs.get_mut(&key) else {
+            unreachable!("the pair was found or inserted above under the same lock");
+        };
+        let generation = pair.generation;
+        let shared = Arc::clone(&pair.shared);
+
+        if reliable {
+            if let Err(err) = pair.credit.consume(charge) {
+                return Err(Early::CreditViolation(ErrorBody {
+                    code: ErrorCode::CreditExceeded,
+                    msg: err.to_string(),
+                }));
+            }
+        } else {
+            // Droppable admission reserves `initial_credit` worth of
+            // headroom for reliable's own worst case up front, rather
+            // than comparing against the raw `MAX_QUEUE_BYTES` — see
+            // this module's own doc comment (finding L1) for why
+            // comparing against the raw cap let the two classes
+            // combine past the documented bound.
+            let droppable_ceiling = MAX_QUEUE_BYTES.saturating_sub(pair.initial_credit as usize);
+            // The tenant's droppable cap over all its pairs (design 2.3): a droppable SEND
+            // over it is silently dropped, as one over the pair's own ceiling.
+            let tenant_cap = book
+                .figures_of(&shared.tenant)
+                .map(|figures| figures.droppable_mib.saturating_mul(1 << 20) as usize);
+            let tenant_held = per_tenant
+                .get(&shared.tenant)
+                .map_or(0, |held| held.droppable_bytes);
+            if pair.queued_bytes + charge as usize > droppable_ceiling
+                || tenant_cap.is_some_and(|cap| tenant_held + charge as usize > cap)
+                || !pair.dgram_bucket.try_take(charge as usize, now)
+            {
+                return Err(Early::Dropped);
+            }
+            pair.droppable_bytes += charge as usize;
+            if let Some(held) = per_tenant.get_mut(&shared.tenant) {
+                held.droppable_bytes += charge as usize;
+            }
+        }
+        pair.queued_bytes += charge as usize;
+        Ok((generation, shared))
+    }
+
+    /// Marks every pair `src` sends in as revoked: `src` has been evicted from a network (its
+    /// session is ending), and what it already queued toward destinations must not be delivered
+    /// there (T2 N2). The destinations' drain loops check [`PairShared::is_revoked`].
+    pub(crate) fn revoke_sender(&self, src: &NodeId) {
+        for ((from, _), pair) in &self.table().pairs {
+            if from == src {
+                pair.shared.revoked.store(true, Ordering::Release);
+            }
         }
     }
 
@@ -646,10 +1050,7 @@ impl ForwardTable {
     /// (not add to or be capped by) whatever it had consumed and not yet
     /// been granted back in a previous session.
     pub(crate) fn clear_for(&self, node_id: &NodeId) {
-        self.pairs
-            .lock()
-            .unwrap()
-            .retain(|(src, dst), _| src != node_id && dst != node_id);
+        self.table().remove_involving(node_id);
     }
 
     /// The credit `src` currently has remaining to send to `dst`, or
@@ -657,9 +1058,8 @@ impl ForwardTable {
     /// (crate-visible so the live end-to-end suite can use it too).
     #[cfg(test)]
     pub(crate) fn remaining_credit(&self, src: &NodeId, dst: &NodeId) -> Option<u32> {
-        self.pairs
-            .lock()
-            .unwrap()
+        self.table()
+            .pairs
             .get(&(*src, *dst))
             .map(|pair| pair.credit.remaining())
     }
@@ -669,9 +1069,11 @@ impl ForwardTable {
     #[cfg(test)]
     pub(crate) fn insert_test_pair(&self, src: &NodeId, dst: &NodeId) {
         let generation = self.next_generation.fetch_add(1, Ordering::Relaxed);
-        self.pairs.lock().unwrap().insert(
+        let mut table = self.table();
+        table.count(&TenantId::Default, src);
+        table.pairs.insert(
             (*src, *dst),
-            PairState::new(1024, Instant::now(), generation),
+            PairState::new(1024, Instant::now(), generation, TenantId::Default),
         );
     }
 
@@ -679,9 +1081,8 @@ impl ForwardTable {
     /// tests (teardown must leave none behind).
     #[cfg(test)]
     pub(crate) fn pair_count_for(&self, node_id: &NodeId) -> usize {
-        self.pairs
-            .lock()
-            .unwrap()
+        self.table()
+            .pairs
             .keys()
             .filter(|(src, dst)| src == node_id || dst == node_id)
             .count()
@@ -691,9 +1092,8 @@ impl ForwardTable {
     /// pair has never sent anything. Exposed for tests.
     #[cfg(test)]
     pub(crate) fn queued_bytes(&self, src: &NodeId, dst: &NodeId) -> Option<usize> {
-        self.pairs
-            .lock()
-            .unwrap()
+        self.table()
+            .pairs
             .get(&(*src, *dst))
             .map(|pair| pair.queued_bytes)
     }
@@ -704,11 +1104,50 @@ impl ForwardTable {
     /// assuming this table's internal numbering.
     #[cfg(test)]
     pub(crate) fn generation_of(&self, src: &NodeId, dst: &NodeId) -> Option<u64> {
-        self.pairs
-            .lock()
-            .unwrap()
+        self.table()
+            .pairs
             .get(&(*src, *dst))
             .map(|pair| pair.generation)
+    }
+
+    /// `src`->`dst`'s [`PairShared`], for tests that call [`Self::drained`] by hand.
+    #[cfg(test)]
+    pub(crate) fn shared_of(&self, src: &NodeId, dst: &NodeId) -> Option<Arc<PairShared>> {
+        self.table()
+            .pairs
+            .get(&(*src, *dst))
+            .map(|pair| Arc::clone(&pair.shared))
+    }
+
+    /// The counts of `tenant`: live pairs and queued droppable bytes (tests).
+    #[cfg(test)]
+    pub(crate) fn tenant_counts(&self, tenant: &TenantId) -> (usize, usize) {
+        self.table()
+            .per_tenant
+            .get(tenant)
+            .map_or((0, 0), |held| (held.pairs, held.droppable_bytes))
+    }
+
+    /// Every count table is empty (tests: nothing leaks once all pairs are gone).
+    #[cfg(test)]
+    pub(crate) fn counts_are_empty(&self) -> bool {
+        let table = self.table();
+        table.per_tenant.is_empty() && table.per_sender.is_empty() && table.per_src.is_empty()
+    }
+
+    /// Counts a tenant's whole volume allowance as used, so that its bucket runs at the floor
+    /// rate from now on (tests: reaching the floor takes the tenant's volume otherwise).
+    #[cfg(test)]
+    pub(crate) fn use_up_volume(&self, tenant: &TenantId, figures: &Figures) {
+        self.shapers
+            .of(tenant, figures)
+            .add_volume(figures.volume_gib.saturating_mul(1 << 30));
+    }
+
+    /// The bucket and volume counter of `tenant`, if it has moved data (tests).
+    #[cfg(test)]
+    pub(crate) fn shaper_of(&self, tenant: &TenantId) -> Option<crate::shaping::Shaper> {
+        self.shapers.get(tenant)
     }
 }
 
@@ -1359,6 +1798,7 @@ mod tests {
             ForwardOutcome::Dropped => "Dropped",
             ForwardOutcome::Refused(_) => "Refused",
             ForwardOutcome::CreditViolation(_) => "CreditViolation",
+            ForwardOutcome::OverQuota { .. } => "OverQuota",
         }
     }
 
@@ -1517,6 +1957,7 @@ mod tests {
             true,
             generation,
             src_session_id,
+            &table.shared_of(&f.src, &f.dst).unwrap(),
         );
         let after_drain = table.remaining_credit(&f.src, &f.dst).unwrap();
         assert_eq!(after_drain, test_limits().credit);
@@ -1563,6 +2004,7 @@ mod tests {
             true,
             generation,
             src_session_id,
+            &table.shared_of(&f.src, &f.dst).unwrap(),
         );
 
         match f._src_handles.2.try_recv() {
@@ -1608,6 +2050,7 @@ mod tests {
             false,
             generation,
             src_session_id,
+            &table.shared_of(&f.src, &f.dst).unwrap(),
         );
 
         assert!(
@@ -2069,6 +2512,7 @@ mod tests {
             true,
             stale_generation,
             src_session_id,
+            &table.shared_of(&f.src, &f.dst).unwrap(),
         );
 
         assert_eq!(
@@ -2109,6 +2553,7 @@ mod tests {
             1_000,
         );
         let stale_generation = table.generation_of(&f.src, &f.dst).unwrap();
+        let stale_shared = table.shared_of(&f.src, &f.dst).unwrap();
         let src_session_id = f.registry.attached_session_id(&f.src).unwrap();
         while f._dst_handles.2.try_recv().is_ok() {}
 
@@ -2132,6 +2577,7 @@ mod tests {
             true,
             stale_generation,
             src_session_id,
+            &stale_shared,
         );
 
         match f._src_handles.2.try_recv() {
@@ -2186,6 +2632,7 @@ mod tests {
             true,
             stale_generation,
             stale_src_session_id,
+            &table.shared_of(&f.src, &f.dst).unwrap(),
         );
 
         assert!(
@@ -2195,3 +2642,6 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod quota_tests;

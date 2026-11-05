@@ -4890,3 +4890,399 @@ async fn a_roster_over_the_tenants_size_figure_is_refused_too_large() {
     ping_pong(&mut s.client, [2; 8]).await;
     assert_eq!(s.held_seq(), 2);
 }
+
+// ---- MT8: tenant data plane quotas (multi tenant design 2.3) ----
+
+/// A member of `network` attached and ready (it claims the Roster seeded at seq 1, so no catch-up
+/// push follows ATTACH).
+async fn attach_to(
+    addr: SocketAddr,
+    cert: CertificateDer<'static>,
+    relay_x25519: X25519PublicKey,
+    identity: &TestIdentity,
+    network: &(Vec<NetworkId>, HashMap<NetworkId, u64>),
+) -> TestClient {
+    let (mut client, _) = TestClient::connect(
+        addr,
+        cert,
+        identity,
+        relay_x25519,
+        network.0.clone(),
+        network.1.clone(),
+        1,
+        10,
+    )
+    .await;
+    client.send(Record::Attach).await;
+    ping_pong(&mut client, [0; 8]).await;
+    client
+}
+
+/// The next record that is not the relay's own liveness traffic: a PING is answered and a REKEY
+/// applied (a long transfer meets both), anything else is returned.
+async fn next_data_record(client: &mut TestClient) -> Option<Record> {
+    loop {
+        match client.recv().await {
+            Some(Record::Ping { nonce }) => client.send(Record::Pong { nonce }).await,
+            Some(Record::Rekey) => client.transport.rekey_incoming(),
+            other => return other,
+        }
+    }
+}
+
+/// What a credit obeying transfer saw.
+struct Transfer {
+    elapsed: std::time::Duration,
+    /// The longest the sender waited for CREDIT with nothing left to spend.
+    longest_credit_wait: std::time::Duration,
+    received: usize,
+}
+
+/// Sends `total` bytes from `sender` to `dst` in records of `chunk` bytes, spending only credit
+/// it holds (WELCOME's `credit0`, then every CREDIT), while `receiver` reads every RECV. Ends when
+/// all bytes arrived and all credit came back. Panics on anything else, an ERROR included: a
+/// throttled transfer must be slower and nothing more.
+async fn transfer(
+    sender: &mut TestClient,
+    dst: NodeId,
+    receiver: &mut TestClient,
+    total: usize,
+    chunk: usize,
+    credit0: u32,
+) -> Transfer {
+    let started = std::time::Instant::now();
+    let send_side = async {
+        let mut credit = i64::from(credit0);
+        let (mut sent, mut returned) = (0usize, 0usize);
+        let mut longest = std::time::Duration::ZERO;
+        let mut spent = 0usize;
+        while returned < spent || sent < total {
+            while sent < total && credit >= chunk as i64 {
+                let len = chunk.min(total - sent);
+                sender.send(send_record(dst, vec![7u8; len])).await;
+                credit -= len as i64;
+                sent += len;
+                spent += len;
+            }
+            let waited = std::time::Instant::now();
+            match next_data_record(sender).await {
+                Some(Record::Credit(body)) => {
+                    credit += i64::from(body.bytes);
+                    returned += body.bytes as usize;
+                    longest = longest.max(waited.elapsed());
+                }
+                other => panic!("the sender expected CREDIT, got {other:?}"),
+            }
+        }
+        longest
+    };
+    let receive_side = async {
+        let mut received = 0usize;
+        while received < total {
+            match next_data_record(receiver).await {
+                Some(Record::Recv { payload, .. }) => received += payload.len(),
+                other => panic!("the receiver expected RECV, got {other:?}"),
+            }
+        }
+        received
+    };
+    let (longest_credit_wait, received) = tokio::join!(send_side, receive_side);
+    Transfer {
+        elapsed: started.elapsed(),
+        longest_credit_wait,
+        received,
+    }
+}
+
+/// A new pair beyond the tenant's figure is answered ERROR `over_quota` with the credit given
+/// back, the session stays, and the pair that exists keeps working.
+#[tokio::test]
+async fn a_new_pair_over_the_tenants_figure_is_refused_over_quota_and_the_old_pair_works() {
+    let (relay, listener, cert, relay_x25519) = bind_test_relay().await;
+    let addr = listener.local_addr().unwrap();
+    let serving = relay.clone();
+    tokio::spawn(async move { serving.serve(&listener).await });
+    let (ia, ib) = (generate_identity(), generate_identity());
+    let net = seed_network(&relay, &[&ia, &ib]);
+    relay.set_tenants(friend_book(&[("ali", &net.0, &[("forwarding_pairs", 1)])]));
+    let mut a = attach_to(addr, cert.clone(), relay_x25519, &ia, &net).await;
+    let mut b = attach_to(addr, cert, relay_x25519, &ib, &net).await;
+
+    // A to B makes the tenant's only pair.
+    a.send(send_record(ib.node_id, vec![1u8; 100])).await;
+    assert!(matches!(b.recv().await, Some(Record::Recv { .. })));
+    assert!(matches!(a.recv().await, Some(Record::Credit(_))));
+
+    // B to A would be a second pair: refused, the charge handed back, nothing reaches A.
+    b.send(send_record(ia.node_id, vec![2u8; 100])).await;
+    let (mut error, mut credit) = (None, None);
+    for _ in 0..2 {
+        match b.recv().await {
+            Some(Record::Error(body)) => error = Some(body),
+            Some(Record::Credit(body)) => credit = Some(body),
+            other => panic!("expected ERROR over_quota and CREDIT, got {other:?}"),
+        }
+    }
+    assert_eq!(error.unwrap().code, ErrorCode::OverQuota);
+    let credit = credit.unwrap();
+    assert_eq!((credit.peer, credit.bytes), (ia.node_id, 100));
+    ping_pong(&mut a, [1; 8]).await; // the next record A hears is its PONG: nothing was forwarded
+    ping_pong(&mut b, [2; 8]).await; // and B's session is alive
+
+    // The pair that exists is not refused.
+    a.send(send_record(ib.node_id, vec![3u8; 100])).await;
+    assert!(matches!(b.recv().await, Some(Record::Recv { .. })));
+    assert!(matches!(a.recv().await, Some(Record::Credit(_))));
+}
+
+/// WELCOME announces the number the relay will enforce for the networks the node proved.
+#[tokio::test]
+async fn welcome_announces_the_tenants_destination_figure() {
+    let (relay, listener, cert, relay_x25519) = bind_test_relay().await;
+    let addr = listener.local_addr().unwrap();
+    let serving = relay.clone();
+    tokio::spawn(async move { serving.serve(&listener).await });
+    let (ia, ib, ic) = (
+        generate_identity(),
+        generate_identity(),
+        generate_identity(),
+    );
+    let ali = seed_network(&relay, &[&ia]);
+    let bob = seed_network(&relay, &[&ib]);
+    let plain = seed_network(&relay, &[&ic]);
+    relay.set_tenants(friend_book(&[
+        ("ali", &ali.0, &[("destinations_per_node", 7)]),
+        ("bob", &bob.0, &[]),
+    ]));
+    for (identity, net, expected) in [
+        (&ia, &ali, 7),
+        // The friend default (32) is above this relay's own figure (10): the lower one is told.
+        (&ib, &bob, 10),
+        (&ic, &plain, 10),
+    ] {
+        let (_client, welcome) = TestClient::connect(
+            addr,
+            cert.clone(),
+            identity,
+            relay_x25519,
+            net.0.clone(),
+            net.1.clone(),
+            1,
+            10,
+        )
+        .await;
+        assert_eq!(welcome.limits.max_peers, expected);
+    }
+}
+
+/// Live measurement: tenant `ali` is stalled by its bandwidth (its CREDIT is delayed), and tenant
+/// `bob`'s transfer at the same time is as fast as it is alone.
+#[tokio::test]
+async fn a_second_tenants_throughput_is_not_reduced_by_the_first_tenants_stall() {
+    let (relay, listener, cert, relay_x25519) = bind_test_relay().await;
+    let addr = listener.local_addr().unwrap();
+    let serving = relay.clone();
+    tokio::spawn(async move { serving.serve(&listener).await });
+    let ids: Vec<TestIdentity> = (0..4).map(|_| generate_identity()).collect();
+    let ali = seed_network(&relay, &[&ids[0], &ids[1]]);
+    let bob = seed_network(&relay, &[&ids[2], &ids[3]]);
+    // Ali: 1 Mbit/s with a 1 MiB burst; Bob: the friend defaults (100 Mbit/s, 256 MiB).
+    relay.set_tenants(friend_book(&[
+        ("ali", &ali.0, &[("bandwidth_mbit", 1), ("burst_mib", 1)]),
+        ("bob", &bob.0, &[]),
+    ]));
+    let credit0 = test_limits().credit;
+    let mut a0 = attach_to(addr, cert.clone(), relay_x25519, &ids[0], &ali).await;
+    let mut a1 = attach_to(addr, cert.clone(), relay_x25519, &ids[1], &ali).await;
+    let mut b0 = attach_to(addr, cert.clone(), relay_x25519, &ids[2], &bob).await;
+    let mut b1 = attach_to(addr, cert, relay_x25519, &ids[3], &bob).await;
+
+    const MIB: usize = 1 << 20;
+    // Bob alone.
+    let alone = transfer(&mut b0, ids[3].node_id, &mut b1, MIB, 16 * 1024, credit0).await;
+    assert_eq!(alone.received, MIB);
+
+    // Bob while Ali moves 2 MiB through its 1 MiB burst and a 1 Mbit/s rate.
+    let ali_run = transfer(
+        &mut a0,
+        ids[1].node_id,
+        &mut a1,
+        2 * MIB,
+        16 * 1024,
+        credit0,
+    );
+    let bob_run = async {
+        // Let Ali get into debt first.
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+        let stats = transfer(&mut b0, ids[3].node_id, &mut b1, MIB, 16 * 1024, credit0).await;
+        // Bob is done and Ali still holds credit back: his transfer did not wait for hers.
+        let held = relay.forwarding.shaper_of(&tenant("ali")).unwrap().held();
+        (stats, held)
+    };
+    let (ali_stats, (bob_stats, ali_held_when_bob_finished)) = tokio::join!(ali_run, bob_run);
+
+    assert_eq!(ali_stats.received, 2 * MIB);
+    assert_eq!(bob_stats.received, MIB);
+    // 1 MiB beyond the burst at 1 Mbit/s (125,000 bytes/s) is about 8 s.
+    assert!(
+        ali_stats.elapsed >= std::time::Duration::from_secs(6),
+        "Ali was not held back: {:?} for 2 MiB",
+        ali_stats.elapsed
+    );
+    assert!(
+        bob_stats.elapsed <= alone.elapsed * 2 + std::time::Duration::from_secs(1),
+        "Bob took {:?} while Ali stalled, {:?} alone",
+        bob_stats.elapsed,
+        alone.elapsed
+    );
+    assert!(
+        ali_held_when_bob_finished > 0,
+        "Bob finished only after Ali's stall ended"
+    );
+    // Nobody's session ended.
+    ping_pong(&mut a0, [1; 8]).await;
+    ping_pong(&mut b0, [1; 8]).await;
+}
+
+/// A tenant at its floor rate moves `total` bytes: it completes, the credit never waits near the
+/// 35 s a node's staged frame gives up after (L4h5), and no session ends.
+async fn floor_transfer(floor: &[(&'static str, u64)], total: usize) -> Transfer {
+    let (relay, listener, cert, relay_x25519) = bind_test_relay().await;
+    let addr = listener.local_addr().unwrap();
+    let serving = relay.clone();
+    tokio::spawn(async move { serving.serve(&listener).await });
+    let (ia, ib) = (generate_identity(), generate_identity());
+    let net = seed_network(&relay, &[&ia, &ib]);
+    relay.set_tenants(friend_book(&[("ali", &net.0, floor)]));
+    let figures = *relay.tenants().figures_of(&tenant("ali")).unwrap();
+    relay.forwarding.use_up_volume(&tenant("ali"), &figures);
+    let mut a = attach_to(addr, cert.clone(), relay_x25519, &ia, &net).await;
+    let mut b = attach_to(addr, cert, relay_x25519, &ib, &net).await;
+
+    let stats = transfer(
+        &mut a,
+        ib.node_id,
+        &mut b,
+        total,
+        16 * 1024,
+        test_limits().credit,
+    )
+    .await;
+    assert_eq!(stats.received, total);
+    assert!(
+        stats.longest_credit_wait < std::time::Duration::from_secs(10),
+        "CREDIT waited {:?}: a node's staged frame gives up after 35 s",
+        stats.longest_credit_wait
+    );
+    ping_pong(&mut a, [1; 8]).await;
+    ping_pong(&mut b, [1; 8]).await;
+    assert!(relay.registry.is_attached(&ia.node_id) && relay.registry.is_attached(&ib.node_id));
+    stats
+}
+
+/// The floor mechanics live, shortened: 8 Mbit/s (1 MB/s) instead of the default 5 Mbit/s, 4 MiB
+/// instead of 16 MiB (the full size is `at_the_default_floor_a_16_mib_transfer_completes`, ignored
+/// because it takes about half a minute).
+#[tokio::test]
+async fn at_a_floor_a_transfer_completes_slowly_and_no_session_ends() {
+    let stats = floor_transfer(&[("volume_gib", 1), ("floor_mbit", 8)], 4 << 20).await;
+    // 4 MiB at 1 MB/s, less the floor's one second burst: about 3 s, never as fast as unthrottled.
+    assert!(
+        stats.elapsed >= std::time::Duration::from_secs(2),
+        "the floor did not slow the transfer: {:?}",
+        stats.elapsed
+    );
+}
+
+/// The design's figure: 16 MiB at the default 5 Mbit/s floor completes with every session alive.
+/// Ignored in the suite (about 27 s plus the debug build's crypto); run with `--ignored`.
+#[tokio::test]
+#[ignore = "takes about half a minute; the shortened floor test runs in the suite"]
+async fn at_the_default_floor_a_16_mib_transfer_completes() {
+    let stats = floor_transfer(&[("volume_gib", 1)], 16 << 20).await;
+    assert!(
+        stats.elapsed >= std::time::Duration::from_secs(20),
+        "{:?}",
+        stats.elapsed
+    );
+}
+
+/// Round T2, N2: RECVs a sender queued toward a destination are not delivered once the sender is
+/// evicted from the network. The destination does not read, so its writes block and most of what
+/// the sender sent sits in the relay's queue; the owner then revokes the sender, and when the
+/// destination reads again it gets only what had already been written to its socket, not the
+/// rest of the queue. The relay's accounting for the dropped items comes back to zero.
+#[tokio::test]
+async fn an_evicted_senders_queued_data_is_not_delivered_to_the_destination() {
+    let timeouts = crate::relay::SessionTimeouts {
+        attach: Duration::from_secs(60),
+        write: Duration::from_secs(60),
+    };
+    let (relay, addr, cert, relay_x25519) = stalling_relay(timeouts, 10_000).await;
+    let (ia, ib) = (generate_identity(), generate_identity());
+    let owner = SigningKey::generate(&mut rand::rng());
+    let network_id = NetworkId::from(owner.verifying_key().to_bytes());
+    relay
+        .rosters()
+        .set(&evict_roster(
+            &owner,
+            network_id,
+            1,
+            &[(ia.node_id, 1), (ib.node_id, 1)],
+            &[],
+        ))
+        .unwrap();
+    let net = (vec![network_id], HashMap::from([(network_id, 1u64)]));
+    let mut a = attach_to(addr, cert.clone(), relay_x25519, &ia, &net).await;
+    let mut b = attach_to(addr, cert, relay_x25519, &ib, &net).await;
+
+    // 100 records of 8 KiB; B reads none of them.
+    const RECORDS: usize = 100;
+    const LEN: usize = 8 * 1024;
+    for _ in 0..RECORDS {
+        a.send(send_record(ib.node_id, vec![5u8; LEN])).await;
+    }
+    // The relay has taken them all from A and B's socket has filled: most are still queued.
+    within(10, "the relay to queue what B's socket cannot take", || {
+        relay
+            .forwarding
+            .queued_bytes(&ia.node_id, &ib.node_id)
+            .is_some_and(|queued| queued >= 500_000)
+    })
+    .await;
+
+    // The owner revokes A: its session ends and what it queued must not go on to B.
+    relay
+        .rosters()
+        .set(&evict_roster(
+            &owner,
+            network_id,
+            2,
+            &[(ia.node_id, 1), (ib.node_id, 1)],
+            &[ia.node_id],
+        ))
+        .unwrap();
+    within(10, "the evicted sender to detach", || {
+        !relay.registry.is_attached(&ia.node_id)
+    })
+    .await;
+
+    let mut received = 0usize;
+    while let Ok(Some(record)) = tokio::time::timeout(Duration::from_secs(2), b.recv()).await {
+        if let Record::Recv { payload, .. } = record {
+            received += payload.len();
+        }
+    }
+    assert!(received > 0, "what was already on the wire still arrives");
+    assert!(
+        received < RECORDS * LEN * 3 / 5,
+        "B received {received} of {} bytes: the queue of the evicted sender was delivered",
+        RECORDS * LEN
+    );
+    assert_eq!(
+        relay.forwarding.pair_count_for(&ia.node_id),
+        0,
+        "the evicted sender's pairs are gone"
+    );
+    assert!(relay.forwarding.counts_are_empty());
+}

@@ -34,7 +34,13 @@ pub mod tenants;
 pub const DEFAULT_PATH: &str = "/_menzil/v1";
 
 /// The per session figures a relay announces in WELCOME: the largest record the protocol has,
-/// the credit protocol.md 10 names, and a ceiling on peers nobody reads yet.
+/// the credit protocol.md 10 names, and the most destinations one sending node may have.
+///
+/// `max_peers` is enforced since the data plane quotas (MT8): the relay refuses a node's NEW
+/// pair beyond this many destinations with ERROR `over_quota` (pairs that exist keep working).
+/// 1024 is far above any personal use, so a relay without tenant files behaves as before; a
+/// tenant with figures is told, and held to, its own lower `destinations_per_node` (32 for the
+/// `friend` class) in the WELCOME of a session that proved its networks.
 const LIMITS: Limits = Limits {
     max_record: 65_535,
     max_peers: 1024,

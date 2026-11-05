@@ -33,6 +33,7 @@ mod roster_store;
 mod session;
 #[cfg(test)]
 mod session_tests;
+mod shaping;
 mod tenant;
 #[cfg(test)]
 mod tests_support;
