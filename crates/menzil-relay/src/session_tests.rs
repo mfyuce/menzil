@@ -4535,3 +4535,358 @@ async fn a_relay_has_the_default_tenant_until_a_book_is_set() {
     ));
     assert_eq!(clone.tenants().id_of(&network).slug(), Some("ali"));
 }
+
+// ---- MT7: tenant session and document quotas (multi tenant design 2.3) ----
+
+use crate::tenant::{Class, Slug, TenantBook, TenantId, TenantSpec};
+
+/// One tenant of [`friend_book`]: its slug, its networks and the figures it overrides.
+type FriendSpec<'a> = (&'a str, &'a [NetworkId], &'a [(&'a str, u64)]);
+
+/// A book of friend tenants.
+fn friend_book(tenants: &[FriendSpec<'_>]) -> TenantBook {
+    let specs = tenants
+        .iter()
+        .enumerate()
+        .map(|(i, (slug, networks, overrides))| TenantSpec {
+            slug: Slug::parse(slug).unwrap(),
+            networks: networks.to_vec(),
+            class: Class::Friend,
+            overrides: overrides
+                .iter()
+                .map(|&(key, value)| (key.to_string(), value))
+                .collect(),
+            terminated: false,
+            extra_names: vec![],
+            added: 1 + i as u64,
+        })
+        .collect();
+    TenantBook::build(specs, vec![], &Default::default())
+}
+
+fn tenant(slug: &str) -> TenantId {
+    TenantId::Named(Slug::parse(slug).unwrap())
+}
+
+/// The ERROR `over_quota` and the GOAWAY `over_quota` (retry in a minute) a refused device is
+/// sent, then the end of the connection.
+async fn assert_over_quota(client: &mut TestClient) {
+    match client.recv().await {
+        Some(Record::Error(body)) => assert_eq!(body.code, ErrorCode::OverQuota, "{body:?}"),
+        other => panic!("expected ERROR over_quota, got {other:?}"),
+    }
+    match client.recv().await {
+        Some(Record::Goaway(body)) => {
+            assert_eq!(body.reason, "over_quota");
+            assert_eq!(body.retry_after_ms, 60_000);
+        }
+        other => panic!("expected GOAWAY over_quota, got {other:?}"),
+    }
+    assert_eq!(client.recv().await, None);
+}
+
+struct TwoTenants {
+    relay: Relay,
+    addr: SocketAddr,
+    cert: CertificateDer<'static>,
+    relay_x25519: X25519PublicKey,
+    /// Three members of tenant `ali`'s network.
+    ali: [TestIdentity; 3],
+    ali_net: (Vec<NetworkId>, HashMap<NetworkId, u64>),
+    /// One member of tenant `bob`'s network.
+    bob: TestIdentity,
+    bob_net: (Vec<NetworkId>, HashMap<NetworkId, u64>),
+}
+
+/// A relay with tenants `ali` (figures `ali_figures` over the friend defaults) and `bob` (the
+/// friend defaults), each with one served network.
+async fn two_tenants(ali_figures: &[(&str, u64)]) -> TwoTenants {
+    let (relay, listener, cert, relay_x25519) = bind_test_relay().await;
+    let addr = listener.local_addr().unwrap();
+    let serve_relay = relay.clone();
+    tokio::spawn(async move { serve_relay.serve(&listener).await });
+    let ali = [
+        generate_identity(),
+        generate_identity(),
+        generate_identity(),
+    ];
+    let bob = generate_identity();
+    let ali_net = seed_network(&relay, &[&ali[0], &ali[1], &ali[2]]);
+    let bob_net = seed_network(&relay, &[&bob]);
+    relay.set_tenants(friend_book(&[
+        ("ali", &ali_net.0, ali_figures),
+        ("bob", &bob_net.0, &[]),
+    ]));
+    TwoTenants {
+        relay,
+        addr,
+        cert,
+        relay_x25519,
+        ali,
+        ali_net,
+        bob,
+        bob_net,
+    }
+}
+
+impl TwoTenants {
+    async fn connect_ali(&self, who: usize, timestamp: u8) -> (TestClient, WelcomeBody) {
+        TestClient::connect(
+            self.addr,
+            self.cert.clone(),
+            &self.ali[who],
+            self.relay_x25519,
+            self.ali_net.0.clone(),
+            self.ali_net.1.clone(),
+            1,
+            timestamp,
+        )
+        .await
+    }
+
+    async fn attach_ali(&self, who: usize, timestamp: u8) -> TestClient {
+        let (mut client, _) = self.connect_ali(who, timestamp).await;
+        client.send(Record::Attach).await;
+        ping_pong(&mut client, [who as u8; 8]).await;
+        client
+    }
+
+    async fn attach_bob(&self) -> TestClient {
+        let (mut client, _) = TestClient::connect(
+            self.addr,
+            self.cert.clone(),
+            &self.bob,
+            self.relay_x25519,
+            self.bob_net.0.clone(),
+            self.bob_net.1.clone(),
+            1,
+            10,
+        )
+        .await;
+        client.send(Record::Attach).await;
+        ping_pong(&mut client, [9; 8]).await;
+        client
+    }
+}
+
+/// A tenant at its attached figure refuses the next device's HELLO before WELCOME lists anything
+/// (ERROR then GOAWAY `over_quota`, retry in a minute), another tenant's first device is let in,
+/// the refused HELLO leaves no replay mark, and the place a leaving device gives back is taken.
+#[tokio::test]
+async fn a_tenant_at_its_attached_figure_refuses_the_next_hello_and_another_tenant_is_untouched() {
+    let t = two_tenants(&[("attached_sessions", 2)]).await;
+    let _a0 = t.attach_ali(0, 10).await;
+    let a1 = t.attach_ali(1, 10).await;
+    assert_eq!(t.relay.usage.attached_of(&tenant("ali")), 2);
+
+    let (mut a2, welcome) = t.connect_ali(2, 12).await;
+    assert!(
+        welcome.rosters.is_empty(),
+        "a refused HELLO is told nothing"
+    );
+    assert_over_quota(&mut a2).await;
+    assert_eq!(t.relay.usage.attached_of(&tenant("ali")), 2);
+    assert_eq!(
+        t.relay.usage.unattached_of(&tenant("ali")),
+        0,
+        "the refusal took no place"
+    );
+
+    // Another tenant is not affected.
+    let _b = t.attach_bob().await;
+    assert_eq!(t.relay.usage.attached_of(&tenant("bob")), 1);
+
+    // One of ali's devices leaves; the refused HELLO (same timestamp 12) now passes.
+    drop(a1);
+    eventually("the leaving device gives its place back", || {
+        t.relay.usage.attached_of(&tenant("ali")) == 1
+    })
+    .await;
+    let mut a2 = t.attach_ali(2, 12).await;
+    ping_pong(&mut a2, [7; 8]).await;
+    assert_eq!(t.relay.usage.attached_of(&tenant("ali")), 2);
+}
+
+/// Several devices can pass HELLO before any attaches; the count that decides is the one taken at
+/// ATTACH, so the device that loses that race is told `over_quota` and ended, and the one that
+/// won is not disturbed.
+#[tokio::test]
+async fn the_attach_that_would_exceed_the_tenant_is_refused_and_the_attached_session_goes_on() {
+    let t = two_tenants(&[("attached_sessions", 1), ("unattached_sessions", 4)]).await;
+    let (mut first, _) = t.connect_ali(0, 10).await;
+    let (mut second, welcome) = t.connect_ali(1, 10).await;
+    assert!(
+        !welcome.rosters.is_empty(),
+        "nobody is attached yet: HELLO passes"
+    );
+    first.send(Record::Attach).await;
+    ping_pong(&mut first, [1; 8]).await;
+    second.send(Record::Attach).await;
+    assert_over_quota(&mut second).await;
+    assert_eq!(
+        t.relay.registry.attached_session_id(&t.ali[1].node_id),
+        None
+    );
+    ping_pong(&mut first, [2; 8]).await;
+    eventually("the refused session gave its places back", || {
+        t.relay.usage.unattached_of(&tenant("ali")) == 0
+            && t.relay.usage.attached_of(&tenant("ali")) == 1
+    })
+    .await;
+}
+
+/// The tenant's unattached figure: the device over it is refused at HELLO, and an ATTACH gives the
+/// place back.
+#[tokio::test]
+async fn a_tenant_at_its_unattached_figure_refuses_the_next_hello_until_one_attaches() {
+    let t = two_tenants(&[("unattached_sessions", 1)]).await;
+    let (mut waiting, _) = t.connect_ali(0, 10).await;
+    assert_eq!(t.relay.usage.unattached_of(&tenant("ali")), 1);
+    let (mut refused, welcome) = t.connect_ali(1, 10).await;
+    assert!(welcome.rosters.is_empty());
+    assert_over_quota(&mut refused).await;
+    // Another tenant has its own figure.
+    let _b = t.attach_bob().await;
+
+    waiting.send(Record::Attach).await;
+    ping_pong(&mut waiting, [1; 8]).await;
+    assert_eq!(
+        t.relay.usage.unattached_of(&tenant("ali")),
+        0,
+        "the attached session no longer waits"
+    );
+    let _second = t.attach_ali(1, 10).await;
+    assert_eq!(t.relay.usage.attached_of(&tenant("ali")), 2);
+}
+
+/// A device that is attached in a full tenant may replace its own session; the old one is told
+/// it was superseded, and the count stays at one.
+#[tokio::test]
+async fn a_device_at_a_full_tenant_may_replace_its_own_session() {
+    let t = two_tenants(&[("attached_sessions", 1)]).await;
+    let mut first = t.attach_ali(0, 10).await;
+    let mut second = t.attach_ali(0, 20).await;
+    match first.recv().await {
+        Some(Record::Goaway(body)) => assert_eq!(body.reason, "superseded"),
+        other => panic!("expected GOAWAY superseded, got {other:?}"),
+    }
+    ping_pong(&mut second, [3; 8]).await;
+    eventually("the superseded registration gave its place up", || {
+        t.relay.usage.attached_of(&tenant("ali")) == 1
+    })
+    .await;
+    // A second device of the tenant is still refused.
+    let (mut other, _) = t.connect_ali(1, 10).await;
+    assert_over_quota(&mut other).await;
+}
+
+/// Every count comes back on every path: a session that handshook and was dropped, one that
+/// attached and was dropped, and one that was cut mid handshake; nothing is left in the table.
+/// A relay with no tenant files counts everyone under the default tenant and refuses nobody.
+#[tokio::test]
+async fn tenant_counts_are_released_on_every_way_a_session_can_end() {
+    let t = two_tenants(&[]).await;
+    let waiting = t.connect_ali(0, 10).await;
+    let attached = t.attach_ali(1, 10).await;
+    let cut = TcpStream::connect(t.addr).await.unwrap();
+    assert_eq!(t.relay.usage.unattached_of(&tenant("ali")), 1);
+    assert_eq!(t.relay.usage.attached_of(&tenant("ali")), 1);
+    drop((waiting, attached, cut));
+    eventually("all counts are back", || {
+        t.relay.usage.tenants_counted() == 0
+    })
+    .await;
+
+    // No tenant files: the default tenant, counted, never refused.
+    let (relay, listener, cert, relay_x25519) = bind_test_relay().await;
+    let addr = listener.local_addr().unwrap();
+    let serve_relay = relay.clone();
+    tokio::spawn(async move { serve_relay.serve(&listener).await });
+    let members: Vec<TestIdentity> = (0..3).map(|_| generate_identity()).collect();
+    let (networks, seq) = seed_network(&relay, &[&members[0], &members[1], &members[2]]);
+    let mut clients = Vec::new();
+    for member in &members {
+        let (mut client, _) = TestClient::connect(
+            addr,
+            cert.clone(),
+            member,
+            relay_x25519,
+            networks.clone(),
+            seq.clone(),
+            1,
+            10,
+        )
+        .await;
+        client.send(Record::Attach).await;
+        ping_pong(&mut client, [1; 8]).await;
+        clients.push(client);
+    }
+    assert_eq!(relay.usage.attached_of(&TenantId::Default), 3);
+    drop(clients);
+    eventually("the default tenant's counts are back", || {
+        relay.usage.tenants_counted() == 0
+    })
+    .await;
+}
+
+/// A member's Roster adoptions of a tenant's network are metered before the signature check: the
+/// third newer Roster at a burst of two is answered ERROR `over_quota` and not adopted, the session
+/// goes on, and a stale resend (which never reaches a signature check) takes no token and gets
+/// no answer.
+#[tokio::test]
+async fn roster_adoptions_beyond_the_networks_bucket_are_refused_over_quota() {
+    let mut s = rated_member(rates((1_000_000, 1_000_000), (1_000_000, 1_000_000), 0)).await;
+    s.relay.set_tenants(friend_book(&[(
+        "ali",
+        &[s.network],
+        &[
+            ("roster_adoptions_per_hour", 1),
+            ("roster_adoption_burst", 2),
+        ],
+    )]));
+    for seq in [2, 3] {
+        let roster = s.roster(seq);
+        s.push(&roster).await;
+    }
+    ping_pong(&mut s.client, [2; 8]).await;
+    assert_eq!(s.held_seq(), 3);
+    // The bucket is empty; a stale resend costs nothing and is not answered.
+    let stale = s.roster(3);
+    s.push(&stale).await;
+    ping_pong(&mut s.client, [3; 8]).await;
+    // A genuine newer Roster is refused unverified, with an answer, and the session stays.
+    let newer = s.roster(4);
+    s.push(&newer).await;
+    match s.client.recv().await {
+        Some(Record::Error(body)) => assert_eq!(body.code, ErrorCode::OverQuota),
+        other => panic!("expected ERROR over_quota, got {other:?}"),
+    }
+    assert_eq!(s.held_seq(), 3, "the refused Roster was not adopted");
+    ping_pong(&mut s.client, [4; 8]).await;
+    assert!(s.relay.registry.is_attached(&s.member.node_id));
+}
+
+/// The tenant's Roster size figure: a Roster over it is answered ERROR `too_large` and not
+/// adopted; one under it is.
+#[tokio::test]
+async fn a_roster_over_the_tenants_size_figure_is_refused_too_large() {
+    let mut s = rated_member(rates((1_000_000, 1_000_000), (1_000_000, 1_000_000), 0)).await;
+    s.relay
+        .set_tenants(friend_book(&[("ali", &[s.network], &[("roster_kib", 1)])]));
+    let crowd: Vec<(NodeId, u32)> = std::iter::once((s.member.node_id, 1))
+        .chain((0..80u8).map(|i| (NodeId::from([i + 1; 32]), 1)))
+        .collect();
+    let big = evict_roster(&s.owner, s.network, 2, &crowd, &[]);
+    assert!(big.encode().len() > 1024);
+    s.push(&big).await;
+    match s.client.recv().await {
+        Some(Record::Error(body)) => assert_eq!(body.code, ErrorCode::TooLarge),
+        other => panic!("expected ERROR too_large, got {other:?}"),
+    }
+    assert_eq!(s.held_seq(), 1);
+    let small = s.roster(2);
+    assert!(small.encode().len() <= 1024);
+    s.push(&small).await;
+    ping_pong(&mut s.client, [2; 8]).await;
+    assert_eq!(s.held_seq(), 2);
+}

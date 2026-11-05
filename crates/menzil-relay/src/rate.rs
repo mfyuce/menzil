@@ -98,24 +98,41 @@ impl Default for SessionRates {
 /// microsecond and no remainder is ever lost to rounding.
 const UNITS_PER_TOKEN: u128 = 60_000_000;
 
+/// The same for a bucket that refills a number of tokens an hour.
+const UNITS_PER_TOKEN_HOURLY: u128 = 3_600_000_000;
+
 /// A token bucket in integer units, on tokio's clock (so tests under `start_paused` are
 /// exact). Starts full.
 #[derive(Debug)]
 pub(crate) struct TokenBucket {
     units: u128,
     cap: u128,
-    per_minute: u128,
+    /// Tokens gained per period (a minute, or an hour for [`Self::per_hour`]).
+    per_period: u128,
+    /// Units one token costs: the period in microseconds.
+    token: u128,
     last: Instant,
 }
 
 impl TokenBucket {
     /// A full bucket of `burst` tokens that refills `per_minute` tokens a minute.
     pub(crate) fn new(per_minute: u32, burst: u32) -> Self {
-        let cap = u128::from(burst) * UNITS_PER_TOKEN;
+        Self::with_token(per_minute, burst, UNITS_PER_TOKEN)
+    }
+
+    /// A full bucket of `burst` tokens that refills `per_hour` tokens an hour (a rate below one
+    /// a minute, like a tenant's Roster adoptions).
+    pub(crate) fn per_hour(per_hour: u32, burst: u32) -> Self {
+        Self::with_token(per_hour, burst, UNITS_PER_TOKEN_HOURLY)
+    }
+
+    fn with_token(per_period: u32, burst: u32, token: u128) -> Self {
+        let cap = u128::from(burst) * token;
         Self {
             units: cap,
             cap,
-            per_minute: u128::from(per_minute),
+            per_period: u128::from(per_period),
+            token,
             last: Instant::now(),
         }
     }
@@ -125,9 +142,9 @@ impl TokenBucket {
         let now = Instant::now();
         let elapsed = now.saturating_duration_since(self.last).as_micros();
         self.last = now;
-        self.units = (self.units + elapsed * self.per_minute).min(self.cap);
-        if self.units >= UNITS_PER_TOKEN {
-            self.units -= UNITS_PER_TOKEN;
+        self.units = (self.units + elapsed * self.per_period).min(self.cap);
+        if self.units >= self.token {
+            self.units -= self.token;
             true
         } else {
             false
@@ -252,6 +269,32 @@ mod tests {
         tokio::time::advance(Duration::from_millis(100)).await;
         assert!(bucket.try_take());
         assert!(!bucket.try_take());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_hourly_bucket_gives_its_burst_then_one_token_per_hour_share() {
+        let mut bucket = TokenBucket::per_hour(20, 5);
+        for _ in 0..5 {
+            assert!(bucket.try_take());
+        }
+        assert!(
+            !bucket.try_take(),
+            "the sixth back to back is over the burst"
+        );
+        // 20 an hour is one token per 180 s.
+        tokio::time::advance(Duration::from_secs(179)).await;
+        assert!(!bucket.try_take());
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert!(bucket.try_take());
+        assert!(!bucket.try_take());
+        tokio::time::advance(Duration::from_secs(10 * 3_600)).await;
+        for _ in 0..5 {
+            assert!(bucket.try_take());
+        }
+        assert!(
+            !bucket.try_take(),
+            "a long wait refills to the burst, no further"
+        );
     }
 
     #[tokio::test(start_paused = true)]

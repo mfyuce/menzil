@@ -122,7 +122,11 @@ impl Default for RelayNotes {
 /// record. `UnknownNetwork` counts only before the attachment settled: later it is the answer to
 /// a document sent for a network the relay does not serve, and the session goes on.
 /// `UnknownE2e` never counts: protocol.md 4.2 makes it the refusal of one SEND, after which the
-/// session goes on (round 13 N3).
+/// session goes on (round 13 N3). `OverQuota` is the same kind of case as `UnknownNetwork`: a
+/// tenant at a figure turns a session away at HELLO or ATTACH (before the attachment settles),
+/// and later it is the answer to one Roster update the tenant's rate refused, with the session
+/// going on (multi tenant design 2.3). A build from before the code existed reads it as
+/// `Unknown(27)`, which is never kept.
 fn turns_away(code: ErrorCode, settled: bool) -> bool {
     match code {
         ErrorCode::BadCert
@@ -131,7 +135,7 @@ fn turns_away(code: ErrorCode, settled: bool) -> bool {
         | ErrorCode::NotMember
         | ErrorCode::Revoked
         | ErrorCode::RosterExpired => true,
-        ErrorCode::UnknownNetwork => !settled,
+        ErrorCode::UnknownNetwork | ErrorCode::OverQuota => !settled,
         _ => false,
     }
 }
@@ -369,6 +373,42 @@ mod tests {
             notes.note_error(&error(code, "x"), 5);
             assert_eq!(notes.last_error(), None, "{code:?}");
         }
+    }
+
+    /// MT7: a tenant's `over_quota` turns a session away while the attachment is new, with the
+    /// GOAWAY that follows it joined; after the attachment settled it is the answer to one Roster
+    /// update and is not kept. A node built before the code existed reads 27 as `Unknown(27)`
+    /// and keeps nothing.
+    #[test]
+    fn over_quota_is_kept_for_a_new_attachment_and_an_older_nodes_unknown_27_is_not() {
+        let notes = RelayNotes::new();
+        notes.begin_attachment();
+        notes.note_error(&error(ErrorCode::OverQuota, "tenant full"), 10);
+        notes.note_goaway("over_quota", 11);
+        assert_eq!(
+            notes.last_error(),
+            Some(RelayError {
+                code: Some(ErrorCode::OverQuota),
+                message: "tenant full".to_string(),
+                goaway: Some("over_quota".to_string()),
+                at: 10,
+                listed_in_own_roster: false,
+            })
+        );
+
+        let settled = RelayNotes::new();
+        settled.begin_attachment();
+        settled.settle(true);
+        settled.note_error(&error(ErrorCode::OverQuota, "no more Roster updates"), 12);
+        assert_eq!(settled.last_error(), None);
+
+        // What a node built before MT7 decodes from the wire number 27.
+        let old = ErrorCode::from(u16::from(ErrorCode::OverQuota));
+        let as_old_build = ErrorCode::Unknown(u16::from(old));
+        let notes = RelayNotes::new();
+        notes.begin_attachment();
+        notes.note_error(&error(as_old_build, "tenant full"), 13);
+        assert_eq!(notes.last_error(), None);
     }
 
     #[test]

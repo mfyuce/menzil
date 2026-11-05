@@ -32,6 +32,7 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::admission::AttachedSlot;
 use crate::forward::ForwardItem;
+use crate::tenant::TenantAttached;
 
 /// How many records [`SessionRegistry::send_to`] will queue for one
 /// attached session before further sends start being dropped. A full 1
@@ -60,6 +61,9 @@ struct Registration {
     /// gives its place up at once (the new registration replaces it), however long it takes to
     /// notice and leave (round T3, M3).
     _slot: Option<AttachedSlot>,
+    /// The same for the attached counts of the session's tenants (`crate::tenant`, MT7): the
+    /// registry holds them, so they follow the registration and not the session task.
+    _tenant_slot: Option<TenantAttached>,
 }
 
 /// A snapshot of one attached session: see [`SessionRegistry::attachment_of`].
@@ -116,7 +120,7 @@ impl SessionRegistry {
         mpsc::Receiver<Record>,
         mpsc::UnboundedReceiver<ForwardItem>,
     ) {
-        self.attach_counted(node_id, session_id, claimed_networks, None)
+        self.attach_counted(node_id, session_id, claimed_networks, None, None)
     }
 
     /// [`Self::attach`] that also hands the registration the session's place in the attached
@@ -128,6 +132,7 @@ impl SessionRegistry {
         session_id: u32,
         claimed_networks: Vec<NetworkId>,
         slot: Option<AttachedSlot>,
+        tenant_slot: Option<TenantAttached>,
     ) -> (
         oneshot::Receiver<()>,
         mpsc::Receiver<Record>,
@@ -146,6 +151,7 @@ impl SessionRegistry {
                 outbound: outbound_tx,
                 forward: forward_tx,
                 _slot: slot,
+                _tenant_slot: tenant_slot,
             },
         );
         drop(guard);

@@ -64,6 +64,10 @@ fn code_meaning(code: &str, listed: bool) -> (&'static str, &'static str) {
             "the documents of a network this device claimed have expired at the relay",
             "the owner or the steward has to issue new ones",
         ),
+        "over_quota" => (
+            "the relay's limit for this device's network is reached (too many devices online or connecting at once, or too many Roster updates)",
+            "this device tries again by itself after a minute; if it keeps happening, switch off a device that is not needed or ask the relay operator to raise the limit",
+        ),
         _ => ("the relay refused this device", "see the relay's own words"),
     }
 }
@@ -91,6 +95,12 @@ pub fn turned_away(rejected: &crate::agent::Rejected, now: u64) -> String {
             format!(
                 "the relay turned this device away: {meaning} ({}{when}{told}){then}. {advice}",
                 one_line(code, 40)
+            )
+        }
+        (None, Some(goaway)) if goaway == "over_quota" => {
+            let (meaning, advice) = code_meaning("over_quota", false);
+            format!(
+                "the relay ended the session of this device: {meaning} (GOAWAY over_quota{when}). {advice}"
             )
         }
         (None, Some(goaway)) => {
@@ -258,6 +268,11 @@ mod tests {
                 "`relay` in config.toml",
             ),
             ("roster_expired", "have expired", "steward"),
+            (
+                "over_quota",
+                "limit for this device's network",
+                "tries again by itself",
+            ),
             ("something_new", "refused this device", "relay's own words"),
         ] {
             let text = turned_away(&rejected(Some(code), None, ""), 1_000 + 180);
@@ -302,6 +317,34 @@ mod tests {
             turned_away(&revoked, 1_000),
             turned_away(&rejected(Some("revoked"), None, ""), 1_000)
         );
+    }
+
+    /// MT7: `over_quota` explains itself whether the ERROR came with its GOAWAY or the GOAWAY is
+    /// all that was kept, and a build that does not know the code says the generic words.
+    #[test]
+    fn over_quota_is_explained_with_or_without_its_error() {
+        let both = turned_away(
+            &rejected(Some("over_quota"), Some("over_quota"), "tenant full"),
+            1_010,
+        );
+        assert!(
+            both.contains("limit for this device's network")
+                && both.contains("the relay said \"tenant full\"")
+                && both.contains("it then ended the session (GOAWAY over_quota)")
+                && both.contains("tries again by itself"),
+            "{both}"
+        );
+        let alone = turned_away(&rejected(None, Some("over_quota"), ""), 1_000 + 7_200);
+        assert!(
+            alone.starts_with("the relay ended the session of this device: ")
+                && alone.contains("limit for this device's network")
+                && alone.contains("(GOAWAY over_quota, 2 hours ago)")
+                && alone.contains("tries again by itself"),
+            "{alone}"
+        );
+        // The name an older build gives the number it does not know.
+        let old = turned_away(&rejected(Some("unknown"), None, ""), 1_000);
+        assert!(old.contains("the relay refused this device"), "{old}");
     }
 
     #[test]

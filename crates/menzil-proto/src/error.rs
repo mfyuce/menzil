@@ -128,6 +128,13 @@ pub enum ErrorCode {
     /// `docs_only` (protocol.md 5.1): the L4 CLOSE of a session that was admitted only to push
     /// documents (`menzil:docs`), sent once the push is answered or its time has run out.
     DocsOnly,
+    /// `over_quota` (protocol.md 4.2): a limit the relay's operator set for the sender's tenant
+    /// (devices online, devices connecting at once, Roster updates of a network) is reached.
+    /// Unlike `rate_limited`, which is the relay's own limit for everyone, this one is about the
+    /// tenant, and trying again later (the GOAWAY that follows a refused session says when)
+    /// works once the tenant is below it. A peer built before this code existed reads it as
+    /// [`Self::Unknown`] with the number 27 and treats it like any code it does not know.
+    OverQuota,
     /// A code this build does not recognize, preserved verbatim.
     Unknown(u16),
 }
@@ -159,6 +166,7 @@ impl ErrorCode {
     const SHUTTING_DOWN: u16 = 24;
     const BAD_DOCUMENT: u16 = 25;
     const DOCS_ONLY: u16 = 26;
+    const OVER_QUOTA: u16 = 27;
 
     /// The symbolic name from protocol.md, e.g. `"bad_cert"`.
     pub fn name(self) -> &'static str {
@@ -189,6 +197,7 @@ impl ErrorCode {
             Self::ShuttingDown => "shutting_down",
             Self::BadDocument => "bad_document",
             Self::DocsOnly => "docs_only",
+            Self::OverQuota => "over_quota",
             Self::Unknown(_) => "unknown",
         }
     }
@@ -223,6 +232,7 @@ impl From<ErrorCode> for u16 {
             ErrorCode::ShuttingDown => ErrorCode::SHUTTING_DOWN,
             ErrorCode::BadDocument => ErrorCode::BAD_DOCUMENT,
             ErrorCode::DocsOnly => ErrorCode::DOCS_ONLY,
+            ErrorCode::OverQuota => ErrorCode::OVER_QUOTA,
             ErrorCode::Unknown(code) => code,
         }
     }
@@ -257,6 +267,7 @@ impl From<u16> for ErrorCode {
             Self::SHUTTING_DOWN => Self::ShuttingDown,
             Self::BAD_DOCUMENT => Self::BadDocument,
             Self::DOCS_ONLY => Self::DocsOnly,
+            Self::OVER_QUOTA => Self::OverQuota,
             other => Self::Unknown(other),
         }
     }
@@ -307,6 +318,7 @@ mod tests {
             ErrorCode::ShuttingDown,
             ErrorCode::BadDocument,
             ErrorCode::DocsOnly,
+            ErrorCode::OverQuota,
         ];
         for code in codes {
             let wire: u16 = code.into();
@@ -338,6 +350,25 @@ mod tests {
         assert_eq!(u16::from(ErrorCode::DocsOnly), 26);
         assert_eq!(ErrorCode::from(26), ErrorCode::DocsOnly);
         assert_eq!(ErrorCode::DocsOnly.name(), "docs_only");
+    }
+
+    #[test]
+    fn over_quota_keeps_its_number_and_name_and_older_peers_read_it_as_unknown() {
+        assert_eq!(u16::from(ErrorCode::OverQuota), 27);
+        assert_eq!(ErrorCode::from(27), ErrorCode::OverQuota);
+        assert_eq!(ErrorCode::OverQuota.name(), "over_quota");
+        // A build from before the code existed has no variant for 27: its `From<u16>` falls
+        // through to `Unknown(27)`, which this build writes with the same number, so the bytes
+        // an old peer reads are exactly the ones below, and it keeps the number it was sent.
+        let mut wire = Vec::new();
+        ciborium::into_writer(&ErrorCode::OverQuota, &mut wire).unwrap();
+        let mut as_number = Vec::new();
+        ciborium::into_writer(&27u16, &mut as_number).unwrap();
+        assert_eq!(wire, as_number);
+        assert_eq!(u16::from(ErrorCode::Unknown(27)), 27);
+        assert_eq!(ErrorCode::Unknown(27).name(), "unknown");
+        // The next number is still free: it reads as unknown here.
+        assert_eq!(ErrorCode::from(28), ErrorCode::Unknown(28));
     }
 
     #[test]

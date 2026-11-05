@@ -36,6 +36,7 @@ use crate::log_throttle::NodeLog;
 use crate::rate::DocBuckets;
 use crate::registry::SessionRegistry;
 use crate::roster_store::RosterStore;
+use crate::tenant::RosterQuota;
 
 /// The most bases a session may have pending at once, one per network.
 const MAX_PENDING_BASES: usize = 8;
@@ -99,6 +100,12 @@ pub(crate) enum AcceptOutcome {
     /// Roster for it that is as new or newer (a stale or duplicate resend; no signature was
     /// checked). Nothing was stored.
     Stale(NetworkId),
+    /// A transfer completed, decoded, was a Roster of a claimed, served network that is newer
+    /// than the held one, and would have gone to the signature check, but the tenant's adoptions
+    /// of that network are used up (`crate::tenant`, design 2.3). Dropped before any signature
+    /// is checked; the session is answered ERROR `over_quota`. Never for a stale transfer, which
+    /// costs no signature check and no token.
+    OverQuota(NetworkId),
     /// A transfer completed as a doc_type this build doesn't act on at
     /// L3 (protocol.md 4.3: "Policies travel only end to end" — never a
     /// raw L3 DOC to or from a relay).
@@ -161,6 +168,11 @@ pub(crate) enum AcceptOutcome {
 /// A session over its rate costs the relay the reassembly it already paid and one decode, to
 /// tell the honest excess ([`AcceptOutcome::OverRateClaimed`]) from the rest
 /// ([`AcceptOutcome::OverRate`]); no signature is checked.
+/// `quota` is what the network's tenant allows (`crate::tenant`, design 2.3), asked only once the
+/// network is known to be claimed and served: a transfer whose encoded size is over the tenant's
+/// Roster size figure is [`AcceptOutcome::TooLarge`] (a base Roster too), and a Roster newer than
+/// the held one takes a token of the network's adoption bucket before its signature is looked at,
+/// or is [`AcceptOutcome::OverQuota`].
 /// `log` throttles the warn lines a peer can cause (isolation rule I7); what a line would have
 /// said is still available at `debug` level in full.
 ///
@@ -181,6 +193,7 @@ pub(crate) fn accept_roster_chunk(
     claimed: &[NetworkId],
     now: u64,
     buckets: &mut DocBuckets,
+    quota: &dyn RosterQuota,
     log: NodeLog<'_>,
 ) -> AcceptOutcome {
     let (doc_type, bytes) = match reassembler.accept(body) {
@@ -242,6 +255,18 @@ pub(crate) fn accept_roster_chunk(
         );
         return AcceptOutcome::Dropped(decoded.network_id);
     }
+    let max_bytes = quota.max_roster_bytes(&decoded.network_id);
+    if bytes.len() > max_bytes {
+        if let Some(held_back) = log.admit("doc_too_large") {
+            tracing::warn!(
+                held_back,
+                len = bytes.len(),
+                max = max_bytes,
+                "a session sent a Roster larger than its tenant allows"
+            );
+        }
+        return AcceptOutcome::TooLarge;
+    }
     if doc_type == DocType::BaseRoster {
         // Judged with the Roster it belongs to, which follows; not stored.
         if !pending.keep(decoded.network_id, roster)
@@ -255,6 +280,22 @@ pub(crate) fn accept_roster_chunk(
         return AcceptOutcome::Nothing;
     }
     let base = pending.take(&decoded.network_id);
+    // A Roster that is not newer than the held one is dropped by the store before any signature
+    // is checked and costs nothing; one that is newer will cost two Ed25519 checks over up to
+    // the tenant's size figure, and that is what the network's bucket meters (threat A11).
+    let newer = rosters
+        .seq_of(&decoded.network_id)
+        .is_none_or(|held| decoded.seq > held);
+    if newer && !quota.try_adopt(&decoded.network_id) {
+        if let Some(held_back) = log.admit("doc_over_quota") {
+            tracing::warn!(
+                held_back,
+                network_id = %decoded.network_id,
+                "a network's Roster adoptions are over its tenant's rate; refusing a transfer unverified"
+            );
+        }
+        return AcceptOutcome::OverQuota(decoded.network_id);
+    }
     match rosters.adopt(&roster, base.as_ref(), now) {
         Ok(true) => AcceptOutcome::NewRoster(decoded.network_id),
         Ok(false) => AcceptOutcome::Stale(decoded.network_id),
@@ -433,6 +474,7 @@ mod tests {
                 claimed,
                 NOW,
                 buckets,
+                &crate::tenant::Unlimited,
                 log,
             );
         }
@@ -802,9 +844,109 @@ mod tests {
             &[],
             NOW,
             &mut DocBuckets::unlimited(),
+            &crate::tenant::Unlimited,
             crate::log_throttle::LogThrottle::default().about(&NodeId::from([7u8; 32])),
         );
         assert_eq!(outcome, AcceptOutcome::IgnoredDocType(DocType::Policy));
+    }
+
+    /// A tenant's quota as `accept_roster_chunk` sees it: a size figure and a number of adoptions.
+    struct Quota {
+        max_bytes: usize,
+        adoptions: std::cell::Cell<u32>,
+    }
+
+    impl RosterQuota for Quota {
+        fn max_roster_bytes(&self, _: &NetworkId) -> usize {
+            self.max_bytes
+        }
+
+        fn try_adopt(&self, _: &NetworkId) -> bool {
+            let left = self.adoptions.get();
+            self.adoptions.set(left.saturating_sub(1));
+            left > 0
+        }
+    }
+
+    fn feed_quota(
+        records: &[Record],
+        rosters: &RosterStore,
+        claimed: &[NetworkId],
+        quota: &Quota,
+    ) -> AcceptOutcome {
+        let mut reassembler = DocReassembler::new();
+        let mut last = AcceptOutcome::Nothing;
+        for record in records {
+            let Record::Doc(body) = record else {
+                unreachable!()
+            };
+            last = accept_roster_chunk(
+                &mut reassembler,
+                &mut PendingBases::new(),
+                body,
+                rosters,
+                claimed,
+                NOW,
+                &mut DocBuckets::unlimited(),
+                quota,
+                crate::log_throttle::LogThrottle::default().about(&NodeId::from([7u8; 32])),
+            );
+        }
+        last
+    }
+
+    /// MT7: a transfer over the tenant's size figure is `TooLarge`, for a claimed network only; a
+    /// newer Roster takes one adoption before its signature is checked and is `OverQuota` when
+    /// there is none; a stale one takes none.
+    #[test]
+    fn the_tenants_size_and_adoption_figures_apply_before_the_signature_check() {
+        let owner = SigningKey::generate(&mut rand::rng());
+        let network_id = NetworkId::from(owner.verifying_key().to_bytes());
+        let rosters = RosterStore::new();
+        rosters.set(&signed_roster(&owner, network_id, 1)).unwrap();
+        let claimed = [network_id];
+        let records = |roster: &Roster| {
+            menzil_proto::split_into_doc_records(DocType::Roster, &roster.encode())
+        };
+        let size = signed_roster(&owner, network_id, 2).encode().len();
+
+        // Over the size figure: TooLarge, and no adoption was taken.
+        let quota = Quota {
+            max_bytes: size - 1,
+            adoptions: std::cell::Cell::new(5),
+        };
+        let two = records(&signed_roster(&owner, network_id, 2));
+        assert_eq!(
+            feed_quota(&two, &rosters, &claimed, &quota),
+            AcceptOutcome::TooLarge
+        );
+        assert_eq!(quota.adoptions.get(), 5);
+        // The same size for a network the session did not claim is dropped silently instead.
+        assert_eq!(
+            feed_quota(&two, &rosters, &[], &quota),
+            AcceptOutcome::Dropped(network_id)
+        );
+
+        // At the figure, with one adoption left: adopted; with none: OverQuota, nothing stored.
+        let quota = Quota {
+            max_bytes: size,
+            adoptions: std::cell::Cell::new(1),
+        };
+        assert_eq!(
+            feed_quota(&two, &rosters, &claimed, &quota),
+            AcceptOutcome::NewRoster(network_id)
+        );
+        let three = records(&signed_roster(&owner, network_id, 3));
+        assert_eq!(
+            feed_quota(&three, &rosters, &claimed, &quota),
+            AcceptOutcome::OverQuota(network_id)
+        );
+        assert_eq!(rosters.seq_of(&network_id), Some(2));
+        // A stale resend takes no adoption even when there are none left.
+        assert_eq!(
+            feed_quota(&two, &rosters, &claimed, &quota),
+            AcceptOutcome::Stale(network_id)
+        );
     }
 
     #[test]
@@ -857,6 +999,7 @@ mod tests {
                 &[],
                 NOW,
                 &mut DocBuckets::unlimited(),
+                &crate::tenant::Unlimited,
                 crate::log_throttle::LogThrottle::default().about(&NodeId::from([7u8; 32])),
             );
             if outcome == AcceptOutcome::TooLarge {

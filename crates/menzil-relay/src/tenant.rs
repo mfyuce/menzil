@@ -7,18 +7,24 @@
 //! `personal` class (no tenant figures, only the relay's global safety limits), so a relay
 //! without tenant files is today's relay.
 //!
-//! This module is data and rules only: slug syntax, the classes and their figures, the
-//! [`TenantBook`] that answers "which tenant owns this network" and the attribution helpers the
-//! enforcing slices (MT7 to MT9) call. Nothing here refuses a session, a Roster or a name yet,
-//! and nothing reads a file: the relay binary loads the tenant files and hands the specs over
-//! (`menzil::relay_cmd`).
+//! This module is data and rules, and (MT7) the counters that enforce the session and document
+//! figures: slug syntax, the classes and their figures, the [`TenantBook`] that answers "which
+//! tenant owns this network", the attribution helpers, and [`TenantUsage`], the relay wide
+//! counters of attached and unattached sessions per tenant and of Roster adoptions per network.
+//! The counters are RAII guards like `crate::admission`'s slots: a count given out is given back
+//! when the guard is dropped, on every path and when a task is cancelled. A tenant of the
+//! `personal` class has no figures and is never refused (it is still counted). Nothing here
+//! refuses a name or a forwarding pair yet (MT8, MT9), and nothing reads a file: the relay binary
+//! loads the tenant files and hands the specs over (`menzil::relay_cmd`).
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use menzil_proto::NetworkId;
 
 use crate::advertise::DEFAULT_RESERVED_LABELS;
+use crate::rate::TokenBucket;
 
 /// Fewest characters in a slug.
 pub const SLUG_MIN_LEN: usize = 3;
@@ -187,7 +193,8 @@ impl Class {
 macro_rules! figures {
     ($($(#[$doc:meta])* $field:ident = $default:expr, max $max:expr;)*) => {
         /// The per tenant figures of a class (design 2.3), in the units the tenant file uses
-        /// (the key names say which). Nothing enforces them yet (MT7, MT8, MT9).
+        /// (the key names say which). Enforced so far: the session figures and the Roster figures
+        /// (MT7); the forwarding, bandwidth and name figures follow (MT8, MT9).
         #[derive(Debug, Clone, Copy, PartialEq, Eq)]
         pub struct Figures {
             $($(#[$doc])* pub $field: u64,)*
@@ -525,6 +532,15 @@ impl TenantBook {
         &self.warnings
     }
 
+    /// The figures that apply to `id`: `None` for the default tenant, for a `personal` one and for
+    /// a tenant this book does not hold (only the global safety limits apply to those).
+    pub fn figures_of(&self, id: &TenantId) -> Option<&Figures> {
+        match id {
+            TenantId::Default => None,
+            TenantId::Named(slug) => self.named.get(slug).and_then(|t| t.figures.as_ref()),
+        }
+    }
+
     /// Attribution of a session (design 2.1): the distinct tenants of the networks it claimed
     /// and passed standing in, in the order of the claims. A NodeId can claim only networks
     /// whose Roster lists it, so no tenant can inflate another's count with these.
@@ -554,8 +570,311 @@ impl TenantBook {
     }
 }
 
+/// Which tenant figure a session was refused for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Quota {
+    /// Too many devices attached (distinct NodeIds).
+    AttachedSessions,
+    /// Too many devices connected and waiting to ATTACH.
+    UnattachedSessions,
+}
+
+/// A session refused because its tenant is at a figure (`over_quota`, design 2.3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct OverQuota {
+    /// The tenant that is full.
+    pub(crate) tenant: TenantId,
+    /// The figure.
+    pub(crate) quota: Quota,
+}
+
+impl OverQuota {
+    /// The text the refused device is shown (ERROR `msg`). It names no tenant and no figure: the
+    /// device knows its own networks, and the operator's slugs and numbers are the operator's.
+    pub(crate) fn message(&self) -> &'static str {
+        match self.quota {
+            Quota::AttachedSessions => {
+                "this relay's limit on devices online for your network is reached; try again later"
+            }
+            Quota::UnattachedSessions => {
+                "this relay's limit on devices connecting for your network is reached; try again shortly"
+            }
+        }
+    }
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct Counts {
+    attached: usize,
+    unattached: usize,
+}
+
+/// A network's bucket of Roster adoptions, with the figures it was made from (a reload that
+/// changes them makes a new one).
+struct AdoptionBucket {
+    figures: (u64, u64),
+    bucket: TokenBucket,
+}
+
+/// The relay wide counters behind the tenant figures (multi tenant design 2.3, slice MT7):
+/// attached and unattached sessions per tenant, and Roster adoptions per network. Shared
+/// (`Arc`) by the session tasks and the registry. A count is taken with one lock, all the
+/// tenants of a session together, so a session over one tenant's figure takes nothing from the
+/// others.
+#[derive(Default)]
+pub(crate) struct TenantUsage {
+    counts: Mutex<HashMap<TenantId, Counts>>,
+    /// One bucket per served network; only a network the session claimed and the relay serves
+    /// is ever charged ([`RosterQuota`]'s caller checks that first), so the table is bounded by
+    /// the networks served.
+    adoptions: Mutex<HashMap<NetworkId, AdoptionBucket>>,
+}
+
+impl TenantUsage {
+    /// Counters all at zero.
+    pub(crate) fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    fn counts(&self) -> MutexGuard<'_, HashMap<TenantId, Counts>> {
+        self.counts.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Counts a handshaken, not yet attached session that claimed `claimed`, against every
+    /// tenant of those networks (one count each, design 2.1). Refused when any of them has its
+    /// `unattached_sessions`, or its `attached_sessions` already attached and this NodeId is not
+    /// one of them. `attached_before` is the claims of the NodeId's current registration, if it
+    /// has one: a NodeId that is attached in a tenant already replaces its own session there, so
+    /// a tenant at the figure still lets its own devices reconnect (as `crate::admission` does
+    /// for the relay wide count). The attached check here only keeps a full tenant from
+    /// handshaking; the count itself is taken at ATTACH ([`Self::admit_attached`]).
+    pub(crate) fn admit_unattached(
+        self: &Arc<Self>,
+        book: &TenantBook,
+        claimed: &[NetworkId],
+        attached_before: &[NetworkId],
+    ) -> Result<TenantUnattached, OverQuota> {
+        let tenants: Vec<TenantId> = book.session_tenants(claimed).into_iter().cloned().collect();
+        let replacing = book.session_tenants(attached_before);
+        let mut counts = self.counts();
+        for id in &tenants {
+            let Some(figures) = book.figures_of(id) else {
+                continue;
+            };
+            let held = counts.get(id).copied().unwrap_or_default();
+            if held.unattached as u64 >= figures.unattached_sessions {
+                return Err(OverQuota {
+                    tenant: id.clone(),
+                    quota: Quota::UnattachedSessions,
+                });
+            }
+            if held.attached as u64 >= figures.attached_sessions && !replacing.contains(&id) {
+                return Err(OverQuota {
+                    tenant: id.clone(),
+                    quota: Quota::AttachedSessions,
+                });
+            }
+        }
+        for id in &tenants {
+            counts.entry(id.clone()).or_default().unattached += 1;
+        }
+        drop(counts);
+        Ok(TenantUnattached {
+            usage: Arc::clone(self),
+            tenants,
+        })
+    }
+
+    /// Counts an attached session that claimed `claimed`, against every tenant of those
+    /// networks. Refused when any of them has its `attached_sessions` attached already, unless
+    /// this NodeId is attached in it now (`replacing` is the claims of its current registration:
+    /// the new session takes the old one's place, and for the moment both exist). The guard
+    /// belongs to the registration (`crate::registry`), so the count is the number of
+    /// registrations, however long a superseded session takes to leave.
+    pub(crate) fn admit_attached(
+        self: &Arc<Self>,
+        book: &TenantBook,
+        claimed: &[NetworkId],
+        replacing: &[NetworkId],
+    ) -> Result<TenantAttached, OverQuota> {
+        let tenants: Vec<TenantId> = book.session_tenants(claimed).into_iter().cloned().collect();
+        let replacing = book.session_tenants(replacing);
+        let mut counts = self.counts();
+        for id in &tenants {
+            let Some(figures) = book.figures_of(id) else {
+                continue;
+            };
+            let held = counts.get(id).copied().unwrap_or_default();
+            if held.attached as u64 >= figures.attached_sessions && !replacing.contains(&id) {
+                return Err(OverQuota {
+                    tenant: id.clone(),
+                    quota: Quota::AttachedSessions,
+                });
+            }
+        }
+        for id in &tenants {
+            counts.entry(id.clone()).or_default().attached += 1;
+        }
+        drop(counts);
+        Ok(TenantAttached {
+            usage: Arc::clone(self),
+            tenants,
+        })
+    }
+
+    fn release(&self, tenants: &[TenantId], change: impl Fn(&mut Counts)) {
+        let mut counts = self.counts();
+        for id in tenants {
+            if let Some(held) = counts.get_mut(id) {
+                change(held);
+                if held.attached == 0 && held.unattached == 0 {
+                    counts.remove(id);
+                }
+            }
+        }
+    }
+
+    /// Takes one Roster adoption of `network_id` from its bucket, if its tenant has figures and
+    /// the bucket has a token; a tenant without figures is never refused. A bucket made from
+    /// other figures than the tenant has now (a reload) is replaced.
+    fn try_adopt(&self, book: &TenantBook, network_id: &NetworkId) -> bool {
+        let Some(figures) = book.tenant_of(network_id).figures else {
+            return true;
+        };
+        let key = (
+            figures.roster_adoptions_per_hour,
+            figures.roster_adoption_burst,
+        );
+        let mut buckets = self
+            .adoptions
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let slot = buckets
+            .entry(*network_id)
+            .or_insert_with(|| AdoptionBucket {
+                figures: key,
+                bucket: Self::adoption_bucket(key),
+            });
+        if slot.figures != key {
+            *slot = AdoptionBucket {
+                figures: key,
+                bucket: Self::adoption_bucket(key),
+            };
+        }
+        slot.bucket.try_take()
+    }
+
+    fn adoption_bucket((per_hour, burst): (u64, u64)) -> TokenBucket {
+        // The figures' ranges (1 to 100,000) fit a u32.
+        TokenBucket::per_hour(
+            u32::try_from(per_hour).unwrap_or(u32::MAX),
+            u32::try_from(burst).unwrap_or(u32::MAX),
+        )
+    }
+
+    /// Sessions of `id` that are attached, by this count (tests).
+    #[cfg(test)]
+    pub(crate) fn attached_of(&self, id: &TenantId) -> usize {
+        self.counts().get(id).map_or(0, |c| c.attached)
+    }
+
+    /// Sessions of `id` that are handshaken and not attached, by this count (tests).
+    #[cfg(test)]
+    pub(crate) fn unattached_of(&self, id: &TenantId) -> usize {
+        self.counts().get(id).map_or(0, |c| c.unattached)
+    }
+
+    /// Tenants with any count left (tests: nothing leaks).
+    #[cfg(test)]
+    pub(crate) fn tenants_counted(&self) -> usize {
+        self.counts().len()
+    }
+}
+
+/// The place of a handshaken, not yet attached session in its tenants' counts
+/// ([`TenantUsage::admit_unattached`]); given back when dropped.
+pub(crate) struct TenantUnattached {
+    usage: Arc<TenantUsage>,
+    tenants: Vec<TenantId>,
+}
+
+impl Drop for TenantUnattached {
+    fn drop(&mut self) {
+        self.usage.release(&self.tenants, |c| {
+            c.unattached = c.unattached.saturating_sub(1)
+        });
+    }
+}
+
+/// The place of an attached session in its tenants' counts ([`TenantUsage::admit_attached`]);
+/// given back when dropped.
+pub(crate) struct TenantAttached {
+    usage: Arc<TenantUsage>,
+    tenants: Vec<TenantId>,
+}
+
+impl Drop for TenantAttached {
+    fn drop(&mut self) {
+        self.usage
+            .release(&self.tenants, |c| c.attached = c.attached.saturating_sub(1));
+    }
+}
+
+/// What a tenant allows of a DOC(roster) transfer, asked by `crate::doc` after it has checked that
+/// the session claimed the network and the relay serves it (so a stranger learns nothing from
+/// the answer).
+pub(crate) trait RosterQuota {
+    /// The largest encoded Roster (or base Roster) of `network_id` its tenant lets through, in
+    /// bytes.
+    fn max_roster_bytes(&self, network_id: &NetworkId) -> usize;
+
+    /// Takes one adoption from the network's bucket. Asked only for a transfer that will reach a
+    /// signature check, and before it; false means refuse it undecoded further.
+    fn try_adopt(&self, network_id: &NetworkId) -> bool;
+}
+
+/// The quota of a relay's tenants as of one moment: the book that was current when it was made.
+pub(crate) struct RelayQuota<'a> {
+    pub(crate) book: Arc<TenantBook>,
+    pub(crate) usage: &'a TenantUsage,
+}
+
+impl RosterQuota for RelayQuota<'_> {
+    fn max_roster_bytes(&self, network_id: &NetworkId) -> usize {
+        self.book
+            .tenant_of(network_id)
+            .figures
+            .map_or(menzil_proto::MAX_DOC_BYTES, |figures| {
+                usize::try_from(figures.roster_kib.saturating_mul(1024))
+                    .unwrap_or(usize::MAX)
+                    .min(menzil_proto::MAX_DOC_BYTES)
+            })
+    }
+
+    fn try_adopt(&self, network_id: &NetworkId) -> bool {
+        self.usage.try_adopt(&self.book, network_id)
+    }
+}
+
+/// No tenant limits: what `crate::doc`'s own tests use.
+#[cfg(test)]
+pub(crate) struct Unlimited;
+
+#[cfg(test)]
+impl RosterQuota for Unlimited {
+    fn max_roster_bytes(&self, _: &NetworkId) -> usize {
+        menzil_proto::MAX_DOC_BYTES
+    }
+
+    fn try_adopt(&self, _: &NetworkId) -> bool {
+        true
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
 
     fn net(n: u8) -> NetworkId {
@@ -850,5 +1169,200 @@ mod tests {
         assert!(book.pair_tenant(&[]).is_none());
         assert_eq!(book.adoption_tenant(&net(2)).slug(), Some("ali"));
         assert_eq!(book.adoption_tenant(&net(9)), &TenantId::Default);
+    }
+    // ---- MT7: the session and Roster figures -------------------------------------------------
+
+    /// The 65th attached device of a tenant is refused while the first of another tenant, and
+    /// any number of the default tenant's, are let in; the counts come back when the guards go.
+    #[test]
+    fn the_65th_attached_node_of_a_tenant_is_refused_while_another_tenants_first_is_accepted() {
+        let book = build(vec![spec("ali", &[1]), spec("veli", &[2])]);
+        let usage = TenantUsage::new();
+        let mut held = Vec::new();
+        for _ in 0..64 {
+            held.push(usage.admit_attached(&book, &[net(1)], &[]).unwrap());
+        }
+        let ali = TenantId::Named(slug("ali"));
+        assert_eq!(usage.attached_of(&ali), 64);
+        let refused = usage.admit_attached(&book, &[net(1)], &[]).err().unwrap();
+        assert_eq!(
+            refused,
+            OverQuota {
+                tenant: ali.clone(),
+                quota: Quota::AttachedSessions
+            }
+        );
+        assert_eq!(usage.attached_of(&ali), 64, "a refusal takes nothing");
+        // Another tenant is not touched, and neither is the default tenant (no figures).
+        let _veli = usage.admit_attached(&book, &[net(2)], &[]).unwrap();
+        for _ in 0..100 {
+            held.push(usage.admit_attached(&book, &[net(9)], &[]).unwrap());
+        }
+        // A NodeId already attached in the tenant may replace its own session at the figure.
+        let replacement = usage.admit_attached(&book, &[net(1)], &[net(1)]).unwrap();
+        assert_eq!(usage.attached_of(&ali), 65, "both exist for the moment");
+        drop(replacement);
+        // One leaves: the next is let in.
+        held.remove(0);
+        assert_eq!(usage.attached_of(&ali), 63);
+        usage.admit_attached(&book, &[net(1)], &[]).unwrap();
+    }
+
+    #[test]
+    fn the_17th_unattached_session_of_a_tenant_is_refused_and_a_full_tenant_does_not_handshake() {
+        let book = build(vec![spec("ali", &[1]), spec("veli", &[2])]);
+        let usage = TenantUsage::new();
+        let mut held = Vec::new();
+        for _ in 0..16 {
+            held.push(usage.admit_unattached(&book, &[net(1)], &[]).unwrap());
+        }
+        let ali = TenantId::Named(slug("ali"));
+        let refused = usage.admit_unattached(&book, &[net(1)], &[]).err().unwrap();
+        assert_eq!(refused.quota, Quota::UnattachedSessions);
+        assert_eq!(refused.tenant, ali);
+        assert_eq!(usage.unattached_of(&ali), 16);
+        assert!(usage.admit_unattached(&book, &[net(2)], &[]).is_ok());
+        // A tenant with 64 attached refuses a new device's HELLO, but not one that is attached.
+        let usage = TenantUsage::new();
+        let attached: Vec<_> = (0..64)
+            .map(|_| usage.admit_attached(&book, &[net(1)], &[]).unwrap())
+            .collect();
+        let full = usage.admit_unattached(&book, &[net(1)], &[]).err().unwrap();
+        assert_eq!(full.quota, Quota::AttachedSessions);
+        assert!(usage.admit_unattached(&book, &[net(1)], &[net(1)]).is_ok());
+        drop(attached);
+    }
+
+    /// A session of two tenants counts against both and is refused when either is full, taking
+    /// nothing from the other; every guard gives its count back, and an emptied entry leaves.
+    #[test]
+    fn a_session_in_two_tenants_counts_against_both_and_every_count_is_given_back() {
+        let figures = |attached: u64| {
+            let mut overrides = BTreeMap::new();
+            overrides.insert("attached_sessions".to_string(), attached);
+            overrides
+        };
+        let mut ali = spec("ali", &[1]);
+        ali.overrides = figures(1);
+        let book = build(vec![ali, spec("veli", &[2])]);
+        let usage = TenantUsage::new();
+        let (ali_id, veli_id) = (TenantId::Named(slug("ali")), TenantId::Named(slug("veli")));
+        let both = usage.admit_attached(&book, &[net(1), net(2)], &[]).unwrap();
+        assert_eq!(
+            (usage.attached_of(&ali_id), usage.attached_of(&veli_id)),
+            (1, 1)
+        );
+        let refused = usage
+            .admit_attached(&book, &[net(2), net(1)], &[])
+            .err()
+            .unwrap();
+        assert_eq!(refused.tenant, ali_id);
+        assert_eq!(usage.attached_of(&veli_id), 1, "veli was not charged");
+        let pending = usage.admit_unattached(&book, &[net(2)], &[]).unwrap();
+        assert_eq!(usage.unattached_of(&veli_id), 1);
+        drop(both);
+        drop(pending);
+        assert_eq!(usage.tenants_counted(), 0, "nothing is left behind");
+        // Dropping the guard of a session counts down by one, not to zero.
+        let (a, b) = (
+            usage.admit_attached(&book, &[net(2)], &[]).unwrap(),
+            usage.admit_attached(&book, &[net(2)], &[]).unwrap(),
+        );
+        drop(a);
+        assert_eq!(usage.attached_of(&veli_id), 1);
+        drop(b);
+        assert_eq!(usage.attached_of(&veli_id), 0);
+    }
+
+    #[test]
+    fn a_personal_tenant_is_counted_and_never_refused() {
+        let mut personal = spec("ali", &[1]);
+        personal.class = Class::Personal;
+        let book = build(vec![personal]);
+        let usage = TenantUsage::new();
+        let held: Vec<_> = (0..300)
+            .map(|_| {
+                (
+                    usage.admit_unattached(&book, &[net(1)], &[]).unwrap(),
+                    usage.admit_attached(&book, &[net(1)], &[]).unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(usage.attached_of(&TenantId::Named(slug("ali"))), 300);
+        assert_eq!(usage.unattached_of(&TenantId::Default), 0);
+        drop(held);
+        assert_eq!(usage.tenants_counted(), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn roster_adoptions_per_network_are_metered_by_the_tenants_bucket() {
+        let mut ali = spec("ali", &[1, 2]);
+        ali.overrides = BTreeMap::from([
+            ("roster_adoptions_per_hour".to_string(), 20),
+            ("roster_adoption_burst".to_string(), 5),
+        ]);
+        let book = Arc::new(build(vec![ali, spec("veli", &[3])]));
+        let usage = TenantUsage::new();
+        let quota = RelayQuota {
+            book: Arc::clone(&book),
+            usage: &usage,
+        };
+        for _ in 0..5 {
+            assert!(quota.try_adopt(&net(1)));
+        }
+        assert!(!quota.try_adopt(&net(1)), "the sixth is over the burst");
+        // Another network of the same tenant has its own bucket; so does another tenant.
+        assert!(quota.try_adopt(&net(2)));
+        assert!(quota.try_adopt(&net(3)));
+        // 20 an hour: one token every 180 s.
+        tokio::time::advance(Duration::from_secs(179)).await;
+        assert!(!quota.try_adopt(&net(1)));
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert!(quota.try_adopt(&net(1)));
+        assert!(!quota.try_adopt(&net(1)));
+        // The default tenant has no figures: never refused, nothing kept.
+        for _ in 0..50 {
+            assert!(quota.try_adopt(&net(9)));
+        }
+        assert_eq!(usage.adoptions.lock().unwrap().len(), 3);
+        // A reload that changes the figures makes a new bucket.
+        let mut ali = spec("ali", &[1, 2]);
+        ali.overrides = BTreeMap::from([("roster_adoption_burst".to_string(), 2)]);
+        let reloaded = RelayQuota {
+            book: Arc::new(build(vec![ali])),
+            usage: &usage,
+        };
+        assert!(reloaded.try_adopt(&net(1)) && reloaded.try_adopt(&net(1)));
+        assert!(!reloaded.try_adopt(&net(1)));
+    }
+
+    #[test]
+    fn the_roster_size_figure_is_the_tenants_and_never_above_the_protocol_maximum() {
+        let mut small = spec("ali", &[1]);
+        small.overrides = BTreeMap::from([("roster_kib".to_string(), 4)]);
+        let book = Arc::new(build(vec![small, spec("veli", &[2])]));
+        let usage = TenantUsage::new();
+        let quota = RelayQuota {
+            book,
+            usage: &usage,
+        };
+        assert_eq!(quota.max_roster_bytes(&net(1)), 4 * 1024);
+        assert_eq!(
+            quota.max_roster_bytes(&net(2)),
+            256 * 1024,
+            "the friend default"
+        );
+        assert_eq!(
+            quota.max_roster_bytes(&net(9)),
+            menzil_proto::MAX_DOC_BYTES,
+            "the default tenant has only the protocol maximum"
+        );
+        let mut big = spec("ali", &[1]);
+        big.overrides = BTreeMap::from([("roster_kib".to_string(), 1_024)]);
+        let quota = RelayQuota {
+            book: Arc::new(build(vec![big])),
+            usage: &usage,
+        };
+        assert_eq!(quota.max_roster_bytes(&net(1)), menzil_proto::MAX_DOC_BYTES);
     }
 }

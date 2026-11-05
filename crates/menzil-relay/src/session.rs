@@ -62,10 +62,11 @@ use crate::doc::{self, AcceptOutcome, PendingBases};
 use crate::error::RelayError;
 use crate::forward::{ForwardItem, ForwardOutcome};
 use crate::hello::{
-    HelloRejection, check_hello_admitting, dedup_networks, over_limit, roster_standing,
+    HelloRejection, check_hello_admitting, dedup_networks, over_limit, over_quota, roster_standing,
 };
 use crate::rate::SessionBudget;
 use crate::relay::Relay;
+use crate::tenant::{OverQuota, TenantUnattached};
 
 /// The exact byte length of a Noise `Xx` pattern's message 1: just the
 /// initiator's ephemeral public key (32 bytes for X25519, `DHLEN`), sent
@@ -136,12 +137,56 @@ fn build_welcome(relay: &Relay, session_id: u32, rosters: HashMap<NetworkId, u64
     }
 }
 
-/// The per NodeId admission cap, as a HELLO check (see `check_hello_admitting`): the slot lives
-/// until the session attaches or ends.
-fn admit_node(relay: &Relay, node_id: &NodeId) -> Result<NodeSlot, HelloRejection> {
-    relay.admission.admit_node(*node_id).ok_or_else(|| {
+/// What a session that passed HELLO holds until it attaches or ends: its place in the per NodeId
+/// admission cap and in the unattached counts of its tenants. Dropping it gives both back.
+pub(crate) struct PreAttach {
+    _node: NodeSlot,
+    _tenants: TenantUnattached,
+}
+
+/// The admission steps of a HELLO that is proven and in standing (see `check_hello_admitting`):
+/// the per NodeId cap, then the figures of the tenants of the networks it claimed (MT7, design
+/// 2.3). A tenant at its figure refuses the session before WELCOME in `Ik` (the check runs before
+/// message 2) with `over_quota`, which only a node in standing in that tenant's network ever
+/// hears. The slots live until the session attaches or ends.
+fn admit_session(
+    relay: &Relay,
+    node_id: &NodeId,
+    claimed: &[NetworkId],
+) -> Result<PreAttach, HelloRejection> {
+    let node = relay.admission.admit_node(*node_id).ok_or_else(|| {
         over_limit("too many sessions of this node are waiting to attach; try again shortly")
+    })?;
+    let attached_before = relay
+        .registry
+        .attachment_of(node_id)
+        .map(|attachment| attachment.claimed_networks)
+        .unwrap_or_default();
+    let tenants = relay
+        .usage
+        .admit_unattached(&relay.tenants(), claimed, &attached_before)
+        .map_err(|refused| {
+            note_over_quota(relay, node_id, &refused, "handshake");
+            over_quota(&refused)
+        })?;
+    Ok(PreAttach {
+        _node: node,
+        _tenants: tenants,
     })
+}
+
+/// The operator's line about a tenant that refused a session; one a minute per node.
+fn note_over_quota(relay: &Relay, node_id: &NodeId, refused: &OverQuota, at: &'static str) {
+    if let Some(held_back) = relay.log.admit_node("tenant_over_quota", node_id) {
+        tracing::warn!(
+            node_id = %node_id,
+            tenant = %refused.tenant,
+            quota = ?refused.quota,
+            at,
+            held_back,
+            "a tenant is at its limit, refusing a session"
+        );
+    }
 }
 
 /// Runs the Noise handshake to completion (protocol.md 4.1), then checks
@@ -160,7 +205,7 @@ async fn run_handshake_and_validate(
     mut conn: InboundConnection,
     relay: &Relay,
     session_id: u32,
-) -> Result<(InboundConnection, Transport, NodeId, HelloBody, NodeSlot), RelayError> {
+) -> Result<(InboundConnection, Transport, NodeId, HelloBody, PreAttach), RelayError> {
     let message1 = conn.recv().await?;
     let pattern = detect_pattern(&message1);
     let prologue_bytes = prologue(
@@ -184,7 +229,7 @@ async fn run_handshake_and_validate(
             &relay.rosters,
             &relay.history,
             unix_now(),
-            |node_id| admit_node(relay, node_id),
+            |node_id, claimed| admit_session(relay, node_id, claimed),
         )),
         _ => None,
     };
@@ -211,14 +256,14 @@ async fn run_handshake_and_validate(
                 &relay.rosters,
                 &relay.history,
                 unix_now(),
-                |node_id| admit_node(relay, node_id),
+                |node_id, claimed| admit_session(relay, node_id, claimed),
             );
             (transport, hello, checked)
         }
     };
 
     match checked {
-        Ok((node_id, node_slot)) => Ok((conn, transport, node_id, hello, node_slot)),
+        Ok((node_id, pre_attach)) => Ok((conn, transport, node_id, hello, pre_attach)),
         Err(rejection) => {
             let error_record = Record::Error(ErrorBody {
                 code: rejection.code,
@@ -226,6 +271,13 @@ async fn run_handshake_and_validate(
             });
             if let Ok(bytes) = transport.encrypt_record(&error_record) {
                 let _ = conn.send(bytes).await;
+            }
+            if rejection.code == ErrorCode::OverQuota {
+                // A tenant's figure, not a verdict on the node: it is told to wait.
+                let goaway = Record::Goaway(over_quota_goaway());
+                if let Ok(bytes) = transport.encrypt_record(&goaway) {
+                    let _ = conn.send(bytes).await;
+                }
             }
             // An `Ik` HELLO is now checked before WELCOME is written, so the ERROR follows
             // WELCOME at once. The node writes ATTACH right after WELCOME; closing this
@@ -267,6 +319,28 @@ async fn send_all(conn: &mut InboundConnection, transport: &mut Transport, recor
 
 /// How long a session ended for sending too much is asked to wait before it reconnects.
 const RATE_LIMITED_RETRY_MS: u32 = 60_000;
+
+/// How long a device a tenant's figure turned away is asked to wait before it reconnects.
+const OVER_QUOTA_RETRY_MS: u32 = 60_000;
+
+/// The GOAWAY that follows ERROR `over_quota` (design 2.3).
+fn over_quota_goaway() -> GoawayBody {
+    GoawayBody {
+        reason: "over_quota".to_string(),
+        retry_after_ms: OVER_QUOTA_RETRY_MS,
+    }
+}
+
+/// Tells a session its tenant is at a figure: ERROR `over_quota`, then GOAWAY `over_quota` with
+/// a retry delay, both best effort. The caller ends the session.
+async fn end_over_quota(conn: &mut InboundConnection, transport: &mut Transport, message: &str) {
+    let error = Record::Error(ErrorBody {
+        code: ErrorCode::OverQuota,
+        msg: message.to_string(),
+    });
+    let _ = send_record(conn, transport, error).await;
+    let _ = send_record(conn, transport, Record::Goaway(over_quota_goaway())).await;
+}
 
 /// Tells a session it is ending for sending too much: ERROR `rate_limited`, then GOAWAY
 /// `rate_limited` with a retry delay, both best effort. The caller ends the session.
@@ -353,6 +427,7 @@ async fn dispatch(
                 claimed_networks,
                 unix_now(),
                 &mut budget.docs,
+                &relay.roster_quota(),
                 relay.log.about(node_id),
             );
             // A transfer the relay could not use (invalid, forged, for a network the session did
@@ -366,7 +441,9 @@ async fn dispatch(
                 AcceptOutcome::Invalid | AcceptOutcome::Dropped(_) | AcceptOutcome::OverRate => {
                     budget.note_unadopted()
                 }
-                AcceptOutcome::OverRateClaimed(_) => budget.note_over_rate(),
+                AcceptOutcome::OverRateClaimed(_) | AcceptOutcome::OverQuota(_) => {
+                    budget.note_over_rate()
+                }
                 _ => false,
             };
             match outcome {
@@ -379,6 +456,16 @@ async fn dispatch(
                     let error = Record::Error(ErrorBody {
                         code: ErrorCode::TooLarge,
                         msg: "DOC transfer exceeded the size limit".to_string(),
+                    });
+                    let _ = send_record(conn, transport, error).await;
+                }
+                // The tenant's Roster adoptions of this network are used up (design 2.3): the
+                // node is told, and tries again on its next attach or push. Only a claimed,
+                // served network of the session gets here, so it tells a stranger nothing.
+                AcceptOutcome::OverQuota(_) => {
+                    let error = Record::Error(ErrorBody {
+                        code: ErrorCode::OverQuota,
+                        msg: "this relay's limit on Roster updates for your network is reached; try again later".to_string(),
                     });
                     let _ = send_record(conn, transport, error).await;
                 }
@@ -643,7 +730,7 @@ async fn run_attached_loop(
     relay: &Relay,
     claimed_networks: Vec<NetworkId>,
     their_roster_seq: HashMap<NetworkId, u64>,
-    node_slot: NodeSlot,
+    pre_attach: PreAttach,
     ip_slot: IpSlot,
 ) {
     // Listening before judging, so a Roster adopted between the two is heard; HELLO was judged
@@ -717,13 +804,13 @@ async fn run_attached_loop(
     }
 
     conn.limit_sends_until(None);
-    // Attached sessions are capped in all. A NodeId that is attached already replaces its old
-    // session and is let in (the old one is told to leave right below); the registry takes the
-    // place over, so the count is the number of registrations, not of session tasks.
-    let Some(attached_slot) = relay
-        .admission
-        .admit_attached(relay.registry.attachment_of(&node_id).is_some())
-    else {
+    // Attached sessions are capped in all, and per tenant (MT7). A NodeId that is attached
+    // already replaces its old session and is let in (the old one is told to leave right
+    // below); the registry takes the place over, so the count is the number of registrations,
+    // not of session tasks. The tenant count is taken here, the moment it can be exact; the
+    // HELLO only kept a full tenant from handshaking.
+    let previous = relay.registry.attachment_of(&node_id);
+    let Some(attached_slot) = relay.admission.admit_attached(previous.is_some()) else {
         if let Some(held_back) = relay.log.admit_node("attach_cap", &node_id) {
             tracing::warn!(session_id, node_id = %node_id, held_back, "relay is at its attached session cap, refusing ATTACH");
         }
@@ -734,8 +821,21 @@ async fn run_attached_loop(
         let _ = send_record(&mut conn, &mut transport, error).await;
         return;
     };
+    let replacing = previous.map(|a| a.claimed_networks).unwrap_or_default();
+    let tenant_slot =
+        match relay
+            .usage
+            .admit_attached(&relay.tenants(), &claimed_networks, &replacing)
+        {
+            Ok(slot) => slot,
+            Err(refused) => {
+                note_over_quota(relay, &node_id, &refused, "attach");
+                end_over_quota(&mut conn, &mut transport, refused.message()).await;
+                return;
+            }
+        };
     // From here on the session counts as attached, no longer as waiting to.
-    drop(node_slot);
+    drop(pre_attach);
     drop(ip_slot);
 
     tracing::info!(session_id, node_id = %node_id, "relay session attached");
@@ -744,6 +844,7 @@ async fn run_attached_loop(
         session_id,
         claimed_networks.clone(),
         Some(attached_slot),
+        Some(tenant_slot),
     );
     // A freshly attached session starts with no inherited label claims
     // — see `crate::advertise::LabelRegistry::clear_for`'s doc comment
@@ -919,7 +1020,7 @@ pub(crate) async fn handle_connection(
         }
     };
     match handshake {
-        Ok((conn, transport, node_id, hello, node_slot)) => {
+        Ok((conn, transport, node_id, hello, pre_attach)) => {
             // The NodeCert was verified by `check_hello`; this reads the serial it judged.
             let Ok(cert) = hello.node_cert.decode() else {
                 tracing::warn!(
@@ -937,7 +1038,7 @@ pub(crate) async fn handle_connection(
                 &relay,
                 dedup_networks(&hello.networks),
                 hello.roster_seq,
-                node_slot,
+                pre_attach,
                 ip_slot,
             )
             .await;

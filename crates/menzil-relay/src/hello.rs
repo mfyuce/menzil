@@ -197,7 +197,7 @@ fn validate_against_rosters<T>(
     cert_serial: u32,
     rosters: &RosterStore,
     history: &NodeHistory,
-    admit: impl FnOnce(&NodeId) -> Result<T, HelloRejection>,
+    admit: impl FnOnce(&NodeId, &[NetworkId]) -> Result<T, HelloRejection>,
 ) -> Result<T, HelloRejection> {
     // Repeats dropped and the count capped before the first look at the store: the work below
     // is then at most MAX_HELLO_NETWORKS lookups however the HELLO was padded.
@@ -224,7 +224,7 @@ fn validate_against_rosters<T>(
     // The caller's admission caps (`crate::admission`) apply to a NodeId that is proven and in
     // standing, and before the history is written: a refused HELLO leaves no mark, so the same
     // node can retry at once.
-    let admitted = admit(&node_id)?;
+    let admitted = admit(&node_id, &claimed)?;
 
     history
         .check_and_record_retaining(node_id, cert_serial, hello.timestamp, |id| {
@@ -255,7 +255,7 @@ pub fn check_hello(
     history: &NodeHistory,
     now: u64,
 ) -> Result<NodeId, HelloRejection> {
-    check_hello_admitting(hello, node_static, rosters, history, now, |_| Ok(()))
+    check_hello_admitting(hello, node_static, rosters, history, now, |_, _| Ok(()))
         .map(|(node_id, ())| node_id)
 }
 
@@ -269,7 +269,7 @@ pub(crate) fn check_hello_admitting<T>(
     rosters: &RosterStore,
     history: &NodeHistory,
     now: u64,
-    admit: impl FnOnce(&NodeId) -> Result<T, HelloRejection>,
+    admit: impl FnOnce(&NodeId, &[NetworkId]) -> Result<T, HelloRejection>,
 ) -> Result<(NodeId, T), HelloRejection> {
     let cert_body = verify_node_cert(hello, node_static, now)?;
     let admitted = validate_against_rosters(
@@ -281,6 +281,13 @@ pub(crate) fn check_hello_admitting<T>(
         admit,
     )?;
     Ok((cert_body.node_id, admitted))
+}
+
+/// The refusal for a session that would take its tenant over a figure (`over_quota`, design
+/// 2.3). Only a proven NodeId in standing in the networks it claimed is ever told this (the
+/// admission step runs after the Roster checks), so it says nothing a stranger could use.
+pub(crate) fn over_quota(refused: &crate::tenant::OverQuota) -> HelloRejection {
+    reject(ErrorCode::OverQuota, refused.message())
 }
 
 /// The refusal for a NodeId that has too many sessions waiting to ATTACH, or a relay with too
@@ -627,7 +634,7 @@ mod tests {
             &rosters,
             &history,
             500,
-            |_| Err(over_limit("full")),
+            |_, _| Err(over_limit("full")),
         );
         assert_eq!(refused.unwrap_err().code, ErrorCode::RateLimited);
         assert!(history.is_empty());
@@ -638,7 +645,7 @@ mod tests {
                 &rosters,
                 &history,
                 500,
-                |_| { Ok(()) }
+                |_, _| { Ok(()) }
             )
             .is_ok(),
             "the same HELLO is accepted once there is room"
@@ -654,7 +661,7 @@ mod tests {
             &rosters,
             &history,
             500,
-            |_| {
+            |_, _| {
                 asked = true;
                 Ok(())
             },
