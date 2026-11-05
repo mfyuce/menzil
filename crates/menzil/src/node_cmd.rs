@@ -836,7 +836,9 @@ pub async fn start(home: &Home, config: &Config, socket: &Path) -> Result<Runnin
         tokio::spawn(async move {
             let mut last: HashMap<NetworkId, u64> = HashMap::new();
             loop {
-                tokio::time::sleep(RELOAD_EVERY).await;
+                let every = crate::cert_renew::test_knob("RELOAD_EVERY")
+                    .map_or(RELOAD_EVERY, Duration::from_secs);
+                tokio::time::sleep(every).await;
                 let mut adopted = Vec::new();
                 match reload_adopting(
                     &home,

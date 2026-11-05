@@ -186,7 +186,8 @@ pub async fn run(renewer: Arc<CertRenewer>) {
             tracing::warn!(network = %network, "{text}");
             eprintln!("warning: {text}");
         }
-        tokio::time::sleep(Duration::from_secs(CHECK_EVERY_SECS)).await;
+        let every = cert_renew::test_knob("CHECK_EVERY").unwrap_or(CHECK_EVERY_SECS);
+        tokio::time::sleep(Duration::from_secs(every.max(1))).await;
     }
 }
 

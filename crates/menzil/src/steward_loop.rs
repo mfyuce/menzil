@@ -612,7 +612,8 @@ pub async fn run(
                 }
             }
         }
-        tokio::time::sleep(POLL).await;
+        let poll = crate::cert_renew::test_knob("POLL").map_or(POLL, Duration::from_secs);
+        tokio::time::sleep(poll).await;
     }
 }
 

@@ -34,10 +34,27 @@ pub const ROTATE_MIN_EXTENSION: u64 = 30 * DAY;
 /// A steward issues at most one rotation pair per network in this long, in seconds.
 pub const ROTATE_EVERY: u64 = 60 * 60;
 
+/// A timing the live tests shorten (cert-rotation design S8): the value of the environment
+/// variable `MENZIL_TEST_<name>` in seconds, read by debug builds only (`cargo test` builds
+/// them; a release build never looks), `None` when it is not set or not a number. The names in
+/// use: `RENEW_WITHIN` (this module's [`RENEW_WITHIN`]), `CHECK_EVERY` ([`CHECK_EVERY_SECS`]),
+/// `POLL` (the steward loop's look) and `RELOAD_EVERY` (the node's reload of the documents).
+/// Not part of the command line or the configuration, and not documented for users.
+pub fn test_knob(name: &str) -> Option<u64> {
+    if !cfg!(debug_assertions) {
+        return None;
+    }
+    std::env::var(format!("MENZIL_TEST_{name}"))
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
+}
+
 /// Whether the node renews its own certificate: the file's `not_after` is within
 /// [`RENEW_WITHIN`] of `now`, or past.
 pub fn renew_due(not_after: u64, now: u64) -> bool {
-    not_after.saturating_sub(now) <= RENEW_WITHIN
+    not_after.saturating_sub(now) <= test_knob("RENEW_WITHIN").unwrap_or(RENEW_WITHIN)
 }
 
 /// The highest serial of `node` among the certificates `policy` lists (the Policy's certificates
