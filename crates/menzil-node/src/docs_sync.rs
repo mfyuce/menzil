@@ -97,12 +97,18 @@ pub struct SyncConfig {
     /// The longest random wait before a fetch of the Policy that follows a newer Roster, and
     /// before the first expiry check after the node starts. Default [`POLICY_JITTER_MAX`].
     pub policy_jitter_max: Duration,
+    /// The waits between the tries at pushing this node's renewed certificate on one session
+    /// when a try fails (the stream could not be opened, the exchange broke or the peer refused
+    /// it), in order; after the last the session is given up on until the next one. Default
+    /// [`PUSH_RETRY`], the schedule of an issuer's push.
+    pub cert_push_retry: [Duration; 4],
 }
 
 impl Default for SyncConfig {
     fn default() -> Self {
         Self {
             policy_jitter_max: POLICY_JITTER_MAX,
+            cert_push_retry: PUSH_RETRY,
         }
     }
 }
@@ -399,6 +405,50 @@ pub(crate) async fn push_to_members<P: MemberPusher + Sync>(
     report
 }
 
+/// What one try at pushing this node's certificate came to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CertTry {
+    /// The peer answered (whatever it made of the certificate: the answer is always the same,
+    /// so nothing more can be learned or done from this side).
+    Done,
+    /// Nothing to push (the held Policy lists the serial, or there is nothing to compare with).
+    NotNeeded,
+    /// The stream could not be opened, the exchange broke or the peer refused it: try again
+    /// after the next wait.
+    Failed,
+}
+
+/// Pushes a certificate with retries (cert rotation round B, L3): `attempt` is run, and after a
+/// [`CertTry::Failed`] again after each wait of `retry` in turn (the wait counted from the failed
+/// try), as long as `alive` says the session is still the one in use; then it is given up on.
+/// Returns how many tries were made.
+pub(crate) async fn push_cert_retrying<A, Fut>(
+    retry: &[Duration],
+    mut attempt: A,
+    alive: impl Fn() -> bool,
+) -> usize
+where
+    A: FnMut() -> Fut,
+    Fut: Future<Output = CertTry>,
+{
+    let mut waits = retry.iter();
+    let mut tries = 0;
+    loop {
+        tries += 1;
+        match attempt().await {
+            CertTry::Done | CertTry::NotNeeded => return tries,
+            CertTry::Failed => {}
+        }
+        let Some(wait) = waits.next() else {
+            return tries;
+        };
+        tokio::time::sleep(*wait).await;
+        if !alive() {
+            return tries;
+        }
+    }
+}
+
 /// Whether a failed session attempt is worth another try later.
 pub(crate) fn step_for_ensure_error(error: EnsureError) -> PushStep {
     match error {
@@ -529,6 +579,25 @@ pub struct DocsSync {
     identity: Option<IdentityCell>,
     /// The `node_cert` candidates other nodes pushed to this one.
     candidates: Arc<CertCandidates>,
+    /// The live sessions (ids from `register_as`) with a `node_cert` push running, so that the
+    /// push at the start of a session and one after a renewal never run side by side.
+    cert_pushing: Mutex<HashSet<u64>>,
+}
+
+/// Takes a session out of [`DocsSync::cert_pushing`] when its push ends, however it ends.
+struct CertPushGuard<'a> {
+    sync: &'a DocsSync,
+    session: u64,
+}
+
+impl Drop for CertPushGuard<'_> {
+    fn drop(&mut self) {
+        self.sync
+            .cert_pushing
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.session);
+    }
 }
 
 /// Removes a network from [`DocsSync::catching_up`] when its round ends, however it ends.
@@ -571,6 +640,7 @@ impl DocsSync {
             catching_up: Mutex::default(),
             pushes: Mutex::default(),
             push_tick: watch::channel(0).0,
+            cert_pushing: Mutex::default(),
         })
     }
 
@@ -758,12 +828,49 @@ impl DocsSync {
         }
     }
 
-    /// The `node_cert` push of a full session, once: nothing when the held Policy lists this
-    /// node's current serial. Failures are only logged; the next session tries again.
-    pub(crate) async fn push_node_cert(&self, handle: &L4SessionHandle) {
+    /// The `node_cert` push of a full session (`session`, the id `register_as` gave it): nothing
+    /// when the held Policy lists this node's current serial. A try that fails (no stream, a
+    /// broken exchange, a refusal such as `rate_limited` from a busy steward) is repeated after
+    /// each wait of [`SyncConfig::cert_push_retry`] while the session lives and the serial is
+    /// still unlisted (round B, L3). One push per session at a time; a second request while one
+    /// runs returns at once (the running one pushes whatever the certificate is by then).
+    pub(crate) async fn push_node_cert(&self, handle: &L4SessionHandle, session: u64) {
+        let _guard = {
+            let mut pushing = self.cert_pushing.lock().unwrap_or_else(|e| e.into_inner());
+            if !pushing.insert(session) {
+                return;
+            }
+            CertPushGuard {
+                sync: self,
+                session,
+            }
+        };
+        let (peer, network_id) = (handle.peer(), handle.network_id());
+        let tries = push_cert_retrying(
+            &self.config.cert_push_retry,
+            || self.push_node_cert_once(handle),
+            || self.session_is_live(session),
+        )
+        .await;
+        if tries > 1 {
+            tracing::debug!(%peer, network = %network_id, tries, "pushed our node_cert after retrying");
+        }
+    }
+
+    /// Whether the session `id` (from `register_as`) is still noted as live.
+    fn session_is_live(&self, id: u64) -> bool {
+        self.live
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .any(|entry| entry.id == id)
+    }
+
+    /// One try of [`Self::push_node_cert`].
+    async fn push_node_cert_once(&self, handle: &L4SessionHandle) -> CertTry {
         let network_id = handle.network_id();
         let Some(cert) = self.node_cert_to_push(network_id) else {
-            return;
+            return CertTry::NotNeeded;
         };
         let peer = handle.peer();
         let params = params(network_id);
@@ -771,7 +878,7 @@ impl DocsSync {
             Ok(stream) => stream,
             Err(error) => {
                 tracing::debug!(%peer, %error, "opening a stream to push a node_cert failed");
-                return;
+                return CertTry::Failed;
             }
         };
         match push_with_cert(&mut stream, &Default::default(), Some(&cert), &params).await {
@@ -779,14 +886,47 @@ impl DocsSync {
                 let _ = stream.close().await;
                 if result.code.is_some() {
                     tracing::warn!(%peer, code = ?result.code, "a peer refused our node_cert");
+                    CertTry::Failed
                 } else {
                     tracing::debug!(%peer, "pushed our node_cert");
+                    CertTry::Done
                 }
             }
             Err(error) => {
                 stream.reset();
                 tracing::debug!(%peer, %error, "pushing a node_cert failed");
+                CertTry::Failed
             }
+        }
+    }
+
+    /// After a renewal (cert rotation S6): starts the `node_cert` push on every session that is
+    /// live now, for the networks whose held Policy does not list the new serial. Sessions that
+    /// come up later push by themselves.
+    pub fn push_node_cert_to_live(self: &Arc<Self>) {
+        let mut sessions: Vec<(NodeId, NetworkId, u64)> = Vec::new();
+        for ((peer, network_id, _), entry) in
+            self.live.lock().unwrap_or_else(|e| e.into_inner()).iter()
+        {
+            if self.node_cert_to_push(*network_id).is_some()
+                && !sessions
+                    .iter()
+                    .any(|(p, n, _)| p == peer && n == network_id)
+            {
+                sessions.push((*peer, *network_id, entry.id));
+            }
+        }
+        for (peer, network_id, id) in sessions {
+            let sync = Arc::clone(self);
+            tokio::spawn(async move {
+                // The session in use for this peer, found, not made.
+                match sync.router.ensure_session(peer, network_id).await {
+                    Ok(handle) => sync.push_node_cert(&handle, id).await,
+                    Err(error) => {
+                        tracing::debug!(%peer, %error, "no session to push a renewed node_cert over");
+                    }
+                }
+            });
         }
     }
 

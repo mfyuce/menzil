@@ -716,7 +716,9 @@ async fn sleep_until_unix(at: Option<u64>) {
 /// * the Roster's and the Policy's `expires` (`has_grant` fails from then on),
 /// * the second after the `not_after` of the certificate a live peer's session key is vouched
 ///   for by (valid while `now <= not_after`); `peers` also carries this node itself (its own
-///   certificate in the Policy is part of its standing, round 11 N1).
+///   certificate in the Policy is part of its standing, round 11 N1),
+/// * the `not_before` of a certificate of such a peer that outranks that one and is not valid
+///   yet: from then on it is the certificate that counts (cert rotation round A, N1).
 ///
 /// `None` when nothing lies ahead. A certificate that is already gone or cannot be resolved has
 /// no future instant: the pass that finds it closes the session.
@@ -729,10 +731,16 @@ pub(crate) fn next_deadline(
 ) -> Option<u64> {
     let grants = policy.grants.iter().filter_map(|grant| grant.expires);
     let documents = [roster.expires, policy.expires];
-    let certs = peers.iter().filter_map(|(peer, peer_static)| {
-        certs
-            .resolve(peer, peer_static, now)
-            .and_then(|cert| cert.not_after.checked_add(1))
+    // For each peer: the end of the certificate that backs it, and the start of any certificate
+    // above that one that is not valid yet (it takes over then, and with another key the
+    // session ends; round A N1).
+    let certs = peers.iter().flat_map(|(peer, peer_static)| {
+        let mut instants = Vec::new();
+        if let Some(cert) = certs.resolve(peer, peer_static, now) {
+            instants.extend(cert.not_after.checked_add(1));
+            instants.extend(certs.takes_over_after(peer, &cert, now));
+        }
+        instants
     });
     grants
         .chain(documents)
@@ -754,6 +762,7 @@ mod tests {
         policy: PolicyBody,
         peer: NodeId,
         peer_static: X25519PublicKey,
+        peer_key: SigningKey,
     }
 
     fn fixture(not_after: u64) -> Fixture {
@@ -802,7 +811,24 @@ mod tests {
             policy,
             peer,
             peer_static,
+            peer_key,
         }
+    }
+
+    /// A certificate of the fixture's peer, signed by it, with `serial`, `key` and the window.
+    fn peer_cert(f: &Fixture, serial: u32, key: u8, window: (u64, u64)) -> NodeCert {
+        NodeCert::sign(
+            &f.peer_key,
+            &NodeCertBody {
+                v: PROTOCOL_VERSION,
+                node_id: f.peer,
+                x25519_pub: X25519PublicKey::from([key; 32]),
+                serial,
+                not_before: window.0,
+                not_after: window.1,
+            },
+        )
+        .unwrap()
     }
 
     /// `next_deadline` for the fixture, with the index of its certificates.
@@ -876,6 +902,61 @@ mod tests {
         assert_eq!(deadline_of(&f, &other, 100), Some(5_000));
         // Past its end the certificate resolves no more: the pass closes the session.
         assert_eq!(deadline_of(&f, &peers, 401), Some(5_000));
+    }
+
+    #[test]
+    fn a_higher_serial_certificate_that_starts_later_is_a_deadline() {
+        // Round A N1: serial 2 (another key) starts at 300, before serial 1 ends at 400.
+        let mut f = fixture(400);
+        let peers = [(f.peer, f.peer_static)];
+        f.policy.certs.push(peer_cert(&f, 2, 9, (300, 900)));
+        assert_eq!(deadline_of(&f, &peers, 100), Some(300));
+        // The same key: still a moment to look again.
+        let mut g = fixture(400);
+        g.policy.certs.push(peer_cert(&g, 2, 7, (300, 900)));
+        assert_eq!(deadline_of(&g, &[(g.peer, g.peer_static)], 100), Some(300));
+        // From its start the higher certificate backs the peer (same key), and its end counts.
+        assert_eq!(deadline_of(&g, &[(g.peer, g.peer_static)], 300), Some(901));
+    }
+
+    #[test]
+    fn a_certificate_that_does_not_outrank_or_is_not_signed_is_no_deadline() {
+        let mut f = fixture(400);
+        let peers = [(f.peer, f.peer_static)];
+        // A lower serial starting later never takes over.
+        let mut lower = fixture(400);
+        lower.policy.certs = vec![
+            peer_cert(&lower, 5, 7, (0, 400)),
+            peer_cert(&lower, 2, 9, (300, 900)),
+        ];
+        assert_eq!(
+            deadline_of(&lower, &[(lower.peer, lower.peer_static)], 100),
+            Some(401)
+        );
+        // A higher serial signed by somebody else is nobody's certificate.
+        let stranger = SigningKey::generate(&mut rand::rng());
+        let forged = NodeCert::sign(
+            &stranger,
+            &NodeCertBody {
+                v: PROTOCOL_VERSION,
+                node_id: f.peer,
+                x25519_pub: X25519PublicKey::from([9u8; 32]),
+                serial: 2,
+                not_before: 300,
+                not_after: 900,
+            },
+        )
+        .unwrap();
+        f.policy.certs.push(forged);
+        assert_eq!(deadline_of(&f, &peers, 100), Some(401));
+        // One that started already is not ahead.
+        let mut started = fixture(400);
+        started.policy.certs.push(peer_cert(&started, 2, 9, (50, 900)));
+        assert_eq!(
+            deadline_of(&started, &[(started.peer, started.peer_static)], 100),
+            Some(5_000),
+            "the old key resolves no more, so the pass closes its session"
+        );
     }
 
     #[test]

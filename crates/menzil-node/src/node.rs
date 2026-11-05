@@ -358,6 +358,19 @@ impl Node {
         self.identity.set(cert, now)
     }
 
+    /// This node's own certificate as it is now (after a renewal, the new one).
+    pub fn own_cert(&self) -> menzil_proto::NodeCert {
+        self.identity.get().node_cert.clone()
+    }
+
+    /// After a renewal ([`Self::renew_identity`]): starts offering the new certificate to the
+    /// peers of the sessions that are live now, for the networks whose held Policy does not list
+    /// its serial (cert rotation S6; a session that comes up later offers it by itself). Must
+    /// be called inside a Tokio runtime; returns at once.
+    pub fn announce_renewed_cert(&self) {
+        self.sync.push_node_cert_to_live();
+    }
+
     /// The renewed certificates peers pushed to this node, one per member, that the held
     /// Policy of `network` does not list yet (cert rotation S5). Empty unless this node was told
     /// it holds a steward key for the network ([`Self::set_candidate_holder`]).
@@ -687,10 +700,11 @@ pub(crate) fn serve_session<H>(
             );
             (Arc::clone(sync), id)
         });
-        if let Some((sync, _)) = &live {
-            // Once per session, from either role: the initiator compares seqs and then, if its
+        if let Some((sync, session_id)) = &live {
+            // From either role: the initiator compares seqs and then, if its
             // certificate is not listed, offers it; the responder only offers it.
             let sync = Arc::clone(sync);
+            let session_id = *session_id;
             let initiator = role == Role::Initiator;
             let handle = handle.clone();
             tokio::spawn(async move {
@@ -698,7 +712,7 @@ pub(crate) fn serve_session<H>(
                     sync.reconcile(handle.clone(), peer_roster_seq, peer_policy_seq)
                         .await;
                 }
-                sync.push_node_cert(&handle).await;
+                sync.push_node_cert(&handle, session_id).await;
             });
         }
         tokio::spawn(async move {

@@ -93,6 +93,39 @@ impl CertIndex {
     }
 }
 
+impl CertIndex {
+    /// The instants after `now` at which a certificate of `node_id` that outranks `current`
+    /// (by [`NodeCertBody::rank`]) starts to be valid, and with it starts to be the one that
+    /// backs the node: a higher serial certificate whose `not_before` lies ahead takes over from
+    /// `current` then (and, with another key, ends the sessions on the old key; round A N1).
+    /// Only certificates that are self signed count. Unordered.
+    pub(crate) fn takes_over_after(
+        &self,
+        node_id: &NodeId,
+        current: &NodeCertBody,
+        now: u64,
+    ) -> Vec<u64> {
+        self.by_node
+            .get(node_id)
+            .into_iter()
+            .flatten()
+            .filter(|entry| {
+                entry.body.rank() > current.rank()
+                    && entry.body.not_before > now
+                    && entry.body.not_before <= entry.body.not_after
+                    && signed_by_its_node(&entry.cert, &entry.body)
+            })
+            .map(|entry| entry.body.not_before)
+            .collect()
+    }
+}
+
+/// Whether `cert` carries a valid signature by the key its own `node_id` names.
+fn signed_by_its_node(cert: &NodeCert, body: &NodeCertBody) -> bool {
+    VerifyingKey::from_bytes(&<[u8; 32]>::from(body.node_id))
+        .is_ok_and(|key| cert.verify(&key).is_ok())
+}
+
 /// `body` (the decoded form of `cert`) when `cert` is signed by the key its own `node_id`
 /// names and is valid at `now`.
 pub(crate) fn verify_decoded(

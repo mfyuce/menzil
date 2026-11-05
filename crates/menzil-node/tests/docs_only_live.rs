@@ -72,6 +72,7 @@ async fn a_member_offline_at_issue_time_learns_the_policy_from_the_new_member_an
     // A day of jitter: the Policy cannot reach X through the ordinary fetch during the test.
     let no_fetch = SyncConfig {
         policy_jitter_max: Duration::from_secs(86_400),
+        ..SyncConfig::default()
     };
 
     let app = TcpListener::bind("127.0.0.1:0").await.unwrap();

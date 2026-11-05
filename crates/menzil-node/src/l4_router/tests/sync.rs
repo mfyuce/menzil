@@ -24,6 +24,7 @@ pub(super) fn sync_for(node: &TestNode, party: &Party, stores: &Stores) -> Arc<D
         party.id,
         SyncConfig {
             policy_jitter_max: Duration::ZERO,
+            ..SyncConfig::default()
         },
         None,
     )
@@ -60,6 +61,7 @@ pub(super) fn sync_renewed(
         party.id,
         SyncConfig {
             policy_jitter_max: Duration::ZERO,
+            ..SyncConfig::default()
         },
         Some(crate::IdentityCell::new(crate::LocalIdentity {
             node_cert: cert.clone(),

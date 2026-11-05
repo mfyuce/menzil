@@ -62,6 +62,7 @@ async fn a_newer_pair_reaches_the_other_node_through_the_relay_and_l4_without_a_
     let (b_policies, b_rosters) = held();
     let no_jitter = SyncConfig {
         policy_jitter_max: Duration::ZERO,
+        ..SyncConfig::default()
     };
     let start = |id: &common::Identity, policies: &Arc<PolicyStore>, rosters: &Arc<RosterStore>| {
         Node::start_with_sync(

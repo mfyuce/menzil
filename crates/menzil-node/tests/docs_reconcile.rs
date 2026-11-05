@@ -63,6 +63,7 @@ async fn a_node_behind_fetches_at_the_handshake_what_its_peer_holds() {
     // The Policy fetch after a newer Roster would wait up to a day: the test is over long before.
     let no_jitter = SyncConfig {
         policy_jitter_max: Duration::from_secs(86_400),
+        ..SyncConfig::default()
     };
     let start = |id: &common::Identity, policies: &Arc<PolicyStore>, rosters: &Arc<RosterStore>| {
         Node::start_with_sync(
