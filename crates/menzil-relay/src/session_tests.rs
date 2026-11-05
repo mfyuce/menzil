@@ -5329,3 +5329,52 @@ async fn an_evicted_senders_queued_data_is_not_delivered_to_the_destination() {
     );
     assert!(relay.forwarding.counts_are_empty());
 }
+
+// ---- MT9: names per tenant over a real session ----
+
+/// ADVERTISE over a session: the share lands in the zone of the tenant that owns the network
+/// the label came from, the ACK names the full name (`names`), and the durable state records it.
+#[tokio::test]
+async fn advertise_over_a_session_names_the_tenant_zone() {
+    let (relay, listener, cert, relay_x25519) = bind_test_relay().await;
+    let addr = listener.local_addr().unwrap();
+    let owner = SigningKey::generate(&mut rand::rng());
+    let network_id = NetworkId::from(owner.verifying_key().to_bytes());
+    let identity = generate_identity();
+    relay
+        .rosters()
+        .set(&roster_with_label(
+            &owner,
+            network_id,
+            identity.node_id,
+            "example",
+        ))
+        .unwrap();
+    relay.set_tenants(friend_book(&[("ali", &[network_id], &[])]));
+    let serve_relay = relay.clone();
+    tokio::spawn(async move { serve_relay.serve(&listener).await });
+
+    let (mut client, _) = TestClient::connect(
+        addr,
+        cert,
+        &identity,
+        relay_x25519,
+        vec![network_id],
+        HashMap::new(),
+        1,
+        10,
+    )
+    .await;
+    client.send(Record::Attach).await;
+    let _ = client.recv_roster_doc().await;
+    client.send(advertise_one("example")).await;
+    match client.recv().await {
+        Some(Record::AdvertiseAck(ack)) => {
+            assert_eq!(ack.accepted, vec!["example"]);
+            assert_eq!(ack.names, vec!["example.ali"]);
+            assert!(ack.rejected.is_empty());
+        }
+        other => panic!("expected an ADVERTISE_ACK, got {other:?}"),
+    }
+    assert!(relay.labels().state().names.contains_key("example.ali"));
+}

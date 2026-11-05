@@ -554,6 +554,48 @@ impl RosterStore {
             .collect()
     }
 
+    /// Like [`Self::labels_granted_to`], but each label with the networks (in the order of
+    /// `networks`) whose Roster grants it to `node_id`: the relay composes a full name from the
+    /// label and the tenant of the granting network (multi tenant design 2.2, rule 2 and 6).
+    pub fn labels_granted_by(
+        &self,
+        networks: &[NetworkId],
+        node_id: &NodeId,
+    ) -> HashMap<String, Vec<NetworkId>> {
+        let guard = self.by_network.read().unwrap();
+        let mut granted: HashMap<String, Vec<NetworkId>> = HashMap::new();
+        for id in networks {
+            let Some(held) = guard.get(id) else { continue };
+            if !held.index.is_unrevoked_member(node_id) {
+                continue;
+            }
+            for label in held.body.labels.iter().filter(|l| &l.node_id == node_id) {
+                let granters = granted.entry(label.name.to_ascii_lowercase()).or_default();
+                if !granters.contains(id) {
+                    granters.push(*id);
+                }
+            }
+        }
+        granted
+    }
+
+    /// Every label any held Roster lists (for any node), lowercase, with the networks that list
+    /// it: what the periodic name pass asks to see whether a Roster still carries a name
+    /// (protocol.md 4.4: "released by an owner signed Roster that drops it").
+    pub fn label_index(&self) -> HashMap<String, Vec<NetworkId>> {
+        let guard = self.by_network.read().unwrap();
+        let mut index: HashMap<String, Vec<NetworkId>> = HashMap::new();
+        for (id, held) in guard.iter() {
+            for label in &held.body.labels {
+                let networks = index.entry(label.name.to_ascii_lowercase()).or_default();
+                if !networks.contains(id) {
+                    networks.push(*id);
+                }
+            }
+        }
+        index
+    }
+
     /// The networks among `src_claimed` (`src`'s HELLO `networks`) whose Roster this relay holds,
     /// that is not yet expired at `now`, and that lists both `src` and `dst` as current,
     /// unrevoked members (protocol.md 4.2's forwarding rule: "`src` and `dst` are both listed and

@@ -543,9 +543,14 @@ async fn dispatch(
                 });
                 let _ = send_record(conn, transport, error).await;
             } else if relay.registry.is_current(node_id, session_id) {
-                let ack = relay
-                    .labels
-                    .advertise(&relay.rosters, claimed_networks, node_id, &body);
+                let ack = relay.labels.advertise(
+                    &relay.rosters,
+                    &relay.tenants(),
+                    claimed_networks,
+                    node_id,
+                    &body,
+                    unix_now(),
+                );
                 let _ = send_record(conn, transport, Record::AdvertiseAck(ack)).await;
             } else {
                 tracing::debug!(
@@ -891,7 +896,7 @@ async fn run_attached_loop(
     // session)", not to the NodeId across reconnects — an opus red team
     // review's finding H2): `node_id` needs clearing in both its possible
     // roles, see `ForwardTable::clear_for`'s own doc comment for why.
-    relay.labels.clear_for(&node_id);
+    relay.labels.clear_for(&node_id, unix_now());
     relay.forwarding.clear_for(&node_id);
 
     // Attach-time catch-up (protocol.md 4.3, extended — see `crate::doc`'s
@@ -1038,7 +1043,7 @@ async fn run_attached_loop(
     if relay.registry.detach_then(&node_id, session_id, || {
         relay.forwarding.clear_for(&node_id)
     }) {
-        relay.labels.clear_for(&node_id);
+        relay.labels.clear_for(&node_id, unix_now());
     }
 }
 

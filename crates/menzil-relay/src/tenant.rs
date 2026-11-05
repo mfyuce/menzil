@@ -13,8 +13,9 @@
 //! counters of attached and unattached sessions per tenant and of Roster adoptions per network.
 //! The counters are RAII guards like `crate::admission`'s slots: a count given out is given back
 //! when the guard is dropped, on every path and when a task is cancelled. A tenant of the
-//! `personal` class has no figures and is never refused (it is still counted). Nothing here
-//! refuses a name or a forwarding pair yet (MT8, MT9), and nothing reads a file: the relay binary
+//! `personal` class has no figures and is never refused (it is still counted). The data plane
+//! figures are enforced by `crate::forward` (MT8) and the name figures by `crate::advertise`
+//! with `crate::names` (MT9); nothing here reads a file: the relay binary
 //! loads the tenant files and hands the specs over (`menzil::relay_cmd`).
 
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -195,7 +196,7 @@ macro_rules! figures {
         /// The per tenant figures of a class (design 2.3), in the units the tenant file uses
         /// (the key names say which). Enforced so far: the session figures and the Roster figures
         /// (MT7) and the data plane figures (MT8: pairs, destinations, droppable bytes, bandwidth,
-        /// burst, volume, floor); the name figures follow (MT9).
+        /// burst, volume, floor) and the name figures (MT9: `names`, `new_names_per_week`).
         #[derive(Debug, Clone, Copy, PartialEq, Eq)]
         pub struct Figures {
             $($(#[$doc])* pub $field: u64,)*
@@ -359,6 +360,8 @@ pub struct TenantBook {
     held_back: HashSet<NetworkId>,
     refused: Vec<Refusal>,
     warnings: Vec<String>,
+    /// Slugs of removed tenants still in quarantine (given to [`Self::build`]).
+    quarantined_slugs: HashSet<String>,
 }
 
 impl Default for TenantBook {
@@ -371,6 +374,7 @@ impl Default for TenantBook {
             held_back: HashSet::new(),
             refused: Vec::new(),
             warnings: Vec::new(),
+            quarantined_slugs: HashSet::new(),
         }
     }
 }
@@ -403,6 +407,7 @@ impl TenantBook {
         let slugs: HashSet<Slug> = specs.iter().map(|spec| spec.slug.clone()).collect();
         let mut book = Self {
             refused,
+            quarantined_slugs: quarantined.clone(),
             ..Self::default()
         };
         let mut granted: HashMap<String, Slug> = HashMap::new();
@@ -550,6 +555,18 @@ impl TenantBook {
     /// How many named tenants there are.
     pub fn named_count(&self) -> usize {
         self.named.len()
+    }
+
+    /// Whether the default tenant may not have `label` as a flat name (design 2.2, rule 4 and
+    /// 10): it is the slug of a tenant, of a removed tenant still in quarantine, or a flat name
+    /// the operator granted a tenant.
+    pub fn reserves_flat_name(&self, label: &str) -> bool {
+        self.quarantined_slugs.contains(label)
+            || self.named.keys().any(|slug| slug.as_str() == label)
+            || self
+                .named
+                .values()
+                .any(|tenant| tenant.extra_names.iter().any(|name| name == label))
     }
 
     /// Whether `network_id` is in a tenant file the book refused: such a network is not served.

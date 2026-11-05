@@ -18,7 +18,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result, anyhow, bail};
 use menzil_proto::trust::{DOC_MAX_LIFETIME, HeldRoster, HeldView, Reason, Verdict, check_bundle};
 use menzil_proto::{Limits, NetworkId, Roster};
-use menzil_relay::{Listener, Relay, RelayError, RelayIdentity, TenantBook};
+use menzil_relay::{Listener, NameState, Relay, RelayError, RelayIdentity, TenantBook};
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use tokio::task::JoinHandle;
@@ -28,6 +28,7 @@ use crate::local::load_identity;
 use crate::persist::Worker;
 use crate::token::{roster_from_bytes, roster_to_bytes};
 
+pub mod names_state;
 pub mod tenants;
 
 /// The WebSocket path nodes ask for unless the operator picks another (protocol.md 3.1).
@@ -314,6 +315,8 @@ pub struct RunningRelay {
     task: JoinHandle<()>,
     reload: JoinHandle<()>,
     keeper: Arc<Worker<(NetworkId, Roster, Option<Roster>)>>,
+    /// Writes `relay/names.state` after every change of the name state (MT9).
+    names_keeper: Arc<Worker<NameState>>,
 }
 
 impl RunningRelay {
@@ -334,9 +337,12 @@ impl RunningRelay {
     }
 
     /// Waits until every Roster the relay adopted over DOC so far has been written to (or
-    /// refused by) the relay directory, at most `timeout`; whether it got there.
+    /// refused by) the relay directory, and the name state as it was has been written to
+    /// `names.state`, at most `timeout` for each; whether it got there.
     pub fn flush_rosters(&self, timeout: std::time::Duration) -> bool {
-        self.keeper.flush(timeout)
+        let rosters = self.keeper.flush(timeout);
+        let names = self.names_keeper.flush(timeout);
+        rosters && names
     }
 
     /// [`Self::flush_rosters`] off the async threads (it blocks on the keeper, which may wait
@@ -344,9 +350,14 @@ impl RunningRelay {
     /// last Roster adopted over DOC is on disk before the process goes.
     pub async fn flush_rosters_blocking(&self, timeout: std::time::Duration) -> bool {
         let keeper = Arc::clone(&self.keeper);
-        tokio::task::spawn_blocking(move || keeper.flush(timeout))
-            .await
-            .unwrap_or(false)
+        let names_keeper = Arc::clone(&self.names_keeper);
+        tokio::task::spawn_blocking(move || {
+            let rosters = keeper.flush(timeout);
+            let names = names_keeper.flush(timeout);
+            rosters && names
+        })
+        .await
+        .unwrap_or(false)
     }
 
     /// Stops the relay.
@@ -407,6 +418,9 @@ pub async fn start(home: &Home, options: &RunOptions) -> Result<RunningRelay> {
         tracing::warn!("{note}");
         eprintln!("warning: {note}");
     }
+    // The durable name state (MT9): a damaged file stops the start, because the relay would
+    // otherwise hand out names it holds back, and then write over the file.
+    let name_state = names_state::load_for_start(home)?;
     let rosters: Vec<StoredRoster> = all_rosters
         .into_iter()
         .filter(|stored| {
@@ -430,6 +444,7 @@ pub async fn start(home: &Home, options: &RunOptions) -> Result<RunningRelay> {
     )?;
     let relay = Relay::new(identity, LIMITS);
     relay.set_tenants(book);
+    relay.labels().load_state(&name_state);
     let mut networks = Vec::new();
     for stored in &rosters {
         let network_id = stored.roster.decode()?.network_id;
@@ -513,6 +528,26 @@ pub async fn start(home: &Home, options: &RunOptions) -> Result<RunningRelay> {
             }
         });
     }
+    // The name state reaches the disk through its own keeper thread, which coalesces: the latest
+    // snapshot wins, and the registry's callback only queues it.
+    let names_keeper = {
+        let home = home.clone();
+        Worker::spawn(
+            "menzil-relay-names",
+            |_: &NameState| (),
+            move |snapshot: NameState| {
+                if let Err(error) = names_state::write_relay_part(&home, &snapshot) {
+                    tracing::warn!(error = %format!("{error:#}"), "the name state could not be kept on disk: a restart will start from the older file");
+                }
+            },
+        )?
+    };
+    {
+        let names_keeper = Arc::clone(&names_keeper);
+        relay
+            .labels()
+            .set_on_change(move |state| names_keeper.submit(state.clone()));
+    }
     let serving = relay.clone();
     let task = tokio::spawn(async move { serving.serve(&listener).await });
     // `add-network` with a newer token while the relay runs is picked up here; the store keeps
@@ -536,6 +571,7 @@ pub async fn start(home: &Home, options: &RunOptions) -> Result<RunningRelay> {
         task,
         reload,
         keeper,
+        names_keeper,
     })
 }
 
@@ -617,6 +653,9 @@ fn reload_once(relay: &Relay, home: &Home, announced: &mut Vec<String>) {
             for network in relay.rosters().networks() {
                 let held_back = book.is_held_back(&network);
                 if (held_back || !present.contains(&network)) && relay.rosters().remove(&network) {
+                    // Its names are released: a flat one waits 180 days for the network to
+                    // come back (design 2.2, rule 9).
+                    relay.labels().network_removed(&network, unix_now());
                     tracing::warn!(
                         %network,
                         held_back,
@@ -629,6 +668,9 @@ fn reload_once(relay: &Relay, home: &Home, announced: &mut Vec<String>) {
             tracing::warn!(error = %format!("{error:#}"), "the Roster files cannot be listed; no network is dropped");
         }
     }
+    // The periodic name pass (MT9): names held are stamped, names unadvertised for 90 days or
+    // dropped from their Roster are released.
+    relay.labels().sweep(relay.rosters(), &book, unix_now());
 }
 
 #[cfg(test)]

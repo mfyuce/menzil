@@ -221,6 +221,13 @@ impl Relay {
         }
     }
 
+    /// The label registry: who holds which full name, and the durable name state behind the
+    /// quotas and the 90 day release (the relay binary loads and keeps it, see
+    /// [`LabelRegistry`]).
+    pub fn labels(&self) -> &LabelRegistry {
+        &self.labels
+    }
+
     /// This relay's held Rosters. An operator or test harness seeds the
     /// very first Roster for a network directly through this handle
     /// (`crate::doc`'s DOC handling, protocol.md 4.3, only ever *updates*

@@ -163,14 +163,25 @@ pub struct RejectedShare {
     pub reason: String,
 }
 
-/// `ADVERTISE_ACK = CBOR{ accepted: [str], rejected: [{name, reason}] }`
-/// (protocol.md 4.2).
+/// `ADVERTISE_ACK = CBOR{ accepted: [str], rejected: [{name, reason}], names?: [str] }`
+/// (protocol.md 4.2, 4.4).
+///
+/// `names` is optional (multi tenant design 2.2, rule 6): the full names the relay accepted, one
+/// per share and tenant zone, relative to the relay's share domain `H` (`app` for the default
+/// tenant's `app.H`, `app.ali` for tenant `ali`'s `app.ali.H`). A node that holds one label in
+/// two tenants' networks sees both. The ACK is an unsigned control message and an older node
+/// decodes it without the key (unknown map keys are ignored); a relay that does not send it
+/// (older, or nothing accepted) decodes as an empty list.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AdvertiseAckBody {
     /// Names accepted as advertised.
     pub accepted: Vec<String>,
     /// Names rejected, with a reason each.
     pub rejected: Vec<RejectedShare>,
+    /// The full names accepted, relative to the relay's share domain (see above); absent when
+    /// empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub names: Vec<String>,
 }
 
 /// `doc_type` for a [`DocBody`]. protocol.md leaves the numeric mapping
@@ -743,6 +754,7 @@ mod tests {
                     name: "taken".to_string(),
                     reason: "label_taken".to_string(),
                 }],
+                names: vec!["example.ali".to_string()],
             }),
             Record::Doc(DocBody {
                 doc_type: DocType::Roster,
@@ -817,6 +829,69 @@ mod tests {
     #[test]
     fn empty_input_is_rejected() {
         assert!(Record::decode(&[]).is_err());
+    }
+
+    /// The ADVERTISE_ACK as an older node knew it: no `names` key.
+    #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
+    struct OldAdvertiseAck {
+        accepted: Vec<String>,
+        rejected: Vec<RejectedShare>,
+    }
+
+    /// MT9: `names` is optional and added after the first release. An older node decodes the new
+    /// ACK (the key is ignored), and a new node decodes an old node's relay's ACK (no key) as an
+    /// empty list.
+    #[test]
+    fn an_older_node_ignores_the_names_of_an_advertise_ack_and_a_new_one_reads_an_old_ack() {
+        let new = AdvertiseAckBody {
+            accepted: vec!["app".to_string()],
+            rejected: vec![],
+            names: vec!["app.ali".to_string(), "app.bob".to_string()],
+        };
+        let wire = Record::AdvertiseAck(new.clone()).encode();
+        assert!(
+            wire.windows(5).any(|w| w == b"names"),
+            "the key is on the wire"
+        );
+        let old: OldAdvertiseAck = decode_cbor_body(&wire[1..]).unwrap();
+        assert_eq!(old.accepted, new.accepted);
+        assert!(old.rejected.is_empty());
+
+        let mut old_wire = vec![RecordType::AdvertiseAck as u8];
+        old_wire.extend(encode_cbor_body_bytes(&OldAdvertiseAck {
+            accepted: vec!["app".to_string()],
+            rejected: vec![],
+        }));
+        match Record::decode(&old_wire).unwrap() {
+            Record::AdvertiseAck(ack) => {
+                assert_eq!(ack.accepted, vec!["app"]);
+                assert!(ack.names.is_empty());
+            }
+            other => panic!("not an ADVERTISE_ACK: {other:?}"),
+        }
+    }
+
+    /// An ACK with nothing to name is the old wire form byte for byte (no new key).
+    #[test]
+    fn an_advertise_ack_without_names_is_the_old_wire_form() {
+        let new = Record::AdvertiseAck(AdvertiseAckBody {
+            accepted: vec![],
+            rejected: vec![],
+            names: vec![],
+        })
+        .encode();
+        let mut old = vec![RecordType::AdvertiseAck as u8];
+        old.extend(encode_cbor_body_bytes(&OldAdvertiseAck {
+            accepted: vec![],
+            rejected: vec![],
+        }));
+        assert_eq!(new, old);
+    }
+
+    fn encode_cbor_body_bytes<T: Serialize>(body: &T) -> Vec<u8> {
+        let mut buf = Vec::new();
+        ciborium::into_writer(body, &mut buf).unwrap();
+        buf
     }
 
     #[test]

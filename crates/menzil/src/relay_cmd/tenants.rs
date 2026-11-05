@@ -37,11 +37,11 @@ use menzil_relay::{
 };
 use serde::Deserialize;
 
-use super::{Keep, StoredRoster, keep_roster_locked, load_rosters_each, relay_dir, roster_path};
+use super::{
+    Keep, StoredRoster, keep_roster_locked, load_rosters_each, names_state, relay_dir, roster_path,
+};
 use crate::home::{Home, parse_hex32};
 use crate::token::decode_roster;
-
-const DAY: u64 = 24 * 60 * 60;
 
 /// The directory of tenant files.
 pub fn tenants_dir(home: &Home) -> std::path::PathBuf {
@@ -50,13 +50,6 @@ pub fn tenants_dir(home: &Home) -> std::path::PathBuf {
 
 fn tenant_path(home: &Home, slug: &str) -> std::path::PathBuf {
     tenants_dir(home).join(format!("{slug}.toml"))
-}
-
-/// The removed slugs and when they were removed, one `<slug> <unix>` per line. A slug stays
-/// here for [`QUARANTINE_DAYS`] and is refused for a new tenant meanwhile (design 2.2, rule 9).
-/// MT9 moves this into `names.state` with the rest of the durable name state.
-fn quarantine_path(home: &Home) -> std::path::PathBuf {
-    tenants_dir(home).join(".quarantine")
 }
 
 /// What a tenant file holds. The figures are the keys that are none of the others
@@ -255,7 +248,7 @@ fn listed_networks(specs: &[TenantSpec], refused: &[Refusal]) -> HashSet<Network
 /// it keeps the book it has.
 pub fn load_book(home: &Home, rosters: &[StoredRoster]) -> Result<TenantBook> {
     let (specs, refused) = read_specs(home)?;
-    let names = default_names(rosters, &listed_networks(&specs, &refused));
+    let names = default_names_with_state(home, rosters, &listed_networks(&specs, &refused))?;
     // Removed slugs still in quarantine: a file that brings one back is refused (design 2.2,
     // rule 1; round T4, N5).
     let removed: HashSet<String> = quarantined(home, super::unix_now())?.into_keys().collect();
@@ -293,39 +286,22 @@ pub fn book_notes(book: &TenantBook, rosters: &[StoredRoster]) -> Vec<String> {
     notes
 }
 
-fn read_quarantine(home: &Home) -> Result<BTreeMap<String, u64>> {
-    let path = quarantine_path(home);
-    let text = match fs::read_to_string(&path) {
-        Ok(text) => text,
-        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(BTreeMap::new()),
-        Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
-    };
-    let mut removed = BTreeMap::new();
-    for line in text.lines().filter(|line| !line.trim().is_empty()) {
-        let (slug, at) = line
-            .split_once(' ')
-            .and_then(|(slug, at)| Some((slug, at.trim().parse::<u64>().ok()?)))
-            .ok_or_else(|| anyhow!("{} has a line that is not `<slug> <unix>`", path.display()))?;
-        removed.insert(slug.to_string(), at);
-    }
-    Ok(removed)
-}
-
-/// Removed slugs still in quarantine at `now`, with the moment each is free again.
+/// Removed slugs still in quarantine at `now`, with the moment each is free again (they live in
+/// `relay/names.state` with the rest of the durable name state, see `names_state`).
 fn quarantined(home: &Home, now: u64) -> Result<BTreeMap<String, u64>> {
-    Ok(read_quarantine(home)?
-        .into_iter()
-        .map(|(slug, at)| (slug, at.saturating_add(QUARANTINE_DAYS * DAY)))
-        .filter(|(_, until)| *until > now)
-        .collect())
+    names_state::quarantined_slugs(home, now)
 }
 
-fn write_quarantine(home: &Home, removed: &BTreeMap<String, u64>) -> Result<()> {
-    let text: String = removed
-        .iter()
-        .map(|(slug, at)| format!("{slug} {at}\n"))
-        .collect();
-    home.write_public(&quarantine_path(home), text.as_bytes())
+/// The flat names the default tenant holds: those its Rosters grant, and those the relay has
+/// ever accepted it for or holds in quarantine for it (`names.state`, design 2.2 rule 4).
+fn default_names_with_state(
+    home: &Home,
+    rosters: &[StoredRoster],
+    listed: &HashSet<NetworkId>,
+) -> Result<HashSet<String>> {
+    let mut names = default_names(rosters, listed);
+    names.extend(names_state::default_flat_names(home)?);
+    Ok(names)
 }
 
 /// What `add-network` did.
@@ -413,7 +389,8 @@ pub fn add_network_to(home: &Home, token: &str, now: u64, tenant: Option<&str>) 
             }
             // Judge the result as the relay would.
             let (rosters, _) = load_rosters_each(home)?;
-            let names = default_names(&rosters, &listed_networks(&specs, &refused));
+            let names =
+                default_names_with_state(home, &rosters, &listed_networks(&specs, &refused))?;
             let others_before = specs.len() - usize::from(created);
             let had_default_networks = rosters.iter().any(|stored| {
                 stored
@@ -592,9 +569,7 @@ pub fn remove_tenant(home: &Home, slug: &str, now: u64) -> Result<Vec<NetworkId>
     for network in &networks {
         remove_if_there(&roster_path(home, network))?;
     }
-    let mut removed = read_quarantine(home)?;
-    removed.insert(slug.to_string(), now);
-    write_quarantine(home, &removed)?;
+    names_state::quarantine_slug_locked(home, slug.as_str(), now)?;
     remove_if_there(&path)?;
     Ok(networks)
 }
@@ -660,6 +635,15 @@ pub fn render_tenants(home: &Home, now: u64) -> Result<String> {
     }
     for (slug, until) in quarantined(home, now)? {
         let _ = writeln!(out, "quarantine: {slug} cannot be used again until {until}");
+    }
+    for (name, entry) in names_state::read(home)?.quarantine {
+        if entry.kind == menzil_relay::QuarantineKind::Flat && entry.until() > now {
+            let _ = writeln!(
+                out,
+                "quarantine: flat name {name} can be taken again only by the network that held it until {}",
+                entry.until()
+            );
+        }
     }
     Ok(out)
 }

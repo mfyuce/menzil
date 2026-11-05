@@ -1527,6 +1527,7 @@ mod tests {
         // Simulate `dst`'s own prior ADVERTISE with accept_peers: false.
         f.labels.advertise(
             &f.rosters,
+            &crate::tenant::TenantBook::default(),
             &[f.network_id],
             &f.dst,
             &menzil_proto::AdvertiseBody {
@@ -1534,6 +1535,7 @@ mod tests {
                 shares: vec![],
                 accept_peers: false,
             },
+            0,
         );
         let table = ForwardTable::new();
         let (e2e, flags, payload) = reliable_send(10);
@@ -1670,6 +1672,7 @@ mod tests {
         // d online, claiming only Y, and closed to peers.
         f.labels.advertise(
             &f.rosters,
+            &crate::tenant::TenantBook::default(),
             &[f.network_y],
             &f.d,
             &menzil_proto::AdvertiseBody {
@@ -1677,6 +1680,7 @@ mod tests {
                 shares: vec![],
                 accept_peers: false,
             },
+            0,
         );
         assert!(!f.labels.accepts_peers(&f.d));
         let closed = f.refusal();

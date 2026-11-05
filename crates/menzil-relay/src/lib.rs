@@ -25,6 +25,7 @@ mod hello;
 mod identity;
 mod listener;
 mod log_throttle;
+mod names;
 mod node_history;
 mod rate;
 mod registry;
@@ -50,6 +51,10 @@ pub use error::RelayError;
 pub use hello::{HelloRejection, check_hello};
 pub use identity::RelayIdentity;
 pub use listener::Listener;
+pub use names::{
+    Claim, NEW_NAMES_WINDOW_DAYS, NameFigures, NameRecord, NameRefusal, NameState, NamesStateError,
+    Quarantine, QuarantineKind, RELEASE_DAYS, TOUCH_SECS,
+};
 pub use node_history::{HistoryViolation, MAX_HISTORY_ENTRIES, NodeHistory};
 pub use rate::{
     ADVERTISE_BURST, ADVERTISE_PER_MINUTE, DOC_BURST, DOC_TRANSFERS_PER_MINUTE, MAX_DOC_BURST,
