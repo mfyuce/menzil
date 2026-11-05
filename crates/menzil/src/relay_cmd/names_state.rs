@@ -17,13 +17,13 @@
 //! per line) is read as slug entries and moved in here the first time anything writes the state
 //! under the lock ([`migrate_legacy_locked`]).
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::io::ErrorKind;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, anyhow};
-use menzil_relay::NameState;
+use menzil_relay::{NameState, QuarantineKind, Slug};
 
 use super::{relay_dir, tenants};
 use crate::home::Home;
@@ -57,7 +57,10 @@ fn read_file(home: &Home) -> Result<NameState> {
     NameState::parse(&text).map_err(|e| damaged(home, e))
 }
 
-/// The slug entries of the first slice's `.quarantine` file, `<slug> <unix>` per line.
+/// The slug entries of the first slice's `.quarantine` file, `<slug> <unix>` per line. A line
+/// that is not that, or whose slug is not a slug, is skipped with a warning: written into
+/// `names.state` it would make the state "damaged" and stop the relay (round T5, N2). A file that
+/// cannot be read at all is an error.
 fn read_legacy(home: &Home) -> Result<BTreeMap<String, u64>> {
     let path = legacy_path(home);
     let text = match fs::read_to_string(&path) {
@@ -67,10 +70,18 @@ fn read_legacy(home: &Home) -> Result<BTreeMap<String, u64>> {
     };
     let mut removed = BTreeMap::new();
     for line in text.lines().filter(|line| !line.trim().is_empty()) {
-        let (slug, at) = line
+        let parsed = line
             .split_once(' ')
             .and_then(|(slug, at)| Some((slug, at.trim().parse::<u64>().ok()?)))
-            .ok_or_else(|| anyhow!("{} has a line that is not `<slug> <unix>`", path.display()))?;
+            .filter(|(slug, _)| Slug::parse(slug).is_ok());
+        let Some((slug, at)) = parsed else {
+            tracing::warn!(
+                file = %path.display(),
+                line,
+                "a line of the old slug quarantine file is not `<slug> <unix>` with a tenant name: skipped"
+            );
+            continue;
+        };
         removed.insert(slug.to_string(), at);
     }
     Ok(removed)
@@ -123,9 +134,11 @@ pub fn write_relay_part(home: &Home, snapshot: &NameState) -> Result<()> {
     };
     migrate_legacy_locked(home)?;
     let on_disk = read_file(home)?;
+    let now = super::unix_now();
     let mut merged = snapshot.relay_part();
     for (name, entry) in on_disk.quarantine {
-        if entry.kind == menzil_relay::QuarantineKind::Slug {
+        // A slug whose quarantine has ended is not carried on (round T5, N2).
+        if entry.kind == QuarantineKind::Slug && entry.until() > now {
             merged.quarantine.insert(name, entry);
         }
     }
@@ -137,6 +150,9 @@ pub fn write_relay_part(home: &Home, snapshot: &NameState) -> Result<()> {
 pub fn quarantine_slug_locked(home: &Home, slug: &str, now: u64) -> Result<()> {
     migrate_legacy_locked(home)?;
     let mut state = read_file(home)?;
+    state
+        .quarantine
+        .retain(|_, q| q.kind != QuarantineKind::Slug || q.until() > now);
     state.quarantine_slug(slug, now);
     write_locked(home, &state)
 }
@@ -150,4 +166,11 @@ pub fn quarantined_slugs(home: &Home, now: u64) -> Result<BTreeMap<String, u64>>
 /// name or an operator grant equal to one is refused (design 2.2, rule 4 and 10).
 pub fn default_flat_names(home: &Home) -> Result<HashSet<String>> {
     Ok(read(home)?.default_flat_names())
+}
+
+/// The flat names a named tenant has been accepted for (an operator grant) or is quarantined
+/// for, each with that tenant's slug: a tenant name equal to one, or another tenant's grant
+/// equal to one, is refused (round T5, L2).
+pub fn tenant_flat_names(home: &Home) -> Result<HashMap<String, String>> {
+    Ok(read(home)?.tenant_flat_names())
 }

@@ -1767,6 +1767,11 @@ async fn a_name_the_default_tenant_was_accepted_for_cannot_become_a_tenant_name(
     add_network(&relay, &token_c, clock()).unwrap();
     let running = running_on(dir.path(), &relay).await;
     advertise_now(&running, &net_a, 1, &["shop"], clock());
+    // The removal ends the session that held the name.
+    running
+        .relay
+        .labels()
+        .clear_for(&NodeId::from([1u8; 32]), clock());
     remove_network(&relay, &net_a.to_hex()).unwrap();
     reload_once(&running.relay, &relay, &mut Vec::new());
     assert!(running.flush_rosters(FLUSH));
@@ -1932,6 +1937,16 @@ async fn removing_a_network_releases_its_names_at_the_next_reload() {
     advertise_now(&running, &net_a, 1, &["app"], clock());
     remove_network(&relay, &net_a.to_hex()).unwrap();
     reload_once(&running.relay, &relay, &mut Vec::new());
+    // A session still holds the name when the network goes (it ends a moment later): the
+    // reload leaves it, as the sweep leaves a held name (round T5, L4)...
+    assert!(running.flush_rosters(FLUSH));
+    assert!(names_file(&relay).contains("\nname app "));
+    // ...and releases it at the pass after the session has gone.
+    running
+        .relay
+        .labels()
+        .clear_for(&NodeId::from([1u8; 32]), clock());
+    reload_once(&running.relay, &relay, &mut Vec::new());
     assert!(running.flush_rosters(FLUSH));
     let text = names_file(&relay);
     assert!(!text.contains("\nname app"), "{text}");
@@ -1961,5 +1976,322 @@ async fn the_reload_releases_a_name_unadvertised_for_ninety_days() {
     assert!(!text.contains("\nname old "), "{text}");
     assert!(text.contains("quarantine flat old "), "{text}");
     assert!(text.contains("\nname fresh "), "{text}");
+    running.stop();
+}
+
+// ---- round T5 ----
+
+/// A signed Roster of a network `owner` controls, with `labels` (name, node) and a `seq`.
+fn owned_roster(
+    owner: &ed25519_dalek::SigningKey,
+    seq: u64,
+    labels: &[(&str, u8)],
+) -> menzil_proto::Roster {
+    let members: Vec<NodeId> = (1..=9u8).map(|n| NodeId::from([n; 32])).collect();
+    let body = menzil_proto::RosterBody {
+        v: menzil_proto::PROTOCOL_VERSION,
+        network_id: NetworkId::from(owner.verifying_key().to_bytes()),
+        seq,
+        issued: clock() - 60,
+        expires: clock() + 10 * DAY,
+        members: members
+            .iter()
+            .map(|&node_id| menzil_proto::RosterMember {
+                node_id,
+                min_serial: 1,
+            })
+            .collect(),
+        revoked: vec![],
+        stewards: vec![],
+        labels: labels
+            .iter()
+            .map(|&(name, n)| menzil_proto::Label {
+                name: name.to_string(),
+                node_id: NodeId::from([n; 32]),
+            })
+            .collect(),
+    };
+    Roster::sign(owner, &body).unwrap()
+}
+
+/// Round T5, M1: an owner of a default tenant network who lists a label equal to an older
+/// tenant's slug in its Roster does not take that tenant offline; advertising the label stays
+/// refused.
+#[tokio::test]
+async fn t5_a_default_roster_label_equal_to_a_slug_does_not_take_the_tenant_down() {
+    let (_a, _oa, id_a, token_a) = another_network();
+    let (dir, relay) = relay_machine();
+    add_network_to(&relay, &token_a, clock(), Some("ali")).unwrap();
+    let owner = ed25519_dalek::SigningKey::generate(&mut rand::rng());
+    let id_d = NetworkId::from(owner.verifying_key().to_bytes());
+    let first = owned_roster(&owner, 1, &[]);
+    add_network(&relay, &encode_roster(&first, None), clock()).unwrap();
+    let running = running_on(dir.path(), &relay).await;
+    assert_eq!(running.tenants().id_of(&id_a).slug(), Some("ali"));
+
+    // The label reaches the relay by `add-network` with a newer token...
+    let with_label = owned_roster(&owner, 2, &[("ALI", 5)]);
+    add_network(&relay, &encode_roster(&with_label, None), clock()).unwrap();
+    let rosters = load_rosters(&relay).unwrap();
+    let book = load_book(&relay, &rosters).unwrap();
+    assert!(book.named("ali").is_some(), "{:?}", book.refused());
+    assert!(!book.is_held_back(&id_a));
+
+    // ...or as a member's push over DOC, which the keeper writes to the file.
+    let pushed = owned_roster(&owner, 3, &[("ali", 5)]);
+    running
+        .relay
+        .rosters()
+        .adopt(&pushed, None, unix_now())
+        .unwrap();
+    assert!(running.flush_rosters(FLUSH));
+    reload_once(&running.relay, &relay, &mut Vec::new());
+    assert_eq!(running.tenants().id_of(&id_a).slug(), Some("ali"));
+    assert!(!running.tenants().is_held_back(&id_a));
+    assert!(
+        running.roster_seq(&id_a).is_some(),
+        "ali's network is still served"
+    );
+
+    // The default tenant cannot advertise the label, which is the slug.
+    let ack = advertise_now(&running, &id_d, 5, &["ali"], clock());
+    assert!(ack.names.is_empty());
+    assert_eq!(ack.rejected[0].reason, "reserved name");
+    running.stop();
+}
+
+/// Round T5, M1: a slug equal to a label a default Roster merely lists (nobody was accepted for
+/// it) is allowed; one the relay accepted the default tenant for still is not.
+#[test]
+fn t5_a_tenant_name_is_judged_against_accepted_names_not_listed_labels() {
+    let (_net, token_d) = labeled_network(&[("shop", 1)]);
+    let (_b, _ob, _id_b, token_b) = another_network();
+    let (_dir, relay) = relay_machine();
+    add_network(&relay, &token_d, clock()).unwrap();
+    let added = add_network_to(&relay, &token_b, clock(), Some("shop")).unwrap();
+    assert_eq!(added.tenant.as_deref(), Some("shop"));
+    let book = load_book(&relay, &load_rosters(&relay).unwrap()).unwrap();
+    assert!(book.named("shop").is_some());
+    assert!(
+        book.reserves_flat_name("shop"),
+        "so the label stays refused for the default tenant"
+    );
+}
+
+/// Round T5, M3: `add-network --tenant <slug>` where the slug equals an older tenant's grant is
+/// refused by the command, and the older tenant stays.
+#[test]
+fn t5_a_new_slug_equal_to_an_older_grant_is_refused_by_the_command() {
+    let (_a, _oa, id_a, token_a) = another_network();
+    let (_b, _ob, id_b, token_b) = another_network();
+    let (_d, relay) = relay_machine();
+    add_network(&relay, &token_a, clock()).unwrap();
+    fs::create_dir_all(tenants_dir(&relay)).unwrap();
+    fs::write(
+        tenant_file(&relay, "ali"),
+        format!(
+            "networks = [\"{}\"]\nextra_names = [\"blog\"]\nadded = 10\n",
+            id_a.to_hex()
+        ),
+    )
+    .unwrap();
+    let error = add_network_to(&relay, &token_b, clock(), Some("blog"))
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("blog") && error.contains("ali"), "{error}");
+    assert!(!tenant_file(&relay, "blog").exists());
+    let book = load_book(&relay, &load_rosters(&relay).unwrap()).unwrap();
+    assert!(book.named("ali").is_some() && !book.is_held_back(&id_a));
+    assert!(!book.is_held_back(&id_b));
+
+    // Hand written, the newer file is the one the relay refuses.
+    fs::write(
+        tenant_file(&relay, "blog"),
+        format!("networks = [\"{}\"]\nadded = 20\n", id_b.to_hex()),
+    )
+    .unwrap();
+    let book = load_book(&relay, &load_rosters(&relay).unwrap()).unwrap();
+    assert!(book.named("ali").is_some() && book.named("blog").is_none());
+    assert!(book.is_held_back(&id_b) && !book.is_held_back(&id_a));
+}
+
+/// Round T5, M3: a command that would leave another tenant refused by the book stops, even when
+/// the other file is not the one the command writes (here ali's `added` lies in the future, so
+/// the new file would count as the older one and ali's grant would lose).
+#[test]
+fn t5_add_network_refuses_what_would_take_another_tenant_offline() {
+    let (_a, _oa, id_a, token_a) = another_network();
+    let (_b, _ob, _id_b, token_b) = another_network();
+    let (_d, relay) = relay_machine();
+    add_network(&relay, &token_a, clock()).unwrap();
+    fs::create_dir_all(tenants_dir(&relay)).unwrap();
+    fs::write(
+        tenant_file(&relay, "ali"),
+        format!(
+            "networks = [\"{}\"]\nextra_names = [\"blog\"]\nadded = {}\n",
+            id_a.to_hex(),
+            clock() + 400 * DAY
+        ),
+    )
+    .unwrap();
+    let error = add_network_to(&relay, &token_b, clock(), Some("blog"))
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("take tenant ali offline"), "{error}");
+    assert!(!tenant_file(&relay, "blog").exists());
+}
+
+/// Round T5, L1 and L2: a grant equal to a removed tenant's quarantined slug, and a slug equal
+/// to a flat name a tenant was accepted for (here in quarantine), are refused.
+#[test]
+fn t5_slugs_and_grants_are_judged_against_quarantined_and_tenant_names() {
+    let (_b, _ob, _id_b, token_b) = another_network();
+    let (_c, _oc, id_c, token_c) = another_network();
+    let (_d, relay) = relay_machine();
+    // A flat name "blog" of tenant ali in quarantine.
+    fs::create_dir_all(super::relay_dir(&relay)).unwrap();
+    let mut state = menzil_relay::NameState::default();
+    let claim = menzil_relay::Claim {
+        full: "blog",
+        tenant: Some("ali"),
+        network: NetworkId::from([7u8; 32]),
+    };
+    let _ = state.accept(&claim, None, clock() - 10);
+    assert!(state.release("blog", clock() - 5));
+    state.quarantine_slug("gone", clock() - 5);
+    fs::write(names_state::state_path(&relay), state.render()).unwrap();
+
+    let error = add_network_to(&relay, &token_b, clock(), Some("blog"))
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("flat name") && error.contains("ali"),
+        "{error}"
+    );
+    assert!(!tenant_file(&relay, "blog").exists());
+
+    // A hand written tenant file whose grant is the quarantined slug is not used.
+    add_network_to(&relay, &token_c, clock(), Some("veli")).unwrap();
+    fs::write(
+        tenant_file(&relay, "veli"),
+        format!(
+            "networks = [\"{}\"]\nextra_names = [\"gone\"]\nadded = 20\n",
+            id_c.to_hex()
+        ),
+    )
+    .unwrap();
+    let book = load_book(&relay, &load_rosters(&relay).unwrap()).unwrap();
+    assert!(book.named("veli").is_none());
+    assert!(book.is_held_back(&id_c));
+}
+
+/// Round T5, L5: the networks of a removed tenant leave the store before the new tenant book is
+/// set, so that in between they are not the default tenant's.
+#[tokio::test]
+async fn t5_a_reload_drops_a_removed_tenants_networks_before_it_swaps_the_book() {
+    let (net_a, token_a) = labeled_network(&[("app", 1)]);
+    let (net_d, token_d) = labeled_network(&[("app", 2)]);
+    let (dir, relay) = relay_machine();
+    add_network_to(&relay, &token_a, clock(), Some("ali")).unwrap();
+    add_network(&relay, &token_d, clock()).unwrap();
+    let running = running_on(dir.path(), &relay).await;
+    // The default tenant's node holds `app`, and is offline for a moment.
+    assert_eq!(
+        advertise_now(&running, &net_d, 2, &["app"], clock()).names,
+        ["app"]
+    );
+    running
+        .relay
+        .labels()
+        .clear_for(&NodeId::from([2u8; 32]), clock());
+    assert_eq!(
+        advertise_now(&running, &net_a, 1, &["app"], clock()).names,
+        ["app.ali"]
+    );
+    running
+        .relay
+        .labels()
+        .clear_for(&NodeId::from([1u8; 32]), clock());
+
+    remove_tenant(&relay, "ali", clock()).unwrap();
+    let mut looked = false;
+    reload_once_with(&running.relay, &relay, &mut Vec::new(), &mut || {
+        looked = true;
+        assert!(
+            !running.relay.rosters().serves(&net_a),
+            "the removed tenant's network was still in the store when the book was swapped"
+        );
+        assert_eq!(
+            running.relay.tenants().id_of(&net_a).slug(),
+            Some("ali"),
+            "the old book still stands at this point"
+        );
+        let ack = advertise_now(&running, &net_a, 1, &["app"], clock());
+        assert!(ack.names.is_empty(), "{ack:?}");
+    });
+    assert!(looked);
+    // The default tenant's name is where it was, and its node can take it again.
+    let state = running.relay.labels().state();
+    assert_eq!(state.names["app"].network, net_d);
+    assert!(!state.quarantine.contains_key("app"));
+    assert_eq!(
+        advertise_now(&running, &net_d, 2, &["app"], clock()).names,
+        ["app"]
+    );
+    running.stop();
+}
+
+/// Round T5, N2: a bad line of the old slug quarantine file is skipped (with a warning), the
+/// good ones are moved, and the name state stays readable; slug entries whose quarantine has
+/// ended are not carried on by a write.
+#[tokio::test]
+async fn t5_the_old_quarantine_file_is_validated_and_ended_slugs_are_pruned() {
+    let (net_a, token_a) = labeled_network(&[("app", 1)]);
+    let (dir, relay) = relay_machine();
+    add_network(&relay, &token_a, clock()).unwrap();
+    fs::create_dir_all(tenants_dir(&relay)).unwrap();
+    let legacy = tenants_dir(&relay).join(".quarantine");
+    fs::write(
+        &legacy,
+        format!(
+            "oldone {}\nBad_Slug 5\nnot a line\nab {}\nx\n",
+            clock(),
+            clock()
+        ),
+    )
+    .unwrap();
+    // A slug entry written by a state file long ago, and one still running.
+    let mut state = menzil_relay::NameState::default();
+    state.quarantine_slug("expired", clock() - 200 * DAY);
+    state.quarantine_slug("current", clock() - DAY);
+    fs::create_dir_all(super::relay_dir(&relay)).unwrap();
+    fs::write(names_state::state_path(&relay), state.render()).unwrap();
+
+    let running = running_on(dir.path(), &relay).await;
+    assert!(!legacy.exists(), "migrated");
+    let text = names_file(&relay);
+    assert!(text.contains("quarantine slug oldone "), "{text}");
+    assert!(
+        !text.contains("Bad_Slug") && !text.contains("quarantine slug ab "),
+        "{text}"
+    );
+    assert!(menzil_relay::NameState::parse(&text).is_ok());
+    // The relay's own write drops the slug whose quarantine ended and keeps the others.
+    advertise_now(&running, &net_a, 1, &["app"], clock());
+    assert!(running.flush_rosters(FLUSH));
+    let text = names_file(&relay);
+    assert!(!text.contains("quarantine slug expired "), "{text}");
+    assert!(text.contains("quarantine slug current "), "{text}");
+    assert!(text.contains("quarantine slug oldone "), "{text}");
+    // And so does `remove-tenant`'s.
+    let mut state = menzil_relay::NameState::parse(&text).unwrap();
+    state.quarantine_slug("stale", clock() - 300 * DAY);
+    fs::write(names_state::state_path(&relay), state.render()).unwrap();
+    let (_b, _ob, _id_b, token_b) = another_network();
+    add_network_to(&relay, &token_b, clock(), Some("ali")).unwrap();
+    remove_tenant(&relay, "ali", clock()).unwrap();
+    let text = names_file(&relay);
+    assert!(!text.contains("quarantine slug stale "), "{text}");
+    assert!(text.contains("quarantine slug ali "), "{text}");
     running.stop();
 }

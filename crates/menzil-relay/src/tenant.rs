@@ -339,6 +339,18 @@ impl Tenant {
     }
 }
 
+/// What [`TenantBook::judge`] holds a file against.
+#[derive(Clone, Copy)]
+struct JudgedNames<'a> {
+    /// The slugs of the files judged before this one.
+    earlier: &'a HashSet<Slug>,
+    default_names: &'a HashSet<String>,
+    tenant_flat: &'a HashMap<String, String>,
+    quarantined: &'a HashSet<String>,
+    /// The grants of the tenants taken so far.
+    granted: &'a HashMap<String, Slug>,
+}
+
 /// A tenant file the book did not take, and the networks it listed: they are held back (not
 /// served), never given to the default tenant, whose names and class are the more generous ones.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -383,13 +395,15 @@ impl TenantBook {
     /// Judges `specs` (tenant files that parsed) and `refused` (files that could not be taken
     /// before this point, their networks held back).
     ///
-    /// `default_names` are the flat names the default tenant holds now (the labels its Rosters
-    /// grant): a slug or an `extra_names` entry equal to one is refused. Files are judged in the
-    /// order they were `added`, then by slug, so that when two overlap the older keeps what is
-    /// contested and the newer is refused; a file is refused for a figure out of range, an
-    /// override on the `personal` class, a bad flat name, an `extra_names` entry equal to any
-    /// tenant's slug, to a default tenant name or to an earlier tenant's entry, and a slug
-    /// equal to a default tenant name. A network a tenant already owns is dropped from a later
+    /// `default_names` are the flat names the relay has accepted the default tenant for, or holds
+    /// in quarantine for it (`names.state`; not merely labels a default Roster lists, which an
+    /// owner can put there at will, round T5, M1): a slug or an `extra_names` entry equal to one
+    /// is refused. Files are judged in the order they were `added`, then by slug, so that when two
+    /// overlap the older keeps what is contested and the newer is refused; a file is refused for a
+    /// figure out of range, an override on the `personal` class, a bad flat name, an `extra_names`
+    /// entry equal to the slug of an older tenant or a slug in quarantine, to a default tenant
+    /// name or to an earlier tenant's entry, and a slug equal to a default tenant name, to an
+    /// earlier tenant's entry or to a flat name a tenant is accepted for. A network a tenant already owns is dropped from a later
     /// file with a warning. More networks than the class's `max_networks` figure is a warning only
     /// (the CLI refuses to add past it; the relay keeps serving what the operator wrote).
     ///
@@ -398,13 +412,28 @@ impl TenantBook {
     /// hand written file cannot bring a removed tenant's name back before the quarantine ends
     /// (round T4, N5).
     pub fn build(
-        mut specs: Vec<TenantSpec>,
+        specs: Vec<TenantSpec>,
         refused: Vec<Refusal>,
         default_names: &HashSet<String>,
         quarantined: &HashSet<String>,
     ) -> Self {
+        Self::build_with_tenant_names(specs, refused, default_names, &HashMap::new(), quarantined)
+    }
+
+    /// [`Self::build`] with the flat names the relay has accepted named tenants for or holds in
+    /// quarantine for them (`tenant_flat`, flat name to the slug of that tenant): a slug equal
+    /// to one is refused, and so is a grant equal to one of another tenant (round T5, L2).
+    pub fn build_with_tenant_names(
+        mut specs: Vec<TenantSpec>,
+        refused: Vec<Refusal>,
+        default_names: &HashSet<String>,
+        tenant_flat: &HashMap<String, String>,
+        quarantined: &HashSet<String>,
+    ) -> Self {
         specs.sort_by(|a, b| (a.added, &a.slug).cmp(&(b.added, &b.slug)));
-        let slugs: HashSet<Slug> = specs.iter().map(|spec| spec.slug.clone()).collect();
+        // The slugs of the files judged before the one at hand: the older file keeps what is
+        // contested, the newer is the one refused (round T5, M3).
+        let mut earlier: HashSet<Slug> = HashSet::new();
         let mut book = Self {
             refused,
             quarantined_slugs: quarantined.clone(),
@@ -412,6 +441,8 @@ impl TenantBook {
         };
         let mut granted: HashMap<String, Slug> = HashMap::new();
         for spec in specs {
+            let before = earlier.clone();
+            earlier.insert(spec.slug.clone());
             if quarantined.contains(spec.slug.as_str()) {
                 book.refuse(
                     &spec,
@@ -422,7 +453,14 @@ impl TenantBook {
                 );
                 continue;
             }
-            match book.judge(&spec, &slugs, default_names, &granted) {
+            let names = JudgedNames {
+                earlier: &before,
+                default_names,
+                tenant_flat,
+                quarantined,
+                granted: &granted,
+            };
+            match book.judge(&spec, &names) {
                 Err(reason) => book.refuse(&spec, reason),
                 Ok(mut tenant) => {
                     for name in &tenant.extra_names {
@@ -459,19 +497,32 @@ impl TenantBook {
         book
     }
 
-    fn judge(
-        &self,
-        spec: &TenantSpec,
-        slugs: &HashSet<Slug>,
-        default_names: &HashSet<String>,
-        granted: &HashMap<String, Slug>,
-    ) -> Result<Tenant, String> {
+    fn judge(&self, spec: &TenantSpec, names: &JudgedNames<'_>) -> Result<Tenant, String> {
+        let JudgedNames {
+            earlier,
+            default_names,
+            tenant_flat,
+            quarantined,
+            granted,
+        } = *names;
         if self.named.contains_key(&spec.slug) {
             return Err(format!("the name {} is already a tenant", spec.slug));
         }
         if default_names.contains(spec.slug.as_str()) {
             return Err(format!(
                 "{} is a flat name the default tenant holds; a tenant name cannot equal one",
+                spec.slug
+            ));
+        }
+        if let Some(owner) = tenant_flat.get(spec.slug.as_str()) {
+            return Err(format!(
+                "{} is a flat name granted to tenant {owner}, held or in quarantine; a tenant name cannot equal one",
+                spec.slug
+            ));
+        }
+        if let Some(owner) = granted.get(spec.slug.as_str()) {
+            return Err(format!(
+                "{} is a name granted to tenant {owner}; a tenant name cannot equal one",
                 spec.slug
             ));
         }
@@ -487,8 +538,20 @@ impl TenantBook {
         let mut extra_names: Vec<String> = Vec::new();
         for name in &spec.extra_names {
             check_flat_name(name)?;
-            if slugs.iter().any(|slug| slug.as_str() == name) {
+            if earlier.iter().any(|slug| slug.as_str() == name) {
                 return Err(format!("extra name {name:?} is a tenant name"));
+            }
+            if quarantined.contains(name) {
+                return Err(format!(
+                    "extra name {name:?} is the name of a removed tenant, in quarantine"
+                ));
+            }
+            if let Some(owner) = tenant_flat.get(name)
+                && owner != spec.slug.as_str()
+            {
+                return Err(format!(
+                    "extra name {name:?} is held by tenant {owner}, or in quarantine for it"
+                ));
             }
             if default_names.contains(name) {
                 return Err(format!(
@@ -1269,12 +1332,22 @@ mod tests {
 
     #[test]
     fn an_extra_name_equal_to_any_slug_or_to_a_default_tenant_name_is_refused() {
-        // Equal to another tenant's slug, whichever file is older.
+        // Equal to another tenant's slug: the older file keeps it, the newer is refused
+        // (round T5, M3: adding a tenant must not take an older one offline).
         let mut grant = spec("ali", &[1]);
         grant.extra_names = vec!["veli".into()];
         grant.added = 1;
         let mut other = spec("veli", &[2]);
         other.added = 2;
+        let book = build(vec![grant.clone(), other.clone()]);
+        assert!(book.named("ali").is_some(), "the older grant stays");
+        assert!(
+            book.named("veli").is_none(),
+            "the newer slug equals ali's grant"
+        );
+        assert!(book.is_held_back(&net(2)) && !book.is_held_back(&net(1)));
+        // A grant that is newer than the slug it equals is the one refused.
+        grant.added = 3;
         let book = build(vec![grant, other]);
         assert!(
             book.named("ali").is_none(),
@@ -1302,6 +1375,45 @@ mod tests {
         let book = TenantBook::build(vec![spec("ali", &[1])], vec![], &held, &HashSet::new());
         assert!(book.named("ali").is_none());
         assert!(book.is_held_back(&net(1)));
+    }
+
+    /// Round T5, L1: a grant equal to the slug of a removed tenant (in quarantine) is refused,
+    /// whoever asks, and the tenant's networks are held back.
+    #[test]
+    fn an_extra_name_equal_to_a_quarantined_slug_is_refused() {
+        let mut grant = spec("veli", &[3]);
+        grant.extra_names = vec!["gone".into()];
+        let quarantined: HashSet<String> = ["gone".to_string()].into();
+        let book = TenantBook::build(vec![grant.clone()], vec![], &no_names(), &quarantined);
+        assert!(book.named("veli").is_none());
+        assert!(book.is_held_back(&net(3)));
+        assert!(book.refused()[0].reason.contains("quarantine"));
+        // Without the quarantine it is an ordinary grant.
+        assert!(build(vec![grant]).named("veli").is_some());
+    }
+
+    /// Round T5, L2: a slug cannot equal a flat name a named tenant is accepted for or is
+    /// quarantined for (the apex of that name is the first level of one namespace), and a grant
+    /// cannot be one of another tenant's, though a tenant keeps its own.
+    #[test]
+    fn a_slug_or_grant_equal_to_a_flat_name_of_a_tenant_is_refused() {
+        let flat: HashMap<String, String> = [("blog".to_string(), "ali".to_string())].into();
+        let build_with = |specs| {
+            TenantBook::build_with_tenant_names(specs, vec![], &no_names(), &flat, &HashSet::new())
+        };
+        let book = build_with(vec![spec("blog", &[1])]);
+        assert!(book.named("blog").is_none());
+        assert!(book.refused()[0].reason.contains("tenant ali"));
+
+        let mut other = spec("veli", &[2]);
+        other.extra_names = vec!["blog".into()];
+        let book = build_with(vec![other]);
+        assert!(book.named("veli").is_none(), "ali holds blog");
+
+        let mut own = spec("ali", &[3]);
+        own.extra_names = vec!["blog".into()];
+        let book = build_with(vec![own]);
+        assert!(book.named("ali").is_some(), "its own grant is not a clash");
     }
 
     #[test]

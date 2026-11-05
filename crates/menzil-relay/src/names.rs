@@ -17,7 +17,8 @@
 //!
 //! - Quota per tenant: `names` held in all and `new_names_per_week` accepted for the first time
 //!   in any 7 days (rule 7). An operator grant (`extra_names`) counts toward the first and is
-//!   exempt from the second.
+//!   exempt from the second. The second is counted from a log of first acceptance times that
+//!   release does not erase (round T5, M2), kept in the state file for 7 days.
 //! - Release: a name not advertised for [`RELEASE_DAYS`] days, and not held by a session now, is
 //!   released (rule 8). A released flat name enters quarantine for [`QUARANTINE_DAYS`] days, bound
 //!   to the network that held it: only that network may take it back meanwhile. A released name
@@ -27,7 +28,7 @@
 //!
 //! Nothing here reads a clock or a file.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt::Write as _;
 
 use menzil_proto::NetworkId;
@@ -137,6 +138,11 @@ pub struct NameState {
     pub names: BTreeMap<String, NameRecord>,
     /// Quarantined first level labels (flat names and slugs).
     pub quarantine: BTreeMap<String, Quarantine>,
+    /// When each tenant with figures had a name accepted for the first time, kept for
+    /// [`NEW_NAMES_WINDOW_DAYS`] days and not erased when the name is released, so that the
+    /// weekly figure cannot be got round by releasing names and claiming new ones (round T5, M2).
+    /// The key is the tenant's slug.
+    pub accepted: BTreeMap<String, Vec<u64>>,
 }
 
 /// Whether a full name is flat (the default tenant's or an operator grant) and not in a zone.
@@ -158,6 +164,7 @@ impl NameState {
                 .filter(|(_, q)| q.kind == QuarantineKind::Flat)
                 .map(|(name, q)| (name.clone(), q.clone()))
                 .collect(),
+            accepted: self.accepted.clone(),
         }
     }
 
@@ -174,6 +181,23 @@ impl NameState {
             .iter()
             .filter(|(_, q)| q.kind == QuarantineKind::Flat && q.tenant.is_none())
             .map(|(name, _)| name.clone());
+        held.chain(quarantined).collect()
+    }
+
+    /// The flat names a named tenant is accepted for or is quarantined for (an operator grant,
+    /// held or released), each with the slug of that tenant: a slug equal to one, or a grant of
+    /// another tenant equal to one, is refused (rule 4 and 10; round T5, L2).
+    pub fn tenant_flat_names(&self) -> HashMap<String, String> {
+        let held = self
+            .names
+            .iter()
+            .filter(|(full, _)| is_flat(full))
+            .filter_map(|(full, record)| Some((full.clone(), record.tenant.clone()?)));
+        let quarantined = self
+            .quarantine
+            .iter()
+            .filter(|(_, q)| q.kind == QuarantineKind::Flat)
+            .filter_map(|(name, q)| Some((name.clone(), q.tenant.clone()?)));
         held.chain(quarantined).collect()
     }
 
@@ -209,7 +233,40 @@ impl NameState {
     pub fn prune(&mut self, now: u64) -> bool {
         let before = self.quarantine.len();
         self.quarantine.retain(|_, q| q.until() > now);
-        self.quarantine.len() != before
+        let changed = self.quarantine.len() != before;
+        // Old entries of the acceptance log go too, without counting as a change: they are
+        // not worth a write, and the next write leaves them out.
+        let window = NEW_NAMES_WINDOW_DAYS * DAY;
+        for times in self.accepted.values_mut() {
+            times.retain(|first| first.saturating_add(window) > now);
+        }
+        self.accepted.retain(|_, times| !times.is_empty());
+        changed
+    }
+
+    /// Brings every time that lies after `now` back to `now` (the clock went forward once and
+    /// was set right again): a name stamped in the future would otherwise not be released, nor a
+    /// quarantine end, nor a first acceptance leave the weekly figure, for as long as the stamp
+    /// lies ahead (round T5, N1). Whether anything changed.
+    pub fn clamp(&mut self, now: u64) -> bool {
+        let mut changed = false;
+        let mut fix = |time: &mut u64| {
+            if *time > now {
+                *time = now;
+                changed = true;
+            }
+        };
+        for record in self.names.values_mut() {
+            fix(&mut record.first);
+            fix(&mut record.last);
+        }
+        for quarantine in self.quarantine.values_mut() {
+            fix(&mut quarantine.since);
+        }
+        for times in self.accepted.values_mut() {
+            times.iter_mut().for_each(&mut fix);
+        }
+        changed
     }
 
     /// Judges a claim for `claim.full`, and records it if it is given. `figures` is `None` for a
@@ -242,7 +299,11 @@ impl NameState {
             }
             return (Ok(()), changed);
         }
+        // A quarantine that ended is dropped at once. One the claimant's own network may end by
+        // taking the name back is dropped only when the name is given: a claim refused for the
+        // quota leaves it standing (round T5, L3).
         let mut cleared = false;
+        let mut take_back = false;
         if let Some(q) = self.quarantine.get(claim.full) {
             if q.until() <= now {
                 self.quarantine.remove(claim.full);
@@ -250,16 +311,23 @@ impl NameState {
             } else if q.kind == QuarantineKind::Slug || q.network != Some(claim.network) {
                 return (Err(NameRefusal::Quarantined), false);
             } else {
-                // The network that held it takes it back.
-                self.quarantine.remove(claim.full);
-                cleared = true;
+                take_back = true;
             }
         }
         if let Some(figures) = figures {
-            let mine = || self.names.values().filter(|r| r.tenant == tenant);
-            let held = mine().count() as u64;
+            let held = self.names.values().filter(|r| r.tenant == tenant).count() as u64;
             let window = NEW_NAMES_WINDOW_DAYS * DAY;
-            let new_this_week = self
+            // The log is the count; a state written before the log existed has none, so the
+            // names held count too, whichever is more.
+            let logged = tenant.as_ref().map_or(0, |slug| {
+                self.accepted.get(slug).map_or(0, |times| {
+                    times
+                        .iter()
+                        .filter(|first| first.saturating_add(window) > now)
+                        .count() as u64
+                })
+            });
+            let held_new = self
                 .names
                 .iter()
                 .filter(|(full, r)| {
@@ -268,9 +336,16 @@ impl NameState {
                         && r.first.saturating_add(window) > now
                 })
                 .count() as u64;
+            let new_this_week = logged.max(held_new);
             if held >= figures.names || (!exempt_weekly && new_this_week >= figures.new_per_week) {
                 return (Err(NameRefusal::OverQuota), cleared);
             }
+            if !exempt_weekly && let Some(slug) = &tenant {
+                self.accepted.entry(slug.clone()).or_default().push(now);
+            }
+        }
+        if take_back {
+            self.quarantine.remove(claim.full);
         }
         self.names.insert(
             claim.full.to_string(),
@@ -340,7 +415,7 @@ impl NameState {
     /// is not "unadvertised"), the others not advertised for [`RELEASE_DAYS`] days are released,
     /// and quarantines that ended are dropped. Whether anything changed.
     pub fn sweep(&mut self, now: u64, is_held: impl Fn(&str) -> bool) -> bool {
-        let mut changed = false;
+        let mut changed = self.clamp(now);
         let keys: Vec<String> = self.names.keys().cloned().collect();
         for full in keys {
             if is_held(&full) {
@@ -371,6 +446,11 @@ impl NameState {
                 r.first,
                 r.last
             );
+        }
+        for (slug, times) in &self.accepted {
+            for first in times {
+                let _ = writeln!(out, "accepted {slug} {first}");
+            }
         }
         for (name, q) in &self.quarantine {
             let kind = match q.kind {
@@ -424,6 +504,17 @@ impl NameState {
                         return Err(fail("a name is listed twice"));
                     }
                 }
+                ["accepted", tenant, first] => {
+                    if !is_label(tenant) {
+                        return Err(fail("not a tenant name"));
+                    }
+                    let first: u64 = first.parse().map_err(|_| fail("not a number"))?;
+                    state
+                        .accepted
+                        .entry((*tenant).to_string())
+                        .or_default()
+                        .push(first);
+                }
                 ["quarantine", kind, name, since, tenant, network] => {
                     let kind = match *kind {
                         "flat" => QuarantineKind::Flat,
@@ -454,7 +545,11 @@ impl NameState {
                         return Err(fail("a quarantined name is listed twice"));
                     }
                 }
-                _ => return Err(fail("not a `name` or `quarantine` line of the right shape")),
+                _ => {
+                    return Err(fail(
+                        "not a `name`, `accepted` or `quarantine` line of the right shape",
+                    ));
+                }
             }
         }
         Ok(state)
@@ -763,6 +858,193 @@ mod tests {
         assert!(
             state.default_flat_names().contains("app"),
             "quarantined still counts"
+        );
+    }
+    /// Round T5, M2: a name released by the sweep or by the operator still counts for the week it
+    /// was first accepted in, so releasing and claiming anew is not a way round the figure.
+    #[test]
+    fn a_released_name_still_counts_toward_the_weekly_figure() {
+        let mut state = NameState::default();
+        for i in 0..5 {
+            let full = format!("n{i}.ali");
+            assert!(
+                state
+                    .accept(&claim(&full, Some("ali"), 1), Some(FIG), NOW + i)
+                    .0
+                    .is_ok()
+            );
+            assert!(state.release(&full, NOW + 10 + i));
+        }
+        assert!(state.names.is_empty());
+        assert_eq!(
+            state
+                .accept(&claim("fresh.ali", Some("ali"), 1), Some(FIG), NOW + 20)
+                .0,
+            Err(NameRefusal::OverQuota),
+            "five were accepted this week, released or not"
+        );
+        // The same name released and claimed again is a new first acceptance each time.
+        let mut again = NameState::default();
+        for round in 0..5 {
+            let at = NOW + round;
+            assert!(
+                again
+                    .accept(&claim("same.ali", Some("ali"), 1), Some(FIG), at)
+                    .0
+                    .is_ok(),
+                "round {round}"
+            );
+            assert!(again.release("same.ali", at));
+        }
+        assert_eq!(
+            again
+                .accept(&claim("same.ali", Some("ali"), 1), Some(FIG), NOW + 6)
+                .0,
+            Err(NameRefusal::OverQuota)
+        );
+        // Seven days after the first acceptance, the log lets go.
+        assert!(
+            state
+                .accept(
+                    &claim("fresh.ali", Some("ali"), 1),
+                    Some(FIG),
+                    NOW + 7 * DAY + 4
+                )
+                .0
+                .is_ok()
+        );
+        // The other tenants' logs are their own.
+        assert!(
+            state
+                .accept(&claim("x.bob", Some("bob"), 2), Some(FIG), NOW + 21)
+                .0
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn the_acceptance_log_is_kept_in_the_text_form_and_pruned_after_the_week() {
+        let mut state = NameState::default();
+        for i in 0..3 {
+            let full = format!("n{i}.ali");
+            let _ = state.accept(&claim(&full, Some("ali"), 1), Some(FIG), NOW + i);
+            state.release(&full, NOW + 5);
+        }
+        let text = state.render();
+        assert_eq!(text.matches("\naccepted ali ").count(), 3, "{text}");
+        let parsed = NameState::parse(&text).unwrap();
+        assert_eq!(parsed, state);
+        assert_eq!(parsed.relay_part(), state, "the relay owns the log");
+        // Damaged lines name the line.
+        for bad in [
+            "accepted ali x",
+            "accepted Ali 1",
+            "accepted ali",
+            "accepted - 1",
+        ] {
+            let error = NameState::parse(&format!("{HEADER}\n{bad}\n")).unwrap_err();
+            assert_eq!(error.line, 2, "{bad}: {error}");
+        }
+        let mut state = parsed;
+        state.prune(NOW + 7 * DAY + 1);
+        assert_eq!(state.accepted.get("ali").map(Vec::len), Some(1));
+        state.prune(NOW + 7 * DAY + 2);
+        assert!(state.accepted.is_empty());
+    }
+
+    /// A state written before the log existed has none; the names held count then.
+    #[test]
+    fn a_state_without_a_log_counts_the_names_it_holds() {
+        let mut state = NameState::default();
+        for i in 0..5 {
+            let full = format!("n{i}.ali");
+            let _ = state.accept(&claim(&full, Some("ali"), 1), Some(FIG), NOW);
+        }
+        state.accepted.clear();
+        assert_eq!(
+            state
+                .accept(&claim("n5.ali", Some("ali"), 1), Some(FIG), NOW + 1)
+                .0,
+            Err(NameRefusal::OverQuota)
+        );
+    }
+
+    /// Round T5, L3: a claim refused for the quota leaves the quarantine of its name standing.
+    #[test]
+    fn an_over_quota_claim_does_not_end_a_quarantine() {
+        let fig = NameFigures {
+            names: 1,
+            new_per_week: 5,
+        };
+        let mut state = NameState::default();
+        assert!(
+            state
+                .accept(&claim("blog", Some("ali"), 1), Some(fig), NOW)
+                .0
+                .is_ok()
+        );
+        assert!(state.release("blog", NOW));
+        assert!(
+            state
+                .accept(&claim("a.ali", Some("ali"), 1), Some(fig), NOW)
+                .0
+                .is_ok()
+        );
+        let (refused, changed) = state.accept(&claim("blog", Some("ali"), 1), Some(fig), NOW + 1);
+        assert_eq!(refused, Err(NameRefusal::OverQuota));
+        assert!(!changed);
+        assert!(state.quarantine.contains_key("blog"));
+        assert_eq!(
+            state.accept(&claim("blog", None, 2), None, NOW + 2).0,
+            Err(NameRefusal::Quarantined),
+            "another network still cannot take it"
+        );
+        // With room again, the network that held it takes it back and the quarantine ends.
+        assert!(state.release("a.ali", NOW + 3));
+        assert!(
+            state
+                .accept(&claim("blog", Some("ali"), 1), Some(fig), NOW + 4)
+                .0
+                .is_ok()
+        );
+        assert!(state.quarantine.is_empty());
+    }
+
+    /// Round T5, N1: stamps in the future (the clock went forward and back) are brought to now.
+    #[test]
+    fn stamps_in_the_future_are_brought_back_to_now() {
+        let mut state = NameState::default();
+        let _ = state.accept(&claim("app", None, 1), None, NOW + 400 * DAY);
+        let _ = state.accept(&claim("a.ali", Some("ali"), 1), Some(FIG), NOW + 400 * DAY);
+        let _ = state.accept(&claim("gone", None, 1), None, NOW + 400 * DAY);
+        state.release("gone", NOW + 400 * DAY);
+        assert!(state.sweep(NOW, |_| false));
+        assert_eq!(state.names["app"].first, NOW);
+        assert_eq!(state.names["app"].last, NOW);
+        assert_eq!(state.quarantine["gone"].since, NOW);
+        assert_eq!(state.accepted["ali"], vec![NOW]);
+        assert!(!state.sweep(NOW, |_| false), "nothing left to clamp");
+        // So the name is released 90 days from now, not 90 days after the wrong stamp.
+        assert!(state.sweep(NOW + 90 * DAY, |_| false));
+        assert!(state.names.is_empty());
+    }
+
+    #[test]
+    fn the_flat_names_of_named_tenants_are_listed_with_their_tenant() {
+        let mut state = NameState::default();
+        let _ = state.accept(&claim("blog", Some("ali"), 1), None, NOW);
+        let _ = state.accept(&claim("shop", Some("veli"), 2), None, NOW);
+        let _ = state.accept(&claim("x.ali", Some("ali"), 1), None, NOW);
+        let _ = state.accept(&claim("app", None, 3), None, NOW);
+        state.release("shop", NOW + 1);
+        let flat = state.tenant_flat_names();
+        assert_eq!(
+            flat,
+            HashMap::from([
+                ("blog".to_string(), "ali".to_string()),
+                ("shop".to_string(), "veli".to_string()),
+            ]),
+            "held and quarantined, flat only, no default tenant name"
         );
     }
 }

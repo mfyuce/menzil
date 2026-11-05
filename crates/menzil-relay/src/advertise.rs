@@ -132,6 +132,10 @@ struct Inner {
     /// Which currently attached node holds each accepted full name.
     holders: HashMap<String, NodeId>,
     state: NameState,
+    /// Networks the operator removed whose names a live session kept at the time
+    /// ([`LabelRegistry::network_removed`]): [`LabelRegistry::sweep`] releases those names once
+    /// the session is gone, although no Roster of the network is held.
+    removed_networks: HashSet<NetworkId>,
     on_change: Option<OnChange>,
 }
 
@@ -513,10 +517,19 @@ impl LabelRegistry {
         let index = rosters.label_index();
         let held_networks: HashSet<NetworkId> = rosters.networks().into_iter().collect();
         let mut guard = self.lock();
-        let Inner { holders, state, .. } = &mut *guard;
+        let Inner {
+            holders,
+            state,
+            removed_networks,
+            ..
+        } = &mut *guard;
         let mut changed = state.sweep(now, |full| holders.contains_key(full));
+        removed_networks.retain(|network| !held_networks.contains(network));
         changed |= state.release_where(now, |full, record| {
-            if holders.contains_key(full) || !held_networks.contains(&record.network) {
+            if holders.contains_key(full)
+                || !(held_networks.contains(&record.network)
+                    || removed_networks.contains(&record.network))
+            {
                 return false;
             }
             let label = full.split('.').next().unwrap_or(full);
@@ -530,15 +543,62 @@ impl LabelRegistry {
         guard.notify(changed);
     }
 
-    /// The relay no longer serves `network` (the operator removed it): every name its Roster
-    /// granted is released at `now`; a flat one is quarantined for 180 days, bound to the
-    /// network, a name in a tenant's zone is simply gone (a removed tenant's slug is
-    /// quarantined by the command that removes it).
-    pub fn network_removed(&self, network: &NetworkId, now: u64) {
+    /// The relay no longer serves `network` (the operator removed it; the caller has removed it
+    /// from `rosters` already): every name its Roster granted is released at `now`; a flat one
+    /// is quarantined for 180 days, bound to the network, a name in a tenant's zone is simply
+    /// gone (a removed tenant's slug is quarantined by the command that removes it).
+    ///
+    /// A name another network of the same tenant still grants is not released but moves to that
+    /// network, and a name a session holds now is left alone, as [`Self::sweep`] leaves them
+    /// (round T5, L4); the sweep releases it after the session has gone. `book` is the tenant book the networks are attributed with.
+    pub fn network_removed(
+        &self,
+        rosters: &RosterStore,
+        book: &TenantBook,
+        network: &NetworkId,
+        now: u64,
+    ) {
+        let index = rosters.label_index();
         let mut guard = self.lock();
-        let changed = guard
-            .state
-            .release_where(now, |_, record| record.network == *network);
+        let Inner {
+            holders,
+            state,
+            removed_networks,
+            ..
+        } = &mut *guard;
+        let mut changed = false;
+        let mut rebind: Vec<(String, NetworkId)> = Vec::new();
+        for (full, record) in &state.names {
+            if record.network != *network {
+                continue;
+            }
+            let label = full.split('.').next().unwrap_or(full);
+            let other = index.get(label).and_then(|networks| {
+                networks.iter().find(|candidate| {
+                    *candidate != network
+                        && book.id_of(candidate).slug() == record.tenant.as_deref()
+                })
+            });
+            if let Some(other) = other {
+                rebind.push((full.clone(), *other));
+            }
+        }
+        for (full, other) in rebind {
+            if let Some(record) = state.names.get_mut(&full) {
+                record.network = other;
+                changed = true;
+            }
+        }
+        let mut kept = false;
+        changed |= state.release_where(now, |full, record| {
+            let release = record.network == *network && !holders.contains_key(full);
+            kept |= record.network == *network && !release;
+            release
+        });
+        if kept {
+            // The sweep releases those once their sessions have ended.
+            removed_networks.insert(*network);
+        }
         guard.notify(changed);
     }
 
@@ -1789,8 +1849,11 @@ mod tests {
         let registry = LabelRegistry::new();
         at(&registry, &rosters, &book, &[flat.id], &f, &["app"], NOW);
         at(&registry, &rosters, &book, &[ali.id], &a, &["app"], NOW);
-        registry.network_removed(&flat.id, NOW + 1);
-        registry.network_removed(&ali.id, NOW + 1);
+        // The removal ends the sessions that claimed the networks; their names are free then.
+        registry.clear_for(&f, NOW);
+        registry.clear_for(&a, NOW);
+        registry.network_removed(&rosters, &book, &flat.id, NOW + 1);
+        registry.network_removed(&rosters, &book, &ali.id, NOW + 1);
         let state = registry.state();
         assert!(state.names.is_empty());
         assert_eq!(state.quarantine["app"].network, Some(flat.id));
@@ -1876,5 +1939,118 @@ mod tests {
             at(&restarted, &rosters, &book, &[flat.id], &f, &["app"], later).names,
             ["app"]
         );
+    }
+
+    // ---- round T5 ----
+
+    /// Round T5, M2 (the reviewer's probe, asserting the fixed behaviour): dropping names from
+    /// the Roster so that the sweep releases them, and claiming new ones, does not get round
+    /// the 5 new names in 7 days.
+    #[test]
+    fn t5_weekly_figure_holds_across_a_release_cycle() {
+        let rosters = RosterStore::new();
+        let mut ali = Net::new();
+        let n = node(2);
+        let book = book(vec![("ali", vec![ali.id], &[], &[])]);
+        let registry = LabelRegistry::new();
+        let mut total_new = 0;
+        let mut last_reasons = Vec::new();
+        for round in 0..6u64 {
+            let labels: Vec<String> = (0..5).map(|i| format!("r{round}x{i}")).collect();
+            let pairs: Vec<(&str, NodeId)> = labels.iter().map(|l| (l.as_str(), n)).collect();
+            ali.publish(&rosters, &[n], &pairs);
+            let now = NOW + round * 20;
+            registry.clear_for(&n, now);
+            registry.sweep(&rosters, &book, now);
+            let refs: Vec<&str> = labels.iter().map(String::as_str).collect();
+            let ack = at(&registry, &rosters, &book, &[ali.id], &n, &refs, now);
+            total_new += ack.names.len();
+            last_reasons = reasons(&ack);
+        }
+        assert_eq!(
+            total_new, 5,
+            "five new names in the week, whatever was released"
+        );
+        assert!(last_reasons.iter().all(|(_, why)| why == "over_quota"));
+        // A week after the first acceptances the figure lets go again.
+        ali.publish(&rosters, &[n], &[("later", n)]);
+        registry.clear_for(&n, NOW + 8 * DAY);
+        registry.sweep(&rosters, &book, NOW + 8 * DAY);
+        let ack = at(
+            &registry,
+            &rosters,
+            &book,
+            &[ali.id],
+            &n,
+            &["later"],
+            NOW + 8 * DAY,
+        );
+        assert_eq!(ack.names, ["later.ali"]);
+    }
+
+    /// Round T5, L4: a removed network's name that another network of the tenant still grants
+    /// moves to that network and is neither released nor quarantined; the live holder keeps it.
+    #[test]
+    fn t5_network_removed_keeps_a_name_another_network_still_grants() {
+        let rosters = RosterStore::new();
+        let (mut d1, mut d2) = (Net::new(), Net::new());
+        let n = node(4);
+        d1.publish(&rosters, &[n], &[("app", n)]);
+        d2.publish(&rosters, &[n], &[("app", n)]);
+        let book = TenantBook::default();
+        let registry = LabelRegistry::new();
+        let first = at(
+            &registry,
+            &rosters,
+            &book,
+            &[d1.id, d2.id],
+            &n,
+            &["app"],
+            NOW,
+        );
+        assert_eq!(first.names, ["app"]);
+        assert_eq!(registry.state().names["app"].network, d1.id);
+        assert!(rosters.remove(&d1.id));
+        registry.network_removed(&rosters, &book, &d1.id, NOW + 10);
+        let state = registry.state();
+        assert_eq!(
+            state.names["app"].network, d2.id,
+            "moved to the network that grants it"
+        );
+        assert!(state.quarantine.is_empty());
+        // The node comes back through the second network: nothing refuses it.
+        registry.clear_for(&n, NOW + 15);
+        let back = at(&registry, &rosters, &book, &[d2.id], &n, &["app"], NOW + 20);
+        assert_eq!(back.names, ["app"]);
+    }
+
+    /// Round T5, L4: a name a live session holds is not released at the removal (the sweep does
+    /// not release such names either); once the session has gone the sweep releases it, into
+    /// quarantine bound to the removed network.
+    #[test]
+    fn t5_network_removed_leaves_a_held_name_to_the_sweep() {
+        let rosters = RosterStore::new();
+        let mut d1 = Net::new();
+        let n = node(5);
+        d1.publish(&rosters, &[n], &[("app", n)]);
+        let book = TenantBook::default();
+        let registry = LabelRegistry::new();
+        at(&registry, &rosters, &book, &[d1.id], &n, &["app"], NOW);
+        assert!(rosters.remove(&d1.id));
+        registry.network_removed(&rosters, &book, &d1.id, NOW + 10);
+        assert!(
+            registry.state().names.contains_key("app"),
+            "a session still holds it"
+        );
+        registry.sweep(&rosters, &book, NOW + 11);
+        assert!(
+            registry.state().names.contains_key("app"),
+            "held: left alone"
+        );
+        registry.clear_for(&n, NOW + 12);
+        registry.sweep(&rosters, &book, NOW + 13);
+        let state = registry.state();
+        assert!(state.names.is_empty());
+        assert_eq!(state.quarantine["app"].network, Some(d1.id));
     }
 }

@@ -605,6 +605,23 @@ fn roster_file_ids(home: &Home) -> Result<HashSet<NetworkId>> {
 /// keeps serving what it has. `announced` holds the notes printed last time, so that a standing
 /// problem is said once and not at every pass.
 fn reload_once(relay: &Relay, home: &Home, announced: &mut Vec<String>) {
+    reload_once_with(relay, home, announced, &mut || {});
+}
+
+/// [`reload_once`] with a function called once, between dropping the networks that are no
+/// longer served and swapping in the new tenant book (tests look at the relay there).
+///
+/// The order matters (round T5, L5): the networks of a removed or held back tenant leave the
+/// store, ending their sessions, BEFORE the new book is set. With the book swapped first, those
+/// networks would for a moment belong to the default tenant, and a node of theirs that
+/// advertised in that moment could take a flat name of the default tenant's and lock its owner
+/// out for 180 days through the quarantine of the removal.
+fn reload_once_with(
+    relay: &Relay,
+    home: &Home,
+    announced: &mut Vec<String>,
+    before_swap: &mut dyn FnMut(),
+) {
     let (rosters, failures) = match load_rosters_each(home) {
         Ok(read) => read,
         Err(error) => {
@@ -616,22 +633,57 @@ fn reload_once(relay: &Relay, home: &Home, announced: &mut Vec<String>) {
         tracing::warn!(error = %format!("{failure:#}"), "a Roster file cannot be read");
     }
     let mut notes = Vec::new();
-    match tenants::load_book(home, &rosters) {
+    let loaded = match tenants::load_book(home, &rosters) {
         Ok(book) => {
             notes = tenants::book_notes(&book, &rosters);
-            relay.set_tenants(book);
+            Some(book)
         }
         Err(error) => {
             notes.push(format!(
                 "the tenant files cannot be read ({error:#}): the relay keeps the tenants it had"
             ));
+            None
         }
-    }
+    };
     if *announced != notes {
         for note in &notes {
             tracing::warn!("{note}");
         }
         *announced = notes;
+    }
+    // Which networks are no longer served is judged with the book that is about to be set (or
+    // the one the relay has, when the tenant files cannot be read).
+    let current = relay.tenants();
+    {
+        let book: &TenantBook = loaded.as_ref().unwrap_or(&current);
+        match roster_file_ids(home) {
+            Ok(present) => {
+                for network in relay.rosters().networks() {
+                    let held_back = book.is_held_back(&network);
+                    if (held_back || !present.contains(&network))
+                        && relay.rosters().remove(&network)
+                    {
+                        // Its names are released: a flat one waits 180 days for the network to
+                        // come back (design 2.2, rule 9).
+                        relay
+                            .labels()
+                            .network_removed(relay.rosters(), book, &network, unix_now());
+                        tracing::warn!(
+                            %network,
+                            held_back,
+                            "the network is no longer served (its Roster file is gone, or its tenant file is not used): the sessions that claimed it end"
+                        );
+                    }
+                }
+            }
+            Err(error) => {
+                tracing::warn!(error = %format!("{error:#}"), "the Roster files cannot be listed; no network is dropped");
+            }
+        }
+    }
+    before_swap();
+    if let Some(book) = loaded {
+        relay.set_tenants(book);
     }
     let book = relay.tenants();
     for stored in &rosters {
@@ -646,26 +698,6 @@ fn reload_once(relay: &Relay, home: &Home, announced: &mut Vec<String>) {
             .adopt(&stored.roster, stored.base.as_ref(), unix_now())
         {
             tracing::warn!(network = ?body.network_id, %error, "a Roster on disk was refused");
-        }
-    }
-    match roster_file_ids(home) {
-        Ok(present) => {
-            for network in relay.rosters().networks() {
-                let held_back = book.is_held_back(&network);
-                if (held_back || !present.contains(&network)) && relay.rosters().remove(&network) {
-                    // Its names are released: a flat one waits 180 days for the network to
-                    // come back (design 2.2, rule 9).
-                    relay.labels().network_removed(&network, unix_now());
-                    tracing::warn!(
-                        %network,
-                        held_back,
-                        "the network is no longer served (its Roster file is gone, or its tenant file is not used): the sessions that claimed it end"
-                    );
-                }
-            }
-        }
-        Err(error) => {
-            tracing::warn!(error = %format!("{error:#}"), "the Roster files cannot be listed; no network is dropped");
         }
     }
     // The periodic name pass (MT9): names held are stamped, names unadvertised for 90 days or

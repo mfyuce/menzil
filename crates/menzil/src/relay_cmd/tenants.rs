@@ -25,7 +25,7 @@
 //! file before the Roster, `remove-network` and `remove-tenant` delete the Roster files before
 //! the tenant file.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt::Write as _;
 use std::fs;
 use std::io::ErrorKind;
@@ -221,18 +221,6 @@ pub fn read_specs(home: &Home) -> Result<(Vec<TenantSpec>, Vec<Refusal>)> {
     Ok((specs, refused))
 }
 
-/// The flat names the default tenant holds: the labels of the Rosters of the networks no
-/// tenant file lists.
-fn default_names(rosters: &[StoredRoster], listed: &HashSet<NetworkId>) -> HashSet<String> {
-    rosters
-        .iter()
-        .filter_map(|stored| stored.roster.decode().ok())
-        .filter(|body| !listed.contains(&body.network_id))
-        .flat_map(|body| body.labels)
-        .map(|label| label.name.to_ascii_lowercase())
-        .collect()
-}
-
 fn listed_networks(specs: &[TenantSpec], refused: &[Refusal]) -> HashSet<NetworkId> {
     specs
         .iter()
@@ -242,17 +230,18 @@ fn listed_networks(specs: &[TenantSpec], refused: &[Refusal]) -> HashSet<Network
         .collect()
 }
 
-/// The tenants the relay directory describes, judged with the Rosters it holds (`rosters`, as
-/// [`load_rosters_each`] read them). An error means the tenant files cannot be told apart from
+/// The tenants the relay directory describes, judged with the name state (`names.state`). The
+/// Rosters (`_rosters`, as [`load_rosters_each`] read them) no longer take part in the judgement
+/// (round T5, M1); the parameter stays for the callers. An error means the tenant files cannot be told apart from
 /// what the operator wrote (see [`read_specs`]): at start the relay does not run, at a reload
 /// it keeps the book it has.
-pub fn load_book(home: &Home, rosters: &[StoredRoster]) -> Result<TenantBook> {
+pub fn load_book(home: &Home, _rosters: &[StoredRoster]) -> Result<TenantBook> {
     let (specs, refused) = read_specs(home)?;
-    let names = default_names_with_state(home, rosters, &listed_networks(&specs, &refused))?;
+    let names = FlatNames::read(home)?;
     // Removed slugs still in quarantine: a file that brings one back is refused (design 2.2,
     // rule 1; round T4, N5).
     let removed: HashSet<String> = quarantined(home, super::unix_now())?.into_keys().collect();
-    Ok(TenantBook::build(specs, refused, &names, &removed))
+    Ok(names.build(specs, refused, &removed))
 }
 
 /// What the operator should hear about the book: refused files, conflicts, and tenants that list
@@ -292,16 +281,38 @@ fn quarantined(home: &Home, now: u64) -> Result<BTreeMap<String, u64>> {
     names_state::quarantined_slugs(home, now)
 }
 
-/// The flat names the default tenant holds: those its Rosters grant, and those the relay has
-/// ever accepted it for or holds in quarantine for it (`names.state`, design 2.2 rule 4).
-fn default_names_with_state(
-    home: &Home,
-    rosters: &[StoredRoster],
-    listed: &HashSet<NetworkId>,
-) -> Result<HashSet<String>> {
-    let mut names = default_names(rosters, listed);
-    names.extend(names_state::default_flat_names(home)?);
-    Ok(names)
+/// The flat names the relay has accepted (or holds in quarantine) for the default tenant and for
+/// named tenants, from `names.state`. Tenant names and grants are judged against these and not
+/// against labels a default tenant's Roster merely lists: an owner can put any label in a Roster
+/// that reaches the relay, and that must not take an older tenant offline (round T5, M1). A label
+/// like that stays refused when it is advertised (`TenantBook::reserves_flat_name`).
+struct FlatNames {
+    default: HashSet<String>,
+    tenants: HashMap<String, String>,
+}
+
+impl FlatNames {
+    fn read(home: &Home) -> Result<Self> {
+        Ok(Self {
+            default: names_state::default_flat_names(home)?,
+            tenants: names_state::tenant_flat_names(home)?,
+        })
+    }
+
+    fn build(
+        &self,
+        specs: Vec<TenantSpec>,
+        refused: Vec<Refusal>,
+        quarantined: &HashSet<String>,
+    ) -> TenantBook {
+        TenantBook::build_with_tenant_names(
+            specs,
+            refused,
+            &self.default,
+            &self.tenants,
+            quarantined,
+        )
+    }
 }
 
 /// What `add-network` did.
@@ -364,6 +375,8 @@ pub fn add_network_to(home: &Home, token: &str, now: u64, tenant: Option<&str>) 
             }
             let existing = specs.iter().position(|spec| spec.slug == slug);
             let created = existing.is_none();
+            // The tenant files as they are now, to tell what this one changes (round T5, M3).
+            let specs_before = specs.clone();
             if created {
                 if let Some(until) = quarantined(home, now)?.get(slug.as_str()) {
                     bail!(
@@ -389,8 +402,8 @@ pub fn add_network_to(home: &Home, token: &str, now: u64, tenant: Option<&str>) 
             }
             // Judge the result as the relay would.
             let (rosters, _) = load_rosters_each(home)?;
-            let names =
-                default_names_with_state(home, &rosters, &listed_networks(&specs, &refused))?;
+            let names = FlatNames::read(home)?;
+            let removed: HashSet<String> = quarantined(home, now)?.into_keys().collect();
             let others_before = specs.len() - usize::from(created);
             let had_default_networks = rosters.iter().any(|stored| {
                 stored
@@ -398,9 +411,24 @@ pub fn add_network_to(home: &Home, token: &str, now: u64, tenant: Option<&str>) 
                     .decode()
                     .is_ok_and(|b| !listed_networks(&specs, &refused).contains(&b.network_id))
             });
-            let trial = TenantBook::build(specs.clone(), refused, &names, &HashSet::new());
+            let before = names.build(specs_before, refused.clone(), &removed);
+            let trial = names.build(specs.clone(), refused, &removed);
             if let Some(refusal) = trial.refused().iter().find(|r| r.name == slug.as_str()) {
                 bail!("tenant {slug} cannot take it: {}", refusal.reason);
+            }
+            // The change must not take any other tenant offline: a file the book takes now and
+            // would refuse after it (a slug equal to its grant, say) stops the command.
+            if let Some(refusal) = trial.refused().iter().find(|r| {
+                !before
+                    .refused()
+                    .iter()
+                    .any(|earlier| earlier.name == r.name)
+            }) {
+                bail!(
+                    "this would take tenant {} offline: {}",
+                    refusal.name,
+                    refusal.reason
+                );
             }
             if let Some(figures) = trial.named(slug.as_str()).and_then(|t| t.figures)
                 && specs[at].networks.len() as u64 > figures.max_networks
