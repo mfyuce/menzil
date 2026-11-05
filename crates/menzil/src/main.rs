@@ -33,7 +33,13 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// Make this device's identity and print the join request to give to a network owner.
-    Init,
+    Init {
+        /// Put this device's identity aside in `<home>/retired/` and make another, for a device
+        /// whose identity may be compromised or lost its place: each owner then moves the old
+        /// node's place to the new one (`menzil admit --replace`). Refused while a node runs.
+        #[arg(long)]
+        new_identity: bool,
+    },
     /// Print this device's join request again.
     JoinRequest,
     /// Create and manage networks this device owns.
@@ -47,11 +53,18 @@ enum Command {
         /// reads it from standard input.
         join_request: String,
         /// The name the member is addressed by (letters, digits, '-', '_' and '.').
-        #[arg(long)]
-        name: String,
+        #[arg(long, required_unless_present = "replace", conflicts_with = "replace")]
+        name: Option<String>,
         /// A role for the member; may be repeated. A steward admits without roles.
-        #[arg(long = "role", value_name = "ROLE")]
+        #[arg(long = "role", value_name = "ROLE", conflicts_with = "replace")]
         roles: Vec<String>,
+        /// Owner only: instead of a new member, move the place of this member (its name, roles,
+        /// grants, egress and accept entries and labels) to the device the join request names,
+        /// and revoke the old device, in one update. The member is a name, the start of a node
+        /// id (8 or more hex digits), or a whole node id; `menzil init --new-identity` prints
+        /// the line.
+        #[arg(long, value_name = "MEMBER")]
+        replace: Option<String>,
         /// The network, when this device is in more than one.
         #[arg(long, value_name = "ID")]
         network: Option<String>,
@@ -352,16 +365,51 @@ async fn run(cli: Cli) -> Result<()> {
         }
     };
     match cli.command {
-        Command::Init => {
+        Command::Init { new_identity } => {
             let home = home()?;
-            let made = local::init(&home, now())?;
-            println!("created the identity of this device: {}", made.node_id);
-            println!("files are in {}", home.root().display());
-            println!();
-            println!(
-                "the join request to give to a network owner (`menzil admit <request> --name <name>`):"
-            );
-            println!("{}", made.join_request);
+            if new_identity {
+                let renewed = local::new_identity(&home, now())?;
+                println!("put the identity {} aside:", renewed.old);
+                println!("  {}", renewed.retired.key.display());
+                println!("  {}", renewed.retired.cert.display());
+                println!(
+                    "it is kept so that a mistake can be undone before an owner revokes it; once the owners have replaced it, delete the files with `rm`"
+                );
+                println!();
+                println!(
+                    "created the identity of this device: {}",
+                    renewed.made.node_id
+                );
+                println!("files are in {}", home.root().display());
+                println!();
+                println!("the join request of the new identity:");
+                println!("{}", renewed.made.join_request);
+                if renewed.networks.is_empty() {
+                    println!();
+                    println!(
+                        "the old identity was a member of none of the networks this device holds"
+                    );
+                }
+                for (network_id, name) in &renewed.networks {
+                    println!();
+                    println!(
+                        "network {network_id}: the old node was {name:?}; its owner moves the place to the new node with:"
+                    );
+                    println!(
+                        "  menzil admit --network {network_id} --replace {name} {}",
+                        renewed.made.join_request
+                    );
+                }
+            } else {
+                let made = local::init(&home, now())?;
+                println!("created the identity of this device: {}", made.node_id);
+                println!("files are in {}", home.root().display());
+                println!();
+                println!(
+                    "the join request to give to a network owner (`menzil admit <request> --name <name>`):"
+                );
+                println!("{}", made.join_request);
+            }
         }
         Command::JoinRequest => println!("{}", local::join_request(&home()?)?),
         Command::Network {
@@ -380,9 +428,30 @@ async fn run(cli: Cli) -> Result<()> {
             join_request,
             name,
             roles,
+            replace,
             network,
         } => {
             let join_request = token_argument(join_request)?;
+            if let Some(member) = replace {
+                let replaced =
+                    local::replace(&home()?, network.as_deref(), &member, &join_request, now())?;
+                println!(
+                    "{} now has the place of {} ({:?}), which is revoked: the network's documents are now #{}",
+                    replaced
+                        .issued
+                        .member
+                        .map(|m| m.to_string())
+                        .unwrap_or_default(),
+                    replaced.old,
+                    replaced.name,
+                    replaced.issued.seq
+                );
+                println!("give this token to the new member, who runs `menzil join <token>`;");
+                println!("the other members and relays need the new documents too:");
+                println!("{}", replaced.issued.token);
+                return Ok(());
+            }
+            let name = name.context("`--name` is required")?;
             let issued = local::admit(
                 &home()?,
                 network.as_deref(),

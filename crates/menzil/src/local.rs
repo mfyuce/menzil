@@ -27,7 +27,7 @@ use menzil_proto::{
 use zeroize::Zeroizing;
 
 use crate::cert_renew::{self as rules, Listed};
-use crate::home::{Home, parse_hex32};
+use crate::home::{Home, Retired, parse_hex32};
 use crate::text;
 use crate::token::{
     decode_cert_request, decode_documents, decode_join_request, decode_steward_request,
@@ -62,10 +62,15 @@ pub fn init(home: &Home, now: u64) -> Result<InitOutcome> {
     // From the check to the last write: two `init`s at once would otherwise both pass the check
     // and leave a key and a certificate that do not belong together.
     let _lock = home.lock_init()?;
+    init_locked(home, now)
+}
+
+/// [`init`] for a caller that holds the init lock.
+fn init_locked(home: &Home, now: u64) -> Result<InitOutcome> {
     let key_path = home.identity_key_path();
     if key_path.exists() {
         bail!(
-            "{} exists: this device already has an identity, and nothing was changed",
+            "{} exists: this device already has an identity, and nothing was changed (`menzil init --new-identity` puts it aside and makes another)",
             key_path.display()
         );
     }
@@ -79,6 +84,57 @@ pub fn init(home: &Home, now: u64) -> Result<InitOutcome> {
     Ok(InitOutcome {
         node_id: keys.node_id(),
         join_request: encode_join_request(&cert),
+    })
+}
+
+/// What [`new_identity`] did.
+#[derive(Debug, Clone)]
+pub struct NewIdentity {
+    /// The identity that was put aside.
+    pub old: NodeId,
+    /// Where its files are now.
+    pub retired: Retired,
+    /// The new identity, as [`init`] makes it.
+    pub made: InitOutcome,
+    /// The networks whose held documents list the old node as a member, with the name it has
+    /// there: what the owner of each is asked to move to the new node (`admit --replace`).
+    pub networks: Vec<(NetworkId, String)>,
+}
+
+/// `menzil init --new-identity` (cert-rotation design Q8, O6): puts this device's identity aside
+/// in `<home>/retired/` and makes another. Refuses while a `menzil node` runs on this home (it
+/// holds the lock, and the identity under it), and holds the init lock throughout. Owner and
+/// steward keys are not the node's identity and are left alone. The files are moved before the
+/// new identity is made, the key last ([`Home::retire_identity`]); the old files stay in
+/// `retired/` for the user to delete once the owners have replaced the node.
+pub fn new_identity(home: &Home, now: u64) -> Result<NewIdentity> {
+    let _node = home
+        .lock_node()
+        .context("a `menzil node` is running on this home: stop it first, it holds the identity")?;
+    let _lock = home.lock_init()?;
+    let (keys, _) = load_identity(home)?;
+    let old = keys.node_id();
+    drop(keys);
+    // Read before anything moves: the place the old node has in each network it is a member of.
+    let mut networks = Vec::new();
+    for network_id in home.networks()? {
+        if let Ok(docs) = load_documents(home, &network_id)
+            && let Some(member) = docs
+                .policy_body()
+                .members
+                .iter()
+                .find(|member| member.node_id == old)
+        {
+            networks.push((network_id, member.name.clone()));
+        }
+    }
+    let retired = home.retire_identity(&old, now)?;
+    let made = init_locked(home, now)?;
+    Ok(NewIdentity {
+        old,
+        retired,
+        made,
+        networks,
     })
 }
 
@@ -380,6 +436,60 @@ pub fn admit(
     };
     save_documents(home, &next)?;
     Ok(issued(&next, Some(member)))
+}
+
+/// What [`replace`] did.
+#[derive(Debug, Clone)]
+pub struct Replaced {
+    /// The new pair; `member` is the new node.
+    pub issued: Issued,
+    /// The node that was replaced and revoked.
+    pub old: NodeId,
+    /// The name the new node has, the old one's.
+    pub name: String,
+}
+
+/// `menzil admit --replace <member> <join-request>` (cert-rotation design Q8, O4), owner only:
+/// the node of the join request takes the place of `member` (a name, the start of a node id, or
+/// a whole node id) and the old node is revoked, in one pair ([`menzil_admin::replace`]). A device
+/// that holds only a steward key is told that the owner revokes; it can [`admit`] the new device
+/// under a new name, and the owner revokes the old one later. Refused for this device's own
+/// node, as `revoke` is.
+pub fn replace(
+    home: &Home,
+    network: Option<&str>,
+    member: &str,
+    join_request: &str,
+    now: u64,
+) -> Result<Replaced> {
+    let network_id = resolve_network(home, network)?;
+    let _lock = home.lock_network(&network_id)?;
+    if !home.owner_key_path(&network_id).exists() && home.steward_key_path(&network_id).exists() {
+        bail!(
+            "only the owner revokes (protocol.md 7.3), and a replacement revokes the old device: admit the new one under a new name with `menzil admit`, and the owner revokes the old one later"
+        );
+    }
+    let owner = load_owner(home, &network_id)?;
+    let current = load_documents(home, &network_id)?;
+    let cert = decode_join_request(join_request)?;
+    let old = revoke_target(&current, member)?;
+    if old == load_identity(home)?.0.node_id() {
+        return Err(menzil_admin::AdminError::RevokeSelf.into());
+    }
+    let name = current
+        .policy_body()
+        .members
+        .iter()
+        .find(|m| m.node_id == old)
+        .map(|m| m.name.clone());
+    let next = menzil_admin::replace(&owner, &current, old, &cert, now)?;
+    save_documents(home, &next)?;
+    Ok(Replaced {
+        issued: issued(&next, Some(cert.decode()?.node_id)),
+        old,
+        // `menzil_admin::replace` refused a node without a place.
+        name: name.unwrap_or_default(),
+    })
 }
 
 /// A member named in the Policy: by name, or by the start of its NodeId in hex (at least 8

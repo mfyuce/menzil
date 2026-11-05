@@ -713,6 +713,18 @@ fn check_admission(
     name: &str,
     now: u64,
 ) -> Result<menzil_proto::NodeCertBody, AdminError> {
+    check_admission_apart_from(current, member, name, None, now)
+}
+
+/// [`check_admission`] with the name of the member `apart` not counted as taken: the name a
+/// device that is being replaced gives up ([`replace`]).
+fn check_admission_apart_from(
+    current: &Documents,
+    member: &NodeCert,
+    name: &str,
+    apart: Option<NodeId>,
+    now: u64,
+) -> Result<menzil_proto::NodeCertBody, AdminError> {
     let cert = checked_cert(member, now)?;
     check_name(name)?;
     if current.is_member(&cert.node_id) {
@@ -732,7 +744,7 @@ fn check_admission(
         .policy_body()
         .members
         .iter()
-        .any(|existing| existing.name.to_lowercase() == wanted)
+        .any(|existing| Some(existing.node_id) != apart && existing.name.to_lowercase() == wanted)
     {
         return Err(AdminError::NameTaken(menzil_proto::shown(name)));
     }
@@ -792,6 +804,18 @@ pub fn revoke(
         return Err(AdminError::AlreadyRevoked(node_id));
     }
     let (mut roster, mut policy) = current.successor(owner, now)?;
+    strip_node(&mut roster, &mut policy, node_id, now)?;
+    Documents::signed(owner, roster, policy)
+}
+
+/// What a revocation does to the bodies: the node is listed in `revoked` and every trace of it
+/// goes (see [`revoke`]). Shared by [`revoke`] and [`replace`], so the two cannot differ.
+fn strip_node(
+    roster: &mut RosterBody,
+    policy: &mut PolicyBody,
+    node_id: NodeId,
+    now: u64,
+) -> Result<(), AdminError> {
     roster.members.retain(|member| member.node_id != node_id);
     roster.revoked.push(RevokedMember {
         node_id,
@@ -812,6 +836,109 @@ pub fn revoke(
     });
     policy.egress.retain(|rule| rule.node_id != node_id);
     policy.accept.retain(|entry| entry.node_id != node_id);
+    Ok(())
+}
+
+/// Moves a member's place to a new device (cert rotation Q8, O4), owner only, in one pair: `old`
+/// is revoked exactly as [`revoke`] does, and the node of `new_cert` takes its name, its roles,
+/// its direct grants (a grant whose `from` or `to_node` is `old` now names the new node; role
+/// grants and `*` grants are not touched), its `egress` and `accept` entries and its labels. The
+/// new member's `min_serial` is the certificate's serial, as in [`admit`].
+///
+/// `old` must be a member of `current`: [`AdminError::AlreadyRevoked`] when it is revoked
+/// already (it has lost its grants, and a plain [`admit`] is the tool), [`AdminError::NotAMember`]
+/// when it is neither. `new_cert` must pass the checks of an admission ([`admit`]: verifies,
+/// valid now, not a member or revoked), except that the name is `old`'s own, which is free to
+/// take again.
+pub fn replace(
+    owner: &OwnerKey,
+    current: &Documents,
+    old: NodeId,
+    new_cert: &NodeCert,
+    now: u64,
+) -> Result<Documents, AdminError> {
+    if current
+        .roster_body()
+        .revoked
+        .iter()
+        .any(|revoked| revoked.node_id == old)
+    {
+        return Err(AdminError::AlreadyRevoked(old));
+    }
+    let place = current
+        .policy_body()
+        .members
+        .iter()
+        .find(|member| member.node_id == old)
+        .cloned()
+        .ok_or(AdminError::NotAMember(old))?;
+    let cert = check_admission_apart_from(current, new_cert, &place.name, Some(old), now)?;
+    let new = cert.node_id;
+    let (mut roster, mut policy) = current.successor(owner, now)?;
+    // What moves is taken before the old node's traces go.
+    let moved_grants: Vec<Grant> = policy
+        .grants
+        .iter()
+        .filter(|grant| {
+            grant.from.target == PrincipalTarget::Node(old)
+                || grant.to_node == NodeOrWildcard::Node(old)
+        })
+        .cloned()
+        .map(|mut grant| {
+            if grant.from.target == PrincipalTarget::Node(old) {
+                grant.from.target = PrincipalTarget::Node(new);
+            }
+            if grant.to_node == NodeOrWildcard::Node(old) {
+                grant.to_node = NodeOrWildcard::Node(new);
+            }
+            grant
+        })
+        .collect();
+    let moved_egress: Vec<_> = policy
+        .egress
+        .iter()
+        .filter(|rule| rule.node_id == old)
+        .cloned()
+        .map(|mut rule| {
+            rule.node_id = new;
+            rule
+        })
+        .collect();
+    let moved_accept: Vec<_> = policy
+        .accept
+        .iter()
+        .filter(|entry| entry.node_id == old)
+        .cloned()
+        .map(|mut entry| {
+            entry.node_id = new;
+            entry
+        })
+        .collect();
+    let moved_labels: Vec<_> = roster
+        .labels
+        .iter()
+        .filter(|label| label.node_id == old)
+        .cloned()
+        .map(|mut label| {
+            label.node_id = new;
+            label
+        })
+        .collect();
+    strip_node(&mut roster, &mut policy, old, now)?;
+    roster.members.push(RosterMember {
+        node_id: new,
+        min_serial: cert.serial,
+    });
+    roster.labels.extend(moved_labels);
+    policy.members.push(PolicyMember {
+        node_id: new,
+        name: place.name,
+        roles: place.roles,
+    });
+    policy.certs.push(new_cert.clone());
+    policy.grants.extend(moved_grants);
+    policy.egress.extend(moved_egress);
+    policy.accept.extend(moved_accept);
     Documents::signed(owner, roster, policy)
 }
 

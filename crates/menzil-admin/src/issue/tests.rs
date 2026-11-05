@@ -2674,3 +2674,259 @@ fn steward_rotate_takes_the_larger_key_as_reference_at_equal_serials_in_any_orde
         );
     }
 }
+
+// ---- replace (cert rotation S7) ----
+
+/// A new device for the phone's place: a certificate with serial 5, so that `min_serial` shows
+/// where it comes from.
+fn replacement() -> (NodeKeys, NodeCert) {
+    let keys = NodeKeys::generate();
+    let cert = keys
+        .issue_cert(5, NOW - 100, NOW - 100 + 400 * DAY)
+        .unwrap();
+    (keys, cert)
+}
+
+#[test]
+fn replacing_moves_the_place_of_a_member_to_a_new_device_and_revokes_the_old_one_in_one_pair() {
+    let b = busy();
+    let (new_keys, new_cert) = replacement();
+    let new = new_keys.node_id();
+    let next = replace(&b.owner, &b.docs, b.phone, &new_cert, NOW + 60).unwrap();
+    let (rb, pb) = (next.roster_body(), next.policy_body());
+    let network_id = next.network_id();
+
+    // One pair, the next number, the owner's.
+    assert_eq!(next.seq(), b.docs.seq() + 1);
+    assert_eq!((rb.issued, rb.expires), (NOW + 60, NOW + 60 + 14 * DAY));
+    assert_eq!(next.verify().unwrap(), Signer::Owner);
+
+    // The old device is revoked the way `revoke` does it, since `now`.
+    assert_eq!(rb.revoked.len(), 1);
+    assert_eq!(
+        (rb.revoked[0].node_id, rb.revoked[0].since),
+        (b.phone, NOW + 60)
+    );
+    let plain = revoke(&b.owner, &b.docs, b.phone, NOW + 60).unwrap();
+    assert_eq!(rb.revoked, plain.roster_body().revoked);
+
+    // The new one is a member with the old one's name and roles, and its own serial as floor.
+    let ids = |list: &[RosterMember]| list.iter().map(|m| m.node_id).collect::<Vec<_>>();
+    assert_eq!(ids(&rb.members), vec![b.laptop, b.tablet, new]);
+    assert_eq!(rb.members[2].min_serial, 5);
+    let placed = pb.members.iter().find(|m| m.node_id == new).unwrap();
+    assert_eq!(placed.name, "phone");
+    assert_eq!(placed.roles, vec!["family".to_string()]);
+    assert!(pb.members.iter().all(|m| m.node_id != b.phone));
+    assert_eq!(pb.members.len(), 3);
+
+    // Certificates: the new one in, the old one out.
+    assert!(pb.certs.contains(&new_cert));
+    assert!(
+        pb.certs
+            .iter()
+            .all(|cert| cert.decode().unwrap().node_id != b.phone)
+    );
+
+    // Direct grants move in both directions (the wildcard target stays a wildcard); the role
+    // grant, the wildcard grant of the laptop and the tablet's are exactly as they were.
+    assert_eq!(pb.grants, {
+        vec![
+            role_grant(
+                network_id,
+                "family",
+                NodeOrWildcard::Node(b.laptop),
+                &["tcp:ssh"],
+            ),
+            Grant {
+                to_node: NodeOrWildcard::Any,
+                ..node_grant(network_id, b.laptop, b.laptop, &["tcp:ssh"])
+            },
+            node_grant(network_id, b.tablet, b.laptop, &["tcp:ssh"]),
+            node_grant(network_id, new, b.laptop, &["tcp:ssh"]),
+            node_grant(network_id, b.laptop, new, &["http:app"]),
+            Grant {
+                to_node: NodeOrWildcard::Any,
+                ..node_grant(network_id, new, b.laptop, &["tcp:web"])
+            },
+        ]
+    });
+    // Egress, accept entries and labels move with their contents.
+    assert_eq!(
+        pb.egress,
+        vec![
+            EgressRule {
+                node_id: b.laptop,
+                allow: vec![HostPortPattern("example.org:443".into())],
+                deny: vec![],
+            },
+            EgressRule {
+                node_id: new,
+                allow: vec![HostPortPattern("example.org:443".into())],
+                deny: vec![],
+            },
+        ]
+    );
+    assert_eq!(
+        pb.accept,
+        vec![
+            AcceptEntry {
+                node_id: b.tablet,
+                peers: true
+            },
+            AcceptEntry {
+                node_id: new,
+                peers: true
+            },
+        ]
+    );
+    assert_eq!(
+        rb.labels,
+        vec![
+            Label {
+                name: "home".into(),
+                node_id: b.laptop
+            },
+            Label {
+                name: "mine".into(),
+                node_id: new
+            },
+        ]
+    );
+
+    // A verifier holding the previous pair adopts it as the owner's, and then the old device
+    // is refused while the new one passes and has what the old one had.
+    assert_eq!(
+        adopted_signer(judged(Some(&b.docs), &next, NOW + 60)),
+        Signer::Owner
+    );
+    let (rosters, policies) = load(&b.docs);
+    menzil_node::DocStore::new(&rosters, &policies)
+        .adopt(&next.bundle(), NOW + 60)
+        .unwrap();
+    let standing =
+        |id, serial| policies.check_membership(&rosters, &network_id, &id, serial, NOW + 60);
+    assert_eq!(standing(b.phone, 1), Err(ErrorCode::Revoked));
+    assert_eq!(standing(new, 5), Ok(()));
+    assert!(policies.has_grant(
+        &rosters,
+        &network_id,
+        &new,
+        &b.laptop,
+        Some(&service("tcp:ssh")),
+        NOW + 60
+    ));
+    assert!(!policies.has_grant(
+        &rosters,
+        &network_id,
+        &b.phone,
+        &b.laptop,
+        Some(&service("tcp:ssh")),
+        NOW + 60
+    ));
+
+    // The old pair is as it was, and the place can move again.
+    assert_eq!(b.docs.roster_body().revoked.len(), 0);
+    let (_, third) = replacement();
+    let again = replace(&b.owner, &next, new, &third, NOW + 120).unwrap();
+    let name_of = |docs: &Documents, id| {
+        docs.policy_body()
+            .members
+            .iter()
+            .find(|m| m.node_id == id)
+            .map(|m| m.name.clone())
+    };
+    assert_eq!(
+        name_of(&again, third.decode().unwrap().node_id).as_deref(),
+        Some("phone")
+    );
+    assert_eq!(again.roster_body().revoked.len(), 2);
+}
+
+#[test]
+fn replacing_refuses_an_old_device_that_is_revoked_or_unknown_and_a_new_one_that_is_taken() {
+    let b = busy();
+    let (_, new_cert) = replacement();
+    let revoked = revoke(&b.owner, &b.docs, b.phone, NOW + 1).unwrap();
+    assert!(matches!(
+        replace(&b.owner, &revoked, b.phone, &new_cert, NOW + 2),
+        Err(AdminError::AlreadyRevoked(id)) if id == b.phone
+    ));
+    let (stranger, _) = node();
+    assert!(matches!(
+        replace(&b.owner, &b.docs, stranger.node_id(), &new_cert, NOW),
+        Err(AdminError::NotAMember(id)) if id == stranger.node_id()
+    ));
+    // The new device may not be a member already (the tablet, nor the old device itself).
+    let (tablet_cert, phone_cert) = (
+        b.docs
+            .policy_body()
+            .certs
+            .iter()
+            .find(|c| c.decode().unwrap().node_id == b.tablet)
+            .unwrap()
+            .clone(),
+        b.phone_cert.clone(),
+    );
+    for cert in [&tablet_cert, &phone_cert] {
+        assert!(matches!(
+            replace(&b.owner, &b.docs, b.phone, cert, NOW),
+            Err(AdminError::AlreadyMember(_))
+        ));
+    }
+    // Nor a device the Roster revoked.
+    assert!(matches!(
+        replace(&b.owner, &revoked, b.tablet, &phone_cert, NOW + 2),
+        Err(AdminError::Revoked(id)) if id == b.phone
+    ));
+    // The certificate is judged like an admission's: expired and forged ones are refused.
+    let keys = NodeKeys::generate();
+    let expired = keys.issue_cert(1, NOW - 2 * DAY, NOW - DAY).unwrap();
+    assert!(replace(&b.owner, &b.docs, b.phone, &expired, NOW).is_err());
+    // Only the network's owner moves places.
+    let other = OwnerKey::generate();
+    assert!(matches!(
+        replace(&other, &b.docs, b.phone, &new_cert, NOW),
+        Err(AdminError::NotThisOwner)
+    ));
+    // Nothing was changed by the refusals.
+    assert_eq!(b.docs.seq(), 3);
+}
+
+#[test]
+fn replacing_gives_the_old_name_only_to_the_new_device_and_keeps_other_names_taken() {
+    let b = busy();
+    let (_, new_cert) = replacement();
+    let next = replace(&b.owner, &b.docs, b.phone, &new_cert, NOW + 1).unwrap();
+    // The name "phone" is the new device's now: nobody else gets it.
+    let (_, other_cert) = node();
+    assert!(matches!(
+        admit(&b.owner, &next, &other_cert, "Phone", &[], NOW + 2),
+        Err(AdminError::NameTaken(_))
+    ));
+}
+
+#[test]
+fn replacing_on_top_of_a_steward_pair_is_the_owners_pair_that_outranks_it() {
+    let s = stewarded();
+    let (phone, phone_cert) = node();
+    let by_steward = steward_admit(&s.steward, &s.base, &phone_cert, "phone", NOW + DAY).unwrap();
+    let (_, new_cert) = replacement();
+    let next = replace(
+        &s.owner,
+        &by_steward,
+        phone.node_id(),
+        &new_cert,
+        NOW + 2 * DAY,
+    )
+    .unwrap();
+    assert_eq!(next.verify().unwrap(), Signer::Owner);
+    assert!(next.seq() > by_steward.seq());
+    assert_eq!(
+        adopted_signer(judged(Some(&by_steward), &next, NOW + 2 * DAY)),
+        Signer::Owner
+    );
+    assert_eq!(next.roster_body().revoked.len(), 1);
+    assert!(next.is_member(&new_cert.decode().unwrap().node_id));
+    assert!(!next.is_member(&phone.node_id()));
+}

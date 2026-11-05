@@ -1945,3 +1945,265 @@ fn the_certificate_report_says_when_a_network_does_not_list_the_current_one() {
     let expired = report.render(report.not_after + 1);
     assert!(expired.contains("EXPIRED"), "{expired}");
 }
+
+// ---- new identity and replace (cert-rotation design S7) ----
+
+fn mode_of(path: &std::path::Path) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+    fs::metadata(path).unwrap().permissions().mode() & 0o777
+}
+
+#[test]
+fn a_new_identity_puts_the_old_one_aside_privately_and_says_where_it_had_a_place() {
+    let two = joined_member();
+    let (old_keys, old_cert) = load_identity(&two.member).unwrap();
+    let old = old_keys.node_id();
+    let key_bytes = fs::read(two.member.identity_key_path()).unwrap();
+    let docs_before = documents_bytes(&two.member, &two.network_id);
+
+    let done = new_identity(&two.member, NOW + 5).unwrap();
+
+    assert_eq!(done.old, old);
+    assert_eq!(done.networks, vec![(two.network_id, "phone".to_string())]);
+    // The old files are in `retired/` under the old id and the time, byte for byte.
+    let stem = format!("{}-{}", old.to_hex(), NOW + 5);
+    assert_eq!(
+        done.retired.key,
+        two.member.retired_dir().join(format!("{stem}.key"))
+    );
+    assert_eq!(
+        done.retired.cert,
+        two.member.retired_dir().join(format!("{stem}.cert"))
+    );
+    assert_eq!(fs::read(&done.retired.key).unwrap(), key_bytes);
+    assert_eq!(fs::read(&done.retired.cert).unwrap(), old_cert.encode());
+    assert_eq!(mode_of(&two.member.retired_dir()), 0o700);
+    assert_eq!(mode_of(&done.retired.key), 0o600);
+    // The home has a whole new identity with a first certificate, that is not the old one.
+    let (new_keys, new_cert) = load_identity(&two.member).unwrap();
+    assert_ne!(new_keys.node_id(), old);
+    assert_eq!(new_keys.node_id(), done.made.node_id);
+    assert_eq!(new_cert.decode().unwrap().serial, 1);
+    assert_eq!(
+        decode_join_request(&done.made.join_request).unwrap(),
+        new_cert
+    );
+    // The documents are not touched.
+    assert_eq!(documents_bytes(&two.member, &two.network_id), docs_before);
+}
+
+#[test]
+fn a_new_identity_is_refused_while_a_node_runs_and_without_an_identity_and_changes_nothing() {
+    let two = joined_member();
+    let key_before = fs::read(two.member.identity_key_path()).unwrap();
+    let cert_before = fs::read(two.member.identity_cert_path()).unwrap();
+    {
+        let _node = two.member.lock_node().unwrap();
+        let error = format!("{:#}", new_identity(&two.member, NOW + 5).unwrap_err());
+        assert!(error.contains("`menzil node` is running"), "{error}");
+    }
+    assert_eq!(
+        fs::read(two.member.identity_key_path()).unwrap(),
+        key_before
+    );
+    assert_eq!(
+        fs::read(two.member.identity_cert_path()).unwrap(),
+        cert_before
+    );
+    assert!(!two.member.retired_dir().exists());
+
+    let (_dir, empty) = device();
+    let error = format!("{:#}", new_identity(&empty, NOW).unwrap_err());
+    assert!(error.contains("no identity"), "{error}");
+    assert!(!empty.retired_dir().exists());
+}
+
+#[test]
+fn the_key_moves_last_so_a_failure_before_it_leaves_the_identity_whole() {
+    let two = joined_member();
+    let (keys, cert) = load_identity(&two.member).unwrap();
+    let old = keys.node_id();
+    let key_before = fs::read(two.member.identity_key_path()).unwrap();
+    let stem = format!("{}-{}", old.to_hex(), NOW + 5);
+
+    // The certificate cannot be put aside (its place is a directory with something in it): the
+    // key has not moved, the identity is whole, and nothing new was made.
+    let cert_to = two.member.retired_dir().join(format!("{stem}.cert"));
+    fs::create_dir_all(cert_to.join("in the way")).unwrap();
+    assert!(new_identity(&two.member, NOW + 5).is_err());
+    assert_eq!(
+        fs::read(two.member.identity_key_path()).unwrap(),
+        key_before
+    );
+    assert_eq!(load_identity(&two.member).unwrap().1, cert);
+    assert!(
+        !two.member
+            .retired_dir()
+            .join(format!("{stem}.key"))
+            .exists()
+    );
+    fs::remove_dir_all(&cert_to).unwrap();
+
+    // A retired key of that name is never replaced: refused before anything moves.
+    let key_to = two.member.retired_dir().join(format!("{stem}.key"));
+    fs::write(&key_to, b"an earlier key").unwrap();
+    assert!(new_identity(&two.member, NOW + 5).is_err());
+    assert_eq!(fs::read(&key_to).unwrap(), b"an earlier key");
+    assert_eq!(
+        fs::read(two.member.identity_key_path()).unwrap(),
+        key_before
+    );
+    assert!(!cert_to.exists(), "the certificate was not copied either");
+    fs::remove_file(&key_to).unwrap();
+
+    // Once nothing is in the way it goes through.
+    assert_eq!(new_identity(&two.member, NOW + 5).unwrap().old, old);
+}
+
+#[test]
+fn a_new_identity_leaves_the_owner_key_and_the_documents_of_an_owner_device_alone() {
+    let two = two_devices();
+    let owner_key = fs::read(two.owner.owner_key_path(&two.network_id)).unwrap();
+    let docs = documents_bytes(&two.owner, &two.network_id);
+    let done = new_identity(&two.owner, NOW + 1).unwrap();
+    assert_eq!(done.networks, vec![(two.network_id, "laptop".to_string())]);
+    assert_eq!(
+        fs::read(two.owner.owner_key_path(&two.network_id)).unwrap(),
+        owner_key
+    );
+    assert_eq!(documents_bytes(&two.owner, &two.network_id), docs);
+    assert!(!two.owner.retired_dir().join("owner").exists());
+}
+
+/// `joined_member`, then the member makes a new identity: the owner is to move the place.
+fn moved_member() -> (Two, NewIdentity, NodeId) {
+    let two = joined_member();
+    let old = load_identity(&two.member).unwrap().0.node_id();
+    let done = new_identity(&two.member, NOW + 5).unwrap();
+    (two, done, old)
+}
+
+#[test]
+fn the_owner_moves_the_place_to_the_new_identity_and_the_old_one_is_revoked() {
+    let (two, done, old) = moved_member();
+    let granted = grant(
+        &two.owner,
+        None,
+        "phone",
+        "laptop",
+        &[service("tcp:ssh")],
+        None,
+        NOW + 2,
+    )
+    .unwrap();
+    assert_eq!(granted.seq, 3);
+    let (_, name) = &done.networks[0];
+
+    let mut token = String::new();
+    for who in [name.clone(), old.to_hex()[..8].to_string(), old.to_hex()] {
+        // The same replacement three ways to name the member: each on a copy of the state.
+        let copy = tempfile::tempdir().unwrap();
+        let home = Home::new(copy.path().join("owner"));
+        copy_dir(two.owner.root(), home.root());
+        let replaced = replace(&home, None, &who, &done.made.join_request, NOW + 10).unwrap();
+        assert_eq!(replaced.old, old, "{who}");
+        assert_eq!(replaced.name, "phone");
+        assert_eq!(replaced.issued.member, Some(done.made.node_id));
+        assert_eq!(replaced.issued.seq, 4);
+        let docs = load_documents(&home, &two.network_id).unwrap();
+        assert!(docs.is_member(&done.made.node_id));
+        assert!(!docs.is_member(&old));
+        assert_eq!(docs.roster_body().revoked.len(), 1);
+        assert_eq!(docs.roster_body().revoked[0].node_id, old);
+        // The grant moved: the new node is the `from` of it.
+        let grants = &docs.policy_body().grants;
+        assert_eq!(grants.len(), 1, "{who}");
+        assert_eq!(
+            grants[0].from.target,
+            PrincipalTarget::Node(done.made.node_id)
+        );
+        token = replaced.issued.token;
+    }
+    // The new device installs the token and is a member with the old one's name.
+    join(&two.member, &token, NOW + 11).unwrap();
+    let report = status(&two.member).unwrap();
+    assert_eq!(report.networks[0].members.len(), 2);
+    assert!(
+        report.networks[0]
+            .members
+            .iter()
+            .any(|m| m.name == "phone" && m.node_id == done.made.node_id)
+    );
+}
+
+/// Copies a home directory (files and directories only), so that one state can be used again.
+fn copy_dir(from: &std::path::Path, to: &std::path::Path) {
+    fs::create_dir_all(to).unwrap();
+    for entry in fs::read_dir(from).unwrap() {
+        let entry = entry.unwrap();
+        let target = to.join(entry.file_name());
+        if entry.file_type().unwrap().is_dir() {
+            copy_dir(&entry.path(), &target);
+        } else {
+            fs::copy(entry.path(), &target).unwrap();
+        }
+    }
+}
+
+#[test]
+fn replace_refuses_a_steward_only_device_this_devices_own_node_and_a_stranger() {
+    let (two, done, old) = moved_member();
+    let (_, name) = done.networks[0].clone();
+
+    // A steward only device is told that the owner revokes, and nothing changes.
+    let s = stewarded();
+    let held = documents_bytes(&s.two.member, &s.two.network_id);
+    let error = format!(
+        "{:#}",
+        replace(&s.two.member, None, "steward", &s.phone_request, NOW + 20).unwrap_err()
+    );
+    assert!(error.contains("only the owner revokes"), "{error}");
+    assert_eq!(documents_bytes(&s.two.member, &s.two.network_id), held);
+
+    // The owner's own node: refused as `revoke` does.
+    let error = format!(
+        "{:#}",
+        replace(
+            &two.owner,
+            None,
+            "laptop",
+            &done.made.join_request,
+            NOW + 20
+        )
+        .unwrap_err()
+    );
+    assert!(error.contains("--self"), "{error}");
+
+    // Nobody of that name; and a join request that is not one.
+    let docs = documents_bytes(&two.owner, &two.network_id);
+    let error = format!(
+        "{:#}",
+        replace(
+            &two.owner,
+            None,
+            "nobody",
+            &done.made.join_request,
+            NOW + 20
+        )
+        .unwrap_err()
+    );
+    assert!(error.contains("no member called"), "{error}");
+    let error = replace(&two.owner, None, &name, "menzil1-join:garbage", NOW + 20);
+    assert!(error.is_err());
+    assert_eq!(documents_bytes(&two.owner, &two.network_id), docs);
+
+    // Once replaced, replacing the revoked one again is refused as such.
+    replace(&two.owner, None, &name, &done.made.join_request, NOW + 30).unwrap();
+    let (_dir, third) = device();
+    let third_request = init(&third, NOW).unwrap().join_request;
+    let error = format!(
+        "{:#}",
+        replace(&two.owner, None, &old.to_hex(), &third_request, NOW + 40).unwrap_err()
+    );
+    assert!(error.contains("revoked already"), "{error}");
+}

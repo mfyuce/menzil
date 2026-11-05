@@ -143,3 +143,82 @@ fn a_certificate_is_shown_renewed_without_a_node_and_listed_by_the_owner() {
         "{shown}"
     );
 }
+
+#[test]
+fn a_new_identity_prints_the_replace_line_and_the_owner_runs_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let (owner, phone) = (dir.path().join("owner"), dir.path().join("phone"));
+    ok(menzil(&owner, &["init"], None));
+    ok(menzil(&owner, &["network", "create"], None));
+    let phone_join = token(&ok(menzil(&phone, &["init"], None)).stdout, "menzil1-join:");
+    let admitted = ok(menzil(
+        &owner,
+        &["admit", "-", "--name", "phone"],
+        Some(&phone_join),
+    ));
+    ok(menzil(
+        &phone,
+        &["join", "-"],
+        Some(&token(&admitted.stdout, "menzil1-docs:")),
+    ));
+
+    // Plain `init` still refuses, and its message names the flag.
+    let refused = menzil(&phone, &["init"], None);
+    assert!(!refused.ok);
+    assert!(
+        refused.stderr.contains("--new-identity"),
+        "{}",
+        refused.stderr
+    );
+
+    let key = std::fs::read(phone.join("identity.key")).unwrap();
+    let done = ok(menzil(&phone, &["init", "--new-identity"], None));
+    let new_join = token(&done.stdout, "menzil1-join:");
+    assert_ne!(new_join, phone_join);
+    assert_eq!(std::fs::read_dir(phone.join("retired")).unwrap().count(), 2);
+    assert!(
+        std::fs::read_dir(phone.join("retired"))
+            .unwrap()
+            .any(|entry| std::fs::read(entry.unwrap().path()).unwrap() == key),
+        "the old key is in retired/"
+    );
+    // The line for the owner names the network, the old name and the new join request.
+    let line = done
+        .stdout
+        .lines()
+        .find(|line| line.contains("menzil admit --network"))
+        .unwrap_or_else(|| panic!("no replace line in {}", done.stdout))
+        .trim()
+        .to_string();
+    assert!(line.contains("--replace phone"), "{line}");
+    assert!(line.ends_with(&new_join), "{line}");
+
+    // `--replace` takes no `--name`, and `admit` needs one or the other.
+    let both = menzil(
+        &owner,
+        &["admit", "-", "--name", "x", "--replace", "phone"],
+        Some(&new_join),
+    );
+    assert!(!both.ok);
+    let neither = menzil(&owner, &["admit", "-"], Some(&new_join));
+    assert!(!neither.ok);
+
+    // The owner runs what the line says (with the join request from standard input).
+    let replaced = ok(menzil(
+        &owner,
+        &["admit", "--replace", "phone", "-"],
+        Some(&new_join),
+    ));
+    assert!(
+        replaced.stdout.contains("which is revoked"),
+        "{}",
+        replaced.stdout
+    );
+    ok(menzil(
+        &phone,
+        &["join", "-"],
+        Some(&token(&replaced.stdout, "menzil1-docs:")),
+    ));
+    let shown = ok(menzil(&phone, &["status"], None)).stdout;
+    assert!(shown.contains("phone"), "{shown}");
+}

@@ -4,6 +4,8 @@
 //! <home>/identity.key              64 secret bytes: Ed25519 seed, X25519 private key (0600)
 //! <home>/identity.cert             this node's NodeCert (public)
 //! <home>/config.toml               settings (written by the user)
+//! <home>/retired/<node id>-<unix>.{key,cert}   an identity `init --new-identity` put aside
+//!                                         (the directory 0700, the key 0600)
 //! <home>/networks/<id>/documents.bin     the Roster and Policy this node holds (one file,
 //!                                         so the pair is replaced atomically)
 //! <home>/owner/<id>.key            32 secret bytes: the owner key of a network (0600)
@@ -25,7 +27,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
-use menzil_proto::NetworkId;
+use menzil_proto::{NetworkId, NodeId};
 
 /// Makes the names of temporary files differ between two writes in one process.
 static TEMPORARIES: AtomicU64 = AtomicU64::new(0);
@@ -54,6 +56,15 @@ impl FileLock {
             }
         }
     }
+}
+
+/// Where [`Home::retire_identity`] put an identity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Retired {
+    /// The secret keys.
+    pub key: PathBuf,
+    /// The certificate.
+    pub cert: PathBuf,
 }
 
 /// A user's menzil directory.
@@ -101,6 +112,11 @@ impl Home {
     /// This node's certificate.
     pub fn identity_cert_path(&self) -> PathBuf {
         self.root.join("identity.cert")
+    }
+
+    /// Where identities that `menzil init --new-identity` replaced are kept.
+    pub fn retired_dir(&self) -> PathBuf {
+        self.root.join("retired")
     }
 
     /// The settings file.
@@ -247,6 +263,54 @@ impl Home {
                 "another `menzil node` is running with {} (one node per identity)",
                 self.root.display()
             )
+        })
+    }
+
+    /// Puts this node's identity aside in [`Self::retired_dir`] as
+    /// `<node id hex>-<unix>.key` and `.cert` (the directory 0700, the key 0600), so that the home
+    /// has none: the certificate is copied, then the key is moved, last, then the certificate
+    /// is removed. The key's existence is what says "initialised", so a failure before the key
+    /// has moved leaves the identity whole and the command can be run again; a failure after
+    /// it leaves a home with no identity, which `menzil init` makes anew. Refuses to replace a
+    /// retired key of the same name. The caller holds the init lock ([`Self::lock_init`]).
+    pub fn retire_identity(&self, node_id: &NodeId, unix: u64) -> Result<Retired> {
+        let dir = self.retired_dir();
+        create_private_dirs(&dir)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))
+                .with_context(|| format!("restricting {}", dir.display()))?;
+        }
+        let stem = format!("{}-{unix}", node_id.to_hex());
+        let (key_to, cert_to) = (
+            dir.join(format!("{stem}.key")),
+            dir.join(format!("{stem}.cert")),
+        );
+        if key_to.exists() {
+            bail!(
+                "{} exists already: a key is never replaced there, and nothing was changed",
+                key_to.display()
+            );
+        }
+        let cert_from = self.identity_cert_path();
+        let cert =
+            fs::read(&cert_from).with_context(|| format!("reading {}", cert_from.display()))?;
+        self.write_public(&cert_to, &cert)?;
+        fs::rename(self.identity_key_path(), &key_to).with_context(|| {
+            format!(
+                "moving {} to {}",
+                self.identity_key_path().display(),
+                key_to.display()
+            )
+        })?;
+        if let Ok(directory) = fs::File::open(&dir) {
+            let _ = directory.sync_all();
+        }
+        fs::remove_file(&cert_from).with_context(|| format!("removing {}", cert_from.display()))?;
+        Ok(Retired {
+            key: key_to,
+            cert: cert_to,
         })
     }
 
@@ -438,6 +502,31 @@ mod tests {
         fs::create_dir_all(dir.path().join("networks").join("notes")).unwrap();
         fs::write(dir.path().join("networks").join("stray.txt"), b"x").unwrap();
         assert_eq!(home.networks().unwrap(), vec![b, a]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_retired_identity_leaves_the_home_without_one_and_the_key_keeps_its_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home::new(dir.path());
+        home.write_secret(&home.identity_key_path(), b"key")
+            .unwrap();
+        home.write_public(&home.identity_cert_path(), b"cert")
+            .unwrap();
+        let id = NodeId::from([9u8; 32]);
+        let retired = home.retire_identity(&id, 77).unwrap();
+        assert!(!home.identity_key_path().exists());
+        assert!(!home.identity_cert_path().exists());
+        assert_eq!(fs::read(&retired.key).unwrap(), b"key");
+        assert_eq!(fs::read(&retired.cert).unwrap(), b"cert");
+        assert_eq!(
+            retired.key.file_name().unwrap().to_string_lossy(),
+            format!("{}-77.key", id.to_hex())
+        );
+        let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&retired.key), 0o600);
+        assert_eq!(mode(&home.retired_dir()), 0o700);
     }
 
     #[test]
