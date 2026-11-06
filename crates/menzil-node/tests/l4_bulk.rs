@@ -231,7 +231,7 @@ async fn wait_attached(events: &mut mpsc::Receiver<SessionEvent>) -> (Epoch, Lim
     timeout(PATIENCE, async {
         loop {
             match events.recv().await {
-                Some(SessionEvent::Attached { epoch, limits }) => return (epoch, limits),
+                Some(SessionEvent::Attached { epoch, limits, .. }) => return (epoch, limits),
                 Some(_) => {}
                 None => panic!("events closed while waiting for Attached"),
             }

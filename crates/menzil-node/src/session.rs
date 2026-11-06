@@ -424,6 +424,10 @@ pub struct Session {
     carrier: Carrier,
     engine: Engine,
     welcome: WelcomeBody,
+    /// The relay's Noise static key of this connection, which `verify_relay_identity` found to
+    /// be the key of the relay's certificate for the NodeId dialed (expose design S-E4: the
+    /// router pins the relay principal's L4 key to it).
+    relay_static: X25519PublicKey,
     tick: tokio::time::Interval,
 }
 
@@ -444,12 +448,13 @@ impl Session {
         // Decided at every connect, from what the store holds now (protocol.md 4.1).
         let claims = claimable_networks(config, &roster_store);
         let mut carrier = Carrier::dial(&config.dial, env).await?;
-        let (transport, welcome) =
+        let (transport, welcome, relay_static) =
             run_handshake(&mut carrier, config, &claims, &roster_store).await?;
         let mut session = Self {
             carrier,
             engine: Engine::new(transport, Instant::now(), Arc::clone(&roster_store), claims),
             welcome,
+            relay_static,
             tick: tokio::time::interval(TICK),
         };
         session.engine.relay_rosters = session.welcome.rosters.clone();
@@ -484,6 +489,12 @@ impl Session {
     /// network's current Roster `seq`.
     pub fn welcome(&self) -> &WelcomeBody {
         &self.welcome
+    }
+
+    /// The relay's Noise static key of this connection, verified against the relay certificate
+    /// of the NodeId dialed.
+    pub fn relay_static(&self) -> X25519PublicKey {
+        self.relay_static
     }
 
     /// Closes the connection politely (a WebSocket Close, then a short wait
@@ -706,7 +717,7 @@ async fn run_handshake(
     config: &SessionConfig,
     claims: &[NetworkId],
     roster_store: &RosterStore,
-) -> Result<(Transport, WelcomeBody), NodeError> {
+) -> Result<(Transport, WelcomeBody, X25519PublicKey), NodeError> {
     let info = &config.dial.connection_info;
     // "`key` is a cache that enables the one round trip IK handshake;
     // when it is absent or stale the node uses XX" (protocol.md 3.2).
@@ -760,7 +771,7 @@ async fn run_handshake(
     }
 
     verify_relay_identity(info, &welcome, &relay_static)?;
-    Ok((transport, welcome))
+    Ok((transport, welcome, relay_static))
 }
 
 /// protocol.md 4.1: "the node verifies `relay_cert.node_id` equals the
@@ -854,6 +865,12 @@ pub enum SessionEvent {
         epoch: Epoch,
         /// WELCOME's own limits (protocol.md 4.1).
         limits: Limits,
+        /// The relay's Noise static key of this attachment's L3 handshake, which the node
+        /// verified is the key of the relay's certificate for the NodeId it dialed. An L4
+        /// `init` from the relay's own NodeId is accepted only from this key (protocol.md 6.1,
+        /// expose design S-E4); it is pinned per epoch, so a relay that rotates its key
+        /// between attachments is judged against the new one and no old session survives.
+        relay_static: X25519PublicKey,
     },
     /// This attachment ended; always the last event of `epoch`. Any
     /// [`OutboundSend`] still tagged with it is now refused with
@@ -1282,7 +1299,11 @@ pub async fn run_session_observed(
             admit(req, epoch, &mut outbound_queue);
         }
         let mut pending: VecDeque<SessionEvent> = VecDeque::new();
-        pending.push_back(SessionEvent::Attached { epoch, limits });
+        pending.push_back(SessionEvent::Attached {
+            epoch,
+            limits,
+            relay_static: session.relay_static(),
+        });
 
         // `retry_after_ms`: `Some(hint)` only for a GOAWAY-caused break,
         // matching the two different backoff calls the loop used to make

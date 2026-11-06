@@ -27,9 +27,9 @@
 //! own doc comment), but neither `menzil_stream::open` nor
 //! `respond_to_open` strips it for an ordinary member session — by
 //! design, since that crate has no session context to know which case it
-//! is in. This module's caller is always a member session (nothing here
-//! runs the relay-principal path TODO.md's `expose` line and
-//! TOBEDECIDED item 8 still need to define), so [`accept_loop`] wraps
+//! is in. [`accept_loop`] and [`accept_loop_tracked`] are for member
+//! sessions (the relay principal's session has its own entry,
+//! [`accept_loop_relay_principal`], which keeps `meta` for gates that validate it), so they wrap
 //! whatever `Authorizer`/`ServiceHandler` it is given in a private
 //! adapter that rebuilds the request with `meta: OpenMeta::default()`
 //! before delegating — the only point where this can actually be
@@ -276,30 +276,43 @@ fn as_member_request(request: &OpenRequest) -> OpenRequest {
     }
 }
 
+/// What the gates of one accept loop get to see of an OPEN: with `keep_meta` false (every member
+/// session) `request` rebuilt with its `meta` scrubbed; with it true (the relay principal's
+/// session only, [`accept_loop_relay_principal`]) the request as it came, `meta` included, for
+/// gates that validate it themselves.
+fn prepared(request: &OpenRequest, keep_meta: bool) -> OpenRequest {
+    if keep_meta {
+        request.clone()
+    } else {
+        as_member_request(request)
+    }
+}
+
 /// Wraps an [`Authorizer`] so every request it actually sees has already
-/// had its `meta` scrubbed — see this module's own doc comment.
-struct MemberAuthorizer<A>(A);
+/// had its `meta` scrubbed (unless the loop is the relay principal's) — see this module's own
+/// doc comment.
+struct MemberAuthorizer<A>(A, bool);
 
 impl<A: Authorizer> Authorizer for MemberAuthorizer<A> {
     fn authorize(&self, request: &OpenRequest) -> OpenDecision {
-        self.0.authorize(&as_member_request(request))
+        self.0.authorize(&prepared(request, self.1))
     }
 }
 
 /// Wraps a [`ServiceHandler`] the same way [`MemberAuthorizer`] wraps an
 /// [`Authorizer`].
-struct MemberServiceHandler<H>(H);
+struct MemberServiceHandler<H>(H, bool);
 
 impl<S, H: ServiceHandler<S> + Sync> ServiceHandler<S> for MemberServiceHandler<H> {
     type Opened = H::Opened;
     type Handling = H::Handling;
 
     async fn open(&self, request: &OpenRequest) -> Result<Self::Opened, OpenRefusal> {
-        self.0.open(&as_member_request(request)).await
+        self.0.open(&prepared(request, self.1)).await
     }
 
     fn handle(&self, stream: S, request: OpenRequest, opened: Self::Opened) -> Self::Handling {
-        self.0.handle(stream, as_member_request(&request), opened)
+        self.0.handle(stream, prepared(&request, self.1), opened)
     }
 }
 
@@ -416,7 +429,7 @@ impl<A: Authorizer> Authorizer for TrackingAuthorizer<'_, A> {
         let generation = self.streams.generation();
         let decision = self.inner.authorize(request);
         *self.seen.lock().unwrap_or_else(PoisonError::into_inner) =
-            Some((generation, as_member_request(request)));
+            Some((generation, prepared(request, self.inner.1)));
         decision
     }
 }
@@ -472,10 +485,48 @@ pub async fn accept_loop_tracked<A, H>(
     H: ServiceHandler<Stream> + Send + Sync + 'static,
     H::Handling: Send + 'static,
 {
+    accept_loop_with(acceptor, authorizer, handler, streams, false).await;
+}
+
+/// [`accept_loop_tracked`] for the relay principal's session and for nothing else (protocol.md
+/// 6.1, expose design S-E4): the OPEN's `meta` reaches `authorizer` and `handler` as the relay
+/// sent it, because the relay principal is the one sender whose `meta` is honored. It is still
+/// peer chosen text, so those two must validate it before they use it ([`crate::RelayAuthorizer`]
+/// and the handler it comes with do); a loop that serves members must never be this one.
+///
+/// [`AcceptedStreams::recheck`] hands the stored requests back scrubbed, which is harmless
+/// here: the relay principal's gates decide on the service, the share and this node's standing,
+/// never on `meta`.
+pub async fn accept_loop_relay_principal<A, H>(
+    acceptor: &mut L4SessionAcceptor,
+    authorizer: A,
+    handler: H,
+    streams: AcceptedStreams,
+) where
+    A: Authorizer + Send + Sync + 'static,
+    H: ServiceHandler<Stream> + Send + Sync + 'static,
+    H::Handling: Send + 'static,
+{
+    accept_loop_with(acceptor, authorizer, handler, streams, true).await;
+}
+
+/// The loop of [`accept_loop_tracked`] and [`accept_loop_relay_principal`]; `keep_meta` is the
+/// only difference.
+async fn accept_loop_with<A, H>(
+    acceptor: &mut L4SessionAcceptor,
+    authorizer: A,
+    handler: H,
+    streams: AcceptedStreams,
+    keep_meta: bool,
+) where
+    A: Authorizer + Send + Sync + 'static,
+    H: ServiceHandler<Stream> + Send + Sync + 'static,
+    H::Handling: Send + 'static,
+{
     let network_id = acceptor.network_id();
     let peer = acceptor.peer();
-    let authorizer = Arc::new(MemberAuthorizer(authorizer));
-    let handler = Arc::new(MemberServiceHandler(handler));
+    let authorizer = Arc::new(MemberAuthorizer(authorizer, keep_meta));
+    let handler = Arc::new(MemberServiceHandler(handler, keep_meta));
     let admission = Arc::new(Semaphore::new(MAX_CONCURRENT_OPENS));
 
     while let Some(stream) = acceptor.accept().await {

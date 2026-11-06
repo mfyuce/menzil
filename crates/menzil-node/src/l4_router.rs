@@ -43,10 +43,15 @@
 //!   [`RouterParts::ready`] with [`SessionReady::docs_only`], and ended with
 //!   CLOSE `docs_only` after [`DOCS_ONLY_LIFETIME`] (or sooner by whoever
 //!   serves its one push). An `init` claiming to come from the attached
-//!   relay's own NodeId is refused outright, and so is asking for a session
-//!   with it: the relay principal (protocol.md 6.1) has no network, no
-//!   Policy and no certificate to check it against, and what an `expose`
-//!   session with it will be is TOBEDECIDED item 8.
+//!   relay's own NodeId is the relay principal (protocol.md 6.1, expose design
+//!   S-E4) and takes a path of its own, [`Engine::on_relay_init`]: never a
+//!   member's checks (the relay is no member), and silence unless the node
+//!   holds unexpired documents for the `init`'s network and stands well in them, the
+//!   relay accepted a share of this node that the network's Roster grants it, and, after the
+//!   handshake's Diffie Hellmans, the initiator's static key is the one the L3 session of
+//!   this very attachment negotiated with the relay ([`SessionEvent::Attached`]'s
+//!   `relay_static`). Asking for a session *with* the relay is still refused: the node never
+//!   dials the relay principal.
 //! * `resp`: matched to our pending initiation by the echoed index and the
 //!   RECV source, then the initiator handshake, L4h2's checks
 //!   ([`decide_initiator_admission`]) and a check that the responder
@@ -131,7 +136,7 @@ use tokio::sync::{mpsc, oneshot, watch};
 use crate::admission::{
     HandshakeAdmission, InitiatorAdmission, decide_initiator_admission,
     decide_initiator_admission_for_docs, decide_responder_admission, is_unrevoked_roster_member,
-    resolve_dial_cert, resolve_dial_cert_for_docs, session_standing,
+    relay_principal_standing, resolve_dial_cert, resolve_dial_cert_for_docs, session_standing,
 };
 use crate::identity::IdentityCell;
 use crate::l4_session::{
@@ -140,8 +145,10 @@ use crate::l4_session::{
 };
 use crate::outbound::{Epoch, OutboundSend, SendBudgets};
 use crate::policy_store::PolicyStore;
+use crate::relay_serve::accepted_shares;
 use crate::roster_store::RosterStore;
 use crate::session::SessionEvent;
+use crate::shares::ShareBook;
 
 /// How many `init`s are sent for one [`RouterHandle::ensure_session`]
 /// before its waiters are told [`EnsureError::Timeout`]: the first and two
@@ -312,6 +319,11 @@ pub struct SessionReady {
     /// ends at [`DOCS_ONLY_LIFETIME`] at the latest. Serve it with the docs only
     /// rules (the responder), or push on it (the initiator).
     pub docs_only: bool,
+    /// The session is the relay principal's (protocol.md 6.1, expose design S-E4): `peer` is
+    /// the attached relay's NodeId, `peer_static` the relay's static key, `network_id` the
+    /// network of the share it serves. It is never in the member rules: serve it with
+    /// [`crate::RelayAuthorizer`]'s rules only (public shares, no documents, no grants).
+    pub relay_principal: bool,
 }
 
 impl std::fmt::Debug for SessionReady {
@@ -325,6 +337,7 @@ impl std::fmt::Debug for SessionReady {
             .field("peer_roster_seq", &self.peer_roster_seq)
             .field("peer_policy_seq", &self.peer_policy_seq)
             .field("docs_only", &self.docs_only)
+            .field("relay_principal", &self.relay_principal)
             .finish_non_exhaustive()
     }
 }
@@ -340,6 +353,7 @@ pub struct RouterConfig {
     budgets: SendBudgets,
     table: TableConfig,
     inbound_budget: usize,
+    shares: ShareBook,
 }
 
 impl RouterConfig {
@@ -347,8 +361,8 @@ impl RouterConfig {
     /// [`LocalIdentity`](crate::LocalIdentity) it is a cell of its own, given the node's
     /// [`IdentityCell`] the router follows its renewals: the `resp` payload and the serial of
     /// every standing check are read from it at each use);
-    /// `relay_node_id` is the relay it is attached to, whose `init`s are
-    /// refused; `policies`/`rosters` are the stores the admission checks
+    /// `relay_node_id` is the relay it is attached to, whose `init`s are the relay principal's
+    /// (see [`Engine::on_relay_init`]); `policies`/`rosters` are the stores the admission checks
     /// read; `budgets` is the node's one [`SendBudgets`], from which every
     /// session to a peer takes `for_peer(peer)`. Fails only if the local
     /// cert does not decode.
@@ -371,7 +385,15 @@ impl RouterConfig {
             budgets,
             table: TableConfig::default(),
             inbound_budget: L4_INBOUND_BUDGET_PER_SESSION,
+            shares: ShareBook::new(),
         })
+    }
+
+    /// The node's [`ShareBook`], which the relay principal's `init`s are judged against (expose
+    /// design S-E4). The default is an empty book of its own, which accepts no relay `init`.
+    pub fn with_shares(mut self, shares: ShareBook) -> Self {
+        self.shares = shares;
+        self
     }
 
     /// Replaces the session table's limits and timeouts (the defaults are
@@ -600,6 +622,8 @@ struct Waiting {
 struct Attached {
     epoch: Epoch,
     limits: Limits,
+    /// The relay's static key of this attachment (see [`SessionEvent::Attached`]).
+    relay_static: X25519PublicKey,
 }
 
 /// How a session came to be.
@@ -669,6 +693,7 @@ struct Engine {
     relay_node_id: NodeId,
     policies: Arc<PolicyStore>,
     rosters: Arc<RosterStore>,
+    shares: ShareBook,
     budgets: SendBudgets,
     inbound_budget: usize,
     table: SessionTable<Entry, Pending>,
@@ -736,6 +761,7 @@ impl Engine {
             relay_node_id: config.relay_node_id,
             policies: config.policies,
             rosters: config.rosters,
+            shares: config.shares,
             budgets: config.budgets,
             inbound_budget: config.inbound_budget,
             table: SessionTable::new(config.local_node_id, config.table, index_source),
@@ -762,8 +788,12 @@ impl Engine {
     // L3 events
     // ------------------------------------------------------------------
 
-    fn on_attached(&mut self, epoch: Epoch, limits: Limits) {
-        self.attached = Some(Attached { epoch, limits });
+    fn on_attached(&mut self, epoch: Epoch, limits: Limits, relay_static: X25519PublicKey) {
+        self.attached = Some(Attached {
+            epoch,
+            limits,
+            relay_static,
+        });
         self.attachment.send_replace(Some(epoch));
     }
 
@@ -910,7 +940,7 @@ impl Engine {
         now: Now,
     ) {
         if src == self.relay_node_id {
-            tracing::debug!("refused an init from the attached relay's own NodeId");
+            self.on_relay_init(attached, sender_index, network_id, noise_msg1, now);
             return;
         }
         if self.is_repeated_init(&src, &network_id, sender_index, &noise_msg1) {
@@ -1074,6 +1104,181 @@ impl Engine {
             peer_roster_seq: None,
             peer_policy_seq: None,
             docs_only: false,
+            relay_principal: false,
+        });
+    }
+
+    /// An `init` whose RECV `src` is the attached relay's own NodeId: the relay principal
+    /// (protocol.md 6.1, expose design S-E4). The relay is no member of any network, so none of
+    /// a member's checks apply; what stands in their place, in this order, each before the next
+    /// and all of them before any Diffie Hellman or allocation but the last:
+    ///
+    /// 1. a repeat of the `init` that made the slot's session is dropped (as for a member);
+    /// 2. the table's handshake rate limit for this peer and its entry cap (the relay counts as
+    ///    one peer: ten sessions a minute in all, however many networks it serves);
+    /// 3. this node holds a Roster and Policy for the `init`'s network, both unexpired, and
+    ///    stands well in them (listed, unrevoked, serial at or above its floor, its own
+    ///    certificate listed for its own static key): [`relay_principal_standing`];
+    /// 4. the book holds an accepted share that this network's Roster grants this node
+    ///    ([`accepted_shares`]: the book is per relay attachment and names no network, the
+    ///    Roster's `labels` are what ties a share to a network);
+    /// 5. the responder handshake runs, and the initiator's static key must equal the relay's
+    ///    static key of the current L3 attachment. A member that puts the relay's NodeId in its
+    ///    own `init` (it cannot make the relay stamp it, but the prologue only needs the claim)
+    ///    holds another key and gets silence, like every refusal here.
+    ///
+    /// The `resp` carries this node's own certificate, the Roster `seq` it holds and a Policy
+    /// `seq` of 0: the relay is never told what the Policy holds. The session is installed in
+    /// the slot of (relay, network) and announced with [`SessionReady::relay_principal`]; it
+    /// belongs to the attachment it came up under like any other and ends with it.
+    fn on_relay_init(
+        &mut self,
+        attached: Attached,
+        sender_index: u32,
+        network_id: NetworkId,
+        noise_msg1: Vec<u8>,
+        now: Now,
+    ) {
+        let src = self.relay_node_id;
+        if self.is_repeated_init(&src, &network_id, sender_index, &noise_msg1) {
+            tracing::debug!("ignored a repeated init from the relay principal");
+            return;
+        }
+        match self.table.on_inbound_init(src, network_id, now.instant) {
+            InitDecision::Respond { .. } => {}
+            InitDecision::Ignore(reason) => {
+                if matches!(reason, IgnoreReason::RateLimited | IgnoreReason::Full) {
+                    if let Some(held_back) = self.refused_log.allow(now.instant) {
+                        tracing::warn!(
+                            ?reason,
+                            held_back,
+                            "ignored an L4 init from the relay principal"
+                        );
+                    }
+                } else {
+                    tracing::debug!(?reason, "ignored an L4 init from the relay principal");
+                }
+                return;
+            }
+        }
+        let Some(roster_seq) = self.rosters.seq(&network_id) else {
+            tracing::debug!(
+                "ignored a relay principal init for a network we hold no documents for"
+            );
+            return;
+        };
+        if let Err(reason) = relay_principal_standing(
+            &self.policies,
+            &self.rosters,
+            &network_id,
+            &self.local_node_id,
+            self.identity.serial(),
+            &self.local_static,
+            now.unix,
+        ) {
+            tracing::debug!(
+                ?reason,
+                "ignored a relay principal init: own standing or documents"
+            );
+            return;
+        }
+        if accepted_shares(
+            &self.shares,
+            &self.rosters,
+            &network_id,
+            &self.local_node_id,
+        )
+        .is_empty()
+        {
+            tracing::debug!("ignored a relay principal init: no accepted share for that network");
+            return;
+        }
+        let msg1_copy = noise_msg1.clone();
+        let init = E2eFrame::Init {
+            sender_index,
+            network_id,
+            noise_msg1,
+        };
+        #[cfg(test)]
+        {
+            self.handshakes_started += 1;
+        }
+        let Ok(hs) = E2eResponderHandshake::start(
+            &self.identity.get().x25519_private,
+            src,
+            self.local_node_id,
+            &init,
+        ) else {
+            tracing::debug!("ignored a relay principal init that did not decrypt");
+            return;
+        };
+        let peer_static = *hs.initiator_static();
+        if peer_static != attached.relay_static {
+            tracing::debug!("ignored an init in the relay's name from another static key");
+            return;
+        }
+        let Ok(index) = self.table.reserve_index(now.instant) else {
+            return;
+        };
+        let Ok((transport, resp)) = hs.finish(
+            self.identity.get().node_cert.clone(),
+            roster_seq,
+            // The Policy is never shown to a relay.
+            0,
+            vec![E2E_PROTO_TAG],
+            index,
+            attached.limits.max_record,
+        ) else {
+            self.table.release_index(index);
+            return;
+        };
+        let (entry, acceptor, task) = self.make_session(
+            index,
+            src,
+            network_id,
+            peer_static,
+            Origin::Answered {
+                sender_index,
+                noise_msg1: msg1_copy,
+            },
+            transport,
+            attached,
+            false,
+        );
+        let handle = entry.handle.clone();
+        match self.table.install_session(
+            index,
+            src,
+            network_id,
+            Role::Responder,
+            entry,
+            now.instant,
+        ) {
+            Ok(installed) => {
+                drop(installed.abandoned);
+                if let Some((_, superseded)) = installed.superseded_candidate {
+                    superseded.handle.close(None);
+                }
+            }
+            Err((error, _)) => {
+                tracing::warn!(?error, "could not install a relay principal session");
+                return;
+            }
+        }
+        self.send(src, attached.epoch, resp.encode());
+        tokio::spawn(task);
+        let _ = self.ready.send(SessionReady {
+            peer: src,
+            network_id,
+            peer_static,
+            role: Role::Responder,
+            epoch: attached.epoch,
+            handle,
+            acceptor,
+            peer_roster_seq: None,
+            peer_policy_seq: None,
+            docs_only: false,
+            relay_principal: true,
         });
     }
 
@@ -1181,6 +1386,7 @@ impl Engine {
             peer_roster_seq: None,
             peer_policy_seq: None,
             docs_only: true,
+            relay_principal: false,
         });
     }
 
@@ -1272,9 +1478,9 @@ impl Engine {
             return;
         }
         if peer == self.relay_node_id {
-            // The relay principal has no network and no cert to dial; what
-            // an `expose` session with it will be is TOBEDECIDED item 8.
-            // Inbound `init`s from it are refused for the same reason.
+            // The relay principal is the relay's to initiate (TOBEDECIDED item 8, expose
+            // design S-E4): it has no network and no cert in any Policy to dial, and a
+            // node that dialed it would offer the relay a session it never asked for.
             let _ = reply.send(Err(EnsureError::UnknownPeer));
             return;
         }
@@ -1524,6 +1730,7 @@ impl Engine {
             peer_roster_seq: Some(payload.roster_seq),
             peer_policy_seq: Some(payload.policy_seq),
             docs_only: false,
+            relay_principal: false,
         });
         self.resolve_waiters(&key, &handle);
     }
@@ -1592,6 +1799,7 @@ impl Engine {
             peer_roster_seq: Some(peer_seqs.0),
             peer_policy_seq: Some(peer_seqs.1),
             docs_only: true,
+            relay_principal: false,
         });
     }
 
@@ -1927,9 +2135,9 @@ async fn run_router(
                     break;
                 };
                 match event {
-                    SessionEvent::Attached { epoch, limits } => {
-                        engine.on_attached(epoch, limits);
-                        forward(&passthrough, SessionEvent::Attached { epoch, limits }, &mut dropped_log);
+                    SessionEvent::Attached { epoch, limits, relay_static } => {
+                        engine.on_attached(epoch, limits, relay_static);
+                        forward(&passthrough, SessionEvent::Attached { epoch, limits, relay_static }, &mut dropped_log);
                     }
                     SessionEvent::Detached { epoch } => {
                         engine.on_detached(epoch);

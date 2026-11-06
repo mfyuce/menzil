@@ -10,11 +10,14 @@
 //! relay's claims end with the session, so a name is only usable while an ACK of the current
 //! attachment accepted it.
 //!
-//! Not here: who may use an accepted share (the relay principal's authorizer is a later slice).
-//! This module only records what the relay accepted and answers [`ShareBook::accepted_service`].
+//! Not here: who may use an accepted share. This module only records what the relay accepted and
+//! answers [`ShareBook::accepted_service`]; the relay principal's router branch and authorizer
+//! (`l4_router`, `relay_serve`, expose design S-E4) ask it.
 //!
 //! The ACK names no network (the relay judges a name against every network the session claimed),
-//! so the book is per relay attachment, not per network.
+//! so the book is per relay attachment, not per network. A caller that needs the network of a
+//! share (the relay principal's session of one network, expose design S-E4) asks the Roster of
+//! that network, which lists the label for this node: `relay_serve::accepted_shares`.
 
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -186,6 +189,10 @@ struct Inner {
     /// What the owner configured; the session follows it.
     configured: watch::Sender<Arc<Vec<Share>>>,
     state: Mutex<State>,
+    /// Counts the changes of what the relay accepted (an ACK came in, the attachment ended), for
+    /// whoever must act when a share is withdrawn (the revalidator of the relay principal's
+    /// sessions).
+    accepted_changes: watch::Sender<u64>,
 }
 
 /// The configured shares and the relay's answer. See the module docs.
@@ -213,10 +220,12 @@ impl ShareBook {
     /// A book with no shares: the node advertises nothing.
     pub fn new() -> Self {
         let (configured, _) = watch::channel(Arc::new(Vec::new()));
+        let (accepted_changes, _) = watch::channel(0);
         Self {
             inner: Arc::new(Inner {
                 configured,
                 state: Mutex::new(State::default()),
+                accepted_changes,
             }),
         }
     }
@@ -281,6 +290,21 @@ impl ShareBook {
         self.inner.configured.subscribe()
     }
 
+    /// A receiver that sees a change each time the relay's answer is stored or forgotten (an
+    /// ADVERTISE_ACK, the end of the attachment): the moment a share can have been withdrawn.
+    pub(crate) fn subscribe_accepted(&self) -> watch::Receiver<u64> {
+        self.inner.accepted_changes.subscribe()
+    }
+
+    fn accepted_changed(&self) {
+        self.inner.accepted_changes.send_modify(|count| *count += 1);
+    }
+
+    /// The shares the relay accepted in this attachment, whole (see [`ShareSnapshot::accepted`]).
+    pub fn accepted(&self) -> Vec<Share> {
+        self.state().snapshot.accepted.clone()
+    }
+
     /// An ADVERTISE with `shares` is about to be sent.
     pub(crate) fn note_sent(&self, shares: &[Share]) {
         let mut state = self.state();
@@ -302,11 +326,14 @@ impl ShareBook {
             .collect();
         snapshot.rejected = ack.rejected.clone();
         snapshot.names = ack.names.clone();
+        drop(state);
+        self.accepted_changed();
     }
 
     /// The attachment ended: the relay's claims ended with it.
     pub(crate) fn note_detached(&self) {
         self.state().snapshot = ShareSnapshot::default();
+        self.accepted_changed();
     }
 }
 

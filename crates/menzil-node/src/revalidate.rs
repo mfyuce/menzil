@@ -11,7 +11,13 @@
 //!   CLOSE `grant_removed`; one that passes has its served streams asked again
 //!   ([`AcceptedStreams::recheck`]), and the ones whose grant is gone are reset;
 //! * a **docs only session** is judged by the Roster alone ([`docs_only_standing`]) and closed
-//!   the same way when that fails; it carries no granted stream to recheck.
+//!   the same way when that fails; it carries no granted stream to recheck;
+//! * a **relay principal session** (protocol.md 6.1, expose design S-E4) has no peer to judge (the
+//!   relay is no member): it is judged by this node's own standing and by the shares, closed with
+//!   the same `grant_removed` when its own standing fails or when no accepted share of its
+//!   network is left, and otherwise has its streams asked again, so that a withdrawn share, or
+//!   documents that expired, resets the streams that depended on them. The shares changing is
+//!   a trigger of its own ([`Revalidator::request_pass`], called by the session's watcher).
 //!
 //! The detail of why stays in the local log (TOBEDECIDED 30 T1); the wire carries one uniform
 //! `grant_removed`.
@@ -39,6 +45,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use menzil_proto::{ErrorCode, NetworkId, NodeId, PolicyBody, RosterBody, X25519PublicKey};
+use menzil_stream::Authorizer;
 use tokio::sync::{Notify, broadcast};
 use tokio::time::MissedTickBehavior;
 
@@ -49,6 +56,7 @@ use crate::l4_router::grant_removed_close;
 use crate::l4_session::L4SessionHandle;
 use crate::l5_stream::AcceptedStreams;
 use crate::policy_store::PolicyStore;
+use crate::relay_serve::RelayAuthorizer;
 use crate::roster_store::RosterStore;
 
 /// How often every network with a live session is looked at whatever else happened (T11).
@@ -92,7 +100,24 @@ pub(crate) enum Kind {
     },
     /// A docs only session, either role: judged by the Roster alone.
     DocsOnly,
+    /// The relay principal's session: judged by this node's own standing and by the shares
+    /// still being accepted, its served streams asked again with `authorizer`.
+    RelayPrincipal {
+        streams: AcceptedStreams,
+        authorizer: RelayAuthorizer,
+    },
 }
+
+/// How a pass judges one session, with what it needs.
+#[derive(Clone)]
+enum Judging {
+    Full,
+    DocsOnly,
+    RelayPrincipal(RelayAuthorizer),
+}
+
+/// A session's streams and the authorizer that asks about them again.
+type Recheck = (AcceptedStreams, Arc<dyn Authorizer + Send + Sync>);
 
 struct LiveSession {
     peer: NodeId,
@@ -276,6 +301,13 @@ impl Revalidator {
         id
     }
 
+    /// Has `network_id` looked at at once, like a registration does: the shares of a relay
+    /// principal session changed (an ADVERTISE_ACK came in), so a share may have been withdrawn.
+    pub(crate) fn request_pass(&self, network_id: NetworkId) {
+        self.state().pending.insert(network_id);
+        self.wake.notify_one();
+    }
+
     /// Drops session `id` (its accept loop ended), and with it the handle and the stream
     /// registry it held.
     pub(crate) fn forget(&self, id: u64) {
@@ -325,7 +357,7 @@ impl Revalidator {
     /// reads the stores and checks a signature per session, runs without it (round 11 L1), so
     /// `register` and `forget` never wait for a pass.
     pub(crate) fn plan(&self, network_id: &NetworkId, now: u64) -> Vec<(u64, Action)> {
-        let mut sessions: Vec<(u64, NodeId, X25519PublicKey, bool)> = self
+        let mut sessions: Vec<(u64, NodeId, X25519PublicKey, Judging)> = self
             .state()
             .sessions
             .iter()
@@ -335,7 +367,13 @@ impl Revalidator {
                     *id,
                     session.peer,
                     session.peer_static,
-                    matches!(session.kind, Kind::Full { .. }),
+                    match &session.kind {
+                        Kind::Full { .. } => Judging::Full,
+                        Kind::DocsOnly => Judging::DocsOnly,
+                        Kind::RelayPrincipal { authorizer, .. } => {
+                            Judging::RelayPrincipal(authorizer.clone())
+                        }
+                    },
                 )
             })
             .collect();
@@ -343,12 +381,12 @@ impl Revalidator {
         self.judge(network_id, &sessions, now)
     }
 
-    /// The standing of each of `sessions` (id, peer, peer static key, full or docs only). Takes
+    /// The standing of each of `sessions` (id, peer, peer static key, how it is judged). Takes
     /// no lock of the registry.
     fn judge(
         &self,
         network_id: &NetworkId,
-        sessions: &[(u64, NodeId, X25519PublicKey, bool)],
+        sessions: &[(u64, NodeId, X25519PublicKey, Judging)],
         now: u64,
     ) -> Vec<(u64, Action)> {
         #[cfg(test)]
@@ -359,12 +397,18 @@ impl Revalidator {
             .clone();
         sessions
             .iter()
-            .filter_map(|(id, peer, peer_static, full)| {
+            .filter_map(|(id, peer, peer_static, judging)| {
                 #[cfg(test)]
                 if let Some(hook) = &hook {
                     hook();
                 }
-                let action = if *full {
+                let action = if let Judging::RelayPrincipal(authorizer) = judging {
+                    // No peer to judge: this node's own standing and the shares.
+                    Some(match authorizer.session_standing(now) {
+                        Ok(()) => Action::Recheck,
+                        Err(reason) => Action::Close(reason),
+                    })
+                } else if matches!(judging, Judging::Full) {
                     Some(
                         match session_standing(
                             &self.policies,
@@ -405,7 +449,7 @@ impl Revalidator {
             network_id: NetworkId,
             handle: L4SessionHandle,
             action: Action,
-            recheck: Option<(AcceptedStreams, PolicyAuthorizer)>,
+            recheck: Option<Recheck>,
         }
         let todo: Vec<Todo> = {
             let state = self.state();
@@ -421,7 +465,17 @@ impl Revalidator {
                             Kind::Full {
                                 streams,
                                 authorizer,
-                            } => Some((streams.clone(), authorizer.clone())),
+                            } => Some((
+                                streams.clone(),
+                                Arc::new(authorizer.clone()) as Arc<dyn Authorizer + Send + Sync>,
+                            )),
+                            Kind::RelayPrincipal {
+                                streams,
+                                authorizer,
+                            } => Some((
+                                streams.clone(),
+                                Arc::new(authorizer.clone()) as Arc<dyn Authorizer + Send + Sync>,
+                            )),
                             Kind::DocsOnly => None,
                         },
                     })
@@ -443,7 +497,7 @@ impl Revalidator {
                 }
                 Action::Recheck => {
                     if let Some((streams, authorizer)) = item.recheck {
-                        let stopped = streams.recheck(&authorizer);
+                        let stopped = streams.recheck(&*authorizer);
                         if stopped > 0 {
                             tracing::info!(
                                 peer = %item.peer,
@@ -464,16 +518,25 @@ impl Revalidator {
     /// change, if there is one: see [`next_deadline`]. This node's own certificate counts when a
     /// full session is live (round 11 N1: its `not_after` ends them).
     pub(crate) fn deadline(&self, network_id: &NetworkId, now: u64) -> Option<u64> {
-        let mut peers: Vec<(NodeId, X25519PublicKey)> = self
-            .state()
-            .sessions
-            .values()
-            .filter(|session| {
-                &session.network_id == network_id && matches!(session.kind, Kind::Full { .. })
-            })
-            .map(|session| (session.peer, session.peer_static))
-            .collect();
-        if !peers.is_empty() {
+        let (mut peers, relay_sessions): (Vec<(NodeId, X25519PublicKey)>, bool) = {
+            let state = self.state();
+            let in_network = || {
+                state
+                    .sessions
+                    .values()
+                    .filter(|session| &session.network_id == network_id)
+            };
+            (
+                in_network()
+                    .filter(|session| matches!(session.kind, Kind::Full { .. }))
+                    .map(|session| (session.peer, session.peer_static))
+                    .collect(),
+                // The relay is no member and has no certificate to watch, but this node's own
+                // certificate and the documents end what is served to it all the same.
+                in_network().any(|session| matches!(session.kind, Kind::RelayPrincipal { .. })),
+            )
+        };
+        if !peers.is_empty() || relay_sessions {
             peers.push((self.local, self.local_static));
         }
         let roster = self.rosters.body(network_id)?;

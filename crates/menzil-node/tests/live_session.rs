@@ -550,7 +550,7 @@ async fn a_reconnect_gets_a_fresh_epoch_and_refuses_a_stale_tagged_send(trust: &
     let peer_task = spawn_node(&relay, &peer, network_id, peer_events_tx, peer_outbound_rx);
 
     let (epoch1, limits) = match timeout(PATIENCE, node_events.recv()).await {
-        Ok(Some(SessionEvent::Attached { epoch, limits })) => (epoch, limits),
+        Ok(Some(SessionEvent::Attached { epoch, limits, .. })) => (epoch, limits),
         other => panic!("expected Attached as the very first event, got {other:?}"),
     };
     assert_eq!(epoch1, Epoch::first());

@@ -435,6 +435,62 @@ fn own_standing(
     own_cert_standing(roster, certs, local, local_static, now)
 }
 
+/// This node's own standing in `network_id`, for serving the relay principal (expose design
+/// S-E4), read once from the held Roster and Policy: [`own_standing`], and, with `check_expiry`,
+/// both documents unexpired at `now`. A public share has no grant to expire, so the documents'
+/// own `expires` is what stops it (protocol.md 5.3: nothing but `menzil:docs` is served on
+/// expired documents). The error is for the local logs.
+// Independent scalars, like `session_standing`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn own_standing_in(
+    policies: &PolicyStore,
+    rosters: &RosterStore,
+    network_id: &NetworkId,
+    local: &NodeId,
+    local_serial: u32,
+    local_static: &X25519PublicKey,
+    now: u64,
+    check_expiry: bool,
+) -> Result<(), ErrorCode> {
+    let roster = rosters.body(network_id).ok_or(ErrorCode::UnknownNetwork)?;
+    let view = policies.view(network_id).ok_or(ErrorCode::UnknownNetwork)?;
+    if check_expiry && (roster.expires <= now || view.body.expires <= now) {
+        return Err(ErrorCode::RosterExpired);
+    }
+    own_standing(
+        &roster,
+        &view.body,
+        &view.certs,
+        local,
+        local_serial,
+        local_static,
+        now,
+    )
+}
+
+/// The standing an `init` from the relay principal needs (expose design S-E4): unexpired
+/// documents for `network_id` and good [`own_standing_in`].
+pub(crate) fn relay_principal_standing(
+    policies: &PolicyStore,
+    rosters: &RosterStore,
+    network_id: &NetworkId,
+    local: &NodeId,
+    local_serial: u32,
+    local_static: &X25519PublicKey,
+    now: u64,
+) -> Result<(), ErrorCode> {
+    own_standing_in(
+        policies,
+        rosters,
+        network_id,
+        local,
+        local_serial,
+        local_static,
+        now,
+        true,
+    )
+}
+
 /// What protocol.md 5.1's responder-side checks decide about one just-read
 /// `init`, before `resp` is written. See this module's own doc comment, point
 /// 1, for why a failed check answers silently rather than on the wire.

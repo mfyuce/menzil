@@ -91,10 +91,14 @@ use crate::l4_router::{
     EnsureError, RouterConfig, RouterHandle, RouterParts, SessionReady, new_router,
 };
 use crate::l4_session::{CloseReason, E2E_PROTO_TAG, L4SessionHandle};
-use crate::l5_stream::{AcceptedStreams, OpenStreamError, accept_loop, accept_loop_tracked, open};
+use crate::l5_stream::{
+    AcceptedStreams, OpenStreamError, accept_loop, accept_loop_relay_principal,
+    accept_loop_tracked, open,
+};
 use crate::outbound::{Epoch, SendBudgets};
 use crate::policy_store::PolicyStore;
 use crate::relay_notes::{RelayError, RelayNotes};
+use crate::relay_serve::{RelayAuthorizer, RelayHandler, RelayServing};
 use crate::revalidate::{Kind, Revalidator};
 use crate::roster_store::RosterStore;
 use crate::session::{Observers, SessionConfig, SessionEvent, run_session_observed};
@@ -233,13 +237,15 @@ impl Node {
         let (local_node_id, local_static) = (local_cert.node_id, local_cert.x25519_pub);
         // Every reader below follows the one cell, so a renewal reaches them all at once.
         let local_serial = OwnSerial::from(&identity);
+        let shares = ShareBook::new();
         let router_config = RouterConfig::new(
             identity.clone(),
             session.dial.connection_info.relay_node_id,
             policies.clone(),
             rosters.clone(),
             SendBudgets::new(),
-        )?;
+        )?
+        .with_shares(shares.clone());
 
         let (events_tx, events_rx) = mpsc::channel(L3_CHANNEL_CAPACITY);
         let (outbound_tx, outbound_rx) = mpsc::channel(L3_CHANNEL_CAPACITY);
@@ -270,7 +276,6 @@ impl Node {
         let (stop_session, stop_rx) = watch::channel(false);
         let (ended_tx, session_ended) = watch::channel(false);
         let relay_notes = RelayNotes::new();
-        let shares = ShareBook::new();
         let mut tasks = vec![
             tokio::spawn({
                 let rosters = rosters.clone();
@@ -304,6 +309,7 @@ impl Node {
                 DocsGate::new(DocsLimits::default()),
                 Some(sync.clone()),
                 Some(revalidator.clone()),
+                RelayServing::new(shares.clone()),
             )),
             // Grants, sessions and served streams, asked again on every change (protocol.md 5.3).
             tokio::spawn(revalidator.run()),
@@ -554,12 +560,13 @@ async fn serve_sessions<H>(
     gate: Arc<DocsGate>,
     sync: Option<Arc<DocsSync>>,
     revalidator: Option<Arc<Revalidator>>,
+    relay: RelayServing,
 ) where
     H: ServiceHandler<Stream> + Send + Sync + 'static,
     H::Handling: Send + 'static,
 {
     while let Some(session) = ready.recv().await {
-        serve_session(
+        serve_session_with_relay(
             session,
             &policies,
             &rosters,
@@ -570,6 +577,7 @@ async fn serve_sessions<H>(
             &gate,
             sync.as_ref(),
             revalidator.as_ref(),
+            Some(&relay),
         );
     }
 }
@@ -603,8 +611,12 @@ impl Drop for Forget {
 /// With `revalidator`, every kind of session is registered with it before its accept loop
 /// starts and forgotten when the loop ends (protocol.md 5.3, L4k); an ordinary session's accept
 /// loop keeps a registry of the streams it serves for the revalidator to ask again.
+///
+/// The relay principal's session (expose design S-E4, [`SessionReady::relay_principal`]) is a
+/// third kind: see [`serve_session_with_relay`].
 // One more independent input of the node's own identity (its cert serial).
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 pub(crate) fn serve_session<H>(
     session: SessionReady,
     policies: &Arc<PolicyStore>,
@@ -620,6 +632,46 @@ pub(crate) fn serve_session<H>(
     H: ServiceHandler<Stream> + Send + Sync + 'static,
     H::Handling: Send + 'static,
 {
+    serve_session_with_relay(
+        session,
+        policies,
+        rosters,
+        local_node_id,
+        local_serial,
+        local_static,
+        handler,
+        gate,
+        sync,
+        revalidator,
+        None,
+    );
+}
+
+/// [`serve_session`] with the node's [`RelayServing`]: the book and the limits of the relay
+/// principal's sessions. A session announced with [`SessionReady::relay_principal`] never takes
+/// the member arms below, whatever else is set. It is authorized by [`RelayAuthorizer`] (no
+/// member scrub: its `meta` is validated, not dropped) behind a [`RelayHandler`], registered
+/// with the revalidator as [`Kind::RelayPrincipal`] and with nothing else: no document sync, no
+/// certificate offer, no candidate, no source of documents. When `relay` is `None` (a caller
+/// that has no shares) such a session is refused every stream.
+// One more independent input of the node's own identity (its cert serial).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn serve_session_with_relay<H>(
+    session: SessionReady,
+    policies: &Arc<PolicyStore>,
+    rosters: &Arc<RosterStore>,
+    local_node_id: NodeId,
+    local_serial: impl Into<OwnSerial>,
+    local_static: X25519PublicKey,
+    handler: &Arc<H>,
+    gate: &Arc<DocsGate>,
+    sync: Option<&Arc<DocsSync>>,
+    revalidator: Option<&Arc<Revalidator>>,
+    relay: Option<&RelayServing>,
+) where
+    H: ServiceHandler<Stream> + Send + Sync + 'static,
+    H::Handling: Send + 'static,
+{
     let SessionReady {
         peer,
         network_id,
@@ -630,8 +682,27 @@ pub(crate) fn serve_session<H>(
         docs_only,
         peer_roster_seq,
         peer_policy_seq,
+        relay_principal,
         ..
     } = session;
+    if relay_principal {
+        serve_relay_principal(
+            peer,
+            network_id,
+            peer_static,
+            acceptor,
+            handle,
+            policies,
+            rosters,
+            local_node_id,
+            local_serial.into(),
+            local_static,
+            handler,
+            revalidator,
+            relay,
+        );
+        return;
+    }
     let authorizer = PolicyAuthorizer::new(
         policies.clone(),
         rosters.clone(),
@@ -739,4 +810,84 @@ pub(crate) fn serve_session<H>(
             }
         });
     }
+}
+
+/// Serves the relay principal's session (protocol.md 6.1, expose design S-E4): only public
+/// shares, validated `meta`, own limits, and judged by the revalidator as
+/// [`Kind::RelayPrincipal`]. A watcher on the book asks the revalidator to look at once when
+/// the relay's answer changes, so a withdrawn share resets its streams without waiting for a
+/// sweep. With no `relay` wiring the session is refused every stream.
+#[allow(clippy::too_many_arguments)]
+fn serve_relay_principal<H>(
+    peer: NodeId,
+    network_id: NetworkId,
+    peer_static: X25519PublicKey,
+    mut acceptor: crate::l4_session::L4SessionAcceptor,
+    handle: L4SessionHandle,
+    policies: &Arc<PolicyStore>,
+    rosters: &Arc<RosterStore>,
+    local_node_id: NodeId,
+    local_serial: OwnSerial,
+    local_static: X25519PublicKey,
+    handler: &Arc<H>,
+    revalidator: Option<&Arc<Revalidator>>,
+    relay: Option<&RelayServing>,
+) where
+    H: ServiceHandler<Stream> + Send + Sync + 'static,
+    H::Handling: Send + 'static,
+{
+    let Some(relay) = relay else {
+        tokio::spawn(async move {
+            accept_loop(&mut acceptor, DenyAll, RefuseAll).await;
+        });
+        return;
+    };
+    let authorizer = RelayAuthorizer::new(
+        policies.clone(),
+        rosters.clone(),
+        relay.shares.clone(),
+        network_id,
+        peer,
+        local_node_id,
+        local_serial,
+        local_static,
+    );
+    let streams = AcceptedStreams::new();
+    let forget = Forget(revalidator.map(|revalidator| {
+        let id = revalidator.register(
+            peer,
+            network_id,
+            peer_static,
+            handle.clone(),
+            Kind::RelayPrincipal {
+                streams: streams.clone(),
+                authorizer: authorizer.clone(),
+            },
+        );
+        (Arc::clone(revalidator), id)
+    }));
+    let handler = RelayHandler::new(
+        Arc::clone(handler),
+        rosters.clone(),
+        relay.clone(),
+        network_id,
+        local_node_id,
+    );
+    let mut changes = relay.shares.subscribe_accepted();
+    let revalidator = revalidator.cloned();
+    tokio::spawn(async move {
+        let serving = accept_loop_relay_principal(&mut acceptor, authorizer, handler, streams);
+        let watching = async {
+            while changes.changed().await.is_ok() {
+                if let Some(revalidator) = &revalidator {
+                    revalidator.request_pass(network_id);
+                }
+            }
+        };
+        tokio::select! {
+            () = serving => {}
+            () = watching => {}
+        }
+        drop(forget);
+    });
 }

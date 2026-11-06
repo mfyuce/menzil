@@ -206,6 +206,14 @@ struct NetInner {
 struct Net {
     inner: Arc<Mutex<NetInner>>,
     relay: NodeId,
+    /// The relay's static key of the attachment (`SessionEvent::Attached`).
+    relay_static: X25519PublicKey,
+}
+
+/// The static key of the relay of [`Net::new`] and [`Net::with_relay`], which no test holds the
+/// private half of.
+fn relay_static() -> X25519PublicKey {
+    X25519PublicKey::from([0xAB; 32])
 }
 
 const LIMITS: Limits = Limits {
@@ -225,6 +233,17 @@ impl Net {
         Self {
             inner: Arc::default(),
             relay,
+            relay_static: relay_static(),
+        }
+    }
+
+    /// A network whose relay is `relay`, with its real keys (the L3 handshake's static key is
+    /// the one of its certificate).
+    fn with_relay_party(relay: &Party) -> Self {
+        Self {
+            inner: Arc::default(),
+            relay: relay.id,
+            relay_static: relay.x25519_public,
         }
     }
 
@@ -361,6 +380,7 @@ impl TestNode {
             .send(SessionEvent::Attached {
                 epoch,
                 limits: LIMITS,
+                relay_static: self.net.relay_static,
             })
             .await
             .unwrap();
@@ -395,6 +415,18 @@ async fn node(net: &Net, party: &Party, stores: &Stores) -> TestNode {
 
 /// [`node`], with another session table configuration.
 async fn node_with(net: &Net, party: &Party, stores: &Stores, table: TableConfig) -> TestNode {
+    node_full(net, party, stores, table, ShareBook::new()).await
+}
+
+/// [`node_with`], with the node's [`ShareBook`] (the relay principal's `init`s are judged
+/// against it).
+async fn node_full(
+    net: &Net,
+    party: &Party,
+    stores: &Stores,
+    table: TableConfig,
+    shares: ShareBook,
+) -> TestNode {
     let (events_tx, events_rx) = mpsc::channel(1024);
     let (outbound_tx, mut outbound_rx) = mpsc::channel::<OutboundSend>(1024);
     net.inner.lock().unwrap().links.insert(
@@ -413,7 +445,8 @@ async fn node_with(net: &Net, party: &Party, stores: &Stores, table: TableConfig
         SendBudgets::new(),
     )
     .unwrap()
-    .with_table_config(table);
+    .with_table_config(table)
+    .with_shares(shares);
     let parts = new_router(config, outbound_tx, events_rx);
     let task = tokio::spawn(parts.task);
 
@@ -1376,7 +1409,7 @@ async fn a_late_notice_from_an_ended_session_cannot_touch_the_one_that_reused_it
     let stores = w.stores(&[&b, &m], vec![w.grant(&m, &b)]);
     let mut d = driven(&b, &stores, NodeId::from([0xAA; 32]), 7);
     let manual = Manual::new(&Net::new(), m);
-    d.engine.on_attached(Epoch::first(), LIMITS);
+    d.engine.on_attached(Epoch::first(), LIMITS, relay_static());
     let recv = |frame: &E2eFrame| Record::Recv {
         src: manual.party.id,
         e2e_proto: E2E_PROTO_TAG,
@@ -1895,7 +1928,7 @@ async fn a_handshake_frame_the_full_outbound_channel_could_not_take_goes_out_on_
     });
     let net = Net::new();
     let (manual_m, manual_n) = (Manual::new(&net, m), Manual::new(&net, n));
-    d.engine.on_attached(Epoch::first(), LIMITS);
+    d.engine.on_attached(Epoch::first(), LIMITS, relay_static());
     let recv = |manual: &Manual, frame: &E2eFrame| Record::Recv {
         src: manual.party.id,
         e2e_proto: E2E_PROTO_TAG,
@@ -1934,7 +1967,7 @@ async fn held_back_frames_keep_their_order_are_bounded_and_die_with_their_attach
     let b = party();
     let stores = w.stores(&[&b], vec![]);
     let mut d = driven_with(&b, &stores, NodeId::from([0xAA; 32]), 1, || 7);
-    d.engine.on_attached(Epoch::first(), LIMITS);
+    d.engine.on_attached(Epoch::first(), LIMITS, relay_static());
     let dst = NodeId::from([0x42; 32]);
 
     // One fits the channel; the rest wait, and past MAX_UNSENT the oldest go.
@@ -2068,7 +2101,7 @@ async fn two_sessions_at(
         },
         Some(budget),
     );
-    d.engine.on_attached(Epoch::first(), LIMITS);
+    d.engine.on_attached(Epoch::first(), LIMITS, relay_static());
     let net = Net::new();
     let recv = |src: NodeId, frame: &E2eFrame| Record::Recv {
         src,
@@ -2237,7 +2270,7 @@ async fn sessions_get_the_default_inbound_budget_unless_the_router_is_told_other
     let (b, m) = (party(), party());
     let stores = w.stores(&[&b, &m], vec![w.grant(&m, &b)]);
     let mut d = driven(&b, &stores, NodeId::from([0xAA; 32]), 7);
-    d.engine.on_attached(Epoch::first(), LIMITS);
+    d.engine.on_attached(Epoch::first(), LIMITS, relay_static());
     let manual = Manual::new(&Net::new(), m);
     let (_hs, init) = manual.init(&b, w.network, 1);
     let record = Record::Recv {
@@ -2361,7 +2394,7 @@ async fn a_stranger_or_a_revoked_member_costs_no_handshake_work_and_gets_no_answ
         rosters: Arc::new(rosters),
     };
     let mut d = driven(&b, &stores, NodeId::from([0xAA; 32]), 7);
-    d.engine.on_attached(Epoch::first(), LIMITS);
+    d.engine.on_attached(Epoch::first(), LIMITS, relay_static());
     let net = Net::new();
     let send_init = |d: &mut Driven, from: &Party| {
         let manual = Manual::new(&net, from.clone_for_test());
@@ -2907,7 +2940,7 @@ async fn the_engine_keeps_one_entry_per_docs_only_peer_and_forgets_them_with_the
         counter += 1;
         counter
     });
-    d.engine.on_attached(Epoch::first(), LIMITS);
+    d.engine.on_attached(Epoch::first(), LIMITS, relay_static());
     let manual = Manual::new(&Net::new(), m);
     for n in 1..=3 {
         let (_hs, init) = manual.init(&r, w.network, n);
@@ -3069,6 +3102,7 @@ async fn a_forged_docs_only_init_does_not_abandon_our_own_initiation_to_that_pee
 
 // The triggers of protocol.md 5.5 (TODO.md L4j S6), over these routers.
 mod docs_places;
+mod relay_principal;
 mod revalidate;
 mod sync;
 
@@ -3101,7 +3135,7 @@ fn driven_with_cell(party: &Party, cell: &IdentityCell, stores: &Stores) -> Driv
         next
     });
     d.engine.identity = cell.clone();
-    d.engine.on_attached(Epoch::first(), LIMITS);
+    d.engine.on_attached(Epoch::first(), LIMITS, relay_static());
     d
 }
 

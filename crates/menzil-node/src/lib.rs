@@ -75,6 +75,7 @@ mod node;
 mod outbound;
 mod policy_store;
 mod relay_notes;
+mod relay_serve;
 mod revalidate;
 mod roster_store;
 mod serve;
@@ -102,7 +103,8 @@ pub use l4_session::{
     L4SessionConfig, L4SessionHandle, SessionNotice, SessionObserver,
 };
 pub use l5_stream::{
-    AcceptedStreams, OpenStreamError, accept_loop, accept_loop_tracked, open as open_stream,
+    AcceptedStreams, OpenStreamError, accept_loop, accept_loop_relay_principal,
+    accept_loop_tracked, open as open_stream,
 };
 pub use node::{Node, NodeConfig, NodeOpenError, RefuseAll, StartError};
 pub use outbound::{
@@ -110,6 +112,10 @@ pub use outbound::{
 };
 pub use policy_store::PolicyStore;
 pub use relay_notes::{ATTACH_SETTLED, RelayError, RelayNotes, listed_in_own_roster};
+pub use relay_serve::{
+    MAX_RELAY_STREAMS, MAX_RELAY_STREAMS_PER_SHARE, RelayAuthorizer, RelayHandler, RelayLimits,
+    RelayPermit, RelayServing,
+};
 pub use roster_store::RosterStore;
 pub use serve::{
     DEFAULT_CONNECT_TIMEOUT, DEFAULT_MAX_CONNECTIONS, DEFAULT_MAX_CONNECTIONS_PER_PEER,
