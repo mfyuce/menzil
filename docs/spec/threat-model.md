@@ -1,6 +1,6 @@
-# menzil threat model (spec v0.2, 2026-09-26)
+# menzil threat model (spec v0.3, 2026-11-06)
 
-Status: v0.2 after the red team review of v0.1. Companion to `protocol.md` v0.2; section references point there.
+Status: v0.3 adds the hostile tenant of a shared relay (2.10, with a non goal in 4 and tests 15 to 19 in 5) to v0.2, which followed the red team review of v0.1. Companion to `protocol.md` v0.3; section references point there.
 
 ## 1. What we protect
 
@@ -56,6 +56,26 @@ The owner is trusted; mistakes are the realistic risk (`to_node: "*"` with `serv
 
 The direct path will most likely be QUIC with its own reliability; L4 version 1 records are defined for the relay path, where the reliable class requires contiguity and only datagrams tolerate loss. Whatever the direct path is, it must add no trust: same identities, same network scoping, same grants.
 
+### 2.10 Hostile tenant on a shared relay
+
+A relay may serve several unrelated tenants, each a group of networks its operator assigned (protocol.md 10). Every tenant trusts the operator exactly as 2.3 says; tenancy protects tenants from each other, not from the operator. The attackers: the owner of a tenant's network, who can sign any Roster for it (any members, any labels, any `seq`, up to its size figure) and run any number of devices; a member device of some tenant; and a stranger with a key it just generated, listed in no Roster. Their goals against a victim tenant: learn its networks, members, labels or which of its nodes are online; reach its nodes; take its share names; starve it of relay memory, CPU, bandwidth, sessions, handshake slots or log lines.
+
+Controls (protocol.md section in brackets):
+
+- Nothing names another tenant's networks. WELCOME lists only the networks the HELLO claimed and passed, and nothing in XX [4.1]; a network the relay does not serve is refused `not_member` like one that does not list the node, at the same cost [4.1]; DOC for a network the session did not claim, or the relay does not serve, gets no answer [4.3]; a HELLO with more than 32 networks is refused before any lookup [4.1]; WELCOME `session` numbers do not count other connections [4.1].
+- Nothing reaches another tenant's node. Forwarding needs a network claimed by both sessions, so an owner who lists a victim's NodeId in its own Roster can send nothing to it; every case after authorization answers the same `peer_offline`, so the answer is no presence oracle [4.2]. A Roster's `min_serial` and `revoked` count only for the networks a node claimed, so one owner cannot lock a node out of another's network.
+- Names live in one zone per tenant. A tenant can produce no name in another's zone, so there is nothing to race for and `label_taken` exists only inside one tenant; flat names exclude every slug; a released flat name and a removed tenant's slug are quarantined for 180 days, so links, bookmarks and certificate history of the old holder never land on a new tenant [4.4, 11].
+- Every resource a tenant can use is bounded per tenant or per session: sessions attached and waiting, pairs, destinations per sender, queued droppable bytes, bandwidth and volume, Roster size and adoptions, names [10]; and per source address and per NodeId before any tenant is known: connection rate, handshakes in flight, sessions waiting to attach, the ATTACH deadline, write timeouts, the replay history bound [10]. A tenant over its bandwidth delays only its own CREDIT [4.2].
+- No lock that other tenants need is held across a signature check or an ADVERTISE decision; the log lines a peer can cause are throttled per peer, so that no peer floods the operator's log or hides another's first warning.
+
+Residual risks, accepted:
+
+- Until the share domain is on the Public Suffix List and browsers carry the listing, a blind share of one tenant can set cookies for the share domain that browsers send to other tenants' shares (cookie tossing). One tenant's abuse, phishing on a share for example, can get the share domain blocklisted for every tenant; the operator's remedy is to remove that tenant.
+- A session counts against the tenant of every network it claims and is refused while any of them is at a session figure. A device that joined a hostile owner's network as well as the victim's can therefore be kept off the victim's network too, for as long as the hostile owner keeps its own tenant full. Listing the device in a Roster is not enough for this: a device claims only the networks it joined, and one that leaves the hostile network out of its HELLO is unaffected.
+- The default tenant has no tenant figures and flat names. A friend's network belongs in a named tenant; a network left in the default tenant is limited only by the global limits.
+- ERROR `over_quota` for a new pair names no destination, so a refused node cannot tell which peer it was; the figures are meant to be reached only by abuse. A relay restart begins a new volume period; only the operator can cause one.
+- Inside one tenant there is no isolation beyond fair sharing of delayed CREDIT: its members share its figures, and one of them can use them up for the others. The tenant's owner admitted that member.
+
 ## 3. Guarantees by layer
 
 | Layer | Confidentiality against | Authenticity | Notes |
@@ -76,6 +96,7 @@ The direct path will most likely be QUIC with its own reliability; L4 version 1 
 - Availability under a determined denial of service against a personal relay.
 - Post quantum confidentiality in version 1.
 - Hiding that menzil is in use: ordinary TLS carrying an ordinary WebSocket to a personal domain, nothing more.
+- Isolation of tenants from the relay operator: on a shared relay the operator sees every tenant's Rosters, NodeIds, traffic metadata, label claims and terminated shares, as 2.3 says; tenancy isolates tenants from each other only (2.10).
 
 ## 5. Security requirements the implementation must test
 
@@ -93,6 +114,11 @@ The direct path will most likely be QUIC with its own reliability; L4 version 1 
 12. With a TLS intercepting proxy in the harness, the node connects, the proxy sees only ciphertext after the upgrade, and an injected record is rejected.
 13. Unknown SNI, no SNI, quarantined names and a fragmented ClientHello up to 16 KiB behave as specified; a peek that exceeds the deadline is closed.
 14. Relay static key rotation: nodes with the old key still connect for 30 days, receive the new NodeCert, and afterwards reject a lower relay serial.
+15. WELCOME `rosters`: a stranger with a fresh key sees no network, in IK and in XX; an IK member sees exactly the networks it claimed, not every network that lists it; an XX member sees none, and its Roster upload is adopted or dropped as equal.
+16. A HELLO that claims a network gets a byte identical ERROR whether the relay does not serve that network or serves it without listing the node; a HELLO that claims no network is refused; a DOC for an unserved network, for a served network the session did not claim, and a forged one all get no record back.
+17. An owner who lists another tenant's node in its own Roster gets the same `peer_offline` whether that node is online, offline, or closed to peers, and the node receives nothing; members of a network both sides claimed still reach each other; every refused reliable SEND is reimbursed.
+18. A tenant never gets a name in another tenant's zone, and the answer to its ADVERTISE does not depend on what another tenant holds; a released flat name and a removed tenant's slug stay quarantined across a relay restart.
+19. One tenant at its figures does not take a second tenant's sessions, pairs or throughput: the 65th attached node of a tenant is refused while another tenant's first is accepted, a new pair over the figure is refused while existing pairs work, and the second tenant's transfer rate is not reduced by the first tenant's stalled credit. At the default floor a 16 MiB transfer completes and no session ends.
 
 ## 6. Open questions after v0.2
 

@@ -1,6 +1,6 @@
-# menzil protocol, version 1 (spec v0.2, 2026-09-26)
+# menzil protocol, version 1 (spec v0.3, 2026-11-06)
 
-Status: v0.2 after the red team review of v0.1 (`reviews/2026-09-26-red-team.md`) and the constraint verification (`reviews/2026-09-26-constraint-verification.md`). Normative for protocol version 1. Which parts ship in which implementation phase is stated in section 13, not by omission.
+Status: v0.3 adds the multi tenant relay (one relay serving several unrelated tenants) to v0.2, which followed the red team review of v0.1 (`reviews/2026-09-26-red-team.md`) and the constraint verification (`reviews/2026-09-26-constraint-verification.md`). Normative for protocol version 1. Which parts ship in which implementation phase is stated in section 13, not by omission.
 
 Terms: node = any menzil process holding an identity; agent = the one per user process that owns the identity and all sessions (section 12); relay = a node role that is publicly reachable and forwards for others; peer = the node at the other end of an end to end session; owner = the key that defines a network; steward = a key the owner delegates for day to day admission and renewal.
 
@@ -22,6 +22,17 @@ Terms: node = any menzil process holding an identity; agent = the one per user p
 - Corrected size limits, chunked documents, L3 PING/PONG and REKEY, TLS 1.2 accepted at L1, proxy authentication details [14, 15, 22].
 - Terminated mode header hygiene, label claims and quotas, SNI router rules, flood limits, grant re-evaluation, signed object encoding, owner key delegation [16 to 24].
 - Phase mapping section, consistency fixes, low findings [25, 26].
+
+## Changes in v0.3 (multi tenant relay)
+
+- A relay groups the networks it serves into tenants; limits and share names are counted per tenant (section 10). The default tenant is today's personal relay.
+- WELCOME `rosters` lists only the networks the HELLO claimed and passed (IK) and is empty in XX; the node uploads a Roster missing from it (4.1, 4.3).
+- A network the relay does not serve is refused `not_member`, like one that does not list the node; a HELLO that claims no network is refused until invites exist; at most 32 distinct networks per HELLO; ATTACH within 10 seconds (4.1).
+- Forwarding needs a network claimed by both sessions; every undeliverable case after authorization is the same `peer_offline` (4.2).
+- DOC(roster) is taken only for a claimed, served network; anything else is dropped without an answer (4.3).
+- New error code 27 `over_quota` and GOAWAY reasons `over_quota` and `rate_limited`; CREDIT may be delayed by a tenant's bandwidth, never withheld (4.2).
+- Share names live in a zone per tenant, with per tenant quotas, release and quarantine; ADVERTISE_ACK gains an optional `names` (4.4, 6.2).
+- Section 10 gains the relay's global safety limits and the per tenant figures; section 11 the tenant files.
 
 ## 1. Layering
 
@@ -148,9 +159,13 @@ In IK the node's payload rides message 1 and the relay's rides message 2; in XX 
 
 `caps` is a list of capability strings from the registry in `menzil-proto`; version 1 defines `dgram` (the node accepts datagram channels), `docs` (the node serves `menzil:docs`), `share-blind` and `share-terminated` (the node can host shares of that mode). Unknown strings are ignored.
 
-The relay verifies the NodeCert and rejects a serial lower than the highest it has seen or lower than the `min_serial` for that node in a Roster of a network the HELLO claims, rejects a `timestamp` not greater than the last accepted for that NodeId, and checks each claimed network against its Rosters: unknown network, unlisted node or revoked node fails with ERROR. A node may claim no network; it may then only redeem an invite. A node does not claim a network whose Roster it holds revokes it.
+The relay verifies the NodeCert and rejects a serial lower than the highest it has seen or lower than the `min_serial` for that node in a Roster of a network the HELLO claims, rejects a `timestamp` not greater than the last accepted for that NodeId, and checks each claimed network against its Rosters: an unlisted node fails with ERROR `not_member`, a revoked node with `revoked`. A network the relay does not serve is judged as a served one that lists nobody: the answer is `not_member`, with the same message, so that no one can test which networks a relay serves; the work done must not tell the two apart either. Repeats in `networks` are ignored; a HELLO that claims more than 32 distinct networks is refused with `too_large` before any Roster is looked at. A HELLO that claims no network is refused with `not_member` until invites exist (phase 2, section 7.2); then a node that claims no network may only redeem an invite. A node does not claim a network whose Roster it holds revokes it, and a node whose own Roster lists it and that is refused `not_member` should tell its user that the relay may not serve that network or may hold an older Roster.
 
-After WELCOME all records are Noise transport messages. The new session is not routable and does not supersede an existing one until the node's first transport record, ATTACH, is decrypted. Then the previous session for that NodeId receives GOAWAY `superseded`. Noise `Rekey()` runs in both directions on REKEY (section 4.2) every hour; there is no forced daily reconnect.
+The admission limits of section 10 (sessions waiting to attach per NodeId, the figures of the claimed networks' tenants) are checked after the Roster checks and before the HELLO's serial and timestamp are recorded, so that only a proven NodeId in standing is ever told `rate_limited` or `over_quota`, and a refused HELLO can be retried at once. A HELLO refused for a tenant figure gets ERROR `over_quota` and then GOAWAY `over_quota` with `retry_after_ms`; the message names no tenant and no figure.
+
+What WELCOME may say depends on what the relay knows when it writes it. In IK the HELLO rides message 1, so the relay checks it before it writes message 2: if it passed, `rosters` lists the `seq` the relay holds for each network the HELLO claimed, and nothing else; if it failed, `rosters` is empty and the ERROR follows WELCOME. In XX WELCOME is written before the HELLO exists, so `rosters` is empty. A relay never lists a network the session did not claim and pass. A node treats a claimed network missing from `rosters` as one the relay holds no Roster of and uploads its own (section 4.3); the relay drops an equal one before any signature check. `limits.max_peers` is lowered to the `destinations_per_node` figure of the tenants of the listed networks (section 10); an XX session hears the relay's own figure. `session` is an opaque number; a relay does not hand out consecutive numbers, which would show every client how many connections other tenants open.
+
+After WELCOME all records are Noise transport messages. The new session is not routable and does not supersede an existing one until the node's first transport record, ATTACH, is decrypted. A session that has not sent ATTACH 10 seconds after its handshake completed is closed, whatever else it sends meanwhile. When ATTACH arrives, the relay checks its total of attached sessions (ERROR `rate_limited` over it) and the attached figure of the session's tenants (ERROR and GOAWAY `over_quota`); a NodeId that is attached already replaces its own session and is let in. Then the previous session for that NodeId receives GOAWAY `superseded`. Noise `Rekey()` runs in both directions on REKEY (section 4.2) every hour; there is no forced daily reconnect.
 
 ### 4.2 Records
 
@@ -164,7 +179,7 @@ u8 type | body
 | 0x01 | SEND | node to relay | `bytes32 dst \| u8 e2e_proto \| u8 flags \| payload` |
 | 0x02 | RECV | relay to node | `bytes32 src \| u8 e2e_proto \| u8 flags \| payload` |
 | 0x03 | ADVERTISE | node to relay | CBOR (4.4) |
-| 0x04 | ADVERTISE_ACK | relay to node | CBOR `{ accepted: [str], rejected: [{ name, reason }] }` |
+| 0x04 | ADVERTISE_ACK | relay to node | CBOR `{ accepted: [str], rejected: [{ name, reason }], names: [str] }`, `names` optional (4.4) |
 | 0x05 | DOC | both | `u8 doc_type \| bytes16 doc_id \| u16 index \| u16 count \| chunk`; chunked Roster (relay and node, `doc_type` roster, or base_roster for the owner signed base of a steward signed Roster, section 2.3) or Policy (node only, never to a relay); whole document at most 1 MiB |
 | 0x06 | PEER_STATE | relay to node | CBOR `{ node_id, online: bool, direct: [Addr] }` (direct empty in phase 1) |
 | 0x07 | CREDIT | relay to node | CBOR `{ peer: node_id, bytes: u32 }` |
@@ -177,19 +192,25 @@ u8 type | body
 | 0x0e | ERROR | both | CBOR `{ code: u16, msg: str }` |
 | 0x0f | GOAWAY | relay to node | CBOR `{ reason: str, retry_after_ms: u32 }` |
 
-GOAWAY `reason` is `superseded` (4.1) or `revoked` (7.3); `revoked` also ends a session whose node a Roster of a claimed network no longer lists or whose `min_serial` it now exceeds, the ERROR before it says which (`revoked`, `not_member` or `stale_serial`). Before that ERROR the relay sends the node the Roster of the network concerned, so that the node can leave the network out of its next HELLO.
+GOAWAY `reason` is `superseded` (4.1), `revoked` (7.3), `over_quota` or `rate_limited`. `revoked` also ends a session whose node a Roster of a claimed network no longer lists or whose `min_serial` it now exceeds, and the session of every member of a network the operator stopped serving, the ERROR before it says which (`revoked`, `not_member` or `stale_serial`). Before that ERROR the relay sends the node the Roster of the network concerned, when it still holds one, so that the node can leave the network out of its next HELLO. `over_quota` follows ERROR `over_quota` when a tenant figure turns a session away (4.1); `rate_limited` follows ERROR `rate_limited` when the relay ends a session for sending more than section 10 allows (4.3). Both carry `retry_after_ms`, 60,000 by default, which the node honors (section 3.3).
 
 `e2e_proto`: `0x01` menzil Noise (section 5), `0x02` reserved for QUIC. Others are rejected with ERROR `unknown_e2e`. `flags` bit 0 = droppable (datagram class). SEND payload is at most 65,535 minus 35 minus the 16 byte AEAD tag, that is 65,484 bytes at the default `max_record` (live-verified against a real relay, L4b round).
 
-Forwarding rule: the relay forwards a SEND as a RECV to `dst` only if `src` and `dst` are both listed and unrevoked in one common, unexpired Roster the relay holds, `dst` is online and attached, and `dst` has not set `accept_peers: false` in its ADVERTISE. Otherwise ERROR `forbidden` or `peer_offline` goes back to the sender. The relay never inspects payloads.
+Forwarding rule: the relay forwards a SEND as a RECV to `dst` only if some network is claimed both by the sender's session and by `dst`'s current attached session, the relay holds an unexpired Roster of it that lists `src` and `dst` as unrevoked members, and `dst` has not set `accept_peers: false` in its ADVERTISE. It decides in this order, so that the answer leaks nothing: if no network the sender claimed has such a Roster, ERROR `forbidden`, whatever the state of `dst`; otherwise, if `dst` is not attached, its session claimed none of those networks, or it does not accept peers, ERROR `peer_offline`, the same message in every case. An owner who lists another tenant's node in its own Roster therefore learns nothing from the answer, and that node receives nothing. A refused reliable SEND is reimbursed: the relay sends the sender a CREDIT for the bytes it charged, because ERROR names no destination. The relay never inspects payloads.
 
-Flow control and queues: the relay keeps one bounded queue per (source session, destination session), default 4 MiB. It never stops reading one session because another destination is slow. Reliable SENDs consume credit granted by CREDIT records for that peer (initial credit `limits.credit`, default 1 MiB, replenished as bytes are written to the destination socket); a reliable SEND beyond credit is a protocol violation and closes the session. Droppable SENDs are not credited, pass through a token bucket per (source, destination) and are the first records dropped when a queue is full. Senders order their output: control records, then reliable SEND, then droppable SEND.
+Flow control and queues: the relay keeps one bounded queue per (source session, destination session), default 4 MiB. It never stops reading one session because another destination is slow. Reliable SENDs consume credit granted by CREDIT records for that peer (initial credit `limits.credit`, default 1 MiB, replenished as bytes are written to the destination socket); a reliable SEND beyond credit is a protocol violation and closes the session. Droppable SENDs are not credited, pass through a token bucket per (source, destination) and are the first records dropped when a queue is full. Senders order their output: control records, then reliable SEND, then droppable SEND. A relay may delay a CREDIT to hold a tenant to its bandwidth (section 10), but never withholds or shrinks one: every byte a reliable SEND consumed is granted back exactly once. A delay is shared fairly among the tenant's senders and stays far below the time a node waits for credit before it gives up, so that it slows a transfer and ends no session. Droppable SENDs of a tenant over its bandwidth are dropped instead.
 
-Error codes are a registry in `menzil-proto`; version 1 defines at least `bad_cert`, `stale_serial`, `stale_timestamp`, `unknown_network`, `not_member`, `revoked`, `roster_expired`, `forbidden`, `peer_offline`, `unknown_e2e`, `credit_exceeded`, `too_large`, `rate_limited`, `label_taken`, `label_unclaimed`, `bad_invite`, `bad_tag`, `bad_document` (25), `docs_only` (26). An admission that cannot be delivered yet is not an error; ADMIT_RESULT `{ pending: true }` reports it.
+Pairs: the (sender NodeId, destination NodeId) state of the paragraph above is a pair; it exists from its first admitted SEND until a session of either side ends. A pair belongs to the tenant of the first network of the sender's HELLO list that authorized it and that `dst` claimed. Only the creation of a new pair is ever refused for a count: when the sender already has `limits.max_peers` destinations, or the pair's tenant is at one of its pair figures (section 10). The answer is ERROR `over_quota` (the credit reimbursed, the session kept); a pair that exists keeps working whatever the counts.
+
+Error codes are a registry in `menzil-proto`; version 1 defines at least `bad_cert`, `stale_serial`, `stale_timestamp`, `unknown_network`, `not_member`, `revoked`, `roster_expired`, `forbidden`, `peer_offline`, `unknown_e2e`, `credit_exceeded`, `too_large`, `rate_limited`, `label_taken`, `label_unclaimed`, `bad_invite`, `bad_tag`, `bad_document` (25), `docs_only` (26), `over_quota` (27). `over_quota` means a tenant figure, or the relay's `max_peers`, refused something (section 10); a node that does not know code 27 treats it as an unknown code. A relay never sends `unknown_network`; an unserved network is answered as 4.1 and 4.3 say. An admission that cannot be delivered yet is not an error; ADMIT_RESULT `{ pending: true }` reports it.
 
 ### 4.3 Documents
 
-A node sends DOC(roster) to a relay when it holds a newer Roster than the relay's WELCOME `rosters` shows, and again on the live session whenever it adopts a Roster newer than the newest the relay is known to hold; a relay sends DOC(roster) to attached members of that network when it receives a newer one. Policies travel only end to end (section 5.5). Relays keep the newest Roster per network they are configured to serve (by NetworkId) and refuse Rosters of other networks.
+A node sends DOC(roster) to a relay when it holds a newer Roster than the relay's WELCOME `rosters` shows (a claimed network missing from `rosters` counts as one the relay does not hold), and again on the live session whenever it adopts a Roster newer than the newest the relay is known to hold; a relay sends DOC(roster) to the attached sessions that claimed that network when it adopts a newer one. Policies travel only end to end (section 5.5). Relays keep the newest Roster per network they are configured to serve (by NetworkId; the first Roster of a network reaches a relay only through its operator, section 11) and refuse Rosters of other networks.
+
+A relay takes a DOC(roster) only for a network the sending session claimed and passed in its HELLO and that the relay serves. It reads the network from the reassembled document before any signature check and drops anything else without an answer: a Roster of another network, a document that does not decode or does not verify, a stale one. So DOC tells no one which networks a relay serves. A transfer over the protocol's 1 MiB is answered ERROR `too_large` whatever it carries; beyond that, two answers exist, both only for a claimed, served network: ERROR `too_large` for a document over the size figure of the network's tenant (section 10), and ERROR `over_quota` for a Roster newer than the held one when the tenant's adoptions of that network are used up; the node sends it again on its next attach or push. A relay counts an adoption only once the Roster has verified, so a forgery cannot use up an owner's allowance, and it charges a transfer that fails verification to the sending NodeId's own allowance instead (section 10). It checks signatures without holding any lock that sessions of other tenants need.
+
+Each session has an allowance of completed DOC transfers, one for Rosters and one for the base Rosters sent ahead of steward signed ones (section 10). A transfer over it is dropped unverified and unanswered. A session is ended with ERROR and GOAWAY `rate_limited` when it sends, within a minute, 3 transfers the relay cannot use (not decodable, forged, for a network it did not claim or the relay does not serve, or over the allowance and not a Roster of a claimed, served network), or 30 transfers that are Rosters of a claimed, served network but over the allowance or refused `over_quota`. A stale transfer counts towards neither, since a node may hold an old copy.
 
 ### 4.4 Advertising public names
 
@@ -199,7 +220,13 @@ ADVERTISE = CBOR{ v: 1, shares: [ { name: str, mode: "blind" | "terminated", ser
 
 `alpn` lists the ALPN protocol identifiers the node terminates for a blind name (for example `h2`, `http/1.1`, `acme-tls/1`); an empty list means any. The relay uses it for one decision only: a ClientHello for the name whose ALPN is `acme-tls/1` is routed to the node only if the node listed it, so that a node that does not run TLS-ALPN-01 receives no challenge connections. Ignored for terminated shares.
 
-A relay accepts a `name` only if the Roster of one of the node's networks lists that name for this NodeId in `labels`. Labels under the relay's share domain are one LDH label each (letters, digits, hyphen, 1 to 63 characters, not starting or ending with a hyphen), not in the relay's reserved list (`www`, `mail`, `admin`, `api`, `relay`, `t`, the operator's own names). Custom domains are fully qualified names whose DNS TXT record `_menzil.<domain>` equals the NetworkId hex, checked at ADVERTISE and daily, exact match only. Quotas per network per relay: 20 names, and at most 5 new names per week. A name is released by an owner signed Roster that drops it, or after 90 days without a session; a released name is quarantined for 180 days before another network may claim it. Operators of multi tenant relays put the share domain on the Public Suffix List so tenants are not same site. On a personal relay the operator may instead pin labels statically in the relay configuration (a fixed list of name to NodeId), which bypasses claims and quotas and is the simplest setup when relay operator and network owner are the same person.
+A relay accepts a `name` only if the Roster of a network the session claimed, in which the node is an unrevoked member, lists that name for this NodeId in `labels`. Only the node's current attached session may advertise (an ADVERTISE before ATTACH, or from a superseded session, is ignored), and each ADVERTISE states the node's complete set of shares: claims it leaves out are dropped. One ADVERTISE carries at most 64 shares; a longer one is refused as a whole and changes nothing. Labels are one LDH label each (letters, digits, hyphen, 1 to 63 characters, not starting or ending with a hyphen), compared in lowercase, and not in the relay's reserved list (`www`, `mail`, `admin`, `api`, `relay`, `t`, the operator's own names). A name with a dot is a custom domain (below).
+
+Tenant zones. Let `H` be the relay's share domain. The relay composes the full name of a share from the label and the tenant (section 10) of the network whose Roster grants it: `<label>.H` for the default tenant, `<label>.<slug>.H` for the tenant `slug`, and `<label>.H` for a label equal to a flat name the operator granted that tenant (`extra_names`, section 11). A Roster never carries a slug, so an owner's documents do not change when the operator places or renames its tenant. A tenant can never produce a name in another tenant's zone: claims of different tenants never collide, and the answer a tenant gets never depends on what another tenant holds. A flat name of the default tenant is never equal to a slug, a quarantined slug or a flat name granted to a tenant (rejected `reserved name`), because `<label>.H` and `<label>.<slug>.H` must not share a first level label. A label that networks of two tenants grant the node is accepted in both zones; a share is accepted if any of its zones accepts it, and is otherwise rejected with the reason of the first. ADVERTISE_ACK `names` lists the full names accepted, relative to `H` (`app` for `app.H`, `app.ali` for `app.ali.H`); a node that does not know the key ignores it.
+
+Holding, quotas, release. A full name is held by at most one attached node: the first claimant holds it and another node of the same tenant gets `label_taken`; claims end with the holder's session, and a new session advertises again. Rejection reasons are `label_unclaimed` (no claimed network grants the label to this node), `label_taken`, `reserved name`, `quarantined` and `over_quota`. A tenant with figures (section 10) holds at most `names` names in all (default 20) and has at most `new_names_per_week` names accepted for the first time in any 7 days (default 5); a flat name the operator granted counts toward the first only; over either, `over_quota`. The default tenant and tenants of the `personal` class have no name figures. A name stays its tenant's between sessions: the relay keeps, across restarts, each name's tenant and network, when it was first accepted and when it was last held, and the quarantines. A name is released when it has not been held by any session for 90 days, counted from the end of its last holder's session; when no Roster the relay holds for a network of its tenant lists the label any more (an owner signed Roster that drops it), at the relay's next periodic pass; and when the operator stops serving its network, unless another network of the same tenant still grants it (the name moves to that network) or a session holds it (released once that session has ended). A released name in a tenant's zone is free again for that tenant at once, since no other tenant can ever get it. A released flat name is quarantined for 180 days, and only the network that held it may take it back meanwhile; a removed tenant's slug is quarantined for 180 days as well (section 11). A claim of a quarantined name is rejected `quarantined`.
+
+Custom domains (phase 2) are fully qualified names whose DNS TXT record `_menzil.<domain>` equals the NetworkId hex, checked at ADVERTISE and daily, exact match only; each counts toward the names of the network's tenant. Until they exist a name with a dot is rejected. Operators of a relay with tenants put `H` on the Public Suffix List, so that each tenant zone and each flat name is a site of its own; until browsers carry the listing, a blind share of one tenant can set cookies for `H` that browsers send to the shares of other tenants (threat model 2.10). On a personal relay the operator may instead pin labels statically in the relay configuration (a fixed list of name to NodeId), which bypasses claims and quotas and is the simplest setup when relay operator and network owner are the same person.
 
 ## 5. End to end session (L4)
 
@@ -294,11 +321,11 @@ A relay is never a member. For share traffic it acts as the relay principal `{ r
 
 ### 6.2 Blind mode (default)
 
-The relay reads the ClientHello on 443 without terminating TLS: it reassembles up to 16 KiB across TLS records and TCP segments with a 10 second deadline and a cap on concurrent peeks. SNI equal to the relay's own host name is handled as section 3. SNI matching an advertised blind name opens `tls:<name>` to the owning node with `meta.sni` and pipes the bytes, ClientHello included. No SNI, an unknown name, or a name in quarantine receives the operator's static site. TLS 1.2 and 1.3 clients route the same way. Encrypted Client Hello is not supported for share names in version 1: the relay publishes no ECH configuration for them.
+The relay reads the ClientHello on 443 without terminating TLS: it reassembles up to 16 KiB across TLS records and TCP segments with a 10 second deadline and a cap on concurrent peeks. SNI equal to the relay's own host name is handled as section 3. Otherwise the router resolves the SNI as a full name of section 4.4 (`<label>.H`, `<label>.<slug>.H`): from the zone to the tenant, then to the node that holds that tenant's name. A full name held by a node opens `tls:<label>` to that node with `meta.sni` and pipes the bytes, ClientHello included. No SNI, an unknown or unheld name, a name in quarantine, and a connection over a tenant's share connection figures (section 10) all receive the operator's static site, the same answer, so that a probe cannot tell them apart. TLS 1.2 and 1.3 clients route the same way. Encrypted Client Hello is not supported for share names in version 1: the relay publishes no ECH configuration for them.
 
 The node terminates TLS with its own certificate. HTTP-01 challenges arrive through the relay's port 80 listener, which forwards `/.well-known/acme-challenge/` requests for a blind name to `acme-http:<name>` and redirects every other port 80 request to https. TLS-ALPN-01 challenges route through the SNI router like any other ClientHello for the name. DNS-01 is the node's own affair.
 
-What blind means: the relay cannot read a blind share as long as it behaves passively. An operator who controls the DNS of the share domain can obtain a certificate for a blind name (DNS-01) and terminate the share itself; this is detectable through certificate transparency and preventable for custom domains with CAA `accounturi` (RFC 8657). The threat model states this explicitly. To avoid connection coalescing leaks, a relay never holds a certificate whose names cover a blind name: terminated shares live under a separate zone (`<label>.t.<domain>` with a wildcard for `*.t.<domain>`), and the relay answers HTTP 421 for any authority it does not terminate.
+What blind means: the relay cannot read a blind share as long as it behaves passively. An operator who controls the DNS of the share domain can obtain a certificate for a blind name (DNS-01) and terminate the share itself; this is detectable through certificate transparency and preventable for custom domains with CAA `accounturi` (RFC 8657). The threat model states this explicitly. To avoid connection coalescing leaks, a relay never holds a certificate whose names cover a blind name: terminated shares live under a separate zone (`<label>.t.<domain>` with a wildcard for `*.t.<domain>`, and for a tenant `<label>.<slug>.t.<domain>` with a wildcard for `*.<slug>.t.<domain>`), and the relay answers HTTP 421 for any authority it does not terminate.
 
 ### 6.3 Terminated mode
 
@@ -358,23 +385,67 @@ The subprotocol `menzil.v1`, both Noise prologues, and every CBOR body's `v` car
 
 ## 10. Limits and abuse controls (relay defaults)
 
+Every figure below is a default the operator may change. A relay applies the global limits to every session; it applies the tenant figures to the networks of each tenant that has them.
+
+Tenants. A relay serves each network for exactly one tenant. A tenant is a name the operator chooses (its slug, section 11) and the networks the operator assigns to it when adding them (`relay add-network <token> --tenant <slug>`): the Roster proves the network, the operator's command assigns it, and nothing about the tenant enters a signed document. A network the operator assigned to no tenant belongs to the default tenant, which has no slug, flat share names (4.4) and the `personal` class: no tenant figures, only the global limits. A relay without tenants is a personal relay as before. A named tenant has the class `friend` unless its file says `personal`; `friend` has the figures of the second table, each changeable per tenant. Attribution: a session counts against every tenant of the networks it claimed and passed (a NodeId can claim only networks whose Roster lists it, so no tenant can raise another's counts), and is refused if any of them is at a figure; a pair counts against the tenant that 4.2 names; a Roster adoption against the tenant of its network; a name against the tenant of the network that granted it. Counts that are not names are kept in memory: a relay restart begins a new volume period.
+
+Global limits:
+
 | Item | Default |
 |---|---|
-| HELLO per source IP | 60 per minute (offices share one proxy address), then HTTP 429 |
-| HELLO per NodeId after a successful Diffie Hellman | 10 per minute |
+| New connections per source address (an IPv6 address counts by its /64) | 60 per minute; the next one is closed before TLS, without an answer |
+| TLS and WebSocket handshakes in flight | 256 in all, 8 per source address, 16 per IPv6 /48; 10 s each |
+| Sessions not yet attached, per source address | 32 |
+| Noise handshake and HELLO | 10 s from the first message |
+| From handshake to ATTACH | 10 s, then the session is closed |
+| Sessions not yet attached, per NodeId | 2 (ERROR `rate_limited`) |
 | Sessions per NodeId | 1 attached |
+| Attached sessions in all | 10,000 (ERROR `rate_limited` at ATTACH) |
+| Distinct networks per HELLO | 32 (ERROR `too_large`) |
+| HELLO that claims no network | refused (`not_member`) until invites exist |
+| Replay history (serial and timestamp per NodeId) | 65,536 NodeIds; NodeIds listed in a held Roster are never evicted |
+| Write to a session that does not read | 5 s, then the session is closed |
 | L3 record | 65,535 bytes payload |
 | Per destination queue | 4 MiB |
 | Initial credit per peer | 1 MiB |
+| Destinations per sending NodeId (`limits.max_peers`) | 1,024 (new pair refused `over_quota`) |
 | Datagram token bucket per (source, destination) | 20 Mbit/s, 256 KiB burst |
+| ADVERTISE per session | 10 per minute, burst 3 (ERROR `rate_limited`, claims unchanged) |
+| Shares per ADVERTISE | 64 |
+| Completed DOC transfers per session | 6 per minute, burst 3 or one per claimed network if more (at most 32); base Rosters the same, counted apart |
+| DOC transfers that end a session within a minute | 3 unusable, or 30 over the rate or `over_quota` for a claimed network (4.3) |
+| Roster transfers that fail verification, per NodeId | 12 per hour, burst 3; then refused unverified |
 | Pending admissions per network | 100 |
-| Names per network, new names per week | 20, 5 |
 | Concurrent ClientHello peeks | 1,024 |
-| Session idle without any record | 60 s |
+| Session idle without any record | 50 s (two ping intervals, section 3.3) |
+
+Per tenant figures of the `friend` class:
+
+| Item | Default | When over |
+|---|---|---|
+| Networks (`max_networks`) | 3 | the operator's command refuses to add one more |
+| Encoded Roster size (`roster_kib`) | 256 KiB (at most the protocol's 1 MiB) | ERROR `too_large` (4.3) |
+| Roster adoptions per network (`roster_adoptions_per_hour`, `roster_adoption_burst`) | 20 per hour, burst 5 | ERROR `over_quota`, unverified (4.3) |
+| Attached sessions, distinct NodeIds (`attached_sessions`) | 64 | ERROR and GOAWAY `over_quota` at HELLO or ATTACH (4.1) |
+| Sessions not yet attached (`unattached_sessions`) | 16 | ERROR and GOAWAY `over_quota` at HELLO |
+| Live pairs (`forwarding_pairs`) | 64 | new pair refused `over_quota` (4.2) |
+| Destinations per sending NodeId (`destinations_per_node`) | 32, announced in WELCOME `max_peers` | new pair refused `over_quota` |
+| Droppable bytes queued over all pairs (`droppable_mib`) | 16 MiB | droppable SEND dropped |
+| Bandwidth (`bandwidth_mbit`, `burst_mib`) | 100 Mbit/s sustained, 256 MiB burst | CREDIT delayed, droppable dropped (4.2) |
+| Volume (`volume_gib`, `volume_days`) | 250 GiB per 30 days | bandwidth falls to the floor until the period ends |
+| Floor (`floor_mbit`) | 5 Mbit/s, burst one second of it; never above the bandwidth | as bandwidth |
+| Names (`names`, `new_names_per_week`) | 20, 5 new per 7 days | ADVERTISE_ACK rejection `over_quota` (4.4) |
+| Share connections (when 6.2 is built) | 256 at once per tenant, 64 per name | the static site (6.2) |
+
+Bandwidth is charged when a reliable RECV is handed to the destination's connection, and droppable bytes when the SEND is admitted. While a tenant's bucket is in debt, the CREDIT owed to its senders is held and released as the bucket refills, the refill shared equally among the senders that wait, each sender's oldest bytes first. At the default floor a lone sender's 1 MiB credit window comes back in under 2 seconds, so a tenant over its volume is slowed, not cut off. A node that is a member of networks of two tenants is refused while either tenant is at a session figure. ERROR `over_quota` for a new pair names no destination, so a node cannot tell which of its new peers was refused; the figures are meant to be reached only by abuse.
+
+A relay behind a reverse proxy or load balancer that hides client addresses sees one address for every client; there the per address limits are limits of the whole relay and the operator must raise them.
 
 ## 11. Configuration surface (informative)
 
-Node: identity path, relays (connection information), networks, services, shares, egress listener. Relay: listen addresses, domains for blind and terminated zones, ACME account, the NetworkIds it serves, WebSocket path, limits, static site directory, reserved names. Phase 1 commands: `menzil init`, `agent`, `admit`, `relay`, `node`, `expose`, `reach`, `stdio`. Phase 2 adds `invite` and `proxy`. Their flags are not part of this protocol.
+Node: identity path, relays (connection information), networks, services, shares, egress listener. Relay: listen addresses, domains for blind and terminated zones, ACME account, the NetworkIds it serves, WebSocket path, limits, static site directory, reserved names, tenants. Phase 1 commands: `menzil init`, `agent`, `admit`, `relay`, `node`, `expose`, `reach`, `stdio`. Phase 2 adds `invite` and `proxy`. Their flags are not part of this protocol.
+
+Tenants on the relay. The operator serves a network by adding the Roster token its owner gave (`relay add-network <token> [--tenant <slug>]`; without `--tenant` a new network goes to the default tenant), stops serving it with `relay remove-network`, removes a tenant and all its networks with `relay remove-tenant`, and lists them with `relay tenants`. A tenant is a file in the relay's directory, written by these commands and editable by hand: its networks, its class (`friend` or `personal`), whether terminated shares are allowed for it (`terminated`, off by default, section 6.3), the exact flat names the operator grants it (`extra_names`, each counting toward its `names` figure once accepted), when it was added, and overrides of any figure of section 10 (named as there; zero or out of range is an error, and a floor may not exceed the bandwidth). A slug is one LDH label of 3 to 32 lowercase letters, digits and hyphens, not starting or ending with a hyphen, not reserved (`www`, `mail`, `admin`, `api`, `relay`, `t`, `_menzil`, the operator's own names), and equal to no other slug, no slug in quarantine, no flat name granted to a tenant, and no flat name the relay has accepted for anyone or holds in quarantine. When two tenant files claim the same thing, the older (by when it was added, then by slug) keeps it and the newer is refused; a refused file's networks are not served at all, never given to the default tenant. A network moves to another tenant only by removing it first. A removed tenant's slug is quarantined for 180 days. The relay keeps its name state (section 4.4) in a file of its own and reads the tenant files and the Rosters again periodically (every 15 seconds); it stops serving a removed network then and ends the sessions of its members (ERROR `not_member`, GOAWAY `revoked`). The operator tells each tenant that tenancy protects tenants from each other, not from the operator (threat model 2.3, 2.10).
 
 ## 12. The agent and local IPC
 
@@ -389,14 +460,20 @@ Exactly one process per user, the agent, holds the identity and owns every L3 an
 | 3.1 step 5 HTTP/2 extended CONNECT | | yes | |
 | 3.3 relay static site for non tunnel paths | minimal 404 page | full static site | |
 | 4 relay session incl. ATTACH, credit, PING, REKEY, DOC | yes | | |
-| 4.4 label claims and quotas | claims in Roster | quotas, custom domains, quarantine | |
+| 4.1 to 4.3 tenant isolation rules (WELCOME, `not_member`, DOC, forwarding) | yes | | |
+| 4.4 label claims, tenant zones, per tenant quotas, release, quarantine | yes | | |
+| 4.4 custom domains | | yes | |
 | 5 end to end session, reliable class, streams | yes | | |
 | 5.4 datagram channels | | yes | |
-| 6.2 blind shares with node side ACME | | yes (becomes the default when it ships) | |
+| 6.2 blind shares with node side ACME, SNI router over tenant zones | | yes (becomes the default when it ships) | |
 | 6.3 terminated shares with relay ACME | yes (the only share mode in phase 1; the relay reads shares in phase 1) | header hygiene complete | |
+| 6.3 terminated zones per tenant, the tenant's `terminated` flag | with 6.3 | | |
 | 7 admission by pasted token; invites through relay | pasted token | invites | |
 | 8 egress SOCKS and HTTP CONNECT listener | | yes | |
 | 8 TUN mode | | | yes |
+| 10 global limits and tenant figures (sessions, Rosters, pairs, bandwidth, volume, names) | yes | | |
+| 10 share connection figures per tenant and per name | | yes (with 6.2) | |
+| 11 tenant files and the operator's tenant commands | yes | | |
 | 12 agent and IPC, stdio, reach | yes | | |
 | PEER_STATE direct addresses, QUIC e2e_proto | | | yes |
 
