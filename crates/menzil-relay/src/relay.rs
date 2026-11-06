@@ -22,6 +22,7 @@ use crate::identity::RelayIdentity;
 use crate::listener::Listener;
 use crate::log_throttle::LogThrottle;
 use crate::node_history::NodeHistory;
+use crate::principal::PrincipalConfig;
 use crate::rate::SessionRates;
 use crate::registry::SessionRegistry;
 use crate::roster_store::RosterStore;
@@ -115,6 +116,8 @@ pub struct Relay {
     relay_id: Option<NodeId>,
     /// Where SENDs to `relay_id` go.
     pub(crate) endpoint: Arc<RelayEndpoint>,
+    /// The figures of the relay principal (`crate::principal`), read when a `Principal` is made.
+    principal: PrincipalConfig,
 }
 
 /// An attached node as the relay's own endpoint needs it: the L3 session it is attached by and
@@ -190,6 +193,7 @@ impl Relay {
             next_session_id: Arc::new(SessionIds::new()),
             relay_id,
             endpoint: Arc::new(RelayEndpoint::default()),
+            principal: PrincipalConfig::default(),
         }
     }
 
@@ -266,6 +270,20 @@ impl Relay {
     pub fn with_session_rates(mut self, rates: SessionRates) -> Self {
         self.rates = rates;
         self
+    }
+
+    /// This relay with `config` as the figures of its relay principal (sessions per tenant and
+    /// in all, idle time, session age; [`PrincipalConfig::default`] otherwise). Call it before
+    /// [`crate::Principal::new`] and before cloning the relay.
+    #[must_use]
+    pub fn with_principal_config(mut self, config: PrincipalConfig) -> Self {
+        self.principal = config;
+        self
+    }
+
+    /// The figures a [`crate::Principal`] made from this relay uses.
+    pub fn principal_config(&self) -> PrincipalConfig {
+        self.principal
     }
 
     /// This relay with other session time limits (tests).

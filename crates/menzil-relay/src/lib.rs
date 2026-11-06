@@ -28,6 +28,7 @@ mod listener;
 mod log_throttle;
 mod names;
 mod node_history;
+mod principal;
 mod rate;
 mod registry;
 mod relay;
@@ -59,6 +60,11 @@ pub use names::{
     Quarantine, QuarantineKind, RELEASE_DAYS, TOUCH_SECS,
 };
 pub use node_history::{HistoryViolation, MAX_HISTORY_ENTRIES, NodeHistory};
+pub use principal::{
+    DEFAULT_HANDSHAKE_TIMEOUT, DEFAULT_IDLE_TIMEOUT, DEFAULT_MAX_PER_TENANT,
+    DEFAULT_MAX_SESSION_AGE, DEFAULT_MAX_TOTAL, DEFAULT_OPEN_TIMEOUT, DEFAULT_SEND_WAIT,
+    DEFAULT_TICK, Principal, PrincipalConfig, PrincipalError, SEND_RETRY,
+};
 pub use rate::{
     ADVERTISE_BURST, ADVERTISE_PER_MINUTE, DOC_BURST, DOC_TRANSFERS_PER_MINUTE, MAX_DOC_BURST,
     OVER_RATE_DOCS_TO_END, SessionRates, UNADOPTED_DOCS_TO_END, UNADOPTED_WINDOW,
