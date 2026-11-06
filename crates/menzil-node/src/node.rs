@@ -97,7 +97,8 @@ use crate::policy_store::PolicyStore;
 use crate::relay_notes::{RelayError, RelayNotes};
 use crate::revalidate::{Kind, Revalidator};
 use crate::roster_store::RosterStore;
-use crate::session::{SessionConfig, SessionEvent, run_session_observed};
+use crate::session::{Observers, SessionConfig, SessionEvent, run_session_observed};
+use crate::shares::ShareBook;
 
 /// Capacity of each of the two channels between [`run_session`] and the
 /// router. Any size works (`run_session` is written not to deadlock on a
@@ -184,6 +185,8 @@ pub struct Node {
     sync: Arc<DocsSync>,
     /// What the relay last said when it turned this node away.
     relay_notes: RelayNotes,
+    /// The shares this node advertises and what the relay answered.
+    shares: ShareBook,
     /// Tells the relay session to write what it holds and close.
     stop_session: watch::Sender<bool>,
     /// Turns `true` when the relay session task has returned.
@@ -267,10 +270,14 @@ impl Node {
         let (stop_session, stop_rx) = watch::channel(false);
         let (ended_tx, session_ended) = watch::channel(false);
         let relay_notes = RelayNotes::new();
+        let shares = ShareBook::new();
         let mut tasks = vec![
             tokio::spawn({
                 let rosters = rosters.clone();
-                let notes = relay_notes.clone();
+                let observers = Observers {
+                    notes: relay_notes.clone(),
+                    shares: shares.clone(),
+                };
                 async move {
                     run_session_observed(
                         session,
@@ -279,7 +286,7 @@ impl Node {
                         outbound_rx,
                         rosters,
                         stop_rx,
-                        notes,
+                        observers,
                     )
                     .await;
                     let _ = ended_tx.send(true);
@@ -317,6 +324,7 @@ impl Node {
             rosters,
             sync,
             relay_notes,
+            shares,
             stop_session,
             session_ended,
             tasks,
@@ -330,6 +338,14 @@ impl Node {
     /// the log alone said.
     pub fn last_relay_error(&self) -> Option<RelayError> {
         self.relay_notes.last_error()
+    }
+
+    /// The shares this node asks its relay to route to it (protocol.md 4.4) and the relay's
+    /// answer to them: set the configured shares through [`ShareBook::set_shares`], read what the
+    /// relay accepted through [`ShareBook::snapshot`] and [`ShareBook::accepted_service`]. The
+    /// node advertises after every attach and whenever the set changes.
+    pub fn shares(&self) -> &ShareBook {
+        &self.shares
     }
 
     /// Whether the node is attached to its relay right now. A relay that is about to turn the

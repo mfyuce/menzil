@@ -17,6 +17,16 @@
 //! max_connections = 256           # served at once, all peers together, at most 1000000
 //! max_connections_per_peer = 64   # served at once for one peer, at most 1000000
 //! connect_timeout_secs = 5        # giving up on a service's local target, at most 9
+//!
+//! # Optional: public names the relay routes to this node (protocol.md 4.4). The service must be
+//! # one of [services]. mode is "blind" (service tls:..., the node terminates TLS), "terminated"
+//! # (http:..., the relay terminates TLS) or "tcp" (tcp:..., reached by name like a blind share).
+//! # alpn is for blind and tcp shares only; leave it out for any.
+//! [[share]]
+//! name = "app"
+//! mode = "blind"
+//! service = "tls:app"
+//! # alpn = ["h2", "http/1.1"]
 //! ```
 //!
 //! A file that does not exist is an empty configuration. Unknown keys are an error: a typo should
@@ -30,8 +40,9 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 use menzil_carrier::{ConnectionInfo, ProxyOverride, redact_userinfo};
+use menzil_node::validate_shares;
 use menzil_node::{LocalServices, LocalTarget, MAX_CONNECT_TIMEOUT, ServeLimits};
-use menzil_proto::ServiceId;
+use menzil_proto::{ServiceId, ServiceKind, Share, ShareMode};
 use serde::Deserialize;
 
 use crate::home::Home;
@@ -52,6 +63,58 @@ pub struct Config {
     /// What this node holds for its peers at most: `[serve]`.
     #[serde(default)]
     pub serve: ServeSettings,
+    /// Public names to advertise to the relay: `[[share]]`.
+    #[serde(default)]
+    pub share: Vec<ShareSettings>,
+}
+
+/// One `[[share]]` entry as written; [`Config::shares`] checks it.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ShareSettings {
+    /// The public label (one lowercase LDH label).
+    pub name: String,
+    /// `blind`, `terminated` or `tcp`.
+    pub mode: String,
+    /// The service the name routes to, as in `[services]`.
+    pub service: String,
+    /// ALPN identifiers the node terminates; none means any.
+    pub alpn: Option<Vec<String>>,
+}
+
+impl ShareSettings {
+    /// The wire share this entry stands for, or why it is not one. `tcp` is a blind share whose
+    /// service is `tcp:` (the wire has two modes), so each mode names the one service kind it
+    /// goes with and a mismatch is an error, not a correction.
+    fn to_share(&self) -> Result<Share> {
+        let name = &self.name;
+        let (mode, kind) = match self.mode.as_str() {
+            "blind" => (ShareMode::Blind, ServiceKind::Tls),
+            "terminated" => (ShareMode::Terminated, ServiceKind::Http),
+            "tcp" => (ShareMode::Blind, ServiceKind::Tcp),
+            other => bail!(
+                "share {name:?} in config.toml: mode {other:?} is not one of \"blind\", \"terminated\", \"tcp\""
+            ),
+        };
+        let service: ServiceId = self.service.parse().map_err(|e| {
+            anyhow!(
+                "share {name:?} in config.toml: service {:?}: {e}",
+                self.service
+            )
+        })?;
+        if service.kind != kind {
+            bail!(
+                "share {name:?} in config.toml: mode {:?} goes with a {kind}: service, not {service}",
+                self.mode
+            );
+        }
+        Ok(Share {
+            name: self.name.clone(),
+            mode,
+            service,
+            alpn: self.alpn.clone().unwrap_or_default(),
+        })
+    }
 }
 
 /// The most connections a `[serve]` limit may name. Each served connection holds a descriptor
@@ -125,6 +188,7 @@ impl std::fmt::Debug for Config {
             .field("services", &self.services)
             .field("agent_socket", &self.agent_socket)
             .field("serve", &self.serve)
+            .field("share", &self.share)
             .finish()
     }
 }
@@ -172,6 +236,26 @@ impl Config {
             Some(text) if text.eq_ignore_ascii_case("direct") => Some(ProxyOverride::Direct),
             Some(url) => Some(ProxyOverride::Use(url.to_string())),
         }
+    }
+
+    /// The shares to advertise, validated: every mode, name, service and ALPN entry is checked
+    /// and an error names the share (nothing is corrected quietly), and each service must be one
+    /// this node serves (`[services]`), since an accepted name that leads nowhere is a mistake.
+    pub fn shares(&self) -> Result<Vec<Share>> {
+        let mut shares = Vec::with_capacity(self.share.len());
+        for settings in &self.share {
+            let share = settings.to_share()?;
+            if !self.services.contains_key(&share.service.to_string()) {
+                bail!(
+                    "share {:?} in config.toml points at {}, which is not in [services]: add it there, or this node would advertise a name it cannot serve",
+                    share.name,
+                    share.service
+                );
+            }
+            shares.push(share);
+        }
+        validate_shares(&shares).map_err(|e| anyhow!("config.toml: {e}"))?;
+        Ok(shares)
     }
 
     /// The services to serve, validated.
@@ -438,6 +522,114 @@ mod tests {
             let error = Config::parse(text).unwrap_err().to_string();
             assert!(error.contains(wanted), "{text:?}: {error}");
         }
+    }
+
+    const SERVICES: &str = r#"
+        [services]
+        "tls:app" = "127.0.0.1:8443"
+        "http:web" = "127.0.0.1:8080"
+        "tcp:ssh" = "127.0.0.1:22"
+    "#;
+
+    fn shares_of(share_tables: &str) -> Result<Vec<Share>> {
+        Config::parse(&format!("{SERVICES}\n{share_tables}")).and_then(|c| c.shares())
+    }
+
+    #[test]
+    fn share_entries_become_wire_shares_for_each_mode() {
+        let shares = shares_of(
+            r#"
+            [[share]]
+            name = "app"
+            mode = "blind"
+            service = "tls:app"
+            alpn = ["h2", "acme-tls/1"]
+
+            [[share]]
+            name = "web"
+            mode = "terminated"
+            service = "http:web"
+
+            [[share]]
+            name = "ssh"
+            mode = "tcp"
+            service = "tcp:ssh"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(shares.len(), 3);
+        assert_eq!(shares[0].mode, ShareMode::Blind);
+        assert_eq!(shares[0].alpn, vec!["h2", "acme-tls/1"]);
+        assert_eq!(shares[0].service.to_string(), "tls:app");
+        assert_eq!(shares[1].mode, ShareMode::Terminated);
+        assert!(shares[1].alpn.is_empty());
+        // `tcp` is a blind share on the wire, with a tcp: service.
+        assert_eq!(shares[2].mode, ShareMode::Blind);
+        assert_eq!(shares[2].service.to_string(), "tcp:ssh");
+        assert!(shares_of("").unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_bad_share_is_an_error_that_names_it_and_nothing_is_changed_quietly() {
+        for (table, wanted) in [
+            (
+                "name = \"app\"\nmode = \"public\"\nservice = \"tls:app\"",
+                "mode \"public\"",
+            ),
+            (
+                "name = \"App\"\nmode = \"blind\"\nservice = \"tls:app\"",
+                "uppercase",
+            ),
+            (
+                "name = \"a.b\"\nmode = \"blind\"\nservice = \"tls:app\"",
+                "dot",
+            ),
+            (
+                "name = \"-a\"\nmode = \"blind\"\nservice = \"tls:app\"",
+                "hyphen",
+            ),
+            (
+                "name = \"app\"\nmode = \"blind\"\nservice = \"http:web\"",
+                "goes with a tls:",
+            ),
+            (
+                "name = \"web\"\nmode = \"terminated\"\nservice = \"tls:app\"",
+                "goes with a http:",
+            ),
+            (
+                "name = \"ssh\"\nmode = \"tcp\"\nservice = \"tls:app\"",
+                "goes with a tcp:",
+            ),
+            (
+                "name = \"app\"\nmode = \"blind\"\nservice = \"nonsense\"",
+                "service \"nonsense\"",
+            ),
+            (
+                "name = \"app\"\nmode = \"blind\"\nservice = \"tls:other\"",
+                "not in [services]",
+            ),
+            (
+                "name = \"web\"\nmode = \"terminated\"\nservice = \"http:web\"\nalpn = [\"h2\"]",
+                "blind shares only",
+            ),
+            (
+                "name = \"app\"\nmode = \"blind\"\nservice = \"tls:app\"\nport = 1",
+                "unknown field",
+            ),
+            ("name = \"app\"\nmode = \"blind\"", "missing field"),
+        ] {
+            let error = match shares_of(&format!("[[share]]\n{table}")) {
+                Ok(_) => panic!("{table:?} was accepted"),
+                Err(e) => format!("{e:#}"),
+            };
+            assert!(error.contains(wanted), "{table:?}: {error}");
+        }
+        // The same name twice is refused as a whole.
+        let error = shares_of(
+            "[[share]]\nname = \"app\"\nmode = \"blind\"\nservice = \"tls:app\"\n[[share]]\nname = \"app\"\nmode = \"tcp\"\nservice = \"tcp:ssh\"",
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("used twice"), "{error:#}");
     }
 
     #[test]

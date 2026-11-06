@@ -802,6 +802,9 @@ pub async fn start(home: &Home, config: &Config, socket: &Path) -> Result<Runnin
         e2e_protos: vec![0x01],
     };
     let services = config.local_services()?;
+    // Checked before anything starts: a bad `[[share]]` stops the node with its reason, as a bad
+    // `[services]` entry does.
+    let shares = config.shares()?;
     let listener = bind_agent_socket(socket).await?;
     let socket_identity =
         file_identity(socket).with_context(|| format!("looking at {}", socket.display()))?;
@@ -817,6 +820,9 @@ pub async fn start(home: &Home, config: &Config, socket: &Path) -> Result<Runnin
         )
         .map_err(|e| anyhow!("{e}"))?,
     );
+    node.shares()
+        .set_shares(shares.clone())
+        .map_err(|e| anyhow!("config.toml: {e}"))?;
     let directory = Arc::new(RwLock::new(Directory::load(home)?));
 
     let renewer = Arc::new(CertRenewer::new(
@@ -833,12 +839,16 @@ pub async fn start(home: &Home, config: &Config, socket: &Path) -> Result<Runnin
     let reload_task = {
         let (home, directory, node) = (home.clone(), directory.clone(), node.clone());
         let (policies, rosters) = (policies.clone(), rosters.clone());
+        // What this node serves is fixed when it starts, so a share may only point at one of
+        // these.
+        let served = config.services.clone();
         tokio::spawn(async move {
             let mut last: HashMap<NetworkId, u64> = HashMap::new();
             loop {
                 let every = crate::cert_renew::test_knob("RELOAD_EVERY")
                     .map_or(RELOAD_EVERY, Duration::from_secs);
                 tokio::time::sleep(every).await;
+                reload_shares(&home, &node, &served);
                 let mut adopted = Vec::new();
                 match reload_adopting(
                     &home,
@@ -878,6 +888,32 @@ pub async fn start(home: &Home, config: &Config, socket: &Path) -> Result<Runnin
         keeper,
         _instance: instance,
     })
+}
+
+/// Reads the `[[share]]` entries of `config.toml` again and, when they differ from what the node
+/// advertises, gives the node the new set (it advertises on its live session). A file that does
+/// not parse or a share that is not valid leaves the node advertising what it did, with the
+/// reason in the log: nothing is half applied. `served` is the `[services]` table the node
+/// started with: a share that points at a service the node does not serve yet needs a restart,
+/// which the log says.
+fn reload_shares(home: &Home, node: &Node, served: &std::collections::BTreeMap<String, String>) {
+    let shares = match Config::load(home).and_then(|config| config.shares()) {
+        Ok(shares) => shares,
+        Err(error) => {
+            tracing::warn!(error = %format!("{error:#}"), "reloading the shares of config.toml failed, the node keeps advertising the ones it has");
+            return;
+        }
+    };
+    if let Some(share) = shares
+        .iter()
+        .find(|share| !served.contains_key(&share.service.to_string()))
+    {
+        tracing::warn!(share = %share.name, service = %share.service, "a share in config.toml points at a service this node did not start with: restart `menzil node` to serve it; the shares are not changed");
+        return;
+    }
+    if let Err(error) = node.shares().set_shares(shares) {
+        tracing::warn!(error = %error, "the shares of config.toml are not valid, the node keeps advertising the ones it has");
+    }
 }
 
 /// Reads the documents again; the stores keep the newer of what they hold and what is on disk

@@ -79,6 +79,7 @@ mod revalidate;
 mod roster_store;
 mod serve;
 mod session;
+mod shares;
 
 pub use admission::{
     HandshakeAdmission, InitiatorAdmission, PolicyAuthorizer, decide_initiator_admission,
@@ -116,5 +117,7 @@ pub use serve::{
     ServeConfigError, ServeLimits,
 };
 pub use session::{
-    Session, SessionConfig, SessionEvent, run_session, run_session_observed, run_session_until,
+    Observers, Session, SessionConfig, SessionEvent, run_session, run_session_observed,
+    run_session_until,
 };
+pub use shares::{MAX_SHARES, ShareBook, ShareError, ShareSnapshot, check_name, validate_shares};

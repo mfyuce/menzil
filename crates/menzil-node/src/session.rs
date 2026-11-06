@@ -75,6 +75,7 @@ use crate::identity::IdentityCell;
 use crate::outbound::{EnqueueOutcome, Epoch, MAX_QUEUED_BYTES, OutboundQueue, OutboundSend};
 use crate::relay_notes::{RelayNotes, listed_in_own_roster};
 use crate::roster_store::RosterStore;
+use crate::shares::{ShareBook, advertise_body};
 
 /// Everything [`Session::connect`] needs beyond what
 /// [`Carrier::dial`] itself takes.
@@ -461,11 +462,15 @@ impl Session {
     /// 4.3), the base first for a steward signed one. Run at attach, and again whenever the
     /// store takes a newer Roster while attached (protocol.md 5.5: a node that adopts a
     /// Roster newer than its relay's sends it on at once).
-    pub async fn push_newer_rosters(&mut self) -> Result<(), NodeError> {
-        for record in self.engine.catch_up_records() {
+    ///
+    /// Returns whether it sent anything.
+    pub async fn push_newer_rosters(&mut self) -> Result<bool, NodeError> {
+        let records = self.engine.catch_up_records();
+        let sent = !records.is_empty();
+        for record in records {
             self.send(record).await?;
         }
-        Ok(())
+        Ok(sent)
     }
 
     /// The networks this session put in HELLO: the configured ones less those this node left out
@@ -1195,6 +1200,25 @@ pub async fn run_session_until(
     .await;
 }
 
+/// What [`run_session_observed`] reports into: the relay's last rejection and the node's shares.
+/// A bare [`RelayNotes`] converts to one with an empty [`ShareBook`], which advertises nothing.
+#[derive(Debug, Clone, Default)]
+pub struct Observers {
+    /// What the relay last said when it turned this node away.
+    pub notes: RelayNotes,
+    /// The shares to advertise and the relay's answer to them.
+    pub shares: ShareBook,
+}
+
+impl From<RelayNotes> for Observers {
+    fn from(notes: RelayNotes) -> Self {
+        Self {
+            notes,
+            shares: ShareBook::new(),
+        }
+    }
+}
+
 /// [`run_session_until`] that also keeps, in `notes`, what the relay last said when it turned
 /// this node away (an ERROR such as `revoked`, `not_member` or `stale_serial`) or ended the
 /// session (GOAWAY), with the time. An attachment that lasts [`RelayNotes::settle_after`]
@@ -1208,14 +1232,18 @@ pub async fn run_session_observed(
     mut outbound: mpsc::Receiver<OutboundSend>,
     roster_store: Arc<RosterStore>,
     mut stop: watch::Receiver<bool>,
-    notes: RelayNotes,
+    observers: impl Into<Observers>,
 ) {
+    let Observers { notes, shares } = observers.into();
     let mut backoff = Backoff::new();
     let mut epoch = Epoch::first();
     // Subscribed for the life of the node, not of one attachment: a notice that comes while the
     // node is reconnecting only makes the next check (which the attach itself also does) a
     // second look.
     let mut roster_changes = roster_store.subscribe();
+    // The configured shares, likewise followed for the life of the node: a change while
+    // reconnecting is advertised by the next attachment anyway.
+    let mut share_changes = shares.subscribe();
     loop {
         let Some((mut session, waiting)) = connect_with_retry(
             &config,
@@ -1236,6 +1264,13 @@ pub async fn run_session_observed(
         tracing::info!(?epoch, "node session attached");
         let attached_at = Instant::now();
         notes.begin_attachment();
+        // Every attachment advertises again (protocol.md 4.4: the relay's claims end with the
+        // session). ATTACH and the Rosters the connect pushed are already on the wire, so the
+        // relay judges the names against the Rosters it holds now. The loop below sends it.
+        share_changes.mark_changed();
+        // Whether an ADVERTISE with shares went out in this attachment: a later empty set is
+        // then still sent, to drop the claims (a relay keeps the last complete set).
+        let mut advertised = false;
         // Whether this attachment claimed every network the node is configured for.
         let complete = session.claimed_networks().len() == config.networks.len();
         let settle = tokio::time::sleep(notes.settle_after());
@@ -1270,6 +1305,9 @@ pub async fn run_session_observed(
                             outbound_queue.note_credit(body.peer, body.bytes);
                         }
                         Ok(record) => {
+                            if let Record::AdvertiseAck(body) = &record {
+                                shares.note_ack(body);
+                            }
                             if let Record::Error(body) = &record {
                                 // A relay answers `not_member` for a network it does not
                                 // serve exactly as for one that does not list the node
@@ -1356,7 +1394,13 @@ pub async fn run_session_observed(
                     // `Closed` cannot happen: the store is held right here.
                     let _ = changed;
                     match tokio::time::timeout(SEND_TIMEOUT, session.push_newer_rosters()).await {
-                        Ok(Ok(())) => {}
+                        Ok(Ok(sent)) => {
+                            // A Roster the relay did not hold may be what a rejected name was
+                            // waiting for (`label_unclaimed`): ask again.
+                            if sent && shares.has_unaccepted() {
+                                share_changes.mark_changed();
+                            }
+                        }
                         Ok(Err(err)) => {
                             tracing::warn!(error = %err, "node session ended while pushing a Roster to the relay, reconnecting");
                             break 'attached None;
@@ -1364,6 +1408,28 @@ pub async fn run_session_observed(
                         Err(_elapsed) => {
                             tracing::warn!("pushing a Roster to the relay stalled past the write timeout, reconnecting");
                             break 'attached None;
+                        }
+                    }
+                }
+                // The shares to advertise: at every attach, and when the owner changes them.
+                // Written the way a Roster push is, bounded by the same write timeout.
+                changed = share_changes.changed() => {
+                    // `Closed` cannot happen: the book is held right here.
+                    let _ = changed;
+                    let wanted = share_changes.borrow_and_update().clone();
+                    if !wanted.is_empty() || advertised {
+                        shares.note_sent(&wanted);
+                        let record = Record::Advertise(advertise_body(&wanted));
+                        match tokio::time::timeout(SEND_TIMEOUT, session.send(record)).await {
+                            Ok(Ok(())) => advertised = !wanted.is_empty(),
+                            Ok(Err(err)) => {
+                                tracing::warn!(error = %err, "node session ended while advertising its shares, reconnecting");
+                                break 'attached None;
+                            }
+                            Err(_elapsed) => {
+                                tracing::warn!("advertising the shares stalled past the write timeout, reconnecting");
+                                break 'attached None;
+                            }
                         }
                     }
                 }
@@ -1413,6 +1479,8 @@ pub async fn run_session_observed(
         let uptime = attached_at.elapsed();
 
         pending.push_back(SessionEvent::Detached { epoch });
+        // The relay's claims ended with the session; so does what it answered about them.
+        shares.note_detached();
         drop(outbound_queue);
         drop(session);
         epoch = epoch.next();
