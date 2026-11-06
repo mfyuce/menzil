@@ -159,8 +159,9 @@ struct State {
     candidates: HashMap<(NetworkId, NodeId), NodeCert>,
     /// Networks whose steward entry made this node ignore candidates, already logged once.
     ignored_logged: HashSet<NetworkId>,
-    /// Members already named in the owner's log line.
-    owner_logged: HashSet<(NetworkId, NodeId)>,
+    /// Members already named in the owner's log line, with the serial the line named: one line
+    /// per renewal (a higher serial is a new line), forgotten once the Policy lists it.
+    owner_logged: HashMap<(NetworkId, NodeId), u32>,
 }
 
 /// The candidate store of a node: the checks above and the certificates that passed them.
@@ -228,6 +229,13 @@ impl CertCandidates {
     fn prune(&self, state: &mut State, network_id: &NetworkId) {
         let roster = self.rosters.body(network_id);
         let policy = self.policies.body(network_id);
+        // A serial the Policy lists needs no more reminders (round C, N1).
+        state.owner_logged.retain(|(network, node), serial| {
+            network != network_id
+                || policy
+                    .as_ref()
+                    .is_none_or(|policy| listed_serial(&policy.certs, node) < Some(*serial))
+        });
         state.candidates.retain(|(network, node), cert| {
             if network != network_id {
                 return true;
@@ -307,9 +315,14 @@ impl CertCandidates {
                     .rosters
                     .body(&network_id)
                     .is_some_and(|roster| !roster.stewards.is_empty());
-                if steward_listed || !state.owner_logged.insert((network_id, from.peer)) {
+                self.prune(&mut state, &network_id);
+                let logged = state.owner_logged.get(&(network_id, from.peer)).copied();
+                if steward_listed || logged.is_some_and(|logged| logged >= body.serial) {
                     return Offer::Ignored;
                 }
+                state
+                    .owner_logged
+                    .insert((network_id, from.peer), body.serial);
                 tracing::info!(
                     network = %network_id,
                     member = %from.peer,

@@ -268,6 +268,41 @@ fn the_owner_notes_a_newer_certificate_once_per_member_and_stores_nothing() {
 }
 
 #[test]
+fn the_owner_notes_each_renewal_once_and_forgets_a_serial_the_policy_lists() {
+    // Round C N1: one line per renewal, not one per member for ever.
+    let m = member(1);
+    let w = World::new(&m, 1, &[1]);
+    let store = CertCandidates::new(w.rosters.clone(), w.policies.clone());
+    store.set_holder(w.network, Some(Holder::Owner), NOW);
+    assert_eq!(store.offer(&w.from(&m), &renewal(&m, 2), NOW), Offer::Noted);
+    assert_eq!(
+        store.offer(&w.from(&m), &renewal(&m, 2), NOW),
+        Offer::Ignored
+    );
+    // The next renewal is a new line, and a late repeat of the older one is not.
+    assert_eq!(store.offer(&w.from(&m), &renewal(&m, 3), NOW), Offer::Noted);
+    assert_eq!(
+        store.offer(&w.from(&m), &renewal(&m, 3), NOW),
+        Offer::Ignored
+    );
+    // The owner accepts serial 3: nothing is remembered about it any more.
+    w.set_policy(2, &m, &[3]);
+    assert_eq!(
+        store.offer(&w.from(&m), &renewal(&m, 4), NOW),
+        Offer::Noted,
+        "the line for serial 4 is written"
+    );
+    assert_eq!(
+        store.lock().owner_logged.get(&(w.network, m.id)),
+        Some(&4),
+        "only the latest serial is kept"
+    );
+    w.set_policy(3, &m, &[4]);
+    store.candidates(w.network);
+    assert!(store.lock().owner_logged.is_empty());
+}
+
+#[test]
 fn the_owner_says_nothing_when_a_steward_is_listed() {
     use menzil_proto::{Steward, StewardBody, StewardKey};
     let m = member(1);

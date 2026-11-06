@@ -580,23 +580,30 @@ pub struct DocsSync {
     /// The `node_cert` candidates other nodes pushed to this one.
     candidates: Arc<CertCandidates>,
     /// The live sessions (ids from `register_as`) with a `node_cert` push running, so that the
-    /// push at the start of a session and one after a renewal never run side by side.
-    cert_pushing: Mutex<HashSet<u64>>,
+    /// push at the start of a session and one after a renewal never run side by side. The flag
+    /// says that another push was asked for while this one ran (round C, E1): the running push
+    /// then looks again before it ends.
+    cert_pushing: Mutex<HashMap<u64, bool>>,
 }
 
-/// Takes a session out of [`DocsSync::cert_pushing`] when its push ends, however it ends.
+/// Takes a session out of [`DocsSync::cert_pushing`] when its push ends, however it ends (also
+/// when the future is dropped half way). A push that ends by itself takes the session out under
+/// the lock that decides it is over ([`DocsSync::push_node_cert`]) and disarms this.
 struct CertPushGuard<'a> {
     sync: &'a DocsSync,
     session: u64,
+    armed: bool,
 }
 
 impl Drop for CertPushGuard<'_> {
     fn drop(&mut self) {
-        self.sync
-            .cert_pushing
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(&self.session);
+        if self.armed {
+            self.sync
+                .cert_pushing
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&self.session);
+        }
     }
 }
 
@@ -833,25 +840,43 @@ impl DocsSync {
     /// broken exchange, a refusal such as `rate_limited` from a busy steward) is repeated after
     /// each wait of [`SyncConfig::cert_push_retry`] while the session lives and the serial is
     /// still unlisted (round B, L3). One push per session at a time; a second request while one
-    /// runs returns at once (the running one pushes whatever the certificate is by then).
+    /// runs returns at once and leaves a mark, and the running push, once its try is over, looks
+    /// again (round C, E1: the certificate may have been renewed again after the running try
+    /// read it). The mark is tested and the session released under one lock, so a request is
+    /// either seen by the running push or starts a push of its own.
     pub(crate) async fn push_node_cert(&self, handle: &L4SessionHandle, session: u64) {
-        let _guard = {
+        let mut guard = {
             let mut pushing = self.cert_pushing.lock().unwrap_or_else(|e| e.into_inner());
-            if !pushing.insert(session) {
+            if let Some(again) = pushing.get_mut(&session) {
+                *again = true;
                 return;
             }
+            pushing.insert(session, false);
             CertPushGuard {
                 sync: self,
                 session,
+                armed: true,
             }
         };
         let (peer, network_id) = (handle.peer(), handle.network_id());
-        let tries = push_cert_retrying(
-            &self.config.cert_push_retry,
-            || self.push_node_cert_once(handle),
-            || self.session_is_live(session),
-        )
-        .await;
+        let mut tries = 0;
+        loop {
+            tries += push_cert_retrying(
+                &self.config.cert_push_retry,
+                || self.push_node_cert_once(handle),
+                || self.session_is_live(session),
+            )
+            .await;
+            let mut pushing = self.cert_pushing.lock().unwrap_or_else(|e| e.into_inner());
+            match pushing.get_mut(&session) {
+                Some(again) if *again && self.session_is_live(session) => *again = false,
+                _ => {
+                    pushing.remove(&session);
+                    guard.armed = false;
+                    break;
+                }
+            }
+        }
         if tries > 1 {
             tracing::debug!(%peer, network = %network_id, tries, "pushed our node_cert after retrying");
         }

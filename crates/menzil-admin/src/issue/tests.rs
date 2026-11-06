@@ -2166,6 +2166,24 @@ fn a_revoked_or_unknown_node_cannot_have_a_renewal_listed() {
 }
 
 #[test]
+fn a_member_with_no_certificate_listed_cannot_have_a_renewal_listed() {
+    // Round C N3: the Roster has the member, the Policy lists none of its certificates (a pair
+    // admission would not make). There is no listed key or serial to follow.
+    let (owner, phone, _, docs) = with_phone();
+    let mut policy = docs.policy_body().clone();
+    policy
+        .certs
+        .retain(|cert| cert.decode().unwrap().node_id != phone.node_id());
+    let bare = Documents::signed(&owner, docs.roster_body().clone(), policy).unwrap();
+    assert!(bare.is_member(&phone.node_id()));
+    let cert = phone.issue_cert(2, NOW - 1000, NOW + DAY).unwrap();
+    assert!(matches!(
+        accept_cert(&owner, &bare, &cert, NOW),
+        Err(AdminError::NotAMember(id)) if id == phone.node_id()
+    ));
+}
+
+#[test]
 fn a_renewal_must_verify_be_valid_now_and_last_at_most_400_days() {
     let (owner, phone, _, docs) = with_phone();
     let long = NodeCertBody {

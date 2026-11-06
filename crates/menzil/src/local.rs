@@ -805,7 +805,13 @@ impl CertReport {
             },
             relative(self.not_after, now)
         );
-        if rules::renew_due(self.not_after, now) {
+        if self.not_before > now {
+            out.push_str(&format!(
+                "  NOT YET VALID: it starts {} (it was made while the clock ran ahead); a relay and the other devices refuse it until then\n",
+                relative(self.not_before, now)
+            ));
+        }
+        if rules::renew_due(self.not_before, self.not_after, now) {
             out.push_str("  it is due for renewal: `menzil node` renews it by itself, or run `menzil cert renew`\n");
         }
         for network in &self.networks {

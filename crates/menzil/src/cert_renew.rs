@@ -4,7 +4,7 @@
 //! what the answer says.
 //!
 //! * [`renew_due`]: the node renews its own certificate (same keys, serial + 1) once the one in
-//!   its file runs out within [`RENEW_WITHIN`].
+//!   its file runs out within [`RENEW_WITHIN`], or when it does not start yet.
 //! * [`unlisted_days`] and [`warn_due`]: a network whose held Policy lists an older certificate
 //!   of this node than the current one is told in `status`; the log says it daily from
 //!   [`WARN_WITHIN`] before the listed one expires.
@@ -52,9 +52,13 @@ pub fn test_knob(name: &str) -> Option<u64> {
 }
 
 /// Whether the node renews its own certificate: the file's `not_after` is within
-/// [`RENEW_WITHIN`] of `now`, or past.
-pub fn renew_due(not_after: u64, now: u64) -> bool {
-    not_after.saturating_sub(now) <= test_knob("RENEW_WITHIN").unwrap_or(RENEW_WITHIN)
+/// [`RENEW_WITHIN`] of `now`, or past; or it does not start yet (`not_before` after `now`: the
+/// certificate was made while the clock ran ahead, round C L2, and nothing but a new one with a
+/// `not_before` a day before the real time can be shown to a relay or a steward). The renewal
+/// starts a day before `now`, so it does not make the certificate due again.
+pub fn renew_due(not_before: u64, not_after: u64, now: u64) -> bool {
+    not_before > now
+        || not_after.saturating_sub(now) <= test_knob("RENEW_WITHIN").unwrap_or(RENEW_WITHIN)
 }
 
 /// The highest serial of `node` among the certificates `policy` lists (the Policy's certificates

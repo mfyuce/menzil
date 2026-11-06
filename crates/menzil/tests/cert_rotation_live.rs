@@ -12,6 +12,8 @@
 //!   `cert accept` brings the device back.
 //! * **A new identity.** `init --new-identity` and `admit --replace`: the new device reaches what
 //!   the old one could, and the old identity is turned away at the relay.
+//! * **An unlisted renewal offered again.** The steward node loses the candidate it recorded; the
+//!   device's periodic check offers the renewal again over the session that is up.
 //!
 //! The flows run side by side in one `#[tokio::test]` (each with its own relay and homes), for
 //! the same reason the other live tests have exactly one: `SSL_CERT_FILE` and the knobs are
@@ -23,6 +25,7 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use futures_util::io::{AsyncReadExt, AsyncWriteExt};
+use menzil_cli::agent::renew_cert;
 use menzil_cli::cert_renew::listed_cert;
 use menzil_cli::config::Config;
 use menzil_cli::home::Home;
@@ -32,6 +35,7 @@ use menzil_cli::local::{
 };
 use menzil_cli::node_cmd::{self, RunningNode};
 use menzil_cli::relay_cmd::{self, DEFAULT_PATH, RunOptions};
+use menzil_node::Holder;
 use menzil_proto::{NetworkId, NodeId};
 use menzil_stream::Stream;
 use tokio::net::TcpListener;
@@ -597,6 +601,108 @@ async fn replace_flow(root: &Path, tls: &Tls) {
     relay.stop();
 }
 
+// ---- flow D: an unlisted renewal is offered again ----------------------------------------
+
+/// Round C M1. The phone renews and the steward node records the renewal as its candidate (the
+/// steward lists a renewal only when it extends the listed certificate by 30 days, and this one
+/// does not). The steward then loses its candidates (what a changed steward entry or a Policy
+/// that stops listing the serial does), and nothing new is announced by a renewal: the phone's
+/// periodic check has to offer the unlisted certificate again over the session that is up.
+async fn relist_flow(root: &Path, tls: &Tls) {
+    const FLOW: &str = "unlisted renewal offered again";
+    let real = unix_now();
+    let owner_home = Home::new(root.join("owner"));
+    let steward_home = Home::new(root.join("steward"));
+    let phone_home = Home::new(root.join("phone"));
+    init(&owner_home, real).unwrap();
+    let network_id = network_create(&owner_home, "owner", real).unwrap();
+    let steward = init(&steward_home, real).unwrap();
+    let phone = init(&phone_home, real).unwrap();
+    let admitted = admit(
+        &owner_home,
+        None,
+        &steward.join_request,
+        "steward",
+        &[],
+        real,
+    )
+    .unwrap();
+    join(&steward_home, &admitted.token, real).unwrap();
+    admit(&owner_home, None, &phone.join_request, "phone", &[], real).unwrap();
+    grant(
+        &owner_home,
+        None,
+        "phone",
+        "steward",
+        &["tcp:echo".parse().unwrap()],
+        None,
+        real,
+    )
+    .unwrap();
+    let asked = steward_request(&steward_home, None).unwrap();
+    let may = ["admit".to_string(), "renew".to_string()];
+    let listed = steward_add(&owner_home, None, &asked.token, &may, 30, real).unwrap();
+    for home in [&steward_home, &phone_home] {
+        join(home, &listed.issued.token, real).unwrap();
+    }
+    let relay = start_relay(root, tls, &owner_home).await;
+
+    let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let echo_port = echo_listener.local_addr().unwrap().port();
+    tokio::spawn(echo_server(echo_listener));
+    write_config(
+        &steward_home,
+        &relay.connection_info,
+        &format!("[services]\n\"tcp:echo\" = \"127.0.0.1:{echo_port}\"\n"),
+    );
+    write_config(&phone_home, &relay.connection_info, "");
+    let steward_node = start_node(&steward_home, &root.join("steward.sock")).await;
+    let phone_node = start_node(&phone_home, &root.join("phone.sock")).await;
+    let serials = |node: &RunningNode| -> Vec<u32> {
+        node.node
+            .cert_candidates(network_id)
+            .iter()
+            .map(|cert| cert.decode().unwrap().serial)
+            .collect()
+    };
+
+    // The session the pushes ride on.
+    let stream = reach(
+        &phone_node,
+        steward.node_id,
+        network_id,
+        "tcp:echo",
+        b"first",
+    )
+    .await
+    .expect("phone reaches the steward");
+    renew_cert(&phone_node.socket).await.unwrap();
+    until(FLOW, "the steward to record the renewal", || {
+        serials(&steward_node) == [2]
+    })
+    .await;
+
+    // The steward forgets it (and takes the entry again, as its loop does at the next change).
+    steward_node.node.set_candidate_holder(network_id, None);
+    assert!(serials(&steward_node).is_empty());
+    steward_node.node.set_candidate_holder(
+        network_id,
+        Some(Holder::Steward {
+            admit: true,
+            renew: true,
+            not_after: unix_now() + DAY,
+        }),
+    );
+    until(FLOW, "the phone to offer the renewal again", || {
+        serials(&steward_node) == [2]
+    })
+    .await;
+
+    drop(stream);
+    drop((phone_node, steward_node));
+    relay.stop();
+}
+
 /// The old identity's node: it may attach for a moment (the relay answers after WELCOME).
 async fn start_old(home: &Home, socket: &Path) -> RunningNode {
     node_cmd::start(home, &Config::load(home).unwrap(), socket)
@@ -646,10 +752,16 @@ async fn certificates_rotate_in_a_steward_network_an_owner_network_and_a_new_ide
         );
     }
 
-    let (a, b, c) = (root.join("a"), root.join("b"), root.join("c"));
+    let (a, b, c, d) = (
+        root.join("a"),
+        root.join("b"),
+        root.join("c"),
+        root.join("d"),
+    );
     tokio::join!(
         steward_flow(&a, &tls),
         owner_only_flow(&b, &tls),
-        replace_flow(&c, &tls)
+        replace_flow(&c, &tls),
+        relist_flow(&d, &tls)
     );
 }

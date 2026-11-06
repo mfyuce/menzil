@@ -949,7 +949,8 @@ pub fn replace(
 /// [`CERT_ISSUE_MARGIN_SECS`] ([`AdminError::CertTooFresh`] otherwise), the node must be a member
 /// ([`AdminError::Revoked`] when it is revoked, [`AdminError::NotAMember`] otherwise), its serial
 /// must be above every listed one ([`AdminError::StaleCert`]) and its key the one of the highest
-/// listed certificate ([`AdminError::NewKey`]).
+/// listed certificate ([`AdminError::NewKey`]). A member of the Roster the Policy lists no
+/// certificate of is refused as [`AdminError::NotAMember`].
 pub fn accept_cert(
     owner: &OwnerKey,
     current: &Documents,
@@ -976,16 +977,17 @@ pub fn accept_cert(
             highest = Some(listed);
         }
     }
-    if let Some(highest) = highest {
-        if body.serial <= highest.serial {
-            return Err(AdminError::StaleCert {
-                listed: highest.serial,
-                offered: body.serial,
-            });
-        }
-        if body.x25519_pub != highest.x25519_pub {
-            return Err(AdminError::NewKey(body.node_id));
-        }
+    // A member the Policy lists no certificate of is not one a renewal can follow (admission
+    // lists the first certificate with the member; `steward_rotate` refuses it the same way).
+    let highest = highest.ok_or(AdminError::NotAMember(body.node_id))?;
+    if body.serial <= highest.serial {
+        return Err(AdminError::StaleCert {
+            listed: highest.serial,
+            offered: body.serial,
+        });
+    }
+    if body.x25519_pub != highest.x25519_pub {
+        return Err(AdminError::NewKey(body.node_id));
     }
     let (roster, mut policy) = current.successor(owner, now)?;
     let mut certs = Vec::with_capacity(policy.certs.len() + 1);

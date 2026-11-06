@@ -11,15 +11,27 @@ const NOW: u64 = 1_800_000_000;
 fn a_node_renews_when_its_certificate_expires_within_sixty_days_and_not_before() {
     let at = |left: i64| NOW.checked_add_signed(left).unwrap();
     // Exactly sixty days left is already due; one second more is not.
-    assert!(renew_due(NOW + 60 * DAY, NOW));
-    assert!(!renew_due(NOW + 60 * DAY + 1, NOW));
-    assert!(renew_due(NOW + 60 * DAY - 1, NOW));
+    let before = NOW - 1;
+    assert!(renew_due(before, NOW + 60 * DAY, NOW));
+    assert!(!renew_due(before, NOW + 60 * DAY + 1, NOW));
+    assert!(renew_due(before, NOW + 60 * DAY - 1, NOW));
     // Long valid, nearly out, out on this very second, long out.
-    assert!(!renew_due(NOW + 399 * DAY, NOW));
-    assert!(renew_due(NOW + 1, NOW));
-    assert!(renew_due(NOW, NOW));
-    assert!(renew_due(at(-1), NOW));
-    assert!(renew_due(0, NOW));
+    assert!(!renew_due(before, NOW + 399 * DAY, NOW));
+    assert!(renew_due(before, NOW + 1, NOW));
+    assert!(renew_due(before, NOW, NOW));
+    assert!(renew_due(before, at(-1), NOW));
+    assert!(renew_due(0, 0, NOW));
+}
+
+#[test]
+fn a_node_renews_a_certificate_that_does_not_start_yet_and_not_one_that_starts_now() {
+    // Round C L2: a renewal made while the clock ran ahead starts in the future. Starting this
+    // very second is valid (`is_valid_at`), a second later is not.
+    assert!(!renew_due(NOW, NOW + 399 * DAY, NOW));
+    assert!(renew_due(NOW + 1, NOW + 399 * DAY, NOW));
+    assert!(renew_due(NOW + 344 * DAY, NOW + 744 * DAY, NOW));
+    // What a renewal at `NOW` makes (a day back, 400 days) is not due again.
+    assert!(!renew_due(NOW - DAY, NOW - DAY + 400 * DAY, NOW));
 }
 
 #[test]

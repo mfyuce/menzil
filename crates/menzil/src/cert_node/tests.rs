@@ -146,6 +146,44 @@ async fn a_node_with_a_certificate_inside_sixty_days_renews_it_by_itself_at_star
 }
 
 #[tokio::test]
+async fn a_node_whose_certificate_does_not_start_yet_renews_it_by_itself_at_start() {
+    // Round C L2: the certificate was made while the clock ran ahead (10 days), so it starts in
+    // the future and has 390 days to run: only the start counts, not the 60 day rule.
+    let dir = tempfile::tempdir().unwrap();
+    let home = Home::new(dir.path().join("home"));
+    let now = real_now();
+    init(&home, now + 10 * DAY).unwrap();
+    network_create(&home, "laptop", now + 10 * DAY).unwrap();
+    let before = load_identity(&home).unwrap().1.decode().unwrap();
+    assert!(before.not_before > now);
+    let node = start(&home, &config(&home), &dir.path().join("a.sock"))
+        .await
+        .unwrap();
+    let started = std::time::Instant::now();
+    while node.node.own_cert().decode().unwrap().serial < 2 {
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(20),
+            "the node did not renew a certificate that does not start yet"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    let after = load_identity(&home).unwrap().1.decode().unwrap();
+    assert_eq!(after.serial, 2);
+    assert!(after.is_valid_at(real_now()));
+    // The renewal is valid now, so the next check leaves it alone.
+    let renewer = renewer(&home, &node);
+    let mut state = CheckState::default();
+    assert!(
+        renewer
+            .check(&mut state, real_now())
+            .await
+            .renewal
+            .is_none()
+    );
+    assert_eq!(file_serial(&home), 2);
+}
+
+#[tokio::test]
 async fn the_check_warns_once_a_day_about_a_network_that_lists_an_older_certificate_ending_soon() {
     let dir = tempfile::tempdir().unwrap();
     let home = Home::new(dir.path().join("home"));

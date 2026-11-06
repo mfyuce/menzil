@@ -119,20 +119,31 @@ impl CertRenewer {
         })
     }
 
-    /// The check every [`CHECK_EVERY_SECS`]: renews when the certificate expires within 60 days,
-    /// and warns (once a day per network) about a network whose listed certificate of this node
-    /// expires within 30 days without the current one being listed.
+    /// The check every [`CHECK_EVERY_SECS`]: renews when the certificate expires within 60 days
+    /// or does not start yet, offers the certificate again to the peers of the live sessions
+    /// while a network does not list it, and warns (once a day per network) about a network
+    /// whose listed certificate of this node expires within 30 days without the current one being
+    /// listed.
     pub async fn check(&self, state: &mut CheckState, now: u64) -> Checked {
         let mut checked = Checked::default();
         let Ok(own) = self.node.own_cert().decode() else {
             return checked;
         };
-        if cert_renew::renew_due(own.not_after, now) {
+        if cert_renew::renew_due(own.not_before, own.not_after, now) {
             checked.renewal = Some(self.renew(now).await.map(|renewed| renewed.serial));
         }
         let Some(status) = self.status(now) else {
             return checked;
         };
+        // Round C M1: a network that does not list the current certificate gets it offered
+        // again over the sessions that are live now, every check. Nothing else does: a renewal
+        // is announced once, and a Policy that stopped listing it, a steward that dropped its
+        // candidates or a push no steward answered would leave it unlisted until the next
+        // session, which may be after the listed certificate ran out. (Not after a renewal made
+        // just now, which announced itself.)
+        if !status.unlisted.is_empty() && !matches!(checked.renewal, Some(Ok(_))) {
+            self.node.announce_renewed_cert();
+        }
         for network in self.home.networks().unwrap_or_default() {
             let Some(policy) = self.policies.body(&network) else {
                 continue;
