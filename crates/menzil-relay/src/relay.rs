@@ -12,11 +12,12 @@ use std::time::Duration;
 
 use tokio::sync::Semaphore;
 
-use menzil_proto::{Limits, NodeId};
+use menzil_proto::{Limits, NodeId, X25519PublicKey};
 
 use crate::admission::{Admission, AdmissionLimits};
 use crate::advertise::LabelRegistry;
-use crate::forward::ForwardTable;
+use crate::endpoint::RelayEndpoint;
+use crate::forward::{ForwardTable, RelaySendOutcome};
 use crate::identity::RelayIdentity;
 use crate::listener::Listener;
 use crate::log_throttle::LogThrottle;
@@ -25,7 +26,7 @@ use crate::rate::SessionRates;
 use crate::registry::SessionRegistry;
 use crate::roster_store::RosterStore;
 use crate::session;
-use crate::tenant::{RelayQuota, TenantBook, TenantUsage};
+use crate::tenant::{RelayQuota, TenantBook, TenantId, TenantUsage};
 
 /// The session numbers a relay hands out: WELCOME's `session` and the key of the registry's
 /// supersede and teardown rules (equality is all they use).
@@ -108,6 +109,23 @@ pub struct Relay {
     /// The counters behind the tenants' session and Roster figures (MT7).
     pub(crate) usage: Arc<TenantUsage>,
     next_session_id: Arc<SessionIds>,
+    /// This relay's own NodeId (from its NodeCert): the `dst` of the frames the relay takes
+    /// itself (`crate::endpoint`) and the `src` of the ones it sends. `None` only if the
+    /// certificate does not decode, and then nothing is ever treated as addressed to the relay.
+    relay_id: Option<NodeId>,
+    /// Where SENDs to `relay_id` go.
+    pub(crate) endpoint: Arc<RelayEndpoint>,
+}
+
+/// An attached node as the relay's own endpoint needs it: the L3 session it is attached by and
+/// the X25519 static key of the NodeCert it presented in HELLO, read together from one
+/// registration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AttachedNode {
+    /// The L3 session id (WELCOME's `session`).
+    pub session_id: u32,
+    /// The static key the node's L3 session was authenticated with.
+    pub x25519_pub: X25519PublicKey,
 }
 
 impl Relay {
@@ -153,6 +171,7 @@ impl Relay {
             .max_record
             .min(menzil_carrier::MAX_MESSAGE_BYTES as u32);
         let tenants = Arc::new(RwLock::new(Arc::new(TenantBook::default())));
+        let relay_id = identity.node_cert.decode().ok().map(|body| body.node_id);
         Self {
             identity: Arc::new(identity),
             rosters: Arc::new(RosterStore::new()),
@@ -169,7 +188,64 @@ impl Relay {
             tenants,
             usage: TenantUsage::new(),
             next_session_id: Arc::new(SessionIds::new()),
+            relay_id,
+            endpoint: Arc::new(RelayEndpoint::default()),
         }
+    }
+
+    /// This relay's own NodeId.
+    pub fn relay_id(&self) -> Option<NodeId> {
+        self.relay_id
+    }
+
+    /// Whether `node` is this relay itself.
+    pub(crate) fn is_relay(&self, node: &NodeId) -> bool {
+        self.relay_id.as_ref() == Some(node)
+    }
+
+    /// Where the SENDs nodes address to this relay's NodeId arrive. Subscribe to take them.
+    pub fn endpoint(&self) -> &RelayEndpoint {
+        &self.endpoint
+    }
+
+    /// The L3 session `node` is attached by and the static key it was authenticated with, or
+    /// `None` if it is not attached. The key is the one the NodeCert of that session's HELLO
+    /// carried, so an L4 session opened to the node over it pins the right key.
+    pub fn attached_node(&self, node: &NodeId) -> Option<AttachedNode> {
+        self.registry
+            .attachment_of(node)
+            .map(|attachment| AttachedNode {
+                session_id: attachment.session_id,
+                x25519_pub: attachment.x25519_pub,
+            })
+    }
+
+    /// Sends one frame to the attached `dst` as this relay (`src` is the relay's NodeId, stamped
+    /// here), through the relay's virtual pair toward that node: the 4 MiB queue, credit and
+    /// drain accounting of any pair, and the bandwidth and volume of `tenant`, the tenant of the
+    /// name the traffic is for. No Roster is consulted and no pair or destination count is
+    /// taken (`ForwardTable::forward_from_relay`).
+    pub fn send_as_relay(
+        &self,
+        tenant: &TenantId,
+        dst: &NodeId,
+        e2e_proto: u8,
+        flags: u8,
+        payload: Vec<u8>,
+    ) -> RelaySendOutcome {
+        let Some(relay_id) = self.relay_id.as_ref() else {
+            return RelaySendOutcome::PeerOffline;
+        };
+        self.forwarding.forward_from_relay(
+            &self.registry,
+            &self.limits,
+            relay_id,
+            tenant,
+            dst,
+            e2e_proto,
+            flags,
+            payload,
+        )
     }
 
     /// This relay with `limits` as its admission caps (connections per address per minute,

@@ -19,6 +19,7 @@ mod admission;
 mod advertise;
 mod connection;
 mod doc;
+mod endpoint;
 mod error;
 mod forward;
 mod hello;
@@ -47,7 +48,9 @@ pub use admission::{
 };
 pub use advertise::{DEFAULT_RESERVED_LABELS, LabelRegistry};
 pub use connection::InboundConnection;
+pub use endpoint::{InboundFrame, RelayEndpoint};
 pub use error::RelayError;
+pub use forward::RelaySendOutcome;
 pub use hello::{HelloRejection, check_hello};
 pub use identity::RelayIdentity;
 pub use listener::Listener;
@@ -61,7 +64,7 @@ pub use rate::{
     OVER_RATE_DOCS_TO_END, SessionRates, UNADOPTED_DOCS_TO_END, UNADOPTED_WINDOW,
 };
 pub use registry::SessionRegistry;
-pub use relay::{AcceptConfig, HANDSHAKE_TIMEOUT, MAX_INFLIGHT_HANDSHAKES, Relay};
+pub use relay::{AcceptConfig, AttachedNode, HANDSHAKE_TIMEOUT, MAX_INFLIGHT_HANDSHAKES, Relay};
 pub use roster_store::RosterStore;
 pub use tenant::{
     Class, Figures, LABEL_MAX_LEN, QUARANTINE_DAYS, Refusal, SLUG_MAX_LEN, SLUG_MIN_LEN, Slug,

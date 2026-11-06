@@ -27,7 +27,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
-use menzil_proto::{NetworkId, NodeId, Record};
+use menzil_proto::{NetworkId, NodeId, Record, X25519PublicKey};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::admission::AttachedSlot;
@@ -44,6 +44,11 @@ const OUTBOUND_CAPACITY: usize = 128;
 
 struct Registration {
     session_id: u32,
+    /// The X25519 static key of the NodeCert this session presented in HELLO (verified there,
+    /// protocol.md 4.1). It belongs to the registration, so it is read in the same lock as the
+    /// session id: whoever opens an L4 session to this node as the relay (the expose
+    /// principal) pins the key of the L3 session it opens it over.
+    x25519_pub: X25519PublicKey,
     /// Networks this session claimed in its own HELLO (protocol.md 4.1),
     /// used to target DOC propagation (protocol.md 4.3) at sessions that
     /// actually asked to hear about a given network, not merely at every
@@ -70,6 +75,7 @@ struct Registration {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Attachment {
     pub(crate) session_id: u32,
+    pub(crate) x25519_pub: X25519PublicKey,
     pub(crate) claimed_networks: Vec<NetworkId>,
 }
 
@@ -121,7 +127,14 @@ impl SessionRegistry {
         mpsc::Receiver<Record>,
         mpsc::UnboundedReceiver<ForwardItem>,
     ) {
-        self.attach_counted(node_id, session_id, claimed_networks, None, None)
+        self.attach_counted(
+            node_id,
+            session_id,
+            X25519PublicKey::from([0u8; 32]),
+            claimed_networks,
+            None,
+            None,
+        )
     }
 
     /// [`Self::attach`] that also hands the registration the session's place in the attached
@@ -131,6 +144,7 @@ impl SessionRegistry {
         &self,
         node_id: NodeId,
         session_id: u32,
+        x25519_pub: X25519PublicKey,
         claimed_networks: Vec<NetworkId>,
         slot: Option<AttachedSlot>,
         tenant_slot: Option<TenantAttached>,
@@ -147,6 +161,7 @@ impl SessionRegistry {
             node_id,
             Registration {
                 session_id,
+                x25519_pub,
                 claimed_networks,
                 supersede: supersede_tx,
                 outbound: outbound_tx,
@@ -255,6 +270,7 @@ impl SessionRegistry {
             .get(node_id)
             .map(|registration| Attachment {
                 session_id: registration.session_id,
+                x25519_pub: registration.x25519_pub,
                 claimed_networks: registration.claimed_networks.clone(),
             })
     }
@@ -367,6 +383,7 @@ mod tests {
             registry.attachment_of(&node_id),
             Some(Attachment {
                 session_id: 1,
+                x25519_pub: X25519PublicKey::from([0u8; 32]),
                 claimed_networks: vec![x]
             })
         );
@@ -375,10 +392,29 @@ mod tests {
             registry.attachment_of(&node_id),
             Some(Attachment {
                 session_id: 2,
+                x25519_pub: X25519PublicKey::from([0u8; 32]),
                 claimed_networks: vec![y, x]
             }),
             "claims and session id always belong together"
         );
+    }
+
+    #[test]
+    fn the_registration_keeps_the_x25519_key_of_its_own_session() {
+        let registry = SessionRegistry::new();
+        let node_id = NodeId::from([1u8; 32]);
+        let (k1, k2) = (
+            X25519PublicKey::from([0x11; 32]),
+            X25519PublicKey::from([0x22; 32]),
+        );
+        let _first = registry.attach_counted(node_id, 1, k1, vec![], None, None);
+        assert_eq!(registry.attachment_of(&node_id).unwrap().x25519_pub, k1);
+        // A re-attach with another key replaces it together with the session id.
+        let _second = registry.attach_counted(node_id, 2, k2, vec![], None, None);
+        let attachment = registry.attachment_of(&node_id).unwrap();
+        assert_eq!((attachment.session_id, attachment.x25519_pub), (2, k2));
+        registry.detach(&node_id, 2);
+        assert!(registry.attachment_of(&node_id).is_none());
     }
 
     #[test]

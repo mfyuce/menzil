@@ -48,7 +48,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use menzil_proto::{
     CreditBody, DocReassembler, ErrorBody, ErrorCode, GoawayBody, HelloBody, NetworkId, NodeId,
-    Record, WelcomeBody,
+    Record, WelcomeBody, X25519PublicKey,
 };
 use menzil_session::{
     HandshakePattern, Liveness, RekeySchedule, RelayHandshake, RelayHandshakeStep, Transport,
@@ -59,6 +59,7 @@ use tokio::sync::broadcast;
 use crate::admission::{IpSlot, NodeSlot};
 use crate::connection::InboundConnection;
 use crate::doc::{self, AcceptOutcome, PendingBases};
+use crate::endpoint::{EndpointCredit, EndpointOutcome};
 use crate::error::RelayError;
 use crate::forward::{ForwardItem, ForwardOutcome};
 use crate::hello::{
@@ -410,6 +411,7 @@ async fn dispatch(
     node_id: &NodeId,
     session_id: u32,
     claimed_networks: &[NetworkId],
+    endpoint_credit: &EndpointCredit,
     incoming: Result<Vec<u8>, RelayError>,
 ) -> Dispatch {
     let bytes = match incoming {
@@ -571,7 +573,34 @@ async fn dispatch(
             // session that is not yet, or no longer, current for
             // `node_id` must not be able to move data through the relay
             // on its behalf.
-            if relay.registry.is_current(node_id, session_id) {
+            if relay.registry.is_current(node_id, session_id) && relay.is_relay(&dst) {
+                // Addressed to the relay itself: taken here, never forwarded and never refused
+                // `forbidden` (`crate::endpoint`). `src` is the session's own NodeId; the SEND
+                // carries none, so nothing a member sends can name another source.
+                let Some(relay_id) = relay.relay_id() else {
+                    return Dispatch::Continue;
+                };
+                match relay.endpoint.accept(
+                    &relay.registry,
+                    relay_id,
+                    endpoint_credit,
+                    *node_id,
+                    session_id,
+                    e2e_proto,
+                    flags,
+                    payload,
+                ) {
+                    EndpointOutcome::Taken => Dispatch::Continue,
+                    EndpointOutcome::Refused(error) => {
+                        let _ = send_record(conn, transport, Record::Error(error)).await;
+                        Dispatch::Continue
+                    }
+                    EndpointOutcome::CreditViolation(error) => {
+                        let _ = send_record(conn, transport, Record::Error(error)).await;
+                        Dispatch::End
+                    }
+                }
+            } else if relay.registry.is_current(node_id, session_id) {
                 let outcome = relay.forwarding.forward(
                     &relay.rosters,
                     &relay.registry,
@@ -767,6 +796,7 @@ async fn run_attached_loop(
     mut transport: Transport,
     node_id: NodeId,
     cert_serial: u32,
+    cert_x25519: X25519PublicKey,
     session_id: u32,
     relay: &Relay,
     claimed_networks: Vec<NetworkId>,
@@ -797,6 +827,8 @@ async fn run_attached_loop(
     let mut pending_bases = PendingBases::new();
     // What this session may still send: ADVERTISE and DOC allowances (`crate::rate`).
     let mut budget = SessionBudget::new(&relay.rates, claimed_networks.len());
+    // What this session may send to the relay's own NodeId (`crate::endpoint`).
+    let endpoint_credit = EndpointCredit::new(&relay.limits);
 
     // Phase 1: not yet routable, waiting for ATTACH as the node's first
     // transport record. Liveness and REKEY are already driven here too,
@@ -822,7 +854,7 @@ async fn run_attached_loop(
             incoming = conn.recv() => {
                 let outcome = dispatch(
                     &mut conn, &mut transport, &mut liveness, &mut doc_reassembler, &mut pending_bases, &mut budget, relay,
-                    &node_id, session_id, &claimed_networks, incoming,
+                    &node_id, session_id, &claimed_networks, &endpoint_credit, incoming,
                 ).await;
                 match outcome {
                     Dispatch::Attach => break,
@@ -883,6 +915,7 @@ async fn run_attached_loop(
     let (mut supersede_rx, mut outbound_rx, mut forward_rx) = relay.registry.attach_counted(
         node_id,
         session_id,
+        cert_x25519,
         claimed_networks.clone(),
         Some(attached_slot),
         Some(tenant_slot),
@@ -919,7 +952,7 @@ async fn run_attached_loop(
             incoming = conn.recv() => {
                 let outcome = dispatch(
                     &mut conn, &mut transport, &mut liveness, &mut doc_reassembler, &mut pending_bases, &mut budget, relay,
-                    &node_id, session_id, &claimed_networks, incoming,
+                    &node_id, session_id, &claimed_networks, &endpoint_credit, incoming,
                 ).await;
                 match outcome {
                     Dispatch::Attach | Dispatch::Continue => {}
@@ -1089,6 +1122,7 @@ pub(crate) async fn handle_connection(
                 transport,
                 node_id,
                 cert.serial,
+                cert.x25519_pub,
                 session_id,
                 &relay,
                 dedup_networks(&hello.networks),

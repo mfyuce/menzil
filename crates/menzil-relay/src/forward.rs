@@ -289,6 +289,11 @@ struct PairState {
     /// What the queued items of this pair carry with them: the tenant to charge and whether the
     /// sender was evicted.
     shared: Arc<PairShared>,
+    /// Whether the pair is in the tenant, sender and relay counts. A member pair is; the relay's
+    /// own virtual pair ([`ForwardTable::forward_from_relay`]) is not, so it never takes a
+    /// tenant's `forwarding_pairs`, `destinations_per_node` or droppable total, and
+    /// [`PairTable::uncount`] and `settle` leave the counts alone for it.
+    counted: bool,
 }
 
 impl PairState {
@@ -309,6 +314,15 @@ impl PairState {
             droppable_bytes: 0,
             src_session,
             shared: Arc::new(PairShared::new(tenant)),
+            counted: true,
+        }
+    }
+
+    /// The relay's own pair toward one node: no sender session, not in any count.
+    fn new_virtual(initial_credit: u32, now: Instant, generation: u64, tenant: TenantId) -> Self {
+        Self {
+            counted: false,
+            ..Self::new(initial_credit, now, generation, tenant, 0)
         }
     }
 }
@@ -413,6 +427,9 @@ impl PairTable {
 
     /// Gives a removed pair's place back, with the droppable bytes it still had queued.
     fn uncount(&mut self, src: &NodeId, pair: &PairState) {
+        if !pair.counted {
+            return;
+        }
         let tenant = &pair.shared.tenant;
         if let Some(held) = self.per_tenant.get_mut(tenant) {
             held.pairs = held.pairs.saturating_sub(1);
@@ -535,6 +552,29 @@ pub(crate) enum ForwardOutcome {
         tenant: TenantId,
         quota: DataQuota,
     },
+}
+
+/// What [`ForwardTable::forward_from_relay`] decided about one frame the relay sends to a node.
+/// The relay is a trusted sender: nothing here is an ERROR for a peer, the caller (the expose
+/// principal) acts on it. `Queued` and `Dropped` are final; the others say why nothing was sent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RelaySendOutcome {
+    /// Handed to the node's connection to send.
+    Queued,
+    /// A droppable frame was discarded (the pair's queue, its token bucket or the name tenant's
+    /// bucket had no room). Silent, as for a member's droppable SEND.
+    Dropped,
+    /// A reliable frame did not fit the pair's credit (the 4 MiB queue is full of what the node
+    /// has not been sent yet). Nothing was queued; try again once the node's connection drained.
+    Full,
+    /// A reliable frame was held back because the name tenant's bandwidth bucket is in debt
+    /// (the shaping every member of that tenant lives under). Nothing was queued; try again
+    /// later.
+    Throttled,
+    /// The node is not attached.
+    PeerOffline,
+    /// `e2e_proto` is neither 0x01 nor 0x02.
+    UnknownE2e,
 }
 
 /// What admitting one SEND to its pair decided, before anything is told to a session (the pair
@@ -918,7 +958,9 @@ impl ForwardTable {
                     // the tenant's total.
                     let freed = pair.droppable_bytes.min(charge as usize);
                     pair.droppable_bytes -= freed;
-                    if let Some(held) = per_tenant.get_mut(&shared.tenant) {
+                    if pair.counted
+                        && let Some(held) = per_tenant.get_mut(&shared.tenant)
+                    {
                         held.droppable_bytes = held.droppable_bytes.saturating_sub(freed);
                     }
                 }
@@ -1058,6 +1100,159 @@ impl ForwardTable {
         Ok((generation, shared))
     }
 
+    /// Sends one frame from the relay itself (`src` = `relay_id` on the wire) to `dst`, through
+    /// the relay's virtual pair toward that node. It is the data plane's half of the expose
+    /// principal (the relay's own L4 session): the same queue, accounting and shaping a member
+    /// SEND gets, minus everything that only makes sense between two members.
+    ///
+    /// Kept: the pair's credit ledger and its 4 MiB queue (a reliable frame past the credit is
+    /// `Full`, a droppable one past the headroom or the token bucket is `Dropped`), the
+    /// drain-based release ([`ForwardTable::drained`] and [`ForwardTable::released`] settle it
+    /// like any item), and the bandwidth and volume of the tenant of the NAME the traffic is for
+    /// (`tenant`, which the caller resolves from the name; the relay's own pair has no network).
+    /// The bucket is charged when the frame is handed to the node's connection; a reliable frame
+    /// is refused as `Throttled` while that bucket is in debt (the relay's own sender has no
+    /// CREDIT record to delay, so it is told instead), and a droppable one is paid from the
+    /// bucket at admission, as for a member.
+    ///
+    /// Skipped: the Roster and membership check (the relay is not a member; the node's own
+    /// consent to the traffic is checked on the node, not here), `accept_peers` (a node closed
+    /// to peers still serves its own shares), and every count: the virtual pair is not in the
+    /// tenant's `forwarding_pairs`, `destinations_per_node` or droppable total, nor in the
+    /// relay's `max_peers` (see [`PairState::counted`]). The pair goes when `dst` next attaches
+    /// or detaches ([`ForwardTable::clear_for`]), like every pair of that node.
+    ///
+    /// The tenant of a frame travels with the frame (a pair per node, but a tenant per call), so
+    /// two names of one node in two tenants are each charged to their own.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn forward_from_relay(
+        &self,
+        registry: &SessionRegistry,
+        limits: &Limits,
+        relay_id: &NodeId,
+        tenant: &TenantId,
+        dst: &NodeId,
+        e2e_proto: u8,
+        flags: u8,
+        payload: Vec<u8>,
+    ) -> RelaySendOutcome {
+        if e2e_proto != 0x01 && e2e_proto != 0x02 {
+            return RelaySendOutcome::UnknownE2e;
+        }
+        let reliable = flags & 0x01 == 0;
+        let charge = (payload.len() as u32).max(MIN_FORWARD_CHARGE_BYTES);
+        // A frame to the relay itself would be a pair (relay, relay) that nothing drains.
+        if dst == relay_id {
+            return RelaySendOutcome::PeerOffline;
+        }
+        let Some(target) = registry.attachment_of(dst) else {
+            return RelaySendOutcome::PeerOffline;
+        };
+        let book = self.book();
+        if reliable
+            && let Some(figures) = book.figures_of(tenant)
+            && self
+                .shapers
+                .of(tenant, figures)
+                .in_debt(figures, tokio::time::Instant::now())
+        {
+            return RelaySendOutcome::Throttled;
+        }
+        let (generation, shared) = match self.admit_virtual(
+            &book,
+            limits,
+            relay_id,
+            dst,
+            tenant,
+            reliable,
+            charge,
+            Instant::now(),
+        ) {
+            Ok(admitted) => admitted,
+            Err(outcome) => return outcome,
+        };
+        let delivered = registry.deliver_to_session(
+            dst,
+            target.session_id,
+            ForwardItem::Recv {
+                record: Box::new(Record::Recv {
+                    // Stamped here, never taken from a caller or a wire field.
+                    src: *relay_id,
+                    e2e_proto,
+                    flags,
+                    payload,
+                }),
+                src: *relay_id,
+                charge,
+                reliable,
+                generation,
+                // The relay has no session in the registry, so no CREDIT is ever owed to it.
+                src_session_id: 0,
+                shared: Arc::clone(&shared),
+            },
+        );
+        if delivered {
+            return RelaySendOutcome::Queued;
+        }
+        // `dst` went away between the read and the hand-off: give back what was reserved.
+        self.released(
+            registry, relay_id, dst, charge, reliable, generation, 0, &shared,
+        );
+        RelaySendOutcome::PeerOffline
+    }
+
+    /// [`Self::admit`] for the relay's virtual pair toward `dst`: the pair is made without
+    /// quota and without counts, and the tenant of this one frame is recorded on it.
+    #[allow(clippy::too_many_arguments)]
+    fn admit_virtual(
+        &self,
+        book: &TenantBook,
+        limits: &Limits,
+        relay_id: &NodeId,
+        dst: &NodeId,
+        tenant: &TenantId,
+        reliable: bool,
+        charge: u32,
+        now: Instant,
+    ) -> Result<(u64, Arc<PairShared>), RelaySendOutcome> {
+        let mut guard = self.table();
+        let key = (*relay_id, *dst);
+        let pair = guard.pairs.entry(key).or_insert_with(|| {
+            let generation = self.next_generation.fetch_add(1, Ordering::Relaxed);
+            PairState::new_virtual(limits.credit, now, generation, tenant.clone())
+        });
+        // The items already queued keep the `PairShared` they were admitted with.
+        if pair.shared.tenant != *tenant {
+            pair.shared = Arc::new(PairShared::new(tenant.clone()));
+        }
+        let generation = pair.generation;
+        let shared = Arc::clone(&pair.shared);
+        if reliable {
+            if pair.credit.consume(charge).is_err() {
+                return Err(RelaySendOutcome::Full);
+            }
+        } else {
+            let droppable_ceiling = MAX_QUEUE_BYTES.saturating_sub(pair.initial_credit as usize);
+            if pair.queued_bytes + charge as usize > droppable_ceiling
+                || !pair.dgram_bucket.try_take(charge as usize, now)
+            {
+                return Err(RelaySendOutcome::Dropped);
+            }
+            if let Some(figures) = book.figures_of(tenant)
+                && !self.shapers.of(tenant, figures).try_take(
+                    figures,
+                    charge,
+                    tokio::time::Instant::now(),
+                )
+            {
+                return Err(RelaySendOutcome::Dropped);
+            }
+            pair.droppable_bytes += charge as usize;
+        }
+        pair.queued_bytes += charge as usize;
+        Ok((generation, shared))
+    }
+
     /// `src`'s session `session_id` has been evicted from a network (it is ending): what that
     /// session already queued toward destinations must not be delivered there (T2 N2), so the
     /// pairs it made are marked ([`PairShared::is_revoked`], checked by the destinations' drain
@@ -1125,6 +1320,16 @@ impl ForwardTable {
             (*src, *dst),
             PairState::new(1024, Instant::now(), generation, TenantId::Default, 0),
         );
+    }
+
+    /// `src`->`dst`'s credit and queue figures for tests of the virtual pair:
+    /// (remaining credit, queued bytes, counted).
+    #[cfg(test)]
+    pub(crate) fn pair_figures(&self, src: &NodeId, dst: &NodeId) -> Option<(u32, usize, bool)> {
+        self.table()
+            .pairs
+            .get(&(*src, *dst))
+            .map(|pair| (pair.credit.remaining(), pair.queued_bytes, pair.counted))
     }
 
     /// How many pairs involve `node_id`, in either role. Exposed for

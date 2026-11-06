@@ -5378,3 +5378,224 @@ async fn advertise_over_a_session_names_the_tenant_zone() {
     }
     assert!(relay.labels().state().names.contains_key("example.ali"));
 }
+
+// ---- SEND to the relay's own NodeId (expose, S-E2) ----
+
+/// One attached member (past its attach-time catch-up) of a freshly seeded network.
+async fn one_attached_member(
+    relay: &Relay,
+    addr: SocketAddr,
+    cert: CertificateDer<'static>,
+    relay_x25519: X25519PublicKey,
+) -> (TestClient, TestIdentity) {
+    let identity = generate_identity();
+    let (networks, seq) = seed_network(relay, &[&identity]);
+    let (mut client, _) =
+        TestClient::connect(addr, cert, &identity, relay_x25519, networks, seq, 1, 10).await;
+    client.send(Record::Attach).await;
+    ping_pong(&mut client, [7; 8]).await;
+    (client, identity)
+}
+
+#[tokio::test]
+async fn a_send_to_the_relays_own_node_id_is_taken_and_credited_not_forbidden() {
+    let (relay, listener, cert, relay_x25519) = bind_test_relay().await;
+    let addr = listener.local_addr().unwrap();
+    let serve_relay = relay.clone();
+    tokio::spawn(async move { serve_relay.serve(&listener).await });
+    let relay_id = relay
+        .relay_id()
+        .expect("the test relay has a decodable NodeCert");
+    let mut inbound = relay.endpoint().subscribe();
+
+    let (mut client, identity) = one_attached_member(&relay, addr, cert, relay_x25519).await;
+    // What the relay holds of the attached node for a later L4 session: its session and key.
+    let attached = relay.attached_node(&identity.node_id).unwrap();
+    assert_eq!(attached.x25519_pub, identity.x25519_public);
+
+    client.send(send_record(relay_id, vec![5u8; 300])).await;
+    let frame = inbound.recv().await.expect("the endpoint got the frame");
+    assert_eq!(frame.src, identity.node_id);
+    assert_eq!(frame.session_id, attached.session_id);
+    assert_eq!(frame.payload, vec![5u8; 300]);
+    // Still held: no CREDIT yet, and the relay's ledger for the session is down by the charge.
+    ping_pong(&mut client, [8; 8]).await;
+
+    drop(frame);
+    match client.recv().await {
+        Some(Record::Credit(body)) => {
+            assert_eq!(body.peer, relay_id);
+            assert_eq!(body.bytes, 300);
+        }
+        other => panic!("expected CREDIT {{peer: relay_id}}, got {other:?}"),
+    }
+    // The session lives on and the credit is usable again.
+    client.send(send_record(relay_id, vec![6u8; 300])).await;
+    assert_eq!(inbound.recv().await.unwrap().payload, vec![6u8; 300]);
+}
+
+#[tokio::test]
+async fn a_send_to_the_relay_with_no_consumer_is_absorbed_and_credited_back() {
+    let (relay, listener, cert, relay_x25519) = bind_test_relay().await;
+    let addr = listener.local_addr().unwrap();
+    let serve_relay = relay.clone();
+    tokio::spawn(async move { serve_relay.serve(&listener).await });
+    let relay_id = relay.relay_id().unwrap();
+
+    let (mut client, _) = one_attached_member(&relay, addr, cert, relay_x25519).await;
+    client.send(send_record(relay_id, vec![1u8; 100])).await;
+    // No ERROR (not `forbidden`, not `peer_offline`): the credit is simply returned.
+    match client.recv().await {
+        Some(Record::Credit(body)) => assert_eq!((body.peer, body.bytes), (relay_id, 100)),
+        other => panic!("expected CREDIT, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn a_reliable_send_to_the_relay_beyond_credit_closes_the_session() {
+    let small_credit = Limits {
+        max_record: 65_535,
+        max_peers: 10,
+        credit: 300,
+    };
+    let (relay, listener, cert, relay_x25519) = bind_test_relay_with_limits(small_credit).await;
+    let addr = listener.local_addr().unwrap();
+    let serve_relay = relay.clone();
+    tokio::spawn(async move { serve_relay.serve(&listener).await });
+    let relay_id = relay.relay_id().unwrap();
+    let mut inbound = relay.endpoint().subscribe();
+
+    let (mut client, identity) = one_attached_member(&relay, addr, cert, relay_x25519).await;
+    // The consumer is slow: it holds the first frame, so its 200 bytes stay spent.
+    client.send(send_record(relay_id, vec![0u8; 200])).await;
+    let held = inbound.recv().await.unwrap();
+    client.send(send_record(relay_id, vec![0u8; 200])).await;
+
+    match client.recv().await {
+        Some(Record::Error(body)) => assert_eq!(body.code, ErrorCode::CreditExceeded),
+        other => panic!("expected ERROR(CreditExceeded), got {other:?}"),
+    }
+    assert_eq!(client.recv().await, None, "the relay ends the session");
+    assert!(
+        inbound.try_recv().is_err(),
+        "the violating frame reached nobody"
+    );
+    drop(held);
+    wait_until_detached(&relay, &identity.node_id).await;
+}
+
+#[tokio::test]
+async fn a_member_cannot_make_a_frame_appear_to_come_from_the_relay() {
+    let (relay, listener, cert, relay_x25519) = bind_test_relay().await;
+    let addr = listener.local_addr().unwrap();
+    let serve_relay = relay.clone();
+    tokio::spawn(async move { serve_relay.serve(&listener).await });
+    let relay_id = relay.relay_id().unwrap();
+    let mut inbound = relay.endpoint().subscribe();
+
+    let (mut client_a, node_a, mut client_b, node_b) =
+        two_attached_members(&relay, addr, cert, relay_x25519).await;
+
+    // A sends to B and to the relay. A SEND has no `src` field: B's RECV is stamped with A's
+    // own NodeId, and what A sent to the relay never reaches B.
+    client_a.send(send_record(node_b, vec![1u8; 100])).await;
+    client_a.send(send_record(relay_id, vec![2u8; 100])).await;
+    match client_b.recv().await {
+        Some(Record::Recv { src, payload, .. }) => {
+            assert_eq!(src, node_a);
+            assert_ne!(src, relay_id);
+            assert_eq!(payload, vec![1u8; 100]);
+        }
+        other => panic!("expected RECV, got {other:?}"),
+    }
+    let frame = inbound.recv().await.unwrap();
+    assert_eq!(frame.src, node_a);
+    assert_eq!(frame.payload, vec![2u8; 100]);
+    ping_pong(&mut client_b, [3; 8]).await;
+
+    // The relay's own frame carries the relay's NodeId, through the virtual pair, and is not a
+    // pair or a destination of anyone.
+    assert_eq!(
+        relay.send_as_relay(
+            &crate::tenant::TenantId::Default,
+            &node_b.clone(),
+            0x01,
+            0,
+            vec![9u8; 100]
+        ),
+        crate::forward::RelaySendOutcome::Queued
+    );
+    match client_b.recv().await {
+        Some(Record::Recv { src, payload, .. }) => {
+            assert_eq!(src, relay_id);
+            assert_eq!(payload, vec![9u8; 100]);
+        }
+        other => panic!("expected the relay's RECV, got {other:?}"),
+    }
+    // Drained: the virtual pair's credit and queue are whole again, and it is uncounted.
+    let credit = test_limits().credit;
+    eventually("the virtual pair drained", || {
+        relay.forwarding.pair_figures(&relay_id, &node_b) == Some((credit, 0, false))
+    })
+    .await;
+    assert_eq!(
+        relay.forwarding.pair_count_for(&node_a),
+        1,
+        "A's own pair to B only"
+    );
+    // Nothing of the relay's reached A: only CREDIT records (for its SEND to B) come before
+    // the PONG, no RECV and no ERROR.
+    client_a.send(Record::Ping { nonce: [4; 8] }).await;
+    loop {
+        match client_a.recv().await {
+            Some(Record::Credit(_)) => {}
+            Some(Record::Pong { nonce }) => {
+                assert_eq!(nonce, [4; 8]);
+                break;
+            }
+            other => panic!("A heard something it should not have: {other:?}"),
+        }
+    }
+    drop(frame);
+}
+
+#[tokio::test]
+async fn the_relays_pair_toward_a_node_goes_when_the_node_detaches() {
+    let (relay, listener, cert, relay_x25519) = bind_test_relay().await;
+    let addr = listener.local_addr().unwrap();
+    let serve_relay = relay.clone();
+    tokio::spawn(async move { serve_relay.serve(&listener).await });
+    let relay_id = relay.relay_id().unwrap();
+
+    let (mut client, identity) = one_attached_member(&relay, addr, cert, relay_x25519).await;
+    assert_eq!(
+        relay.send_as_relay(
+            &crate::tenant::TenantId::Default,
+            &identity.node_id,
+            0x01,
+            0,
+            vec![1u8; 100]
+        ),
+        crate::forward::RelaySendOutcome::Queued
+    );
+    assert!(matches!(client.recv().await, Some(Record::Recv { .. })));
+    drop(client);
+    wait_until_detached(&relay, &identity.node_id).await;
+    assert!(
+        relay
+            .forwarding
+            .pair_figures(&relay_id, &identity.node_id)
+            .is_none()
+    );
+    assert!(relay.forwarding.counts_are_empty());
+    assert_eq!(
+        relay.send_as_relay(
+            &crate::tenant::TenantId::Default,
+            &identity.node_id,
+            0x01,
+            0,
+            vec![1u8; 100]
+        ),
+        crate::forward::RelaySendOutcome::PeerOffline
+    );
+}

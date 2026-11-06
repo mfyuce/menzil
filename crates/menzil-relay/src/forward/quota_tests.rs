@@ -978,3 +978,357 @@ async fn one_members_windows_do_not_hold_another_members_credit_at_the_floor() {
     assert_eq!(hub_back, spent, "sum granted equals sum consumed");
     assert_eq!(w.table.shaper_of(&ali()).unwrap().held(), 0);
 }
+
+// ---- the relay's own virtual pair (S-E2, `ForwardTable::forward_from_relay`) ----
+
+const RELAY_ID: [u8; 32] = [0xee; 32];
+
+fn relay_id() -> NodeId {
+    NodeId::from(RELAY_ID)
+}
+
+impl World {
+    /// One frame the relay sends to `dst` for a name of `tenant`.
+    fn relay_send(
+        &self,
+        tenant: &TenantId,
+        dst: NodeId,
+        reliable: bool,
+        len: usize,
+    ) -> RelaySendOutcome {
+        self.table.forward_from_relay(
+            &self.registry,
+            &self.limits,
+            &relay_id(),
+            tenant,
+            &dst,
+            0x01,
+            if reliable { 0x00 } else { 0x01 },
+            vec![0u8; len],
+        )
+    }
+}
+
+fn bo() -> TenantId {
+    TenantId::Named(Slug::parse("bob").unwrap())
+}
+
+#[test]
+fn the_relays_frame_arrives_with_the_relay_as_src_and_needs_no_roster() {
+    let mut w = World::new(1024);
+    // Attached with no Roster at all and no claims: the relay is not a member of anything.
+    let node = NodeId::from([0x31; 32]);
+    w.attach(node, vec![]);
+    assert_eq!(
+        w.relay_send(&TenantId::Default, node, true, 100),
+        RelaySendOutcome::Queued
+    );
+    match w.handles.get_mut(&node).unwrap().2.try_recv() {
+        Ok(ForwardItem::Recv { record, src, .. }) => {
+            assert_eq!(src, relay_id());
+            match *record {
+                Record::Recv {
+                    src,
+                    e2e_proto,
+                    flags,
+                    ref payload,
+                } => {
+                    assert_eq!(src, relay_id(), "the relay stamps src");
+                    assert_eq!((e2e_proto, flags, payload.len()), (0x01, 0, 100));
+                }
+                other => panic!("expected RECV, got {other:?}"),
+            }
+        }
+        other => panic!("expected a queued item, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_frame_to_an_unattached_node_or_with_an_unknown_e2e_proto_queues_nothing() {
+    let w = World::new(1024);
+    let node = NodeId::from([0x31; 32]);
+    assert_eq!(
+        w.relay_send(&TenantId::Default, node, true, 100),
+        RelaySendOutcome::PeerOffline
+    );
+    assert!(w.table.pair_figures(&relay_id(), &node).is_none());
+    let outcome = w.table.forward_from_relay(
+        &w.registry,
+        &w.limits,
+        &relay_id(),
+        &TenantId::Default,
+        &node,
+        0x7f,
+        0,
+        vec![],
+    );
+    assert_eq!(outcome, RelaySendOutcome::UnknownE2e);
+    // Nor a frame from the relay to itself.
+    assert_eq!(
+        w.relay_send(&TenantId::Default, relay_id(), true, 100),
+        RelaySendOutcome::PeerOffline
+    );
+}
+
+#[test]
+fn the_virtual_pair_takes_no_pair_or_destination_count_and_is_never_refused_for_one() {
+    let mut w = World::new(1024);
+    let net = w.network(4);
+    // The tightest figures a tenant can have: one pair, one destination per node.
+    w.tenant(
+        "ali",
+        &[&net],
+        &[("forwarding_pairs", 1), ("destinations_per_node", 1)],
+    );
+    // A member's own pair takes the only place.
+    assert!(queued(&w.send(&net, 1, 100)));
+    assert_eq!(w.table.tenant_counts(&ali()).0, 1);
+    // The relay talks to every node of the tenant: none of it is refused or counted.
+    for to in 0..4 {
+        for _ in 0..3 {
+            assert_eq!(
+                w.relay_send(&ali(), net.nodes[to], true, 100),
+                RelaySendOutcome::Queued
+            );
+        }
+        let (_, _, counted) = w.table.pair_figures(&relay_id(), &net.nodes[to]).unwrap();
+        assert!(!counted);
+    }
+    assert_eq!(
+        w.table.tenant_counts(&ali()),
+        (1, 0),
+        "only the member pair counts"
+    );
+    // The member's place was not taken by the relay's pairs, and is not freed by them either.
+    let (quota, _, _) = quota_of(w.send(&net, 2, 100));
+    assert_eq!(quota, DataQuota::Pairs);
+
+    // The relay's pair toward a node goes with that node, and takes no count of the tenant's
+    // with it (node 3 has no member pair).
+    w.table.clear_for(&net.nodes[3]);
+    assert!(w.table.pair_figures(&relay_id(), &net.nodes[3]).is_none());
+    assert_eq!(w.table.tenant_counts(&ali()), (1, 0));
+    for node in &net.nodes {
+        w.table.clear_for(node);
+    }
+    assert!(w.table.counts_are_empty());
+    assert!(w.table.pair_figures(&relay_id(), &net.nodes[0]).is_none());
+}
+
+#[test]
+fn the_virtual_pair_does_not_count_against_max_peers() {
+    let mut w = World::new(1);
+    let net = w.network(3);
+    for to in 0..3 {
+        assert_eq!(
+            w.relay_send(&TenantId::Default, net.nodes[to], true, 100),
+            RelaySendOutcome::Queued
+        );
+    }
+    // The member's one allowed destination is still free.
+    assert!(queued(&w.send(&net, 1, 100)));
+}
+
+#[test]
+fn the_4_mib_queue_bound_holds_for_the_virtual_pair() {
+    let mut w = World::new(1024);
+    w.limits.credit = MAX_QUEUE_BYTES as u32;
+    let node = NodeId::from([0x31; 32]);
+    w.attach(node, vec![]);
+    let frame = 65_536;
+    let mut sent = 0;
+    while w.relay_send(&TenantId::Default, node, true, frame) == RelaySendOutcome::Queued {
+        sent += frame;
+        let (_, queued_bytes, _) = w.table.pair_figures(&relay_id(), &node).unwrap();
+        assert_eq!(queued_bytes, sent);
+        assert!(queued_bytes <= MAX_QUEUE_BYTES);
+    }
+    assert_eq!(sent, MAX_QUEUE_BYTES, "filled to the bound, not past it");
+    assert_eq!(
+        w.relay_send(&TenantId::Default, node, true, frame),
+        RelaySendOutcome::Full
+    );
+    // Droppable has no headroom left once the credit is the whole queue.
+    assert_eq!(
+        w.relay_send(&TenantId::Default, node, false, 100),
+        RelaySendOutcome::Dropped
+    );
+    assert_eq!(
+        w.table.pair_figures(&relay_id(), &node).unwrap().1,
+        MAX_QUEUE_BYTES,
+        "a refused frame takes nothing"
+    );
+
+    // The node's connection drains: the queue and the credit come back, and the relay (which has
+    // no session) is sent no CREDIT record.
+    assert_eq!(w.drain(node), MAX_QUEUE_BYTES as u64);
+    assert_eq!(
+        w.table.pair_figures(&relay_id(), &node),
+        Some((MAX_QUEUE_BYTES as u32, 0, false))
+    );
+    assert_eq!(
+        w.relay_send(&TenantId::Default, node, true, frame),
+        RelaySendOutcome::Queued
+    );
+}
+
+#[test]
+fn reliable_and_droppable_frames_together_never_exceed_the_queue() {
+    let mut w = World::new(1024);
+    let node = NodeId::from([0x31; 32]);
+    w.attach(node, vec![]);
+    // The default credit is 1 MiB: 3 MiB of headroom for droppable, of which the token bucket
+    // lets 256 KiB through at once.
+    for _ in 0..16 {
+        assert_eq!(
+            w.relay_send(&TenantId::Default, node, true, 65_536),
+            RelaySendOutcome::Queued
+        );
+    }
+    let mut dropped = 0;
+    for _ in 0..100 {
+        match w.relay_send(&TenantId::Default, node, false, 65_536) {
+            RelaySendOutcome::Queued => {}
+            RelaySendOutcome::Dropped => dropped += 1,
+            other => panic!("unexpected {other:?}"),
+        }
+        let (_, queued_bytes, _) = w.table.pair_figures(&relay_id(), &node).unwrap();
+        assert!(queued_bytes <= MAX_QUEUE_BYTES);
+    }
+    assert!(dropped > 0, "the bucket drops the excess");
+}
+
+#[test]
+fn the_virtual_pairs_droppable_bytes_stay_out_of_the_tenants_droppable_total() {
+    let mut w = World::new(1024);
+    let net = w.network(3);
+    w.tenant("ali", &[&net], &[("droppable_mib", 1)]);
+    // A member's droppable bytes are in the tenant's total and stay queued.
+    assert!(queued(&w.send_with(
+        &net,
+        net.nodes[0],
+        net.nodes[2],
+        false,
+        1000
+    )));
+    assert_eq!(w.table.tenant_counts(&ali()), (1, 1000));
+    // The relay's droppable frame to another node of the tenant is queued and drained.
+    assert_eq!(
+        w.relay_send(&ali(), net.nodes[1], false, 500),
+        RelaySendOutcome::Queued
+    );
+    assert_eq!(
+        w.table.tenant_counts(&ali()),
+        (1, 1000),
+        "the relay's droppable bytes are not added"
+    );
+    w.drain(net.nodes[1]);
+    assert_eq!(
+        w.table.tenant_counts(&ali()),
+        (1, 1000),
+        "and draining them frees nothing of the member's"
+    );
+}
+
+#[test]
+fn the_name_tenant_is_charged_for_what_the_relay_sends_and_no_other_tenant_is() {
+    let mut w = World::new(1024);
+    let net = w.network(2);
+    w.tenant("ali", &[&net], &[("bandwidth_mbit", 1), ("burst_mib", 1)]);
+    let node = net.nodes[1];
+
+    for _ in 0..3 {
+        assert_eq!(
+            w.relay_send(&ali(), node, true, 1000),
+            RelaySendOutcome::Queued
+        );
+    }
+    // Nothing is charged before the node's connection has taken the frames.
+    assert_eq!(w.table.shaper_of(&ali()).unwrap().volume_used(), 0);
+    assert_eq!(w.drain(node), 3000);
+    assert_eq!(w.table.shaper_of(&ali()).unwrap().volume_used(), 3000);
+    assert!(
+        w.table.shaper_of(&TenantId::Default).is_none(),
+        "the default tenant has no bucket and was not charged"
+    );
+}
+
+#[test]
+fn two_names_of_one_node_in_two_tenants_are_each_charged_to_their_own() {
+    let mut w = World::new(1024);
+    let a = w.network(2);
+    let b = w.network(2);
+    w.tenants_of(&[
+        ("ali", &[&a], &[("bandwidth_mbit", 1)]),
+        ("bob", &[&b], &[("bandwidth_mbit", 1)]),
+    ]);
+    // One node attached (in `a`), with a name in each tenant.
+    let node = a.nodes[0];
+    assert_eq!(
+        w.relay_send(&ali(), node, true, 1000),
+        RelaySendOutcome::Queued
+    );
+    assert_eq!(
+        w.relay_send(&bo(), node, true, 2000),
+        RelaySendOutcome::Queued
+    );
+    assert_eq!(
+        w.relay_send(&ali(), node, true, 500),
+        RelaySendOutcome::Queued
+    );
+    w.drain(node);
+    assert_eq!(w.table.shaper_of(&ali()).unwrap().volume_used(), 1500);
+    assert_eq!(w.table.shaper_of(&bo()).unwrap().volume_used(), 2000);
+}
+
+#[test]
+fn a_droppable_relay_frame_is_paid_from_the_name_tenants_bucket() {
+    let mut w = World::new(1024);
+    let net = w.network(2);
+    w.tenant("ali", &[&net], &[("bandwidth_mbit", 1), ("burst_mib", 1)]);
+    let node = net.nodes[1];
+    assert_eq!(
+        w.relay_send(&ali(), node, false, 1000),
+        RelaySendOutcome::Queued
+    );
+    // Taken at admission, as for a member.
+    assert_eq!(w.table.shaper_of(&ali()).unwrap().volume_used(), 1000);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_reliable_relay_frame_waits_while_the_name_tenants_bucket_is_in_debt() {
+    let mut w = World::new(1024);
+    let net = w.network(2);
+    // 1 Mbit/s is 125,000 bytes a second; burst 1 MiB.
+    w.tenant("ali", &[&net], &[("bandwidth_mbit", 1), ("burst_mib", 1)]);
+    let node = net.nodes[1];
+    // The burst is used up (to the byte) and then some: the bucket is in debt.
+    for _ in 0..16 {
+        assert_eq!(
+            w.relay_send(&ali(), node, true, 65_536),
+            RelaySendOutcome::Queued
+        );
+    }
+    w.drain(node);
+    assert_eq!(
+        w.relay_send(&ali(), node, true, 65_536),
+        RelaySendOutcome::Queued,
+        "at zero, not yet in debt"
+    );
+    w.drain(node);
+    assert_eq!(
+        w.relay_send(&ali(), node, true, 65_536),
+        RelaySendOutcome::Throttled
+    );
+    // Another tenant's name is not held by it.
+    assert_eq!(
+        w.relay_send(&TenantId::Default, node, true, 65_536),
+        RelaySendOutcome::Queued
+    );
+    // Time pays the debt off (65,536 bytes at 125,000 a second).
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(
+        w.relay_send(&ali(), node, true, 65_536),
+        RelaySendOutcome::Queued
+    );
+}

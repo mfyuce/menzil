@@ -341,6 +341,16 @@ impl Shaper {
         true
     }
 
+    /// Whether the bucket is in debt now (reliable traffic took more than it held). The relay's
+    /// own sender (the expose principal) is not held back by delayed CREDIT as a member is, so it
+    /// asks this before a reliable frame and waits while it is true.
+    pub(crate) fn in_debt(&self, figures: &Figures, now: Instant) -> bool {
+        let mut inner = self.lock();
+        inner.figures = ShapeFigures::from_figures(figures);
+        inner.refill(now);
+        inner.tokens < 0.0
+    }
+
     /// Runs until nothing is held: shares out what time has paid off among the senders, hands
     /// the paid records to the senders that are still the same session, and sleeps until the
     /// next record is due (or a new record joins). Spawned once per burst of debt by whoever got
