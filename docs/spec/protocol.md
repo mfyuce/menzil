@@ -2,7 +2,7 @@
 
 Status: v0.3 adds the multi tenant relay (one relay serving several unrelated tenants) and NodeCert renewal to v0.2, which followed the red team review of v0.1 (`reviews/2026-09-26-red-team.md`) and the constraint verification (`reviews/2026-09-26-constraint-verification.md`). Normative for protocol version 1. Which parts ship in which implementation phase is stated in section 13, not by omission.
 
-Terms: node = any menzil process holding an identity; agent = the one per user process that owns the identity and all sessions (section 12); relay = a node role that is publicly reachable and forwards for others; peer = the node at the other end of an end to end session; owner = the key that defines a network; steward = a key the owner delegates for day to day admission and renewal.
+Terms: node = any menzil process holding an identity; agent = the one per user process that owns the identity and all sessions (section 12); relay = a node role that is publicly reachable and forwards for others; peer = the node at the other end of an end to end session; owner = the key that defines a network; steward = a key the owner delegates for day to day admission and renewal; tenant = the group of networks an operator serves under one name (its slug) on a relay, with its own name zone and figures (section 10).
 
 ## Changes in v0.2 (red team finding numbers in brackets)
 
@@ -165,7 +165,7 @@ WELCOME (relay -> node)   final handshake message from the relay carries
               limits: { max_record: u32, max_peers: u32, credit: u32 }, rosters: { NetworkId: u64 } }
 ```
 
-In IK the node's payload rides message 1 and the relay's rides message 2; in XX the node's payload rides message 3 and the relay's message 2. The node verifies `relay_cert.node_id` equals the `id` of its connection information and `relay_cert.x25519_pub` equals the relay static key of the handshake, and remembers the highest relay serial. During rotation a relay accepts handshakes to both its old and new static key for 30 days and always returns the newest NodeCert. WELCOME `time` is informational and never extends any validity.
+In IK the node's payload rides message 1 and the relay's rides message 2; in XX the node's payload rides message 3 and the relay's message 2. The node verifies the self signature of `relay_cert` under the `id` of its connection information, that `relay_cert.node_id` equals that `id`, and that `relay_cert.x25519_pub` equals the relay static key of the handshake. It keeps no memory of relay serials: the relay is pinned by its NodeId and static key in the connection information, and the serial of its certificate is not looked at. Relay certificate renewal is not built: a relay serves the NodeCert it loaded at start and renews nothing while it runs, and nothing the node checks depends on the serial. A new relay key is a new NodeId and new connection information (section 2.2), so there is no period in which a relay answers to two static keys. WELCOME `time` is informational and never extends any validity.
 
 `caps` is a list of capability strings from the registry in `menzil-proto`; version 1 defines `dgram` (the node accepts datagram channels), `docs` (the node serves `menzil:docs`), `share-blind` and `share-terminated` (the node can host shares of that mode). Unknown strings are ignored.
 
@@ -252,9 +252,9 @@ data  = u8 0x03 | u32 receiver_index | u64 counter | ciphertext
 
 In every frame, `sender_index` is the index the sender of that frame chose for itself and `receiver_index` the index its receiver chose. So `init` carries the initiator's own index; `resp` carries the responder's own index as `sender_index` and echoes the initiator's, from `init`, as `receiver_index`; and each side stamps the other's index as `receiver_index` on every `data` frame it sends. A node never lets two of its live sessions share an index.
 
-Handshake payloads: `CBOR{ v: 1, node_cert: NodeCert, roster_seq: u64, policy_seq: u64, e2e_protos: [u8], docs_only: bool }`; `docs_only` is optional and set only by a responder. There is no application data in message 1.
+Handshake payload: `CBOR{ v: 1, node_cert: NodeCert, roster_seq: u64, policy_seq: u64, e2e_protos: [u8], docs_only: bool }`. It rides in message 2 (`resp`) only and is the responder's; `docs_only` is optional. Message 1 (`init`) carries no payload, and a responder refuses a message 1 that decrypts to a non empty one. The initiator therefore sends no NodeCert and no document sequence numbers in the handshake: the responder learns its static key from message 1 and resolves its certificate from its own Policy.
 
-Checks. The initiator verifies the responder's `node_cert.node_id` equals the NodeId it dialed and `x25519_pub` equals the handshake static key. The responder verifies the initiator's `node_id` equals the RECV `src` and its static key matches, that both are unrevoked members of `network_id` in an unexpired Roster and Policy, and that the initiator's serial is not below `min_serial`. The responder checks that the RECV `src` is an unrevoked member in its Roster before any Diffie Hellman, and stays silent otherwise. A member with no grant on this node is admitted like any other; what it may open is decided per stream (section 5.3). If the initiator is an unrevoked member in the responder's Roster but cannot be admitted, because the certificate that counts for it in the responder's Policy (section 2.2) is missing or not for the handshake key, it is not in that Policy, or the responder's documents have expired, the responder completes the handshake with `docs_only: true` in its payload and accepts only a `menzil:docs` push on that session (section 5.5). Every other failed check is answered with silence.
+Checks. The initiator verifies the responder's `node_cert.node_id` equals the NodeId it dialed and `x25519_pub` equals the handshake static key. The initiator also checks the payload certificate's self signature and window, and that it names no other key than the one it dialed, and then its own standing: the responder must be an unrevoked member of `network_id`, with the serial of the certificate its own Policy lists for the negotiated key (never the serial the payload claims) not below `min_serial`. The responder takes the initiator's `node_id` from the RECV `src` (it is in the prologue, so a wrong one fails the handshake) and its static key from message 1, and verifies that both are unrevoked members of `network_id` in an unexpired Roster and Policy, and that the serial of the initiator's certificate in its Policy for that key is not below `min_serial`. The responder checks that the RECV `src` is an unrevoked member in its Roster before any Diffie Hellman, and stays silent otherwise. A member with no grant on this node is admitted like any other; what it may open is decided per stream (section 5.3). If the initiator is an unrevoked member in the responder's Roster but cannot be admitted, because the certificate that counts for it in the responder's Policy (section 2.2) is missing or not for the handshake key, it is not in that Policy, or the responder's documents have expired, the responder completes the handshake with `docs_only: true` in its payload and accepts only a `menzil:docs` push on that session (section 5.5). Every other failed check is answered with silence.
 Handshakes are rate limited per peer (10 per minute) because each costs four Diffie Hellman operations and two signature checks.
 
 Simultaneous open: if both sides initiate to each other, the session initiated by the lower NodeId (byte wise) is kept. A responder keeps its current session with a peer until a data record on the new session decrypts. A session is pinned to the relay path its initiation used; if that relay session ends, the L4 session ends (phase 1 consequence, decision 0001).
@@ -343,7 +343,7 @@ What blind means: the relay cannot read a blind share as long as it behaves pass
 
 ### 6.3 Terminated mode
 
-Shares advertised as `terminated` are served under the terminated zone with the relay's certificate (wildcard by DNS-01 or per name by HTTP-01 or TLS-ALPN-01 from the relay's own ACME account). The relay terminates TLS and HTTP and opens one `http:<name>` stream per client connection carrying HTTP/1.1. It parses every request, requires `Host` to equal the SNI name (421 otherwise), removes any `Forwarded`, `X-Forwarded-*` and `X-Real-IP` headers, sets fresh `X-Forwarded-For` and `X-Forwarded-Proto`, translates HTTP/2 to HTTP/1.1 rejecting CR, LF and NUL in field values and requests with both `Content-Length` and `Transfer-Encoding`, and passes `Upgrade` (WebSocket) through. Relay side access control (a password page, OIDC) is a later addition to this mode only. Terminated mode requires opt in per share by the node and per network by the operator; the CLI warns that the relay reads these shares.
+Shares advertised as `terminated` are served under the terminated zone with the relay's certificate (wildcard by DNS-01 or per name by HTTP-01 or TLS-ALPN-01 from the relay's own ACME account). The relay terminates TLS and HTTP and opens one `http:<name>` stream per client connection carrying HTTP/1.1. It parses every request, requires `Host` to equal the SNI name (421 otherwise), removes any `Forwarded`, `X-Forwarded-*` and `X-Real-IP` headers, sets fresh `X-Forwarded-For` and `X-Forwarded-Proto`, translates HTTP/2 to HTTP/1.1 rejecting CR, LF and NUL in field values and requests with both `Content-Length` and `Transfer-Encoding`, and passes `Upgrade` (WebSocket) through. Relay side access control (a password page, OIDC) is a later addition to this mode only. Terminated mode requires opt in per share by the node and per tenant by the operator (the tenant's `terminated` flag in its tenant file, off by default and always off for the default tenant); the CLI warns that the relay reads these shares.
 
 ### 6.4 Raw TCP
 
@@ -361,7 +361,7 @@ A `tcp:` share is reachable by SNI on 443 as a blind share whose node side speak
 Invite = Signed("invite"){ v: 1, network_id, invite_id: bytes16, secret_hash: bytes32, roles: [str], expires: u64, uses: u8 }
 ```
 
-The owner or steward hands the device the Invite plus a 32 byte secret in one URL. The secret never leaves the device. The device connects to the relay with its NodeCert, no network claim, and sends
+The owner or steward hands the device the Invite plus a 32 byte secret in one URL. The secret never leaves the device. The device connects to the relay with its NodeCert and, as the invite flow is designed, no network claim; until invitations are built a relay refuses a session that claims no network (section 4.1, section 10). It sends
 
 ```
 ADMIT_REQUEST = CBOR{ invite: Invite, node_cert: NodeCert,
@@ -500,7 +500,7 @@ Exactly one process per user, the agent, holds the identity and owns every L3 an
 | 12 agent and IPC, stdio, reach | yes | | |
 | PEER_STATE direct addresses, QUIC e2e_proto | | | yes |
 
-## 14. Open items after v0.2
+## 14. Open items after v0.3
 
 1. Whether the relay should be allowed to cache Policies encrypted to members (availability when the steward is offline) or documents must always come from members.
 2. yamux receive window auto tuning policy once credits exist (answer 5 of the red team: about 14 Mbit/s per stream at 150 ms with 256 KiB).

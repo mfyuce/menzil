@@ -46,7 +46,7 @@ Unrecoverable for that network: the attacker can sign documents and admit member
 
 ### 2.7 Internet attacker against the relay
 
-Attempts: connection floods, HELLO floods (an office behind one proxy shares one address, so per address limits are generous and per NodeId limits apply after the Diffie Hellman), SNI probing, abuse of terminated shares as an open proxy, ACME abuse, admission request floods. Controls: rate limits, one attached session per NodeId, 65,535 byte records, bounded queues, per name connection limits, label claims signed by owners with quotas and quarantine, unknown SNI receives the static site, ACME routing only for known names, Host must match SNI (421 otherwise), pending admissions capped. Public shares are the one surface accepting unauthenticated connections; everything else requires a Noise handshake with a listed identity. Share names are public knowledge through certificate transparency; the static site fallback prevents casual probing, not enumeration.
+Attempts: connection floods, HELLO floods (an office behind one proxy shares one address, so per address limits are generous; a NodeId is bounded once the handshake has proven it, by the cap on its sessions waiting to attach, since a per NodeId HELLO rate is not built), SNI probing, abuse of terminated shares as an open proxy, ACME abuse, admission request floods. Controls: rate limits, one attached session per NodeId, 65,535 byte records, bounded queues, label claims signed by owners with quotas and quarantine, unknown SNI receives the static site, ACME routing only for known names, Host must match SNI (421 otherwise), pending admissions capped; per tenant and per name share connection figures are designed for the SNI router and not built. Public shares are the one surface accepting unauthenticated connections; everything else requires a Noise handshake with a listed identity. Share names are public knowledge through certificate transparency; the static site fallback prevents casual probing, not enumeration.
 
 ### 2.8 Wrong policy
 
@@ -122,7 +122,7 @@ Residual risks, accepted:
 20. A renewal with the same keys, listed by the owner or by a steward, keeps every live session, and sessions on it outlive the older certificate's `not_after`; a renewal nobody lists ends the node's sessions at that `not_after`, and a late listing brings it back. A steward signed Policy that lists another key for a base member, drops or lowers a renewal the verifier holds, lists a second certificate for a node, or rotates without both `admit` and `renew` is refused; owner and steward refuse a renewal with a new key, a serial not above the listed one, or one valid for less than 5 minutes.
 21. A pushed `node_cert` is never adopted on trust: one for another node than the session's peer, for another static key than the session's, with a new key, a bad signature, a window over 400 days, or a serial not above the highest known is refused, and every receiver gives the same answer whether it holds a steward key, the owner key or neither, so the push tells no one where the steward lives.
 
-## 6. Open questions after v0.2
+## 6. Open questions after v0.3
 
 1. Should relays be allowed to cache Policies encrypted to members for availability when no member with newer documents is online?
 2. Is a 14 day document expiry the right trade between revocation latency under a withholding relay and steward availability requirements?

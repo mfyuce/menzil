@@ -5,13 +5,15 @@
 //! signed document of the same kind it was made from, and the steward's authority is the
 //! `Steward` entry in the base Roster (signed by the owner inside a Roster signed by the owner).
 //! The steward's rights are enforced by comparing the document with its base field by field:
-//! `renew` may change `seq`, `issued` and `expires`, and list a member's renewed certificate
-//! (same keys, higher serial) in the tail of `certs`; `admit` may also append new, unrevoked
-//! members at the end of the lists. The right a change needs is `admit` when it appends members
-//! the verifier did not hold, else `renew` (so a renewed certificate alone needs `renew`, and a
-//! steward that may only `admit` cannot renew). Nothing else may differ. The owner's own next documents
-//! jump [`STEWARD_SEQ_SPAN`] past the base, so nothing a steward signed from that base can
-//! outrank them.
+//! `renew` may change `seq`, `issued` and `expires`; `admit` may append new, unrevoked members at
+//! the end of the lists, with their certificates at the end of `certs`; a member's renewed
+//! certificate (same keys, higher serial) in that tail of `certs` is a rotation. The right a
+//! change needs is `admit` when it appends members the verifier did not hold, else `renew` (so a
+//! steward that may only `admit` cannot renew what it admitted). A rotation needs both `admit`
+//! and `renew`, also when the pair admits a member as well (`policy_rules`; the Roster of such a
+//! pair needs `renew`, or `admit` by what it appends). Nothing else may differ.
+//! The owner's own next documents jump [`STEWARD_SEQ_SPAN`] past the base, so nothing a steward
+//! signed from that base can outrank them.
 //!
 //! Nothing here reads a clock, a store or a socket: the held state is passed in as a
 //! [`HeldView`], the offered documents as a [`Bundle`], and `now` as a parameter. The answer is a
