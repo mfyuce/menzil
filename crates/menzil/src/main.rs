@@ -226,7 +226,8 @@ struct ExposeArgs {
     name: Option<String>,
     /// blind: the relay forwards the encrypted bytes and the local target speaks TLS itself (the
     /// default); tcp: the same by name, for any protocol inside the TLS (`tcp:` service);
-    /// terminated: the relay terminates TLS (not built yet).
+    /// terminated: the relay terminates TLS and sends the target plain HTTP/1.1, so it reads the
+    /// share (the tenant must have `terminated` on; no --alpn).
     #[arg(long, default_value = "blind", value_name = "MODE", value_parser = ["blind", "tcp", "terminated"])]
     mode: String,
     /// The host of the local target. Anything but this machine's loopback shows the target to
@@ -1032,7 +1033,7 @@ mod tests {
         assert_eq!(args.host, "::1");
         assert_eq!(args.alpn, ["h2", "http/1.1", "acme-tls/1"]);
         assert!(args.replace);
-        // Terminated parses (the command refuses it by name); anything else is clap's.
+        // Terminated parses; anything else is clap's.
         assert_eq!(
             expose_args(&["expose", "1", "--name", "a", "--mode", "terminated"])
                 .unwrap()
@@ -1085,6 +1086,6 @@ mod tests {
     fn the_help_says_the_target_speaks_its_own_tls() {
         let help = parse(&["expose", "--help"]).err().unwrap().to_string();
         assert!(help.contains("must speak TLS itself"), "{help}");
-        assert!(help.contains("not built yet"), "{help}");
+        assert!(help.contains("reads the share"), "{help}");
     }
 }

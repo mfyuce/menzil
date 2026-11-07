@@ -86,17 +86,18 @@ fn a_request_line_round_trips_and_every_field_is_checked() {
 
 #[test]
 fn what_cannot_be_exposed_is_refused_with_its_reason() {
+    // A terminated share takes no ALPN list: the relay terminates its TLS.
     let mut terminated = spec("app", 80);
     terminated.mode = ExposeMode::Terminated;
+    assert!(terminated.validate().is_ok());
+    terminated.alpn = vec!["h2".to_string()];
     let error = terminated.validate().unwrap_err().to_string();
     assert!(
-        error.contains("terminated mode is not built yet")
-            && error.contains("S-E9a")
-            && error.contains("S-E9b"),
+        error.contains("does not apply to a terminated share"),
         "{error}"
     );
     // The refusal comes before the file is looked at.
-    assert!(err(plan_expose("", &terminated)).contains("not built yet"));
+    assert!(err(plan_expose("", &terminated)).contains("does not apply"));
 
     for (change, wanted) in [
         (
@@ -806,9 +807,10 @@ fn a_failed_edit_leaves_the_file_as_it_was() {
     let home = Home::new(dir.path().join("home"));
     plain_config(&home, dir.path(), "");
     let before = config_text(&home);
-    let mut terminated = spec("app", 1);
-    terminated.mode = ExposeMode::Terminated;
-    assert!(expose(&home, &terminated, None).is_err());
+    let mut refused = spec("app", 1);
+    refused.mode = ExposeMode::Terminated;
+    refused.alpn = vec!["h2".to_string()];
+    assert!(expose(&home, &refused, None).is_err());
     assert!(unexpose(&home, "nothing", None).is_err());
     assert_eq!(config_text(&home), before);
 }
@@ -1078,6 +1080,52 @@ fn a_target_that_is_not_loopback_gets_a_warning() {
         None,
     );
     assert!(!out.contains("warning"), "{out}");
+}
+
+#[test]
+fn a_terminated_share_is_written_as_http_and_the_output_says_the_relay_reads_it() {
+    let mut web = spec("web", 8080);
+    web.mode = ExposeMode::Terminated;
+    let plan = plan_expose(BASE, &web).unwrap();
+    assert!(plan.new_text.contains("\"http:web\" = \"127.0.0.1:8080\""));
+    assert!(
+        plan.new_text
+            .contains("[[share]]\nname = \"web\"\nmode = \"terminated\"\nservice = \"http:web\"\n")
+    );
+    assert!(!plan.new_text.contains("alpn"));
+    let shares = plan.config.shares().unwrap();
+    assert_eq!(shares.len(), 1);
+    assert_eq!(shares[0].mode, ShareMode::Terminated);
+
+    let out = render_exposed(
+        &web,
+        true,
+        &view("web", ShareState::Pending),
+        &[],
+        true,
+        None,
+    );
+    assert!(
+        out.contains("warning: the relay terminates TLS for this share and READS"),
+        "{out}"
+    );
+    assert!(out.contains("plain HTTP/1.1"), "{out}");
+    assert!(
+        out.contains("turned `terminated` on for your tenant"),
+        "{out}"
+    );
+    assert!(!out.contains("must speak TLS itself"), "{out}");
+    // A blind share never gets that warning.
+    let blind = render_exposed(
+        &spec("app", 80),
+        true,
+        &view("app", ShareState::Pending),
+        &[],
+        true,
+        None,
+    );
+    assert!(!blind.contains("READS"), "{blind}");
+    assert!(blind.contains("must speak TLS itself"), "{blind}");
 }
 
 #[test]

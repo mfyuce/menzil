@@ -9,7 +9,7 @@
 //! socket (protocol.md 12, requests `expose` and `unexpose`) instead of being restarted:
 //!
 //! ```text
-//! client -> agent   expose name=<label> mode=<blind|tcp> host=<host> port=<port> replace=<0|1> [alpn=<a,b>]\n
+//! client -> agent   expose name=<label> mode=<blind|tcp|terminated> host=<host> port=<port> replace=<0|1> [alpn=<a,b>]\n
 //! client -> agent   unexpose <label>\n
 //! agent  -> client  error <message>\n      or
 //!                   ok\n, then   changed yes|no, share <fields>, note <text> (repeated)
@@ -58,7 +58,8 @@ pub enum ExposeMode {
     Blind,
     /// `tcp:<label>`: reached by SNI like a blind share; any protocol inside the TLS.
     Tcp,
-    /// `http:<label>`: the relay terminates TLS (not built yet).
+    /// `http:<label>`: the relay terminates TLS and speaks HTTP/1.1 to the local target, so it
+    /// reads the share's traffic (protocol.md 6.3).
     Terminated,
 }
 
@@ -98,13 +99,14 @@ impl ExposeMode {
 pub struct ExposeSpec {
     /// The public label (one lowercase LDH label).
     pub label: String,
-    /// Blind or tcp (terminated is refused by [`Self::validate`]).
+    /// Blind, tcp or terminated.
     pub mode: ExposeMode,
     /// The host of the local target.
     pub host: String,
     /// The port of the local target.
     pub port: u16,
-    /// ALPN identifiers the target terminates; none means any.
+    /// ALPN identifiers the target terminates; none routes every ALPN except `acme-tls/1`, which
+    /// must be listed by name. Not allowed for a terminated share (the relay terminates TLS).
     pub alpn: Vec<String>,
     /// Change a share or a service that exists already.
     pub replace: bool,
@@ -138,11 +140,12 @@ impl ExposeSpec {
     }
 
     /// Checks everything that can be checked without the file: the mode, the label, the port,
-    /// the host and the ALPN list. Terminated mode is refused by name.
+    /// the host and the ALPN list. A terminated share takes no ALPN list: the relay, not the
+    /// target, terminates its TLS.
     pub fn validate(&self) -> Result<()> {
-        if self.mode == ExposeMode::Terminated {
+        if self.mode == ExposeMode::Terminated && !self.alpn.is_empty() {
             bail!(
-                "terminated mode is not built yet: it needs the relay's own certificates (relay ACME, slice S-E9a) and its HTTP terminator (slice S-E9b); use `--mode blind` (the relay forwards the encrypted bytes and cannot read them) or `--mode tcp`"
+                "--alpn does not apply to a terminated share: the relay terminates TLS itself and sends the target plain HTTP/1.1"
             );
         }
         check_name(&self.label).map_err(|e| anyhow!("{e}"))?;
@@ -164,7 +167,10 @@ impl ExposeSpec {
         }
         let share = Share {
             name: self.label.clone(),
-            mode: ShareMode::Blind,
+            mode: match self.mode {
+                ExposeMode::Terminated => ShareMode::Terminated,
+                ExposeMode::Blind | ExposeMode::Tcp => ShareMode::Blind,
+            },
             service: self.service()?,
             alpn: self.alpn.clone(),
         };
@@ -1305,10 +1311,22 @@ pub fn render_exposed(
             text::escaped(&view.label)
         ));
     }
-    out.push_str(&format!(
-        "the target must speak TLS itself: the relay forwards the encrypted bytes of a {} share and cannot read or terminate them\n",
-        view.mode
-    ));
+    if spec.mode == ExposeMode::Terminated {
+        out.push_str(
+            "warning: the relay terminates TLS for this share and READS all of its traffic (protocol.md 6.3); do not expose anything you would not show the relay operator\n",
+        );
+        out.push_str(
+            "the target must speak plain HTTP/1.1 (no TLS): the relay sends it the decrypted requests\n",
+        );
+        out.push_str(
+            "it is served only if the relay operator turned `terminated` on for your tenant (`relay` tenant file) and the relay holds a certificate for the name\n",
+        );
+    } else {
+        out.push_str(&format!(
+            "the target must speak TLS itself: the relay forwards the encrypted bytes of a {} share and cannot read or terminate them\n",
+            view.mode
+        ));
+    }
     if !is_loopback(&spec.host) {
         out.push_str(&format!(
             "warning: {} is not this machine's loopback: whoever reaches the public name reaches {}\n",
