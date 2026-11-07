@@ -2896,3 +2896,82 @@ fn update_tenant_refuses_max_networks_below_the_networks_it_has() {
     )
     .unwrap();
 }
+
+// ---- The status export (`relay/status.json`) ----
+
+/// Waits (real time, up to 10 s) for `read` of the relay's status file to satisfy `ok`.
+async fn status_when(home: &Home, ok: impl Fn(&status::StatusDoc) -> bool) -> status::StatusDoc {
+    let mut last = None;
+    for _ in 0..200 {
+        match status::read(home, unix_now()) {
+            Ok(doc) if ok(&doc) => return doc,
+            other => last = Some(other),
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("the status file never showed it: {last:?}");
+}
+
+/// A running relay writes its tenants' counters to `status.json` (the default tenant under its
+/// reserved key), keeps it current, and stops writing when it stops.
+#[tokio::test]
+async fn a_running_relay_exports_its_counters_and_stops_with_the_relay() {
+    let (_oa, owner_a, _ida, _) = token_of_a_network();
+    let (_ob, owner_b, idb, _) = token_of_a_network();
+    let (dir, relay_home) = home();
+    init(&relay_home, clock()).unwrap();
+    add_network_to(&relay_home, &relay_token(&owner_a), clock(), None).unwrap();
+    add_network_to(&relay_home, &relay_token(&owner_b), clock(), Some("ali")).unwrap();
+    let options = run_options(dir.path());
+    let running = start_with_status_every(&relay_home, &options, None, Duration::from_millis(100))
+        .await
+        .unwrap();
+    let first = status_when(&relay_home, |_| true).await;
+    assert_eq!(first.version, status::VERSION);
+    let keys: std::collections::BTreeSet<&str> = first.tenants.keys().map(String::as_str).collect();
+    assert_eq!(
+        keys,
+        std::collections::BTreeSet::from([status::DEFAULT_KEY, "ali"]),
+        "the default tenant and the named one, nothing else"
+    );
+    assert_eq!(first.entry("ali"), status::TenantEntry::default());
+    // A counter that changes later shows up in a later export.
+    let mut names = NameState::default();
+    for full in ["a.ali", "b.ali"] {
+        names.names.insert(
+            full.to_string(),
+            menzil_relay::NameRecord {
+                tenant: Some("ali".to_string()),
+                network: idb,
+                first: 1,
+                last: 1,
+            },
+        );
+    }
+    running.relay.labels().load_state(&names);
+    let later = status_when(&relay_home, |doc| doc.entry("ali").names == 2).await;
+    assert_eq!(later.entry(status::DEFAULT_KEY).names, 0);
+    // The text on disk is what `relay status --json` prints.
+    let on_disk = std::fs::read_to_string(status::status_path(&relay_home)).unwrap();
+    assert!(on_disk.contains("\"_default\""));
+    for secret in [idb.to_hex().as_str(), "menzil1-"] {
+        assert!(
+            !on_disk.contains(secret),
+            "the file names no network or token"
+        );
+    }
+    // Stopping the relay stops the export: nothing is written after the last pass.
+    running.stop();
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    let stopped = status::read(&relay_home, unix_now())
+        .unwrap()
+        .generated_unix;
+    tokio::time::sleep(Duration::from_millis(2_200)).await;
+    assert_eq!(
+        status::read(&relay_home, unix_now())
+            .unwrap()
+            .generated_unix,
+        stopped,
+        "the status export went on after the relay stopped"
+    );
+}

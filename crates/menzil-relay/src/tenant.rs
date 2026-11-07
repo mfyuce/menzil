@@ -992,6 +992,14 @@ impl TenantUsage {
         )
     }
 
+    /// Attached sessions per tenant (the operator's status export).
+    pub(crate) fn attached_counts(&self) -> HashMap<TenantId, usize> {
+        self.counts()
+            .iter()
+            .map(|(id, held)| (id.clone(), held.attached))
+            .collect()
+    }
+
     /// Sessions of `id` that are attached, by this count (tests).
     #[cfg(test)]
     pub(crate) fn attached_of(&self, id: &TenantId) -> usize {

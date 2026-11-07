@@ -48,6 +48,7 @@ mod tenant;
 #[cfg(test)]
 mod tests_support;
 mod tls;
+mod usage_snapshot;
 
 pub use acme::{
     AcmeConfig, MAX_PENDING_ORDERS, ORDER_BACKOFF_MAX, ORDER_MIN_INTERVAL, OrderLimiter,
@@ -95,3 +96,4 @@ pub use tenant::{
     SlugError, Tenant, TenantBook, TenantId, TenantSpec, check_flat_name,
 };
 pub use tls::server_config;
+pub use usage_snapshot::TenantUsageNow;

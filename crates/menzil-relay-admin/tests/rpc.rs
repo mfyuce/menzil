@@ -594,7 +594,7 @@ async fn list_tenants_pages_in_slug_order() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn get_figures_lists_every_key_and_usage_is_unimplemented() {
+async fn get_figures_lists_every_key() {
     let fx = Fixture::start().await;
     let mut c = fx.client().await;
     let figs = c
@@ -614,10 +614,6 @@ async fn get_figures_lists_every_key_and_usage_is_unimplemented() {
     }
     let names = figs.iter().find(|f| f.key == "names").unwrap();
     assert_eq!((names.class_default_friend, names.max), (20, 100_000));
-    // Every key GetFigures names is accepted by UpdateTenant at its maximum.
-    let e = c.get_usage(aref("alpha")).await.unwrap_err();
-    assert_eq!(e.code(), Code::Unimplemented);
-    assert!(!e.message().is_empty());
     fx.shutdown().await;
 }
 

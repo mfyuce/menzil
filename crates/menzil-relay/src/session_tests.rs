@@ -5692,3 +5692,103 @@ async fn the_relays_pair_toward_a_node_goes_when_the_node_detaches() {
         crate::forward::RelaySendOutcome::PeerOffline
     );
 }
+
+// ---- The status export: what the relay counts per tenant now ----
+
+/// Each tenant's counters are its own: sessions, pairs, volume with the time the period still
+/// runs, and names; a tenant that moved no data has no period yet.
+#[tokio::test]
+async fn the_usage_snapshot_counts_each_tenant_apart() {
+    let (relay, _listener, _cert, _x) = bind_test_relay().await;
+    let (ali_net, veli_net) = (NetworkId::from([1; 32]), NetworkId::from([2; 32]));
+    relay.set_tenants(friend_book(&[
+        ("ali", &[ali_net], &[]),
+        ("veli", &[veli_net], &[]),
+    ]));
+    let book = relay.tenants();
+    let _ali: Vec<_> = (0..2)
+        .map(|_| relay.usage.admit_attached(&book, &[ali_net], &[]).unwrap())
+        .collect();
+    let _veli = relay.usage.admit_attached(&book, &[veli_net], &[]).unwrap();
+    let _default = relay
+        .usage
+        .admit_attached(&book, &[NetworkId::from([9; 32])], &[])
+        .unwrap();
+    let node = |n: u8| NodeId::from([n; 32]);
+    for n in 0..3 {
+        relay
+            .forwarding
+            .insert_test_pair_for(&tenant("ali"), &node(10 + n), &node(20));
+    }
+    relay
+        .forwarding
+        .insert_test_pair_for(&TenantId::Default, &node(30), &node(31));
+    let figures = *book.figures_of(&tenant("ali")).unwrap();
+    relay.forwarding.use_up_volume(&tenant("ali"), &figures);
+    let record = |tenant: Option<&str>| crate::NameRecord {
+        tenant: tenant.map(str::to_string),
+        network: ali_net,
+        first: 1,
+        last: 1,
+    };
+    let mut names = crate::NameState::default();
+    for (full, tenant) in [
+        ("a.ali", Some("ali")),
+        ("b.ali", Some("ali")),
+        ("flat", None),
+        ("c.veli", Some("veli")),
+    ] {
+        names.names.insert(full.to_string(), record(tenant));
+    }
+    relay.labels().load_state(&names);
+
+    let before = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let snapshot = relay.usage_snapshot();
+    assert_eq!(snapshot.len(), 3, "the default tenant and the two named");
+    let ali = snapshot[&tenant("ali")];
+    assert_eq!(ali.attached_sessions, 2);
+    assert_eq!(ali.live_pairs, 3);
+    assert_eq!(ali.bytes_period, figures.volume_gib << 30);
+    assert_eq!(ali.names, 2);
+    let thirty_days = 30 * 86_400;
+    let end = u64::try_from(ali.period_end_unix).unwrap();
+    assert!(
+        (before + thirty_days - 5..=before + thirty_days + 5).contains(&end),
+        "the period ends in 30 days: {end} against {before}"
+    );
+    let veli = snapshot[&tenant("veli")];
+    assert_eq!((veli.attached_sessions, veli.live_pairs), (1, 0));
+    assert_eq!((veli.bytes_period, veli.period_end_unix), (0, 0));
+    assert_eq!(veli.names, 1);
+    let default = snapshot[&TenantId::Default];
+    assert_eq!((default.attached_sessions, default.live_pairs), (1, 1));
+    assert_eq!(default.names, 1);
+    assert_eq!((default.bytes_period, default.period_end_unix), (0, 0));
+}
+
+/// A suspended tenant's live counts are zero whatever the counters still hold; its period and
+/// names are kept.
+#[tokio::test]
+async fn a_suspended_tenants_live_counts_are_zero() {
+    let (relay, _listener, _cert, _x) = bind_test_relay().await;
+    let net = NetworkId::from([1; 32]);
+    let mut book = friend_book(&[("ali", &[net], &[])]);
+    let _held = relay.usage.admit_attached(&book, &[net], &[]).unwrap();
+    relay.forwarding.insert_test_pair_for(
+        &tenant("ali"),
+        &NodeId::from([5; 32]),
+        &NodeId::from([6; 32]),
+    );
+    let figures = *book.figures_of(&tenant("ali")).unwrap();
+    relay.forwarding.use_up_volume(&tenant("ali"), &figures);
+    relay.set_tenants(book.clone());
+    assert_eq!(relay.usage_snapshot()[&tenant("ali")].attached_sessions, 1);
+    book.suspend(&Slug::parse("ali").unwrap());
+    relay.set_tenants(book);
+    let ali = relay.usage_snapshot()[&tenant("ali")];
+    assert_eq!((ali.attached_sessions, ali.live_pairs), (0, 0));
+    assert_eq!(ali.bytes_period, figures.volume_gib << 30);
+}

@@ -12,6 +12,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use menzil_cli::home::{Home, parse_hex32};
+use menzil_cli::relay_cmd::status::{self, StatusDoc, StatusError};
 use menzil_cli::relay_cmd::tenants::{self, TenantError, TenantInfo, UpdateTenant};
 use menzil_cli::token::decode_roster;
 use menzil_proto::NetworkId;
@@ -310,6 +311,49 @@ pub fn figures() -> Vec<Figure> {
         .collect()
 }
 
+/// The status for a failed read of the relay's status export: fixed texts, no path.
+fn status_of_export(error: StatusError) -> Status {
+    match error {
+        StatusError::Missing | StatusError::Stale => Status::failed_precondition(
+            "the relay is not exporting its usage: it is down, not running here, or has stopped writing its status",
+        ),
+        StatusError::TooLarge | StatusError::Malformed => {
+            Status::failed_precondition("the relay's usage export cannot be used")
+        }
+        StatusError::Io => Status::internal("the relay's files could not be read or written"),
+    }
+}
+
+/// The usage of the tenant `slug` out of the relay's status document: the counters of its
+/// entry, all zero when the document does not list it (the relay has not picked the tenant up
+/// yet), and zero live counts (sessions, pairs) when the tenant is `suspended`.
+pub fn usage_of(doc: &StatusDoc, slug: &str, suspended: bool) -> Usage {
+    let entry = doc.entry(slug);
+    let live = |count: u32| if suspended { 0 } else { count };
+    Usage {
+        attached_sessions: live(entry.attached_sessions),
+        live_pairs: live(entry.live_pairs),
+        bytes_period: entry.bytes_period,
+        names: entry.names,
+        period_end_unix: entry.period_end_unix,
+        generated_unix: i64::try_from(doc.generated_unix).unwrap_or(i64::MAX),
+    }
+}
+
+/// `GetUsage` at time `now`: NOT_FOUND when the tenant has no file; then the status document must
+/// be there, within its size cap, valid and at most a minute old (FAILED_PRECONDITION otherwise).
+/// A tenant file the relay does not use still has a usage: zeros, or what the document lists.
+fn usage_for(home: &Home, slug: &str, now: u64) -> Result<Usage, Status> {
+    let slug = parse_slug(slug)?;
+    let suspended = match tenants::get_tenant(home, slug.as_str()) {
+        Ok(info) => info.suspended,
+        Err(TenantError::Precondition(_)) => false,
+        Err(other) => return Err(status_of(&other, home)),
+    };
+    let doc = status::read(home, now).map_err(status_of_export)?;
+    Ok(usage_of(&doc, slug.as_str(), suspended))
+}
+
 // ---------------------------------------------------------------------------------------------
 // The service
 // ---------------------------------------------------------------------------------------------
@@ -541,10 +585,13 @@ impl TenantAdmin for Admin {
         .await
     }
 
-    async fn get_usage(&self, _request: Request<TenantRef>) -> Result<Response<Usage>, Status> {
-        Err(Status::unimplemented(
-            "the relay keeps its counters in memory and does not export them yet",
-        ))
+    async fn get_usage(&self, request: Request<TenantRef>) -> Result<Response<Usage>, Status> {
+        let req = request.into_inner();
+        let slug_text = req.slug.clone();
+        self.run("GetUsage", &slug_text, false, move |home| {
+            usage_for(home, &req.slug, now()).map(Response::new)
+        })
+        .await
     }
 
     async fn get_figures(

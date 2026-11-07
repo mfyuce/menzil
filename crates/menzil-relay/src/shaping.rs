@@ -392,7 +392,29 @@ impl Shaper {
         grant(registry, due);
     }
 
-    /// The bytes charged in the current volume period (tests, and the operator's status).
+    /// The bytes charged in the current volume period and how long that period still runs, as of
+    /// `now`, changing nothing: a period that has ended since the last charge is shown as the
+    /// new one the next charge would start (zero bytes), as [`Inner::refill`] would roll it.
+    pub(crate) fn volume_status(&self, now: Instant) -> (u64, Duration) {
+        let inner = self.lock();
+        let period = inner.figures.period;
+        if period.is_zero() {
+            return (inner.period_bytes, Duration::ZERO);
+        }
+        let since = now.saturating_duration_since(inner.period_start);
+        let (bytes, start) = if since >= period {
+            let whole = since.as_secs() / period.as_secs().max(1);
+            (
+                0,
+                inner.period_start + period * u32::try_from(whole).unwrap_or(u32::MAX),
+            )
+        } else {
+            (inner.period_bytes, inner.period_start)
+        };
+        (bytes, (start + period).saturating_duration_since(now))
+    }
+
+    /// The bytes charged in the current volume period (tests).
     #[cfg(test)]
     pub(crate) fn volume_used(&self) -> u64 {
         self.lock().period_bytes
@@ -465,6 +487,22 @@ impl Shapers {
         shaper
     }
 
+    /// The volume used and the time left of `tenant`'s period ([`Shaper::volume_status`]), if it
+    /// has a bucket (it has moved data).
+    pub(crate) fn volume_status(
+        &self,
+        tenant: &crate::tenant::TenantId,
+        now: Instant,
+    ) -> Option<(u64, Duration)> {
+        let shaper = self
+            .by_tenant
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(tenant)
+            .cloned()?;
+        Some(shaper.volume_status(now))
+    }
+
     /// The bucket of `tenant`, if it has one (tests).
     #[cfg(test)]
     pub(crate) fn get(&self, tenant: &crate::tenant::TenantId) -> Option<Shaper> {
@@ -495,6 +533,33 @@ mod tests {
             volume_days: 30,
             ..Figures::friend()
         }
+    }
+
+    /// The status export reads the volume of the period and when it ends without touching the
+    /// bucket, and shows a period that has ended since the last charge as the next one.
+    #[tokio::test(start_paused = true)]
+    async fn the_volume_status_reports_the_period_and_rolls_it_without_a_charge() {
+        let day = Duration::from_secs(86_400);
+        let start = Instant::now();
+        let shaper = Shaper::new(&slow(), start);
+        assert_eq!(shaper.volume_status(start), (0, 30 * day));
+        shaper.charge(&slow(), 1_000, None, start);
+        tokio::time::advance(10 * day).await;
+        assert_eq!(shaper.volume_status(Instant::now()), (1_000, 20 * day));
+        // Read only: asking again changes nothing.
+        assert_eq!(shaper.volume_status(Instant::now()), (1_000, 20 * day));
+        assert_eq!(shaper.volume_used(), 1_000);
+        // After the period (35 days in): nothing used, the next period has 25 days to run.
+        tokio::time::advance(25 * day).await;
+        assert_eq!(shaper.volume_status(Instant::now()), (0, 25 * day));
+        assert_eq!(
+            shaper.volume_used(),
+            1_000,
+            "the status does not roll the real counter"
+        );
+        // 65 days in: two periods are gone, the third ends at day 90.
+        tokio::time::advance(30 * day).await;
+        assert_eq!(shaper.volume_status(Instant::now()), (0, 25 * day));
     }
 
     #[tokio::test(start_paused = true)]

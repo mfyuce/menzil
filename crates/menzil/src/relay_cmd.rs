@@ -32,6 +32,7 @@ use crate::persist::Worker;
 use crate::token::{roster_from_bytes, roster_to_bytes};
 
 pub mod names_state;
+pub mod status;
 pub mod tenants;
 
 /// The WebSocket path nodes ask for unless the operator picks another (protocol.md 3.1).
@@ -438,6 +439,8 @@ pub struct RunningRelay {
     relay: Relay,
     task: JoinHandle<()>,
     reload: JoinHandle<()>,
+    /// Writes `relay/status.json` every few seconds ([`status`]).
+    status: JoinHandle<()>,
     keeper: Arc<Worker<(NetworkId, Roster, Option<Roster>)>>,
     /// Writes `relay/names.state` after every change of the name state (MT9).
     names_keeper: Arc<Worker<NameState>>,
@@ -488,6 +491,7 @@ impl RunningRelay {
     pub fn stop(&self) {
         self.task.abort();
         self.reload.abort();
+        self.status.abort();
     }
 }
 
@@ -540,6 +544,16 @@ pub async fn start_with(
     home: &Home,
     options: &RunOptions,
     front: Option<&FrontDoorOptions>,
+) -> Result<RunningRelay> {
+    start_with_status_every(home, options, front, status::EXPORT_EVERY).await
+}
+
+/// [`start_with`] with the interval of the status export (`relay/status.json`) given.
+pub(crate) async fn start_with_status_every(
+    home: &Home,
+    options: &RunOptions,
+    front: Option<&FrontDoorOptions>,
+    status_every: std::time::Duration,
 ) -> Result<RunningRelay> {
     // The front door needs the relay's own host name to tell its nodes from the public, before
     // anything is bound or read.
@@ -757,6 +771,7 @@ pub async fn start_with(
             }
         })
     };
+    let status = status::spawn_exporter(relay.clone(), home.clone(), status_every);
     Ok(RunningRelay {
         addr,
         connection_info: info,
@@ -765,6 +780,7 @@ pub async fn start_with(
         relay,
         task,
         reload,
+        status,
         keeper,
         names_keeper,
     })

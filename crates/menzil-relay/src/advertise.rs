@@ -317,6 +317,16 @@ impl LabelRegistry {
         self.lock().on_change = Some(Arc::new(on_change));
     }
 
+    /// How many names each tenant holds now (the key is the slug, `None` the default tenant), the
+    /// count the `names` figure is held to, without copying the name state.
+    pub fn name_counts(&self) -> HashMap<Option<String>, usize> {
+        let mut counts: HashMap<Option<String>, usize> = HashMap::new();
+        for record in self.lock().state.names.values() {
+            *counts.entry(record.tenant.clone()).or_default() += 1;
+        }
+        counts
+    }
+
     /// A copy of the durable name state now.
     pub fn state(&self) -> NameState {
         self.lock().state.clone()

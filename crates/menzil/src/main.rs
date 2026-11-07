@@ -297,6 +297,14 @@ enum RelayCommand {
     },
     /// List the tenants of this relay, their networks and what the relay makes of their files.
     Tenants,
+    /// Show what the running relay counts per tenant (devices attached, live pairs, bytes in the
+    /// volume period, names), from the status file it writes every 10 seconds. Fails when the
+    /// relay is not running here or its file is more than 60 seconds old.
+    Status {
+        /// Print the status document as JSON (version 1; the default tenant is `_default`).
+        #[arg(long)]
+        json: bool,
+    },
     /// Run the relay until interrupted and print the connection information for nodes.
     Run {
         /// Where to listen.
@@ -851,6 +859,17 @@ async fn run(cli: Cli) -> Result<()> {
         Command::Relay {
             command: RelayCommand::Tenants,
         } => print!("{}", relay_cmd::tenants::render_tenants(&home()?, now())?),
+        Command::Relay {
+            command: RelayCommand::Status { json },
+        } => {
+            let at = now();
+            let doc = relay_cmd::status::read(&home()?, at)?;
+            if json {
+                print!("{}", doc.render());
+            } else {
+                print!("{}", doc.render_human(at));
+            }
+        }
         Command::Relay {
             command:
                 RelayCommand::Run {

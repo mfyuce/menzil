@@ -1,4 +1,5 @@
-// Sahip: menzil repo'su (proto/menzil_admin.proto). Sürüm 3.1; menzil-ui sürümlü kopya kullanır.
+// Sahip: menzil repo'su (proto/menzil_admin.proto). Sürüm 3.2; menzil-ui sürümlü kopya kullanır.
+// v3.2 (2026-11-07): GetUsage gerçek (status.json), Usage.generated_unix=6 eklendi.
 // TASLAK v3.1 (2026-11-07): v3 kabul edildi (tunnel_yanit_v3.md); D1: kota anahtarları sabit değil, GetFigures eklendi. v2'ye tunnel yanıtı (contract/tunnel_yanit_v2.md, koşullu kabul K1-K3) işlendi.
 // Sınır: menzil rölesi hesap bilmez; kiracı = slug + ağlar (relay/tenants/<slug>.toml). Ajan (tunnel
 // sahibi, mTLS, röle ile aynı makinede) yalnız bu dosyaları yazar; RPC yanıtı "dosya yazıldı"dır,
@@ -26,7 +27,10 @@ service TenantAdmin {
   rpc RemoveTenant(TenantRef) returns (RemoveTenantResponse);
   rpc GetTenant(TenantRef) returns (Tenant);
   rpc ListTenants(ListTenantsRequest) returns (ListTenantsResponse);
-  // Rölede sayaçlar bellekte ve dışa aktarma yok: UNIMPLEMENTED (sonra `menzil relay status` JSON).
+  // Röle sayaçlarını her 10 sn'de `<röle dizini>/status.json` dosyasına yazar (`menzil relay status --json`
+  // aynı belgeyi basar); ajan bu dosyadan yanıtlar. Kiracı dosyası yoksa NOT_FOUND; röle çalışmıyor ya da
+  // dosya 60 sn'den eskiyse FAILED_PRECONDITION (sabit metin). Dosyada olmayan (röle henüz görmemiş) kiracı
+  // ve askıdaki kiracının canlı sayaçları (attached_sessions, live_pairs) sıfırdır.
   rpc GetUsage(TenantRef) returns (Usage);
   // Kota anahtarları (menzil `Figures::KEYS`, bugün 18, kodla değişir): form bundan üretilir, istemci sabit tutmaz.
   // Eski ajanda UNIMPLEMENTED olabilir. Bilinmeyen anahtar UpdateTenant'ta INVALID_ARGUMENT.
@@ -73,7 +77,8 @@ message Usage {
   uint32 live_pairs = 2;
   uint64 bytes_period = 3;
   uint32 names = 4;
-  int64 period_end_unix = 5;
+  int64 period_end_unix = 5;       // 0: kiracı henüz veri taşımadı (dönemi ilk baytla başlar)
+  int64 generated_unix = 6;        // v3.2 (isteğe bağlı alan): rölenin bu sayaçları yazdığı an
 }
 message GetFiguresRequest {}
 // class_default_personal 0: the personal class has no per-tenant figure (only the relay's global limits);

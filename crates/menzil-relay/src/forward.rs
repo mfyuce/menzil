@@ -1331,6 +1331,18 @@ impl ForwardTable {
         );
     }
 
+    /// [`Self::insert_test_pair`] counted for `tenant` (tests of the status export).
+    #[cfg(test)]
+    pub(crate) fn insert_test_pair_for(&self, tenant: &TenantId, src: &NodeId, dst: &NodeId) {
+        let generation = self.next_generation.fetch_add(1, Ordering::Relaxed);
+        let mut table = self.table();
+        table.count(tenant, src);
+        table.pairs.insert(
+            (*src, *dst),
+            PairState::new(1024, Instant::now(), generation, tenant.clone(), 0),
+        );
+    }
+
     /// `src`->`dst`'s credit and queue figures for tests of the virtual pair:
     /// (remaining credit, queued bytes, counted).
     #[cfg(test)]
@@ -1381,6 +1393,25 @@ impl ForwardTable {
             .pairs
             .get(&(*src, *dst))
             .map(|pair| Arc::clone(&pair.shared))
+    }
+
+    /// Live forwarding pairs per tenant (the operator's status export).
+    pub(crate) fn pair_counts(&self) -> HashMap<TenantId, usize> {
+        self.table()
+            .per_tenant
+            .iter()
+            .map(|(tenant, held)| (tenant.clone(), held.pairs))
+            .collect()
+    }
+
+    /// The bytes charged in `tenant`'s volume period and the time that period still runs, if the
+    /// tenant has moved data (the operator's status export).
+    pub(crate) fn volume_status(
+        &self,
+        tenant: &TenantId,
+        now: tokio::time::Instant,
+    ) -> Option<(u64, std::time::Duration)> {
+        self.shapers.volume_status(tenant, now)
     }
 
     /// The counts of `tenant`: live pairs and queued droppable bytes (tests).
