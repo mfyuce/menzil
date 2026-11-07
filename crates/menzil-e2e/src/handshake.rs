@@ -74,22 +74,19 @@
 //! NodeCert could otherwise make two honest peers "negotiate" a key with
 //! no real secrecy, with nothing downstream able to tell.
 //!
-//! **A known, deliberately unfixed gap** (also a red-team finding,
-//! rated low severity): [`E2eInitiatorHandshake::finish`] consumes
-//! `self` even when `resp` fails to decrypt or doesn't match. Since
-//! `snow` itself restores a `HandshakeState`'s symmetric state on a
-//! failed read, a non-consuming API (returning `self` back alongside
-//! the error) is possible in principle and would let a caller retry
-//! against a later, genuine `resp` after an earlier forged or
-//! misrouted one — relevant if a relay (which could simply drop
-//! traffic instead, no better off either way) or a confused co-member
-//! delivers garbage before the real response arrives. Not implemented:
-//! the fix needs `hs: Option<snow::HandshakeState>` plus `.take()` so a
-//! field can be conditionally moved out of `&mut self`, which is more
-//! structure than this already-minimal crate's stated scope calls for
-//! on its own; tracked in TODO.md as a specific follow-up for whichever
-//! of L4e/L4h ends up owning handshake retry behavior, not silently
-//! left as a surprise.
+//! **A failed `resp` does not end the initiator's handshake.**
+//! [`E2eInitiatorHandshake::finish`] takes `&mut self` and moves the
+//! `snow` state out (`Option::take`) only once `resp` has decrypted.
+//! `snow` restores the symmetric state on a failed read (and the one
+//! field it does not restore, the remote ephemeral key, is overwritten
+//! by the first token of the next message 2), so a forged, corrupted or
+//! misrouted `resp` leaves the handshake exactly as `start` made it and
+//! a later genuine `resp` still completes it. Nothing a forged `resp`
+//! carries is kept. Whether a caller retries is its own policy (the L4
+//! router still ends an initiation on a failed `finish`). After a
+//! `resp` has authenticated the handshake is spent: a later `finish`,
+//! including one after a payload decode failure, returns
+//! `E2eError::HandshakeSpent`.
 
 use menzil_proto::{E2eFrame, E2eHandshakePayload, NetworkId, NodeCert, NodeId, X25519PublicKey};
 
@@ -158,7 +155,9 @@ fn is_all_zero(key: &X25519PublicKey) -> bool {
 /// An initiator-side handshake after sending `init`, awaiting `resp`.
 #[derive(Debug)]
 pub struct E2eInitiatorHandshake {
-    hs: snow::HandshakeState,
+    /// `None` once a `resp` has authenticated (the state moved into the
+    /// transport); a failed read leaves it in place.
+    hs: Option<snow::HandshakeState>,
     /// The index this side chose and sent in `init`; `resp` must echo it.
     own_index: u32,
 }
@@ -198,7 +197,7 @@ impl E2eInitiatorHandshake {
         };
         Ok((
             Self {
-                hs,
+                hs: Some(hs),
                 own_index: sender_index,
             },
             frame,
@@ -215,13 +214,17 @@ impl E2eInitiatorHandshake {
     /// Fails with `E2eError::UnexpectedFrame` if `resp` is not an
     /// [`E2eFrame::Resp`], or `E2eError::EchoedIndexMismatch` if its
     /// `receiver_index` is not the `sender_index` this handshake actually
-    /// sent in `init`.
+    /// sent in `init`, or `E2eError::Noise` if `resp` does not decrypt.
+    /// In all three cases the handshake is unchanged and a later genuine
+    /// `resp` can still complete it. Once a `resp` has authenticated the
+    /// handshake is spent: a payload that then fails to decode, or any
+    /// later call, gives `E2eError::HandshakeSpent`.
     ///
     /// `max_record` (WELCOME's `limits.max_record`) becomes the new
     /// [`E2eTransport`]'s plaintext budget ceiling — see its own
     /// `encrypt_data` docs for why this crate enforces one at all.
     pub fn finish(
-        mut self,
+        &mut self,
         resp: &E2eFrame,
         max_record: u32,
     ) -> Result<(E2eTransport, E2eHandshakePayload, X25519PublicKey), E2eError> {
@@ -239,13 +242,22 @@ impl E2eInitiatorHandshake {
                 actual: echoed_index,
             });
         }
-        let payload_bytes = read(&mut self.hs, noise_msg2)?;
+        // The guard against a second `finish` after success.
+        let Some(hs) = self.hs.as_mut() else {
+            return Err(E2eError::HandshakeSpent);
+        };
+        let payload_bytes = read(hs, noise_msg2)?;
+        // The read authenticated: the state has advanced and cannot be
+        // reused, so it leaves `self` here and only here.
+        let Some(hs) = self.hs.take() else {
+            return Err(E2eError::HandshakeSpent);
+        };
         let payload = E2eHandshakePayload::decode(&payload_bytes)?;
-        let responder_static = remote_static(&self.hs).expect(
+        let responder_static = remote_static(&hs).expect(
             "IK's initiator already knows the responder's static key from the start; by \
              message 2 it is necessarily still known",
         );
-        let transport = E2eTransport::from_finished(self.hs, responder_index, max_record)?;
+        let transport = E2eTransport::from_finished(hs, responder_index, max_record)?;
         Ok((transport, payload, responder_static))
     }
 }
@@ -449,7 +461,7 @@ mod tests {
 
     #[test]
     fn initiator_finish_rejects_a_non_resp_frame() {
-        let (initiator_hs, _init_frame) = E2eInitiatorHandshake::start(
+        let (mut initiator_hs, _init_frame) = E2eInitiatorHandshake::start(
             &fresh_private_key(),
             &fresh_public_key(),
             NetworkId::from([1u8; 32]),
@@ -496,7 +508,7 @@ mod tests {
         // sender chose and `receiver_index` the one its receiver chose; each
         // side then stamps the other's index on its `data` frames.
         let (responder_priv, responder_pub) = fresh_keypair();
-        let (initiator_hs, init_frame) = E2eInitiatorHandshake::start(
+        let (mut initiator_hs, init_frame) = E2eInitiatorHandshake::start(
             &fresh_private_key(),
             &responder_pub,
             NetworkId::from([1u8; 32]),
@@ -549,7 +561,7 @@ mod tests {
     #[test]
     fn initiator_finish_rejects_a_resp_that_echoes_another_index() {
         let (responder_priv, responder_pub) = fresh_keypair();
-        let (initiator_hs, init_frame) = E2eInitiatorHandshake::start(
+        let (mut initiator_hs, init_frame) = E2eInitiatorHandshake::start(
             &fresh_private_key(),
             &responder_pub,
             NetworkId::from([1u8; 32]),
@@ -587,6 +599,212 @@ mod tests {
                 expected: 42,
                 actual: 43
             }
+        ));
+    }
+
+    const NET: [u8; 32] = [1u8; 32];
+    const A_ID: [u8; 32] = [2u8; 32];
+    const B_ID: [u8; 32] = [3u8; 32];
+
+    /// One initiator session (own index 42) against the responder
+    /// `responder_priv`, and the genuine `resp` its responder answers with
+    /// plus that responder's transport.
+    fn session(
+        responder_priv: &[u8; 32],
+        responder_pub: &X25519Pub,
+    ) -> (E2eInitiatorHandshake, E2eTransport, E2eFrame) {
+        let (initiator_hs, init_frame) = E2eInitiatorHandshake::start(
+            &fresh_private_key(),
+            responder_pub,
+            NetworkId::from(NET),
+            NodeId::from(A_ID),
+            NodeId::from(B_ID),
+            42,
+        )
+        .unwrap();
+        let responder_hs = E2eResponderHandshake::start(
+            responder_priv,
+            NodeId::from(A_ID),
+            NodeId::from(B_ID),
+            &init_frame,
+        )
+        .unwrap();
+        let (responder_transport, resp) = responder_hs
+            .finish(sample_cert(), 7, 8, vec![0x01], 99, 65_535)
+            .unwrap();
+        (initiator_hs, responder_transport, resp)
+    }
+
+    fn data_parts(frame: E2eFrame) -> (u64, Vec<u8>) {
+        match frame {
+            E2eFrame::Data {
+                counter,
+                ciphertext,
+                ..
+            } => (counter, ciphertext),
+            other => panic!("not data: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_failed_resp_leaves_the_handshake_usable_for_the_genuine_one() {
+        let (responder_priv, responder_pub) = fresh_keypair();
+        let (mut initiator_hs, mut responder_transport, genuine) =
+            session(&responder_priv, &responder_pub);
+
+        // A misrouted `resp`: a well formed answer from the same responder
+        // to a different initiator session that also chose index 42.
+        let (_other_hs, _other_transport, misrouted) = session(&responder_priv, &responder_pub);
+        let (sender_index, noise_msg2) = match &genuine {
+            E2eFrame::Resp {
+                sender_index,
+                noise_msg2,
+                ..
+            } => (*sender_index, noise_msg2.clone()),
+            other => panic!("not a resp: {other:?}"),
+        };
+        let resp_with = |noise_msg2: Vec<u8>, receiver_index: u32| E2eFrame::Resp {
+            sender_index,
+            receiver_index,
+            noise_msg2,
+        };
+        let mut bit_flipped = noise_msg2.clone();
+        *bit_flipped.last_mut().unwrap() ^= 0x01;
+        let mut ephemeral_flipped = noise_msg2.clone();
+        ephemeral_flipped[0] ^= 0x01;
+        let forged = [
+            misrouted,
+            resp_with(bit_flipped, 42),
+            resp_with(ephemeral_flipped, 42),
+            resp_with(noise_msg2[..3].to_vec(), 42),
+            resp_with(vec![], 42),
+            resp_with(noise_msg2.clone(), 43),
+            E2eFrame::Init {
+                sender_index: 42,
+                network_id: NetworkId::from(NET),
+                noise_msg1: vec![],
+            },
+        ];
+        for (i, frame) in forged.iter().enumerate() {
+            // The `Err` is the whole result: no transport, no payload, no key.
+            let result = initiator_hs.finish(frame, 65_535);
+            assert!(result.is_err(), "forged resp {i} must not complete");
+            assert!(
+                !matches!(result, Err(E2eError::HandshakeSpent)),
+                "forged resp {i} must not spend the handshake"
+            );
+        }
+
+        // The genuine `resp` still completes it, with the right keys.
+        let (mut initiator_transport, payload, responder_static) =
+            initiator_hs.finish(&genuine, 65_535).unwrap();
+        assert_eq!(responder_static, responder_pub);
+        assert_eq!(payload.roster_seq, 7);
+        assert_eq!(payload.policy_seq, 8);
+        // Both directions decrypt under the transport keys, from counter 0
+        // on (no nonce was advanced by the failed attempts).
+        for round in 0..2u64 {
+            let (counter, ciphertext) = data_parts(
+                initiator_transport
+                    .encrypt_data(&menzil_proto::E2eDataBody::Keep)
+                    .unwrap(),
+            );
+            assert_eq!(counter, round);
+            responder_transport
+                .decrypt_data(counter, &ciphertext)
+                .unwrap();
+            let (counter, ciphertext) = data_parts(
+                responder_transport
+                    .encrypt_data(&menzil_proto::E2eDataBody::Keep)
+                    .unwrap(),
+            );
+            assert_eq!(counter, round);
+            initiator_transport
+                .decrypt_data(counter, &ciphertext)
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn a_resp_under_a_wrong_key_gives_no_transport_and_the_right_one_then_does() {
+        // The forger is a responder with another static key that nonetheless
+        // read a (differently keyed) init of its own and answers well formed.
+        let (responder_priv, responder_pub) = fresh_keypair();
+        let (forger_priv, forger_pub) = fresh_keypair();
+        let (mut initiator_hs, mut responder_transport, genuine) =
+            session(&responder_priv, &responder_pub);
+        let (_forger_hs, mut forger_transport, forged) = session(&forger_priv, &forger_pub);
+        assert!(initiator_hs.finish(&forged, 65_535).is_err());
+
+        let (mut initiator_transport, _payload, responder_static) =
+            initiator_hs.finish(&genuine, 65_535).unwrap();
+        assert_eq!(responder_static, responder_pub);
+        let (counter, ciphertext) = data_parts(
+            initiator_transport
+                .encrypt_data(&menzil_proto::E2eDataBody::Keep)
+                .unwrap(),
+        );
+        // Only the genuine responder's keys decrypt it.
+        assert!(forger_transport.decrypt_data(counter, &ciphertext).is_err());
+        responder_transport
+            .decrypt_data(counter, &ciphertext)
+            .unwrap();
+    }
+
+    #[test]
+    fn a_second_finish_after_success_is_an_error_not_a_panic() {
+        let (responder_priv, responder_pub) = fresh_keypair();
+        let (mut initiator_hs, _responder_transport, genuine) =
+            session(&responder_priv, &responder_pub);
+        initiator_hs.finish(&genuine, 65_535).unwrap();
+        for _ in 0..2 {
+            assert!(matches!(
+                initiator_hs.finish(&genuine, 65_535),
+                Err(E2eError::HandshakeSpent)
+            ));
+        }
+    }
+
+    #[test]
+    fn an_authenticated_resp_with_an_undecodable_payload_spends_the_handshake() {
+        // The responder's own key signs the transcript, so this `resp`
+        // authenticates, but its payload is not a handshake payload. The
+        // Noise state has advanced, so it is not retried.
+        let (responder_priv, responder_pub) = fresh_keypair();
+        let (mut initiator_hs, init_frame) = E2eInitiatorHandshake::start(
+            &fresh_private_key(),
+            &responder_pub,
+            NetworkId::from(NET),
+            NodeId::from(A_ID),
+            NodeId::from(B_ID),
+            42,
+        )
+        .unwrap();
+        let prologue_bytes = prologue(NetworkId::from(NET), NodeId::from(A_ID), NodeId::from(B_ID));
+        let mut responder = snow::Builder::new(ik_params())
+            .local_private_key(&responder_priv)
+            .unwrap()
+            .prologue(&prologue_bytes)
+            .unwrap()
+            .build_responder()
+            .unwrap();
+        let E2eFrame::Init { noise_msg1, .. } = init_frame else {
+            panic!("not an init");
+        };
+        read(&mut responder, &noise_msg1).unwrap();
+        let noise_msg2 = write(&mut responder, &[0xff, 0xff, 0xff]).unwrap();
+        let resp = E2eFrame::Resp {
+            sender_index: 99,
+            receiver_index: 42,
+            noise_msg2,
+        };
+        assert!(matches!(
+            initiator_hs.finish(&resp, 65_535),
+            Err(E2eError::Proto(_))
+        ));
+        assert!(matches!(
+            initiator_hs.finish(&resp, 65_535),
+            Err(E2eError::HandshakeSpent)
         ));
     }
 

@@ -1406,7 +1406,7 @@ mod tests {
         let a_node = NodeId::from([network_seed.wrapping_add(0x10); 32]);
         let b_node = NodeId::from([network_seed.wrapping_add(0x20); 32]);
 
-        let (a_hs, init) =
+        let (mut a_hs, init) =
             E2eInitiatorHandshake::start(&a_priv, &b_pub, network_id, a_node, b_node, 1).unwrap();
         let b_hs = E2eResponderHandshake::start(&b_priv, a_node, b_node, &init).unwrap();
         let (b_transport, resp) = b_hs

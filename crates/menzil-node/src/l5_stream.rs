@@ -775,7 +775,7 @@ mod tests {
         let a_node = NodeId::from([0x11; 32]);
         let b_node = NodeId::from([0x21; 32]);
 
-        let (a_hs, init) =
+        let (mut a_hs, init) =
             E2eInitiatorHandshake::start(&a_priv, &b_pub, network_id, a_node, b_node, 1).unwrap();
         let b_hs = E2eResponderHandshake::start(&b_priv, a_node, b_node, &init).unwrap();
         let (b_transport, resp) = b_hs
@@ -1357,7 +1357,7 @@ mod tests {
         let network_id = NetworkId::from([3u8; 32]);
         let a_node = NodeId::from([0x13; 32]);
         let b_node = NodeId::from([0x23; 32]);
-        let (a_hs, init) =
+        let (mut a_hs, init) =
             E2eInitiatorHandshake::start(&a_priv, &b_pub, network_id, a_node, b_node, 1).unwrap();
         let b_hs = E2eResponderHandshake::start(&b_priv, a_node, b_node, &init).unwrap();
         let (b_transport, resp) = b_hs

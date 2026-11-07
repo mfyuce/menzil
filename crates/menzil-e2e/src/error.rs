@@ -14,6 +14,11 @@ pub enum E2eError {
     /// or [`menzil_proto::E2eDataBody`] failed to encode or decode.
     #[error("proto error: {0}")]
     Proto(#[from] menzil_proto::ProtoError),
+    /// [`crate::handshake::E2eInitiatorHandshake::finish`] was called on a
+    /// handshake that an authenticated `resp` already completed (or
+    /// consumed): its Noise state is gone and cannot be reused.
+    #[error("the initiator handshake already consumed an authenticated resp")]
+    HandshakeSpent,
     /// A caller passed an [`menzil_proto::E2eFrame`] variant other than
     /// the one a given step expects (e.g. a `Resp` where an `Init` was
     /// required).

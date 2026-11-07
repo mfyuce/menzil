@@ -915,7 +915,7 @@ impl Session {
     ) -> Result<E2eTransport, PrincipalError> {
         let relay = &self.shared.relay;
         let (node, network) = self.key;
-        let (handshake, init) = E2eInitiatorHandshake::start(
+        let (mut handshake, init) = E2eInitiatorHandshake::start(
             &relay.identity.x25519_private,
             &self.node_static,
             network,

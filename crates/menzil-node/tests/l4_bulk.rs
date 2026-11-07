@@ -332,7 +332,7 @@ async fn live_pair(relay: &TestRelay) -> Pair {
     wait_until_routable(&a, &mut b).await;
 
     let max_record = a_limits.max_record.min(b_limits.max_record);
-    let (a_hs, init) = E2eInitiatorHandshake::start(
+    let (mut a_hs, init) = E2eInitiatorHandshake::start(
         &a.id.x25519_private,
         &b.id.x25519_public,
         network_id,

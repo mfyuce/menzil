@@ -594,7 +594,7 @@ impl Manual {
 
     /// Completes `hs` with `resp` and returns the transport and the
     /// responder's index (the `receiver_index` of every frame sent to it).
-    fn finish(hs: E2eInitiatorHandshake, resp: &E2eFrame) -> (E2eTransport, u32) {
+    fn finish(mut hs: E2eInitiatorHandshake, resp: &E2eFrame) -> (E2eTransport, u32) {
         let E2eFrame::Resp { sender_index, .. } = resp else {
             panic!("not a resp: {resp:?}");
         };
@@ -2327,7 +2327,7 @@ impl World {
 
 /// [`Manual::finish`], keeping the responder's handshake payload too.
 fn finish_with_payload(
-    hs: E2eInitiatorHandshake,
+    mut hs: E2eInitiatorHandshake,
     resp: &E2eFrame,
 ) -> (E2eTransport, u32, menzil_proto::E2eHandshakePayload) {
     let E2eFrame::Resp { sender_index, .. } = resp else {

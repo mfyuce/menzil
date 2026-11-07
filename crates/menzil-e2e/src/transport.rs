@@ -341,7 +341,7 @@ pub(crate) mod tests {
         let initiator_node_id = NodeId::from([2u8; 32]);
         let responder_node_id = NodeId::from([3u8; 32]);
 
-        let (initiator_hs, init_frame) = E2eInitiatorHandshake::start(
+        let (mut initiator_hs, init_frame) = E2eInitiatorHandshake::start(
             &initiator_priv,
             &responder_pub,
             network_id,

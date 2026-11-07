@@ -1630,7 +1630,7 @@ impl Engine {
             index,
             peer,
             network,
-            state,
+            mut state,
         } = self
             .table
             .take_pending_for_resp(*receiver_index, &src, now.instant)
