@@ -390,6 +390,7 @@ fn ack(accepted: &[&str]) -> AdvertiseAckBody {
         accepted: accepted.iter().map(|s| s.to_string()).collect(),
         rejected: Vec::new(),
         names: Vec::new(),
+        share_domain: None,
     }
 }
 

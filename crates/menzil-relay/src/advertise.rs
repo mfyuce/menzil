@@ -369,6 +369,7 @@ impl LabelRegistry {
                     ),
                 }],
                 names: vec![],
+                share_domain: None,
             };
         }
 
@@ -507,10 +508,12 @@ impl LabelRegistry {
             },
         );
 
+        // The share domain is the session's to add (it knows the front door).
         AdvertiseAckBody {
             accepted,
             rejected,
             names,
+            share_domain: None,
         }
     }
 

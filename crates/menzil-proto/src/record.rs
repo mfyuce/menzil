@@ -163,8 +163,8 @@ pub struct RejectedShare {
     pub reason: String,
 }
 
-/// `ADVERTISE_ACK = CBOR{ accepted: [str], rejected: [{name, reason}], names?: [str] }`
-/// (protocol.md 4.2, 4.4).
+/// `ADVERTISE_ACK = CBOR{ accepted: [str], rejected: [{name, reason}], names?: [str],
+/// share_domain?: str }` (protocol.md 4.2, 4.4).
 ///
 /// `names` is optional (multi tenant design 2.2, rule 6): the full names the relay accepted, one
 /// per share and tenant zone, relative to the relay's share domain `H` (`app` for the default
@@ -172,6 +172,12 @@ pub struct RejectedShare {
 /// two tenants' networks sees both. The ACK is an unsigned control message and an older node
 /// decodes it without the key (unknown map keys are ignored); a relay that does not send it
 /// (older, or nothing accepted) decodes as an empty list.
+///
+/// `share_domain` is optional too (TBD 53): the relay's share domain `H`, lowercase, so that a
+/// node learns from one source the name it would order a certificate for. It is INFORMATIONAL
+/// ONLY: a receiver never refuses anything because of it. It uses the same compatibility scheme
+/// as `names` (an older node ignores the unknown key, an older relay decodes as `None`, and a
+/// relay without a share domain omits the key).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AdvertiseAckBody {
     /// Names accepted as advertised.
@@ -182,6 +188,10 @@ pub struct AdvertiseAckBody {
     /// empty.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub names: Vec<String>,
+    /// The relay's share domain `H` (informational only, see above); absent when the relay has
+    /// none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub share_domain: Option<String>,
 }
 
 /// `doc_type` for a [`DocBody`]. protocol.md leaves the numeric mapping
@@ -755,6 +765,7 @@ mod tests {
                     reason: "label_taken".to_string(),
                 }],
                 names: vec!["example.ali".to_string()],
+                share_domain: Some("share.example.org".to_string()),
             }),
             Record::Doc(DocBody {
                 doc_type: DocType::Roster,
@@ -847,6 +858,7 @@ mod tests {
             accepted: vec!["app".to_string()],
             rejected: vec![],
             names: vec!["app.ali".to_string(), "app.bob".to_string()],
+            share_domain: None,
         };
         let wire = Record::AdvertiseAck(new.clone()).encode();
         assert!(
@@ -878,6 +890,7 @@ mod tests {
             accepted: vec![],
             rejected: vec![],
             names: vec![],
+            share_domain: None,
         })
         .encode();
         let mut old = vec![RecordType::AdvertiseAck as u8];
@@ -886,6 +899,57 @@ mod tests {
             rejected: vec![],
         }));
         assert_eq!(new, old);
+    }
+
+    /// TBD 53: `share_domain` round trips, is on the wire only when set, an older node ignores
+    /// it, and an old style map without the key decodes as `None`.
+    #[test]
+    fn the_share_domain_of_an_advertise_ack_round_trips_and_is_optional() {
+        let some = AdvertiseAckBody {
+            accepted: vec!["app".to_string()],
+            rejected: vec![],
+            names: vec!["app".to_string()],
+            share_domain: Some("share.example.org".to_string()),
+        };
+        let wire = Record::AdvertiseAck(some.clone()).encode();
+        assert!(
+            wire.windows(12).any(|w| w == b"share_domain"),
+            "the key is on the wire"
+        );
+        match Record::decode(&wire).unwrap() {
+            Record::AdvertiseAck(back) => assert_eq!(back, some),
+            other => panic!("not an ADVERTISE_ACK: {other:?}"),
+        }
+        let old: OldAdvertiseAck = decode_cbor_body(&wire[1..]).unwrap();
+        assert_eq!(old.accepted, some.accepted);
+
+        let none = AdvertiseAckBody {
+            share_domain: None,
+            ..some.clone()
+        };
+        let wire_none = Record::AdvertiseAck(none.clone()).encode();
+        assert!(
+            !wire_none.windows(12).any(|w| w == b"share_domain"),
+            "no key when None"
+        );
+        // Byte identical to the form without the field at all.
+        #[derive(Serialize)]
+        struct WithoutDomain {
+            accepted: Vec<String>,
+            rejected: Vec<RejectedShare>,
+            names: Vec<String>,
+        }
+        let mut before = vec![RecordType::AdvertiseAck as u8];
+        before.extend(encode_cbor_body_bytes(&WithoutDomain {
+            accepted: none.accepted.clone(),
+            rejected: vec![],
+            names: none.names.clone(),
+        }));
+        assert_eq!(wire_none, before);
+        match Record::decode(&before).unwrap() {
+            Record::AdvertiseAck(back) => assert_eq!(back.share_domain, None),
+            other => panic!("not an ADVERTISE_ACK: {other:?}"),
+        }
     }
 
     fn encode_cbor_body_bytes<T: Serialize>(body: &T) -> Vec<u8> {

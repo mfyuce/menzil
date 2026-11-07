@@ -988,6 +988,95 @@ async fn advertise_after_attach_is_accepted_and_acknowledged() {
 }
 
 #[tokio::test]
+async fn the_advertise_ack_carries_the_share_domain_of_a_relay_with_a_front_door() {
+    let (relay, listener, cert, relay_x25519) = bind_test_relay().await;
+    let relay = relay.with_front_door(
+        crate::front_door::FrontDoorConfig::new("localhost", "Share.Example.Test").unwrap(),
+    );
+    let addr = listener.local_addr().unwrap();
+
+    let owner = SigningKey::generate(&mut rand::rng());
+    let network_id = NetworkId::from(owner.verifying_key().to_bytes());
+    let identity = generate_identity();
+    relay
+        .rosters()
+        .set(&roster_with_label(
+            &owner,
+            network_id,
+            identity.node_id,
+            "example",
+        ))
+        .unwrap();
+    let serve_relay = relay.clone();
+    tokio::spawn(async move { serve_relay.serve(&listener).await });
+
+    let (mut client, _) = TestClient::connect(
+        addr,
+        cert,
+        &identity,
+        relay_x25519,
+        vec![network_id],
+        HashMap::new(),
+        1,
+        10,
+    )
+    .await;
+    client.send(Record::Attach).await;
+    let _ = client.recv_roster_doc().await;
+    client.send(advertise_one("example")).await;
+    match client.recv().await {
+        Some(Record::AdvertiseAck(ack)) => {
+            assert_eq!(ack.accepted, vec!["example"]);
+            assert_eq!(ack.share_domain.as_deref(), Some("share.example.test"));
+        }
+        other => panic!("expected an ADVERTISE_ACK, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn a_relay_without_a_share_domain_sends_none_in_the_advertise_ack() {
+    let (relay, listener, cert, relay_x25519) = bind_test_relay().await;
+    let addr = listener.local_addr().unwrap();
+
+    let owner = SigningKey::generate(&mut rand::rng());
+    let network_id = NetworkId::from(owner.verifying_key().to_bytes());
+    let identity = generate_identity();
+    relay
+        .rosters()
+        .set(&roster_with_label(
+            &owner,
+            network_id,
+            identity.node_id,
+            "example",
+        ))
+        .unwrap();
+    let serve_relay = relay.clone();
+    tokio::spawn(async move { serve_relay.serve(&listener).await });
+
+    let (mut client, _) = TestClient::connect(
+        addr,
+        cert,
+        &identity,
+        relay_x25519,
+        vec![network_id],
+        HashMap::new(),
+        1,
+        10,
+    )
+    .await;
+    client.send(Record::Attach).await;
+    let _ = client.recv_roster_doc().await;
+    client.send(advertise_one("example")).await;
+    match client.recv().await {
+        Some(Record::AdvertiseAck(ack)) => {
+            assert_eq!(ack.accepted, vec!["example"]);
+            assert_eq!(ack.share_domain, None);
+        }
+        other => panic!("expected an ADVERTISE_ACK, got {other:?}"),
+    }
+}
+
+#[tokio::test]
 async fn a_reconnecting_session_does_not_inherit_the_previous_sessions_claims() {
     let (relay, listener, cert, relay_x25519) = bind_test_relay().await;
     let addr = listener.local_addr().unwrap();

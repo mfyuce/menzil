@@ -855,6 +855,7 @@ fn each_share_shows_what_the_relay_answered_and_why() {
             "apple".into(),
             "other.zed".into(),
         ],
+        share_domain: None,
     };
     let configured = [app.clone(), web, db, ssh];
     let views = views_from(&configured, &snapshot, &services, true);

@@ -191,6 +191,36 @@ pub struct ShareSnapshot {
     /// The full names it accepted, relative to its share domain (`names` of the ACK; empty from a
     /// relay that does not send it).
     pub names: Vec<String>,
+    /// The relay's share domain `H` from its latest ACK of this attachment, if it sent a
+    /// plausible one (TBD 53). Informational only: nothing is refused because of it.
+    pub share_domain: Option<String>,
+}
+
+/// Whether `domain` is a plausible share domain as an ACK may carry it: lowercase letters, digits
+/// and hyphens in at least two dot separated labels of 1 to 63 bytes (not starting or ending
+/// with a hyphen), no trailing dot, 253 bytes at most. The same shape the CLI accepts for
+/// `share_domain` in config.toml. A node never trusts the field beyond this: it is unsigned
+/// control data from the relay.
+pub fn plausible_share_domain(domain: &str) -> bool {
+    if domain.is_empty() || domain.len() > 253 {
+        return false;
+    }
+    let mut labels = 0usize;
+    for label in domain.split('.') {
+        labels += 1;
+        let bytes = label.as_bytes();
+        if bytes.is_empty()
+            || bytes.len() > 63
+            || bytes[0] == b'-'
+            || bytes[bytes.len() - 1] == b'-'
+            || !bytes
+                .iter()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || *b == b'-')
+        {
+            return false;
+        }
+    }
+    labels >= 2
 }
 
 #[derive(Default)]
@@ -308,6 +338,14 @@ impl ShareBook {
         self.state().snapshot.names.clone()
     }
 
+    /// The relay's share domain `H` as its latest ADVERTISE_ACK of this attachment gave it, or
+    /// `None` (no ACK yet, the relay sent none or an implausible one, or the attachment ended).
+    /// INFORMATIONAL ONLY: it must not be used to refuse a stream or a name (for instance
+    /// `meta.sni` is not checked against it).
+    pub fn share_domain(&self) -> Option<String> {
+        self.state().snapshot.share_domain.clone()
+    }
+
     /// Whether the relay accepted a share that points at `service`, in this attachment. This is
     /// the question a later slice's authorizer asks before it lets the relay open that service.
     pub fn accepted_service(&self, service: &ServiceId) -> bool {
@@ -380,6 +418,11 @@ impl ShareBook {
             .collect();
         snapshot.rejected = ack.rejected.clone();
         snapshot.names = ack.names.clone();
+        snapshot.share_domain = ack
+            .share_domain
+            .as_ref()
+            .filter(|domain| plausible_share_domain(domain))
+            .cloned();
         drop(state);
         self.accepted_changed();
     }
@@ -619,6 +662,7 @@ mod tests {
 
     fn ack(accepted: &[&str], rejected: &[(&str, &str)], names: &[&str]) -> AdvertiseAckBody {
         AdvertiseAckBody {
+            share_domain: None,
             accepted: accepted.iter().map(|s| s.to_string()).collect(),
             rejected: rejected
                 .iter()
@@ -656,6 +700,67 @@ mod tests {
             !book.accepted_service(&a.service),
             "the claims ended with the session"
         );
+    }
+
+    #[test]
+    fn the_share_domain_of_the_latest_ack_is_kept_and_cleared_at_detach() {
+        let book = ShareBook::new();
+        assert_eq!(book.share_domain(), None);
+        book.note_sent(&[blind("a")]);
+        let mut first = ack(&["a"], &[], &["a"]);
+        first.share_domain = Some("share.example.org".to_string());
+        book.note_ack(&first);
+        assert_eq!(book.share_domain().as_deref(), Some("share.example.org"));
+        assert_eq!(
+            book.snapshot().share_domain.as_deref(),
+            Some("share.example.org")
+        );
+
+        // The latest ACK wins, also when it carries none (an older or reconfigured relay).
+        book.note_ack(&ack(&["a"], &[], &["a"]));
+        assert_eq!(book.share_domain(), None);
+        let mut again = ack(&["a"], &[], &["a"]);
+        again.share_domain = Some("other.example.org".to_string());
+        book.note_ack(&again);
+        assert_eq!(book.share_domain().as_deref(), Some("other.example.org"));
+
+        book.note_detached();
+        assert_eq!(book.share_domain(), None, "forgotten with the attachment");
+    }
+
+    #[test]
+    fn a_hostile_share_domain_in_an_ack_is_ignored() {
+        let long_label = format!("{}.example.org", "a".repeat(64));
+        let too_long = format!("{}.org", "a.".repeat(130));
+        for bad in [
+            "",
+            "localhost",
+            "Share.Example.Org",
+            "share.example.org.",
+            "-a.example.org",
+            "a-.example.org",
+            "a..example.org",
+            "sh are.example.org",
+            "share.example.org/path",
+            "share.example.org:443",
+            "https://share.example.org",
+            "sha\u{e9}re.example.org",
+            "a\nb.example.org",
+            long_label.as_str(),
+            too_long.as_str(),
+        ] {
+            let book = ShareBook::new();
+            book.note_sent(&[blind("a")]);
+            let mut hostile = ack(&["a"], &[], &["a"]);
+            hostile.share_domain = Some(bad.to_string());
+            book.note_ack(&hostile);
+            assert_eq!(book.share_domain(), None, "{bad:?} must be ignored");
+            // The rest of the ACK is still taken.
+            assert!(book.snapshot().acked);
+            assert_eq!(book.names(), vec!["a".to_string()]);
+        }
+        assert!(plausible_share_domain("a.b"));
+        assert!(plausible_share_domain("xn--80ak6aa92e.example.org"));
     }
 
     #[test]

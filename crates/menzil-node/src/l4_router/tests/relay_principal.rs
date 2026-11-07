@@ -48,6 +48,7 @@ fn book_accepting(shares: &[Share]) -> ShareBook {
         accepted: shares.iter().map(|s| s.name.clone()).collect(),
         rejected: vec![],
         names: vec![],
+        share_domain: None,
     });
     book
 }
@@ -686,6 +687,7 @@ async fn a_withdrawn_share_resets_its_stream_and_the_session_keeps_the_others() 
         accepted: vec!["other".to_string()],
         rejected: vec![],
         names: vec![],
+        share_domain: None,
     });
 
     let mut byte = [0u8; 1];
@@ -772,6 +774,7 @@ async fn losing_every_share_closes_the_session_with_grant_removed() {
         accepted: vec![],
         rejected: vec![],
         names: vec![],
+        share_domain: None,
     });
     match ended(&mut up.relay_ready.acceptor).await.as_ref() {
         EndReason::PeerClosed { code, .. } => assert_eq!(*code, ErrorCode::GrantRemoved),

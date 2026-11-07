@@ -545,7 +545,7 @@ async fn dispatch(
                 });
                 let _ = send_record(conn, transport, error).await;
             } else if relay.registry.is_current(node_id, session_id) {
-                let ack = relay.labels.advertise(
+                let mut ack = relay.labels.advertise(
                     &relay.rosters,
                     &relay.tenants(),
                     claimed_networks,
@@ -553,6 +553,12 @@ async fn dispatch(
                     &body,
                     unix_now(),
                 );
+                // TBD 53: the share domain H, informational for the node (it learns the name
+                // to order certificates for from one source). `FrontDoorConfig` holds it in
+                // the one normalized lowercase form the front door matches names against.
+                ack.share_domain = relay
+                    .front_door_config()
+                    .map(|front| front.share_domain().to_string());
                 let _ = send_record(conn, transport, Record::AdvertiseAck(ack)).await;
             } else {
                 tracing::debug!(
