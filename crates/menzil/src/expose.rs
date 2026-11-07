@@ -35,6 +35,7 @@
 use std::net::IpAddr;
 
 use anyhow::{Context, Result, anyhow, bail};
+use menzil_node::acme::{FailureKind, check_domain};
 use menzil_node::{LocalServices, ShareBook, ShareSnapshot, check_name, validate_shares};
 use menzil_proto::{ServiceId, ServiceKind, Share, ShareMode};
 
@@ -893,6 +894,80 @@ impl ShareState {
     }
 }
 
+/// How the certificate of one full name stands, as the agent reports it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CertViewState {
+    /// None is kept and no order is running or has failed.
+    None,
+    /// One is kept and ends at this Unix time.
+    Valid(u64),
+    /// An order is running.
+    Renewing,
+    /// The latest attempt failed, or nothing is ordered (a share domain that differs).
+    Failed(FailureKind),
+}
+
+/// The certificate of one full name of a share (`menzil node` with `[acme]`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CertView {
+    /// The full name, such as `app.relay.example.org`.
+    pub name: String,
+    /// How it stands.
+    pub state: CertViewState,
+}
+
+impl CertView {
+    /// `name=state` for the wire: `none`, `valid:<Unix seconds>`, `renewing` or
+    /// `failed:<code>` (a fixed word, never the CA's text).
+    fn token(&self) -> String {
+        let state = match self.state {
+            CertViewState::None => "none".to_string(),
+            CertViewState::Valid(not_after) => format!("valid:{not_after}"),
+            CertViewState::Renewing => "renewing".to_string(),
+            CertViewState::Failed(kind) => format!("failed:{}", kind.code()),
+        };
+        format!("{}={state}", self.name)
+    }
+
+    /// Reads one `name=state`; `None` for a name that is not a domain name or a state this
+    /// client does not know.
+    fn from_token(token: &str) -> Option<Self> {
+        let (name, state) = token.split_once('=')?;
+        check_domain(name).ok()?;
+        let state = match state {
+            "none" => CertViewState::None,
+            "renewing" => CertViewState::Renewing,
+            other => {
+                if let Some(not_after) = other.strip_prefix("valid:") {
+                    CertViewState::Valid(not_after.parse().ok()?)
+                } else {
+                    CertViewState::Failed(FailureKind::from_code(other.strip_prefix("failed:")?)?)
+                }
+            }
+        };
+        Some(Self {
+            name: name.to_string(),
+            state,
+        })
+    }
+
+    /// The state in words, for the person: `none`, `valid until 2027-02-01`, `renewing` or
+    /// `failed: <fixed text>`.
+    pub fn state_text(&self) -> String {
+        match self.state {
+            CertViewState::None => "none".to_string(),
+            CertViewState::Valid(not_after) => {
+                format!("valid until {}", text::date_utc(not_after))
+            }
+            CertViewState::Renewing => "renewing".to_string(),
+            CertViewState::Failed(kind) => format!("failed: {}", kind.text()),
+        }
+    }
+}
+
+/// The most certificates one `share` line carries.
+const MAX_CERTS_PER_SHARE: usize = 8;
+
 /// One share as `expose list` and `menzil status` show it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ShareView {
@@ -912,6 +987,9 @@ pub struct ShareView {
     pub names: Vec<String>,
     /// The relay's reason, for a rejected share.
     pub reason: Option<String>,
+    /// The certificates the node gets for the names of this share (empty unless `[acme]` is set
+    /// and the share lists `acme-tls/1`).
+    pub certs: Vec<CertView>,
 }
 
 fn mode_word(share: &Share) -> &'static str {
@@ -971,6 +1049,7 @@ pub fn views_from(
                 state,
                 names,
                 reason,
+                certs: Vec::new(),
             }
         })
         .collect()
@@ -990,6 +1069,7 @@ pub fn config_views(config: &Config) -> Result<Vec<ShareView>> {
             state: ShareState::NoNode,
             names: Vec::new(),
             reason: None,
+            certs: Vec::new(),
         })
         .collect())
 }
@@ -1011,7 +1091,8 @@ fn clean_names(names: impl IntoIterator<Item = String>) -> Vec<String> {
 
 impl ShareView {
     /// The wire form: `share label=.. mode=.. service=.. target=.. state=.. [alpn=a,b]
-    /// [names=a,b] [reason=<rest of the line>]`. No value but the reason has a space.
+    /// [names=a,b] [certs=<name>=<state>,..] [reason=<rest of the line>]`. No value but the
+    /// reason has a space.
     pub fn to_line(&self) -> String {
         let mut line = format!(
             "share label={} mode={} service={} state={}",
@@ -1030,6 +1111,16 @@ impl ShareView {
         if !names.is_empty() {
             line.push_str(&format!(" names={}", names.join(",")));
         }
+        let certs: Vec<String> = self
+            .certs
+            .iter()
+            .filter(|cert| check_domain(&cert.name).is_ok())
+            .take(MAX_CERTS_PER_SHARE)
+            .map(CertView::token)
+            .collect();
+        if !certs.is_empty() {
+            line.push_str(&format!(" certs={}", certs.join(",")));
+        }
         if let Some(reason) = &self.reason {
             line.push_str(&format!(" reason={}", text::one_line(reason, 300)));
         }
@@ -1047,6 +1138,7 @@ impl ShareView {
         let (mut label, mut mode, mut service, mut target, mut state) =
             (None, None, None, None, None);
         let (mut alpn, mut names) = (Vec::new(), Vec::new());
+        let mut certs = Vec::new();
         for token in head.split(' ').filter(|t| !t.is_empty()) {
             let Some((key, value)) = token.split_once('=') else {
                 continue;
@@ -1067,6 +1159,14 @@ impl ShareView {
                 }
                 "alpn" => alpn = value.split(',').map(str::to_string).collect(),
                 "names" => names = value.split(',').map(str::to_string).collect(),
+                // A client skips an entry it does not understand, like a field.
+                "certs" => {
+                    certs = value
+                        .split(',')
+                        .filter_map(CertView::from_token)
+                        .take(MAX_CERTS_PER_SHARE)
+                        .collect();
+                }
                 _ => {}
             }
         }
@@ -1087,6 +1187,7 @@ impl ShareView {
             state: state?,
             names: clean_names(names),
             reason,
+            certs,
         })
     }
 }
@@ -1245,7 +1346,7 @@ pub fn render_share(view: &ShareView, domain: Option<&str>) -> String {
     } else {
         format!(", alpn {}", text::escaped(&view.alpn.join(", ")))
     };
-    format!(
+    let mut out = format!(
         "{}: {} {} -> {}{alpn}\n  {}; {}\n",
         text::escaped(&view.label),
         view.mode,
@@ -1255,7 +1356,15 @@ pub fn render_share(view: &ShareView, domain: Option<&str>) -> String {
             .map_or_else(|| "(not served)".to_string(), text::escaped),
         state_text(view),
         public_address(view, domain)
-    )
+    );
+    for cert in &view.certs {
+        out.push_str(&format!(
+            "  cert {}: {}\n",
+            text::escaped(&cert.name),
+            cert.state_text()
+        ));
+    }
+    out
 }
 
 /// `menzil expose list`.
@@ -1272,8 +1381,8 @@ pub fn render_status(views: &[ShareView], domain: Option<&str>) -> String {
     views
         .iter()
         .map(|view| {
-            format!(
-                "share {}: {} {} -> {}; {}; {}\n",
+            let mut line = format!(
+                "share {}: {} {} -> {}; {}; {}",
                 text::escaped(&view.label),
                 view.mode,
                 text::escaped(&view.service),
@@ -1282,7 +1391,16 @@ pub fn render_status(views: &[ShareView], domain: Option<&str>) -> String {
                     .map_or_else(|| "(not served)".to_string(), text::escaped),
                 state_text(view),
                 public_address(view, domain)
-            )
+            );
+            for cert in &view.certs {
+                line.push_str(&format!(
+                    "; cert {}: {}",
+                    text::escaped(&cert.name),
+                    cert.state_text()
+                ));
+            }
+            line.push('\n');
+            line
         })
         .collect()
 }

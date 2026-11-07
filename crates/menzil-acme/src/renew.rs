@@ -10,7 +10,7 @@ use x509_parser::extensions::GeneralName;
 
 use super::client::{AcmeClient, Issued};
 use super::http::AcmeTransport;
-use super::{AcmeError, ChallengeBook, check_domain};
+use super::{AcmeError, ChallengeBook, FailureKind, check_domain};
 
 /// The longest the loop sleeps in one piece, so that a clock that jumped is noticed.
 const MAX_SLEEP: Duration = Duration::from_secs(6 * 3600);
@@ -182,7 +182,7 @@ impl CertStore {
 }
 
 /// One name to keep a certificate for.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct AcmeJob {
     /// The share's name (its label), as in `[[share]]`.
     pub share: String,
@@ -190,16 +190,43 @@ pub struct AcmeJob {
     pub domain: String,
 }
 
+/// What a renewal loop is doing, as [`run_renewals_observed`] reports it (for a status display;
+/// nothing is decided from it).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Progress {
+    /// An order is being made now.
+    Renewing,
+    /// An order ended with a certificate that is stored.
+    Issued,
+    /// An attempt failed; another follows after a wait.
+    Failed(FailureKind),
+    /// The attempt ended because the name is not wanted any more (nothing failed).
+    Idle,
+}
+
 /// Keeps a certificate for `job.domain` fresh, forever (the caller aborts the task): when none is
 /// stored, or the stored one is past its renewal time, and `wanted()` says so, an
 /// [`AcmeClient::obtain`] is run and its result stored; a failure is logged and retried after
 /// a wait that doubles from one minute to one hour, with jitter.
 pub async fn run_renewals<T: AcmeTransport>(
+    client: AcmeClient<T>,
+    store: CertStore,
+    wanted: impl Fn() -> bool + Send + Sync,
+    book: ChallengeBook,
+    job: AcmeJob,
+) {
+    run_renewals_observed(client, store, wanted, book, job, |_| {}).await
+}
+
+/// [`run_renewals`] that also tells `observe` what it is doing: [`Progress::Renewing`] before
+/// each order, and how the order ended.
+pub async fn run_renewals_observed<T: AcmeTransport>(
     mut client: AcmeClient<T>,
     store: CertStore,
     wanted: impl Fn() -> bool + Send + Sync,
     book: ChallengeBook,
     job: AcmeJob,
+    observe: impl Fn(Progress) + Send + Sync,
 ) {
     let mut backoff = BACKOFF_START;
     loop {
@@ -218,6 +245,7 @@ pub async fn run_renewals<T: AcmeTransport>(
             tokio::time::sleep(UNWANTED_WAIT).await;
             continue;
         }
+        observe(Progress::Renewing);
         let outcome = client.obtain(&job.domain, &book, &wanted).await;
         let wait = match outcome
             .and_then(|issued| store.save(&job.domain, &issued).map(|()| issued))
@@ -225,12 +253,17 @@ pub async fn run_renewals<T: AcmeTransport>(
             Ok(issued) => {
                 tracing::info!(domain = %job.domain, not_after = issued.not_after, "a certificate was issued and stored");
                 backoff = BACKOFF_START;
+                observe(Progress::Issued);
                 // However short a lifetime the CA chose, one order a minute at most.
                 BACKOFF_START
             }
-            Err(AcmeError::NotWanted) => UNWANTED_WAIT,
+            Err(AcmeError::NotWanted) => {
+                observe(Progress::Idle);
+                UNWANTED_WAIT
+            }
             Err(error) => {
                 tracing::warn!(domain = %job.domain, %error, "ACME did not issue a certificate; retrying later");
+                observe(Progress::Failed(error.failure_kind()));
                 let wait = backoff.mul_f64(0.75 + fastrand::f64() / 2.0);
                 backoff = (backoff * 2).min(BACKOFF_MAX);
                 wait

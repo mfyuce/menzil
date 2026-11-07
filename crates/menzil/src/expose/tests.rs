@@ -904,7 +904,118 @@ fn view(label: &str, state: ShareState) -> ShareView {
         state,
         names: vec![],
         reason: None,
+        certs: vec![],
     }
+}
+
+fn cert(name: &str, state: CertViewState) -> CertView {
+    CertView {
+        name: name.to_string(),
+        state,
+    }
+}
+
+/// `menzil node` with `[acme]` reports a certificate per full name on the `share` line, as fixed
+/// words; text of the CA never rides on it, a client skips what it does not know and a hostile
+/// agent cannot make a line of it that breaks the others.
+#[test]
+fn the_certificates_of_a_share_ride_on_its_line_as_fixed_words() {
+    use menzil_node::acme::FailureKind;
+    let mut full = view("app", ShareState::Accepted);
+    full.names = vec!["app".into(), "app.ali".into()];
+    full.certs = vec![
+        cert("app.share.test", CertViewState::Valid(1_800_000_000)),
+        cert("app.ali.share.test", CertViewState::Renewing),
+        cert("x.share.test", CertViewState::None),
+        cert(
+            "y.share.test",
+            CertViewState::Failed(FailureKind::Validation),
+        ),
+        cert(
+            "z.share.test",
+            CertViewState::Failed(FailureKind::DomainMismatch),
+        ),
+    ];
+    let line = full.to_line();
+    assert!(
+        line.contains(
+            " certs=app.share.test=valid:1800000000,app.ali.share.test=renewing,x.share.test=none,y.share.test=failed:validation,z.share.test=failed:domain_mismatch"
+        ),
+        "{line}"
+    );
+    assert_eq!(ShareView::from_line(&line).unwrap(), full);
+    // A share with a reason keeps both.
+    let mut with_reason = full.clone();
+    with_reason.reason = Some("whatever certs=evil.share.test=none".into());
+    let back = ShareView::from_line(&with_reason.to_line()).unwrap();
+    assert_eq!(back.certs, full.certs, "the reason is the rest of the line");
+    // No certificates, no key.
+    assert!(!view("a", ShareState::Accepted).to_line().contains("certs="));
+    // Hostile or newer: a name that is not a domain, a state or a failure code this client does
+    // not know, a missing state, and more entries than a line carries are skipped or cut.
+    let many: Vec<String> = (0..20).map(|n| format!("n{n}.share.test=none")).collect();
+    let line = format!(
+        "share label=a mode=blind service=tls:a state=accepted certs=Bad_Name=none,ok.share.test=valid:7,b.share.test=valid:x,c.share.test=failed:the-ca-said-no,d.share.test=future,e.share.test,f.share.test=failed:ca_refused,{}",
+        many.join(",")
+    );
+    let back = ShareView::from_line(&line).unwrap();
+    assert_eq!(back.certs.len(), 8, "{:?}", back.certs);
+    assert_eq!(
+        back.certs[0],
+        cert("ok.share.test", CertViewState::Valid(7))
+    );
+    assert_eq!(
+        back.certs[1],
+        cert(
+            "f.share.test",
+            CertViewState::Failed(FailureKind::CaRefused)
+        )
+    );
+    // A line carries at most eight, whatever the node holds.
+    let mut crowded = view("a", ShareState::Accepted);
+    crowded.certs = (0..20)
+        .map(|n| cert(&format!("n{n}.share.test"), CertViewState::None))
+        .collect();
+    assert_eq!(crowded.to_line().matches(".share.test=none").count(), 8);
+    // A name that is not a domain never leaves the node on a line either.
+    let mut odd = view("a", ShareState::Accepted);
+    odd.certs = vec![cert("evil name", CertViewState::None)];
+    assert!(!odd.to_line().contains("certs="));
+}
+
+#[test]
+fn certificates_are_listed_under_the_share_in_words() {
+    use menzil_node::acme::FailureKind;
+    let mut shown = view("app", ShareState::Accepted);
+    shown.certs = vec![
+        cert("a.share.test", CertViewState::Valid(1_800_000_000)),
+        cert("b.share.test", CertViewState::None),
+        cert("c.share.test", CertViewState::Renewing),
+        cert(
+            "d.share.test",
+            CertViewState::Failed(FailureKind::Unreachable),
+        ),
+    ];
+    let list = render_list(std::slice::from_ref(&shown), None);
+    assert!(
+        list.contains("  cert a.share.test: valid until 2027-01-15\n"),
+        "{list}"
+    );
+    assert!(list.contains("  cert b.share.test: none\n"), "{list}");
+    assert!(list.contains("  cert c.share.test: renewing\n"), "{list}");
+    assert!(
+        list.contains("  cert d.share.test: failed: the CA could not be reached\n"),
+        "{list}"
+    );
+    let status = render_status(std::slice::from_ref(&shown), None);
+    assert!(
+        status.contains("; cert a.share.test: valid until 2027-01-15"),
+        "{status}"
+    );
+    assert!(status.contains("; cert d.share.test: failed: the CA could not be reached"));
+    // No certificates: nothing added.
+    let plain = render_list(&[view("app", ShareState::Accepted)], None);
+    assert!(!plain.contains("cert "), "{plain}");
 }
 
 #[test]

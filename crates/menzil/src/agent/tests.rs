@@ -1415,6 +1415,7 @@ fn a_view(label: &str) -> ShareView {
         state: ShareState::Accepted,
         names: vec![label.to_string(), format!("{label}.ali")],
         reason: None,
+        certs: vec![],
     }
 }
 

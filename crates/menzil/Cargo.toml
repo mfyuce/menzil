@@ -39,6 +39,8 @@ tracing-subscriber = { workspace = true }
 zeroize = "1"
 
 [dev-dependencies]
+# the in process CA the ACME wiring tests order from (no new code: the workspace's own crate).
+menzil-acme = { path = "../menzil-acme", default-features = false, features = ["testing"] }
 rand = "0.10.3"
 rcgen = "0.14.10"
 tempfile = "3"

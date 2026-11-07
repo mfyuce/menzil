@@ -1064,3 +1064,54 @@ async fn the_renewal_loop_orders_for_a_wanted_name_stores_the_result_and_stays_q
     );
     task.abort();
 }
+
+#[test]
+fn failures_have_fixed_words_and_sentences_that_carry_no_ca_text() {
+    use crate::FailureKind::*;
+    let all = [
+        Unreachable,
+        CaRefused,
+        CaInvalid,
+        Validation,
+        Name,
+        Local,
+        DomainMismatch,
+    ];
+    for kind in all {
+        assert_eq!(FailureKind::from_code(kind.code()), Some(kind));
+        assert!(!kind.text().is_empty() && !kind.code().contains(' '));
+    }
+    // The words are part of the agent socket's protocol (protocol.md 12): they do not drift.
+    let words: Vec<&str> = all.iter().map(|kind| kind.code()).collect();
+    assert_eq!(
+        words,
+        [
+            "unreachable",
+            "ca_refused",
+            "ca_invalid",
+            "validation",
+            "name",
+            "local",
+            "domain_mismatch"
+        ]
+    );
+    assert_eq!(FailureKind::from_code("the CA said no"), None);
+    let kind = |e: AcmeError| e.failure_kind();
+    assert_eq!(kind(AcmeError::Http("x".into())), Unreachable);
+    assert_eq!(kind(AcmeError::Timeout("order")), Validation);
+    assert_eq!(kind(AcmeError::Failed("x".into())), Validation);
+    assert_eq!(kind(AcmeError::Protocol("x".into())), CaInvalid);
+    assert_eq!(kind(AcmeError::BadDomain("x".into())), Name);
+    assert_eq!(kind(AcmeError::TooManyPending), Name);
+    assert_eq!(kind(AcmeError::Store("x".into())), Local);
+    assert_eq!(kind(AcmeError::Tls("x".into())), Local);
+    let problem = AcmeError::Problem {
+        status: 403,
+        kind: "urn:x".into(),
+        detail: "secret detail".into(),
+    };
+    assert_eq!(kind(problem), CaRefused);
+    for kind in all {
+        assert!(!kind.text().contains("secret"));
+    }
+}

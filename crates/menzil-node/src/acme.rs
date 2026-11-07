@@ -18,9 +18,14 @@
 //!   certificate.
 //! * [`wanted`]: whether a share is one the node asks a CA for (accepted, blind, `acme-tls/1`).
 //!
-//! What this module does not do: decide the share's full name (the share domain is the relay's,
-//! open decision 53, so the caller passes the domain), or hand the issued certificate to the
-//! service behind the share (it is written to `<home>/acme/certs/<domain>/{fullchain,privkey}.pem`).
+//! * [`spawn_renewals`] (module `supervisor`): the renewal tasks. They are started and stopped
+//!   from the relay's ADVERTISE_ACK, which names the share domain `H` and the full names it
+//!   accepted, so the operator keeps no second setting; `menzil node` starts them when
+//!   config.toml has an `[acme]` table (protocol.md 11, 12).
+//!
+//! What this module does not do: hand the issued certificate to the service behind the share. It
+//! is written to `<home>/acme/certs/<domain>/{fullchain,privkey}.pem` and the service reads it
+//! from there; the node signals nobody and runs no command (protocol.md 12).
 
 use std::pin::Pin;
 
@@ -28,14 +33,21 @@ use menzil_proto::ServiceKind;
 use menzil_stream::{OpenRefusal, OpenRequest, ServiceHandler, Stream};
 
 pub use menzil_acme::{
-    AccountKey, AcmeClient, AcmeJob, AcmeTransport, CertStore, HttpRequest, HttpResponse,
-    HttpsTransport, Issued, Method, Timing, renewal_time,
+    AccountKey, AcmeClient, AcmeJob, AcmeTransport, CertStore, FailureKind, HttpRequest,
+    HttpResponse, HttpsTransport, Issued, Method, Progress, Timing, renewal_time,
 };
 pub use menzil_acme::{
     AcmeError, ChallengeBook, MAX_PENDING, PENDING_TTL, PendingOrder, check_domain, client, http,
     renew,
 };
 use menzil_acme::{Served, answer_or_pass};
+
+mod supervisor;
+
+pub use supervisor::{
+    AcmeSetup, AcmeStatus, CertState, DomainMismatch, MAX_JOBS, Plan, candidate_jobs, plan,
+    spawn_renewals,
+};
 
 use crate::serve::{LocalServices, OpenedTarget, TokioStream};
 pub use crate::shares::ACME_ALPN;
@@ -133,5 +145,7 @@ impl ServiceHandler<Stream> for AcmeHandler {
     }
 }
 
+#[cfg(test)]
+mod supervisor_tests;
 #[cfg(test)]
 mod tests;

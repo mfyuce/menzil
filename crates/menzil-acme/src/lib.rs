@@ -39,7 +39,7 @@ pub const ACME_ALPN: &str = "acme-tls/1";
 
 pub use client::{AccountKey, AcmeClient, Issued, Timing};
 pub use http::{AcmeTransport, HttpRequest, HttpResponse, HttpsTransport, Method};
-pub use renew::{AcmeJob, CertStore, renewal_time, run_renewals};
+pub use renew::{AcmeJob, CertStore, Progress, renewal_time, run_renewals, run_renewals_observed};
 
 /// How long an order waits for its validation connection (and so how long its challenge
 /// certificate can be served).
@@ -94,6 +94,87 @@ pub enum AcmeError {
     /// The certificate store or the account key file.
     #[error("store: {0}")]
     Store(String),
+}
+
+/// Why an attempt to obtain a certificate failed, as a fixed word and a fixed sentence: the
+/// words of the CA and of the transport (untrusted text) never reach a status display.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FailureKind {
+    /// The CA could not be reached or did not answer in time.
+    Unreachable,
+    /// The CA refused or answered with a problem.
+    CaRefused,
+    /// The CA's answer was not what RFC 8555 says, or the certificate it returned was not the
+    /// one asked for.
+    CaInvalid,
+    /// The CA tried the validation and it failed (or never came).
+    Validation,
+    /// The name is not one an order may be for, or too many orders wait.
+    Name,
+    /// The node's own side failed (keys, TLS setup, the files).
+    Local,
+    /// The share domain in config.toml differs from the relay's, so nothing is ordered.
+    DomainMismatch,
+}
+
+impl FailureKind {
+    /// The one word the agent socket carries.
+    pub fn code(self) -> &'static str {
+        match self {
+            Self::Unreachable => "unreachable",
+            Self::CaRefused => "ca_refused",
+            Self::CaInvalid => "ca_invalid",
+            Self::Validation => "validation",
+            Self::Name => "name",
+            Self::Local => "local",
+            Self::DomainMismatch => "domain_mismatch",
+        }
+    }
+
+    /// The kind a [`FailureKind::code`] word names.
+    pub fn from_code(code: &str) -> Option<Self> {
+        [
+            Self::Unreachable,
+            Self::CaRefused,
+            Self::CaInvalid,
+            Self::Validation,
+            Self::Name,
+            Self::Local,
+            Self::DomainMismatch,
+        ]
+        .into_iter()
+        .find(|kind| kind.code() == code)
+    }
+
+    /// The fixed sentence a person reads.
+    pub fn text(self) -> &'static str {
+        match self {
+            Self::Unreachable => "the CA could not be reached",
+            Self::CaRefused => "the CA refused the request",
+            Self::CaInvalid => "the CA's answer was not valid",
+            Self::Validation => "the CA's validation failed",
+            Self::Name => "the name cannot be ordered",
+            Self::Local => "a local error (keys, TLS setup or the files)",
+            Self::DomainMismatch => {
+                "share_domain in config.toml differs from the relay's, nothing is ordered"
+            }
+        }
+    }
+}
+
+impl AcmeError {
+    /// The [`FailureKind`] of this error.
+    pub fn failure_kind(&self) -> FailureKind {
+        match self {
+            Self::BadDomain(_) | Self::TooManyPending => FailureKind::Name,
+            Self::Cert(_) | Self::Tls(_) | Self::Store(_) | Self::NotWanted => FailureKind::Local,
+            Self::Http(_) => FailureKind::Unreachable,
+            Self::Timeout(_) => FailureKind::Validation,
+            Self::Problem { .. } => FailureKind::CaRefused,
+            Self::Protocol(_) => FailureKind::CaInvalid,
+            Self::Failed(_) => FailureKind::Validation,
+        }
+    }
 }
 
 /// Whether `domain` is a name an order may be for: 1 to 253 bytes, dot separated labels of 1 to

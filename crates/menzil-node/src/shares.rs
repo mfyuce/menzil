@@ -312,6 +312,22 @@ impl ShareBook {
             .unwrap_or_else(PoisonError::into_inner) = (ack_timeout, retry_delay);
     }
 
+    /// Stores `ack` as the relay's answer to an ADVERTISE of `shares`, as the session does when
+    /// one comes in, without a relay. For tests of what is built on the answer; never called by
+    /// the node itself.
+    #[doc(hidden)]
+    pub fn simulate_answer(&self, shares: &[Share], ack: &AdvertiseAckBody) {
+        self.note_sent(shares);
+        self.note_ack(ack);
+    }
+
+    /// Stores the end of the attachment, as the session does. For tests, like
+    /// [`ShareBook::simulate_answer`].
+    #[doc(hidden)]
+    pub fn simulate_detach(&self) {
+        self.note_detached();
+    }
+
     /// The bookkeeping of the answers to the ADVERTISE records of one attachment, with this
     /// book's figures.
     pub(crate) fn advertise_watch(&self) -> AdvertiseWatch {

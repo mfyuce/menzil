@@ -23,6 +23,16 @@
 //! # operator tells it to you (relay run --share-domain).
 //! # share_domain = "tunnel.example.org"
 //!
+//! # Optional: have this node get and renew certificates for its blind shares that list
+//! # "acme-tls/1" (TLS-ALPN-01, protocol.md 6.2). There is no default CA: name the directory (for a
+//! # trial, the CA's staging directory). The name to order comes from the relay (its share domain
+//! # in the ADVERTISE_ACK); `share_domain` above is only a cross check. Without this table the node
+//! # orders nothing. A change needs a restart.
+//! # [acme]
+//! # directory_url = "https://acme-staging-v02.api.letsencrypt.org/directory"
+//! # contact = "mailto:ops@example.org"       # optional
+//! # account_key = "acme/account.key"          # optional; relative to the home; this is the default
+//!
 //! # Optional: public names the relay routes to this node (protocol.md 4.4). The service must be
 //! # one of [services]. mode is "blind" (service tls:..., the node terminates TLS), "terminated"
 //! # (http:..., the relay terminates TLS) or "tcp" (tcp:..., reached by name like a blind share).
@@ -68,12 +78,38 @@ pub struct Config {
     /// The relay's share domain (`H` of protocol.md 4.4), for printing public URLs only: nothing
     /// is decided from it ([`Self::share_domain`] checks it).
     pub share_domain: Option<String>,
+    /// Certificates this node gets for its blind shares: `[acme]`. Off without it.
+    pub acme: Option<AcmeSettings>,
     /// What this node holds for its peers at most: `[serve]`.
     #[serde(default)]
     pub serve: ServeSettings,
     /// Public names to advertise to the relay: `[[share]]`.
     #[serde(default)]
     pub share: Vec<ShareSettings>,
+}
+
+/// The `[acme]` table as written; [`Config::acme`] checks it. There is no default CA.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AcmeSettings {
+    /// The CA's RFC 8555 directory (https).
+    pub directory_url: String,
+    /// The contact for the CA's notices (`mailto:...`), if any.
+    pub contact: Option<String>,
+    /// The account key file; by default `acme/account.key` in the home. A relative path is
+    /// relative to the home, not to the directory the node was started in.
+    pub account_key: Option<PathBuf>,
+}
+
+/// [`AcmeSettings`] checked, with the account key path made whole.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AcmeChecked {
+    /// The CA's directory URL.
+    pub directory_url: String,
+    /// The contact, if any.
+    pub contact: Option<String>,
+    /// The account key file.
+    pub account_key_path: PathBuf,
 }
 
 /// One `[[share]]` entry as written; [`Config::shares`] checks it.
@@ -196,6 +232,7 @@ impl std::fmt::Debug for Config {
             .field("services", &self.services)
             .field("agent_socket", &self.agent_socket)
             .field("share_domain", &self.share_domain)
+            .field("acme", &self.acme)
             .field("serve", &self.serve)
             .field("share", &self.share)
             .finish()
@@ -265,6 +302,52 @@ impl Config {
         }
         validate_shares(&shares).map_err(|e| anyhow!("config.toml: {e}"))?;
         Ok(shares)
+    }
+
+    /// The `[acme]` table, checked, or `None` without one (the node then orders nothing).
+    /// `directory_url` must be an `https://` URL with a host and no user name or password (there
+    /// is no default CA), `contact` a `mailto:` URI, `account_key` a path (relative to `home`).
+    pub fn acme(&self, home: &Home) -> Result<Option<AcmeChecked>> {
+        let Some(settings) = &self.acme else {
+            return Ok(None);
+        };
+        let plain = |text: &str| !text.chars().any(|c| c.is_control() || c.is_whitespace());
+        let url = settings.directory_url.as_str();
+        let authority = url
+            .strip_prefix("https://")
+            .map(|rest| rest.split(['/', '?', '#']).next().unwrap_or_default());
+        match authority {
+            Some(authority) if !authority.is_empty() && !authority.contains('@') && plain(url) => {}
+            _ => bail!(
+                "directory_url {url:?} in [acme] of config.toml must be an https:// URL with a host and no user name or password (there is no default CA: name the directory, for a trial the CA's staging directory)"
+            ),
+        }
+        if let Some(contact) = &settings.contact {
+            let ok = contact
+                .strip_prefix("mailto:")
+                .is_some_and(|address| !address.is_empty())
+                && contact.len() <= 255
+                && plain(contact);
+            if !ok {
+                bail!(
+                    "contact {contact:?} in [acme] of config.toml must be a mailto: address, such as mailto:ops@example.org"
+                );
+            }
+        }
+        let account_key_path = match &settings.account_key {
+            None => menzil_node::acme::CertStore::account_key_path(home.root()),
+            Some(path) if path.as_os_str().is_empty() => {
+                bail!(
+                    "account_key in [acme] of config.toml is empty (leave the key out for the default)"
+                )
+            }
+            Some(path) => home.root().join(path),
+        };
+        Ok(Some(AcmeChecked {
+            directory_url: url.to_string(),
+            contact: settings.contact.clone(),
+            account_key_path,
+        }))
     }
 
     /// The services to serve with the local target of each, validated.
@@ -685,6 +768,125 @@ mod tests {
         )
         .unwrap_err();
         assert!(format!("{error:#}").contains("used twice"), "{error:#}");
+    }
+
+    fn acme_of(text: &str) -> Result<Option<AcmeChecked>> {
+        Config::parse(text).and_then(|c| c.acme(&Home::new("/h")))
+    }
+
+    /// Without `[acme]` the node orders nothing: the configuration is exactly what it was.
+    #[test]
+    fn no_acme_table_changes_nothing() {
+        assert_eq!(acme_of("").unwrap(), None);
+        let text = format!(
+            "{SERVICES}\n[[share]]\nname = \"app\"\nmode = \"blind\"\nservice = \"tls:app\"\nalpn = [\"acme-tls/1\"]\n"
+        );
+        let config = Config::parse(&text).unwrap();
+        assert_eq!(config.acme, None);
+        assert_eq!(config.acme(&Home::new("/h")).unwrap(), None);
+        // The shares and services are read as before.
+        assert_eq!(config.shares().unwrap().len(), 1);
+        assert_eq!(config.local_services().unwrap().len(), 3);
+        // The debug print has the table (and it holds no secret).
+        let with = Config::parse("[acme]\ndirectory_url = \"https://ca.test/dir\"").unwrap();
+        assert!(format!("{with:?}").contains("https://ca.test/dir"));
+    }
+
+    #[test]
+    fn a_valid_acme_table_is_read_with_the_account_key_under_the_home() {
+        let checked = acme_of(
+            "[acme]\ndirectory_url = \"https://acme-staging-v02.api.letsencrypt.org/directory\"\n",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            checked.directory_url,
+            "https://acme-staging-v02.api.letsencrypt.org/directory"
+        );
+        assert_eq!(checked.contact, None);
+        assert_eq!(
+            checked.account_key_path,
+            PathBuf::from("/h/acme/account.key")
+        );
+        let checked = acme_of(
+            "[acme]\ndirectory_url = \"https://ca.test:14000/dir?x=1\"\ncontact = \"mailto:ops@example.org\"\naccount_key = \"keys/ca.pem\"\n",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(checked.contact.as_deref(), Some("mailto:ops@example.org"));
+        // A relative key path is the home's, an absolute one is as written.
+        assert_eq!(checked.account_key_path, PathBuf::from("/h/keys/ca.pem"));
+        let checked = acme_of(
+            "[acme]\ndirectory_url = \"https://ca.test/dir\"\naccount_key = \"/etc/menzil/acme.key\"\n",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            checked.account_key_path,
+            PathBuf::from("/etc/menzil/acme.key")
+        );
+    }
+
+    #[test]
+    fn a_bad_acme_table_is_an_error_that_names_it() {
+        // The parser: a typo, a missing url, a key of the wrong type.
+        for (text, wanted) in [
+            (
+                "[acme]\ndirectory_url = \"https://ca.test/dir\"\ncontcat = \"x\"",
+                "contcat",
+            ),
+            ("[acme]\ncontact = \"mailto:a@b.c\"", "directory_url"),
+            ("[acme]", "directory_url"),
+            ("[acme]\ndirectory_url = 5", "string"),
+            (
+                "[acme]\ndirectory_url = \"https://ca.test/dir\"\naccount_key = 5",
+                "string",
+            ),
+        ] {
+            let error = match Config::parse(text) {
+                Ok(_) => panic!("{text:?} was accepted"),
+                Err(e) => e.to_string(),
+            };
+            assert!(error.contains(wanted), "{text:?}: {error}");
+        }
+        // The checks after it: https only, a host, no credentials, a mailto contact.
+        for (text, wanted) in [
+            ("[acme]\ndirectory_url = \"http://ca.test/dir\"", "https://"),
+            ("[acme]\ndirectory_url = \"ca.test/dir\"", "https://"),
+            ("[acme]\ndirectory_url = \"\"", "https://"),
+            ("[acme]\ndirectory_url = \"https://\"", "host"),
+            ("[acme]\ndirectory_url = \"https:///dir\"", "host"),
+            (
+                "[acme]\ndirectory_url = \"https://user:pw@ca.test/dir\"",
+                "no user name",
+            ),
+            (
+                "[acme]\ndirectory_url = \"https://ca.test/d ir\"",
+                "https://",
+            ),
+            (
+                "[acme]\ndirectory_url = \"https://ca.test/dir\"\ncontact = \"ops@example.org\"",
+                "mailto:",
+            ),
+            (
+                "[acme]\ndirectory_url = \"https://ca.test/dir\"\ncontact = \"mailto:\"",
+                "mailto:",
+            ),
+            (
+                "[acme]\ndirectory_url = \"https://ca.test/dir\"\ncontact = \"mailto:a b@c.d\"",
+                "mailto:",
+            ),
+            (
+                "[acme]\ndirectory_url = \"https://ca.test/dir\"\naccount_key = \"\"",
+                "account_key",
+            ),
+        ] {
+            let error = match acme_of(text) {
+                Ok(_) => panic!("{text:?} was accepted"),
+                Err(e) => format!("{e:#}"),
+            };
+            assert!(error.contains(wanted), "{text:?}: {error}");
+        }
     }
 
     #[test]

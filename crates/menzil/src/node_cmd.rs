@@ -19,6 +19,10 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 use menzil_carrier::DialConfig;
+use menzil_node::acme::{
+    AcmeError, AcmeHandler, AcmeSetup, AcmeStatus, AcmeTransport, CertState, CertStore,
+    ChallengeBook, HttpsTransport, Timing, candidate_jobs, spawn_renewals,
+};
 use menzil_node::{
     Adopted, AdoptedDocs, DocStore, EnsureError, LocalIdentity, LocalServices, Node, NodeConfig,
     NodeError, NodeOpenError, OpenStreamError, PolicyStore, RelayError, RosterStore, SessionConfig,
@@ -32,7 +36,9 @@ use tokio::task::JoinHandle;
 use crate::agent::{self, Opener};
 use crate::cert_node::{self, CertRenewer};
 use crate::config::Config;
-use crate::expose::{self, ExposeReply, ExposeSpec, Runtime, ShareView, UnexposeReply};
+use crate::expose::{
+    self, CertView, CertViewState, ExposeReply, ExposeSpec, Runtime, ShareView, UnexposeReply,
+};
 use crate::home::{FileLock, Home};
 use crate::local::{keep_documents, load_documents, load_identity};
 use crate::persist::Worker;
@@ -612,6 +618,47 @@ pub struct NodeOpener {
     certs: Option<Arc<CertRenewer>>,
     /// What `expose` and `unexpose` change: the home (for `config.toml`) and the node's services.
     shares: Option<(Home, LocalServices)>,
+    /// What the node's certificates stand at, when it gets them (`[acme]`).
+    acme: Option<AcmeView>,
+}
+
+/// What a status display needs to say how the certificates of the shares stand: the renewal
+/// tasks' status and the store they write to.
+#[derive(Debug, Clone)]
+pub struct AcmeView {
+    status: AcmeStatus,
+    store: CertStore,
+}
+
+impl AcmeView {
+    /// The view of `status` over the certificates in `home`.
+    pub fn new(status: AcmeStatus, home: &Home) -> Self {
+        Self {
+            status,
+            store: CertStore::new(home.root()),
+        }
+    }
+
+    /// Gives each view of an accepted share the certificates of its names that the node orders
+    /// (see [`candidate_jobs`]): the full names, and how each stands now.
+    pub fn fill(&self, snapshot: &menzil_node::ShareSnapshot, views: &mut [ShareView]) {
+        let now = unix_now();
+        for job in candidate_jobs(snapshot) {
+            let Some(view) = views.iter_mut().find(|view| view.label == job.share) else {
+                continue;
+            };
+            let state = match self.status.state(&self.store, &job.domain, now) {
+                CertState::None => CertViewState::None,
+                CertState::Valid { not_after } => CertViewState::Valid(not_after),
+                CertState::Renewing => CertViewState::Renewing,
+                CertState::Failed(kind) => CertViewState::Failed(kind),
+            };
+            view.certs.push(CertView {
+                name: job.domain,
+                state,
+            });
+        }
+    }
 }
 
 impl NodeOpener {
@@ -622,7 +669,14 @@ impl NodeOpener {
             directory,
             certs: None,
             shares: None,
+            acme: None,
         }
+    }
+
+    /// Lets the agent show how the certificates of the shares stand, from `acme`.
+    pub fn with_acme(mut self, acme: AcmeView) -> Self {
+        self.acme = Some(acme);
+        self
     }
 
     /// Lets the agent answer `expose` and `unexpose` (they change `config.toml` in `home` and
@@ -752,7 +806,12 @@ impl Opener for NodeOpener {
     async fn shares(&self) -> Vec<ShareView> {
         match &self.shares {
             Some((_, services)) => {
-                expose::share_views(self.node.shares(), services, self.node.is_attached())
+                let mut views =
+                    expose::share_views(self.node.shares(), services, self.node.is_attached());
+                if let Some(acme) = &self.acme {
+                    acme.fill(&self.node.shares().snapshot(), &mut views);
+                }
+                views
             }
             None => Vec::new(),
         }
@@ -765,6 +824,7 @@ impl Opener for NodeOpener {
         let book = self.node.shares().clone();
         let attached = self.node.is_attached();
         let label = spec.label.clone();
+        let acme = self.acme.clone();
         // The config lock waits for other writers on a thread of its own.
         tokio::task::spawn_blocking(move || {
             let runtime = Runtime {
@@ -773,7 +833,11 @@ impl Opener for NodeOpener {
             };
             let plan =
                 expose::expose(&home, &spec, Some(&runtime)).map_err(|e| format!("{e:#}"))?;
-            let share = expose::share_views(&book, &services, attached)
+            let mut views = expose::share_views(&book, &services, attached);
+            if let Some(acme) = &acme {
+                acme.fill(&book.snapshot(), &mut views);
+            }
+            let share = views
                 .into_iter()
                 .find(|view| view.label == label)
                 .ok_or_else(|| "the node does not hold the share after it was made".to_string())?;
@@ -829,6 +893,8 @@ pub struct RunningNode {
     pub directory: Arc<RwLock<Directory>>,
     /// The services this node serves; `menzil expose` and the reload change them while it runs.
     pub services: LocalServices,
+    /// How the certificates of the shares stand, when `[acme]` is set.
+    pub acme: Option<AcmeView>,
     tasks: Vec<JoinHandle<()>>,
     /// Writes the documents the node adopts over the network to disk (see
     /// [`keep_adopted_documents`]).
@@ -854,8 +920,24 @@ impl Drop for RunningNode {
     }
 }
 
-/// Starts the node and the agent socket.
+/// Starts the node and the agent socket. With `[acme]` in the configuration the node also gets
+/// and renews certificates for its blind shares that list `acme-tls/1`, from the CA over HTTPS
+/// with the platform's trust store.
 pub async fn start(home: &Home, config: &Config, socket: &Path) -> Result<RunningNode> {
+    start_with_acme_transport(home, config, socket, HttpsTransport::platform).await
+}
+
+/// [`start`] with another way to reach the CA (a test's in process CA); `transport` is called
+/// only when the configuration has `[acme]`.
+pub async fn start_with_acme_transport<T>(
+    home: &Home,
+    config: &Config,
+    socket: &Path,
+    transport: impl FnOnce() -> Result<T, AcmeError>,
+) -> Result<RunningNode>
+where
+    T: AcmeTransport + Clone + Send + Sync + 'static,
+{
     // First: two nodes with one identity would displace each other at the relay, and the socket
     // path alone does not stop that (it depends on the environment).
     let instance = home.lock_node()?;
@@ -882,26 +964,79 @@ pub async fn start(home: &Home, config: &Config, socket: &Path) -> Result<Runnin
     // Checked before anything starts: a bad `[[share]]` stops the node with its reason, as a bad
     // `[services]` entry does.
     let shares = config.shares()?;
+    // The same for `[acme]`: a bad table, or a share domain that cannot serve as a cross check,
+    // stops the node with its reason (a node that was asked for certificates and quietly runs
+    // without them would look like one that works).
+    let acme = config.acme(home)?;
+    let acme_transport = match &acme {
+        Some(_) => {
+            config.share_domain()?;
+            Some(transport().map_err(|e| anyhow!("ACME: {e}"))?)
+        }
+        None => None,
+    };
     let listener = bind_agent_socket(socket).await?;
     let socket_identity =
         file_identity(socket).with_context(|| format!("looking at {}", socket.display()))?;
-    let node = Arc::new(
-        Node::start(
-            NodeConfig {
-                session,
-                env: text_environment(std::env::vars_os()),
-                policies: policies.clone(),
-                rosters: rosters.clone(),
-            },
-            services,
-        )
-        .map_err(|e| anyhow!("{e}"))?,
-    );
+    let node_config = NodeConfig {
+        session,
+        env: text_environment(std::env::vars_os()),
+        policies: policies.clone(),
+        rosters: rosters.clone(),
+    };
+    // With ACME the node answers validation connections for the names it orders; the book is
+    // shared with the renewal tasks.
+    let challenges = acme.as_ref().map(|_| ChallengeBook::new());
+    let started = match &challenges {
+        Some(book) => Node::start(node_config, AcmeHandler::new(services, book.clone())),
+        None => Node::start(node_config, services),
+    };
+    let node = Arc::new(started.map_err(|e| anyhow!("{e}"))?);
     node.shares()
         .set_shares(shares.clone())
         .map_err(|e| anyhow!("config.toml: {e}"))?;
     let directory = Arc::new(RwLock::new(Directory::load(home)?));
 
+    // The certificates of the shares: one task per name the relay's ACK lists for a share that
+    // lists `acme-tls/1`, started and stopped as the relay answers (see `menzil_node::acme`).
+    let acme_status = AcmeStatus::new();
+    let (acme_task, acme_view) = match (acme, acme_transport, challenges) {
+        (Some(acme), Some(transport), Some(challenges)) => {
+            let configured = {
+                let (home, mut last) = (home.clone(), config.share_domain()?);
+                move || {
+                    // A file in the middle of an edit keeps the last value that was good.
+                    if let Ok(config) = Config::load(&home)
+                        && let Ok(domain) = config.share_domain()
+                    {
+                        last = domain;
+                    }
+                    last.clone()
+                }
+            };
+            let task = spawn_renewals(
+                AcmeSetup {
+                    transport,
+                    directory_url: acme.directory_url,
+                    contact: acme.contact,
+                    account_key_path: acme.account_key_path,
+                    store: CertStore::new(home.root()),
+                    timing: Timing::default(),
+                },
+                node.shares().clone(),
+                challenges,
+                acme_status.clone(),
+                configured,
+            );
+            (Some(task), Some(AcmeView::new(acme_status, home)))
+        }
+        _ => (None, None),
+    };
+    let mut opener = NodeOpener::new(node.clone(), directory.clone())
+        .with_shares(home.clone(), services_handle.clone());
+    if let Some(view) = &acme_view {
+        opener = opener.with_acme(view.clone());
+    }
     let renewer = Arc::new(CertRenewer::new(
         home.clone(),
         node.clone(),
@@ -909,11 +1044,7 @@ pub async fn start(home: &Home, config: &Config, socket: &Path) -> Result<Runnin
     ));
     let agent_task = tokio::spawn(agent::serve(
         listener,
-        Arc::new(
-            NodeOpener::new(node.clone(), directory.clone())
-                .with_certs(renewer.clone())
-                .with_shares(home.clone(), services_handle.clone()),
-        ),
+        Arc::new(opener.with_certs(renewer.clone())),
     ));
     // The certificate: a check now and every six hours (renews 60 days before it runs out).
     let cert_task = tokio::spawn(cert_node::run(renewer));
@@ -971,7 +1102,11 @@ pub async fn start(home: &Home, config: &Config, socket: &Path) -> Result<Runnin
         socket_identity,
         directory,
         services: services_handle,
-        tasks: vec![agent_task, reload_task, steward_task, cert_task],
+        acme: acme_view,
+        tasks: [agent_task, reload_task, steward_task, cert_task]
+            .into_iter()
+            .chain(acme_task)
+            .collect(),
         keeper,
         _instance: instance,
     })

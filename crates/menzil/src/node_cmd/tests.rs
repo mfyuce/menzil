@@ -1482,3 +1482,296 @@ fn a_changed_share_of_a_served_service_applies_and_one_that_needs_a_restart_keep
     assert_eq!(plan.apply, vec![old_web]);
     assert!(plan.needs_restart.is_empty());
 }
+
+// ---- the node's certificates (`[acme]`) ----
+
+mod acme_wiring {
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    use menzil_acme::testing::{FakeCa, Flags};
+    use menzil_node::acme::{ChallengeBook, FailureKind};
+    use menzil_proto::AdvertiseAckBody;
+
+    use super::*;
+    use crate::expose::{CertView, CertViewState, ShareView};
+
+    fn real_now() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+    }
+
+    // `plain` comes first: a status line must not be given the certificates of another share.
+    const SERVICES: &str = "[services]\n\"tls:app\" = \"127.0.0.1:8443\"\n\"tls:plain\" = \"127.0.0.1:8444\"\n[[share]]\nname = \"plain\"\nmode = \"blind\"\nservice = \"tls:plain\"\nalpn = [\"h2\"]\n[[share]]\nname = \"app\"\nmode = \"blind\"\nservice = \"tls:app\"\nalpn = [\"acme-tls/1\"]\n";
+    const ACME: &str = "[acme]\ndirectory_url = \"https://ca.test/dir\"\n";
+
+    fn home_with(dir: &Path, config: &str) -> (Home, Config) {
+        let home = Home::new(dir.join("home"));
+        init(&home, real_now()).unwrap();
+        network_create(&home, "laptop", real_now()).unwrap();
+        std::fs::write(
+            home.config_path(),
+            format!("relay = \"menzil://relay.example.org:443/_menzil/v1?id={}\"\nproxy = \"direct\"\n{config}", "ab".repeat(32)),
+        )
+        .unwrap();
+        let config = Config::load(&home).unwrap();
+        (home, config)
+    }
+
+    fn failing_ca() -> Arc<FakeCa> {
+        FakeCa::new(
+            &ChallengeBook::new(),
+            Flags {
+                validation_fails: true,
+                ..Flags::default()
+            },
+        )
+    }
+
+    fn orders(ca: &Arc<FakeCa>) -> usize {
+        ca.state()
+            .log
+            .iter()
+            .filter(|r| *r == "Post /order")
+            .count()
+    }
+
+    fn answer(domain: &str, names: &[&str]) -> AdvertiseAckBody {
+        AdvertiseAckBody {
+            accepted: vec!["app".to_string(), "plain".to_string()],
+            rejected: vec![],
+            names: names.iter().map(|n| n.to_string()).collect(),
+            share_domain: Some(domain.to_string()),
+        }
+    }
+
+    async fn status_of(socket: &Path) -> Vec<ShareView> {
+        crate::agent::query_node_status(socket)
+            .await
+            .unwrap()
+            .shares
+    }
+
+    /// The certificates of the share `label` in the agent's status, by name.
+    async fn certs_of(socket: &Path, label: &str) -> Vec<CertView> {
+        let mut certs = status_of(socket)
+            .await
+            .into_iter()
+            .find(|view| view.label == label)
+            .map(|view| view.certs)
+            .unwrap_or_default();
+        certs.sort_by(|a, b| a.name.cmp(&b.name));
+        certs
+    }
+
+    async fn until_status(
+        socket: &Path,
+        label: &str,
+        what: &str,
+        check: impl Fn(&[CertView]) -> bool,
+    ) {
+        let started = Instant::now();
+        loop {
+            let certs = certs_of(socket, label).await;
+            if check(&certs) {
+                return;
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(20),
+                "timed out: {what}; {certs:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// The whole path inside the process: the relay's answer (stood in for), the renewal task
+    /// the node started for it, the CA asked for the names of the answer and nothing else, and
+    /// the agent's `status` saying how each certificate stands.
+    #[tokio::test]
+    async fn a_node_with_acme_orders_for_the_names_of_the_relays_answer_and_reports_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let (home, config) = home_with(dir.path(), &format!("{SERVICES}{ACME}"));
+        let ca = failing_ca();
+        let socket = dir.path().join("a.sock");
+        let called = std::cell::Cell::new(0);
+        let node = start_with_acme_transport(&home, &config, &socket, || {
+            called.set(called.get() + 1);
+            Ok(ca.clone())
+        })
+        .await
+        .unwrap();
+        assert_eq!(called.get(), 1);
+        assert!(node.acme.is_some());
+        // The relay has not answered: nothing is ordered, no certificate is claimed.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(orders(&ca), 0);
+        assert!(status_of(&socket).await.iter().all(|v| v.certs.is_empty()));
+
+        // The answer names `H` and two zones of `app`: both are ordered, `plain` is not.
+        node.node.shares().simulate_answer(
+            &config.shares().unwrap(),
+            &answer("share.test", &["app", "app.ali", "plain"]),
+        );
+        let failed = CertViewState::Failed(FailureKind::Validation);
+        until_status(&socket, "app", "both names fail validation", |certs| {
+            certs.len() == 2 && certs.iter().all(|c| c.state == failed)
+        })
+        .await;
+        assert_eq!(
+            certs_of(&socket, "app").await,
+            vec![
+                CertView {
+                    name: "app.ali.share.test".into(),
+                    state: failed
+                },
+                CertView {
+                    name: "app.share.test".into(),
+                    state: failed
+                },
+            ]
+        );
+        assert!(
+            certs_of(&socket, "plain").await.is_empty(),
+            "a share that does not list acme-tls/1 has no certificate line"
+        );
+        assert!(orders(&ca) >= 1);
+
+        // The end of the attachment: the tasks stop and the status is forgotten.
+        node.node.shares().simulate_detach();
+        let stopped = {
+            until_status(&socket, "app", "the status is forgotten", |certs| {
+                certs.is_empty()
+            })
+            .await;
+            orders(&ca)
+        };
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(orders(&ca), stopped, "nothing is ordered while detached");
+    }
+
+    /// A share domain in config.toml that is not the relay's: nothing is ordered, and the status
+    /// says why.
+    #[tokio::test]
+    async fn a_configured_share_domain_that_differs_from_the_relays_stops_the_orders() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_text = format!("share_domain = \"other.test\"\n{SERVICES}{ACME}");
+        let (home, config) = home_with(dir.path(), &config_text);
+        let ca = failing_ca();
+        let socket = dir.path().join("a.sock");
+        let node = start_with_acme_transport(&home, &config, &socket, || Ok(ca.clone()))
+            .await
+            .unwrap();
+        node.node
+            .shares()
+            .simulate_answer(&config.shares().unwrap(), &answer("share.test", &["app"]));
+        until_status(&socket, "app", "the mismatch is reported", |certs| {
+            certs.len() == 1 && certs[0].state == CertViewState::Failed(FailureKind::DomainMismatch)
+        })
+        .await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(orders(&ca), 0);
+
+        // The file is edited to agree (the next look of the supervisor, here brought on by
+        // another answer, reads it again): the order is made. A file that does not parse in the
+        // middle of an edit keeps the last good value and changes nothing.
+        let shares = config.shares().unwrap();
+        let text = std::fs::read_to_string(home.config_path()).unwrap();
+        std::fs::write(home.config_path(), text.replace("other.test", "share.test")).unwrap();
+        node.node
+            .shares()
+            .simulate_answer(&shares, &answer("share.test", &["app"]));
+        until_status(&socket, "app", "the order after the edit", |certs| {
+            certs.len() == 1 && certs[0].state == CertViewState::Failed(FailureKind::Validation)
+        })
+        .await;
+        let ordered = orders(&ca);
+        assert!(ordered >= 1);
+        std::fs::write(home.config_path(), "this is [not toml").unwrap();
+        node.node
+            .shares()
+            .simulate_answer(&shares, &answer("share.test", &["app"]));
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(
+            certs_of(&socket, "app").await[0].state,
+            CertViewState::Failed(FailureKind::Validation),
+            "an unreadable file does not bring the cross check back or take the names away"
+        );
+    }
+
+    /// Without `[acme]` the node is what it was: no handler around the services, no tasks, no CA
+    /// asked for a transport, and an answer from the relay changes nothing.
+    #[tokio::test]
+    async fn a_node_without_acme_starts_no_certificate_machinery() {
+        let dir = tempfile::tempdir().unwrap();
+        let (home, config) = home_with(dir.path(), SERVICES);
+        let socket = dir.path().join("a.sock");
+        let node =
+            start_with_acme_transport(&home, &config, &socket, || -> Result<Arc<FakeCa>, _> {
+                panic!("no transport is needed without [acme]")
+            })
+            .await
+            .unwrap();
+        assert!(node.acme.is_none());
+        node.node
+            .shares()
+            .simulate_answer(&config.shares().unwrap(), &answer("share.test", &["app"]));
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(status_of(&socket).await.iter().all(|v| v.certs.is_empty()));
+        assert!(
+            !home.root().join("acme").exists(),
+            "no account key, no store"
+        );
+    }
+
+    /// A bad `[acme]` table, an unusable share domain beside it and a transport that cannot be
+    /// made each stop the node at start with the reason, before it binds anything.
+    #[tokio::test]
+    async fn a_bad_acme_setup_stops_the_node_at_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let ca = failing_ca();
+        for (text, wanted) in [
+            (
+                // Top level keys come before any table, so each text is whole.
+                format!("{SERVICES}[acme]\ndirectory_url = \"http://ca.test/dir\"\n"),
+                "https://",
+            ),
+            (
+                format!("share_domain = \"no scheme://x\"\n{SERVICES}{ACME}"),
+                "share_domain",
+            ),
+        ] {
+            let (home, config) = home_with(dir.path(), &text);
+            let socket = dir.path().join("b.sock");
+            let error =
+                match start_with_acme_transport(&home, &config, &socket, || Ok(ca.clone())).await {
+                    Ok(_) => panic!("{text:?} was accepted"),
+                    Err(e) => format!("{e:#}"),
+                };
+            assert!(error.contains(wanted), "{text:?}: {error}");
+            assert!(!socket.exists(), "nothing was bound");
+            let _ = std::fs::remove_dir_all(dir.path().join("home"));
+        }
+        let (home, config) = home_with(dir.path(), &format!("{SERVICES}{ACME}"));
+        let socket = dir.path().join("c.sock");
+        let error = match start_with_acme_transport(
+            &home,
+            &config,
+            &socket,
+            || -> Result<Arc<FakeCa>, _> {
+                Err(menzil_node::acme::AcmeError::Tls("no roots".into()))
+            },
+        )
+        .await
+        {
+            Ok(_) => panic!("a transport that cannot be made was accepted"),
+            Err(e) => format!("{e:#}"),
+        };
+        assert!(
+            error.contains("ACME") && error.contains("no roots"),
+            "{error}"
+        );
+        assert!(!socket.exists());
+    }
+}
