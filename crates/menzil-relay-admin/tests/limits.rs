@@ -192,7 +192,8 @@ async fn parallel_changes_leave_a_valid_consistent_file() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn at_most_32_rpcs_run_at_once() {
-    let fx = Fixture::start().await;
+    // A long deadline: the held changes must not time out however starved the machine is.
+    let fx = Fixture::start_with_timeout(Some(Duration::from_secs(300))).await;
     let mut c = fx.client().await;
     let a = Owner::new();
     c.create_tenant(create("alpha", &a.token())).await.unwrap();
@@ -209,7 +210,16 @@ async fn at_most_32_rpcs_run_at_once() {
             }));
         }
     }
-    tokio::time::sleep(Duration::from_millis(1500)).await;
+    // The 8 turned away answer at once; wait for them instead of for a fixed time.
+    let waiting = std::time::Instant::now();
+    while tasks.iter().filter(|t| t.is_finished()).count() < 8 {
+        assert!(
+            waiting.elapsed() < Duration::from_secs(120),
+            "the refusals never came"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(200)).await;
     let turned_away = tasks.iter().filter(|t| t.is_finished()).count();
     assert_eq!(turned_away, 8, "40 requests, 32 allowed");
     drop(guard);
@@ -228,31 +238,21 @@ async fn at_most_32_rpcs_run_at_once() {
     fx.shutdown().await;
 }
 
-/// A change still queued when its request times out must not run afterwards.
+/// A change still queued when its request times out must not run afterwards. The agent's own
+/// deadline is short here and the transport's backstop is longer, so the agent's deadline is the
+/// one that fires (the order that hid a defect: with the agent's deadline first, the cancel flag
+/// was never set and the abandoned change ran when the mutex was released).
 #[tokio::test(flavor = "multi_thread")]
-async fn a_request_over_15_seconds_is_dropped_and_its_change_never_runs() {
-    let fx = Fixture::start().await;
+async fn a_request_over_its_deadline_is_dropped_and_its_change_never_runs() {
+    let fx = Fixture::start_with_timeout(Some(Duration::from_millis(400))).await;
     let mut c = fx.client().await;
     let a = Owner::new();
     c.create_tenant(create("alpha", &a.token())).await.unwrap();
     let guard = fx.admin.hold_writes();
-    let started = std::time::Instant::now();
     let e = c.update_tenant(terminate("alpha", true)).await.unwrap_err();
-    assert!(
-        started.elapsed() >= Duration::from_secs(14),
-        "{:?}",
-        started.elapsed()
-    );
-    assert!(
-        started.elapsed() < Duration::from_secs(25),
-        "{:?}",
-        started.elapsed()
-    );
-    assert!(
-        matches!(e.code(), Code::DeadlineExceeded | Code::Cancelled),
-        "{e:?}"
-    );
+    assert_eq!(e.code(), Code::DeadlineExceeded, "{e:?}");
     drop(guard);
+    // The abandoned change, if it were going to run, runs as soon as the mutex is free.
     tokio::time::sleep(Duration::from_millis(800)).await;
     let t = c
         .get_tenant(TenantRef {

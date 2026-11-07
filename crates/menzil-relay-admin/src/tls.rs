@@ -237,8 +237,11 @@ impl AdminServer {
                 });
             }
         });
+        // The transport's own deadline is a backstop that always fires after the agent's, so the
+        // agent's (which cancels a queued change) is the one a client sees.
+        let backstop = self.admin.request_timeout() + Duration::from_secs(2);
         let result = Server::builder()
-            .timeout(crate::service::REQUEST_TIMEOUT)
+            .timeout(backstop)
             .max_concurrent_streams(crate::service::MAX_CONCURRENT as u32)
             .add_service(self.admin.into_server())
             .serve_with_incoming_shutdown(ReceiverStream::new(rx), shutdown)

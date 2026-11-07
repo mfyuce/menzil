@@ -68,11 +68,19 @@ pub struct Fixture {
 
 impl Fixture {
     pub async fn start() -> Self {
+        Self::start_with_timeout(None).await
+    }
+
+    /// `start` with another per-request deadline in the agent.
+    pub async fn start_with_timeout(timeout: Option<std::time::Duration>) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let relay_home = dir.path().join("relay-home");
         let certs = generate(&dir.path().join("certs"), "localhost", "menzil-ui").unwrap();
         let config = server_config(&files_of(&certs)).unwrap();
-        let admin = Admin::new(Home::new(&relay_home));
+        let mut admin = Admin::new(Home::new(&relay_home));
+        if let Some(timeout) = timeout {
+            admin = admin.with_request_timeout(timeout);
+        }
         let server = AdminServer::bind("127.0.0.1:0".parse().unwrap(), config, admin.clone())
             .await
             .unwrap();

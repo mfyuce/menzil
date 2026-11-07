@@ -51,6 +51,7 @@ pub struct Admin {
     home: Arc<Home>,
     writes: Arc<std::sync::Mutex<()>>,
     permits: Arc<Semaphore>,
+    request_timeout: Duration,
 }
 
 /// Sets the flag when dropped before `disarm`: the RPC's future was dropped (deadline, client gone)
@@ -75,7 +76,22 @@ impl Admin {
             home: Arc::new(home),
             writes: Arc::new(std::sync::Mutex::new(())),
             permits: Arc::new(Semaphore::new(MAX_CONCURRENT)),
+            request_timeout: REQUEST_TIMEOUT,
         }
+    }
+
+    /// The same agent with another per-request deadline (tests only; the default is
+    /// [`REQUEST_TIMEOUT`]).
+    #[doc(hidden)]
+    #[must_use]
+    pub fn with_request_timeout(mut self, timeout: Duration) -> Self {
+        self.request_timeout = timeout;
+        self
+    }
+
+    /// The per-request deadline of this agent.
+    pub fn request_timeout(&self) -> Duration {
+        self.request_timeout
     }
 
     /// Holds the mutex that every change takes, for as long as the guard lives. For tests of the
@@ -123,10 +139,18 @@ impl Admin {
             }
             work(&home)
         });
-        let result = match tokio::time::timeout(REQUEST_TIMEOUT, task).await {
+        let result = match tokio::time::timeout(self.request_timeout, task).await {
             Ok(Ok(result)) => result,
             Ok(Err(_)) => Err(Status::internal("internal error")),
-            Err(_) => Err(Status::deadline_exceeded("the request took too long")),
+            Err(_) => {
+                // The deadline passed: a change still queued behind the mutex must never run
+                // later, or a request answered "too slow" would be applied after all. (A change
+                // that already started cannot be taken back and finishes.) Set here and not only
+                // on drop: when this timeout fires before any outer layer drops the future, the
+                // guard is disarmed below and would never set the flag.
+                guard.flag.store(true, Ordering::SeqCst);
+                Err(Status::deadline_exceeded("the request took too long"))
+            }
         };
         guard.armed = false;
         match &result {
