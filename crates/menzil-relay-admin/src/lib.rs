@@ -21,4 +21,4 @@ pub mod service;
 pub mod tls;
 
 pub use service::Admin;
-pub use tls::{AdminServer, TlsFiles, server_config};
+pub use tls::{AdminServer, ConnLimits, TlsFiles, server_config};

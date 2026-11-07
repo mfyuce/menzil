@@ -331,6 +331,10 @@ impl RelayAcme {
 struct NameState {
     next_allowed: Instant,
     backoff: Duration,
+    /// Since when the name has not been wanted (`None`: it is wanted); its state is kept
+    /// [`ORDER_BACKOFF_MAX`] after that, so that a name toggled off and on does not start with
+    /// a clean sheet (expose round 3, M2).
+    unwanted_since: Option<Instant>,
 }
 
 #[derive(Default)]
@@ -369,6 +373,7 @@ impl OrderLimiter {
         let state = inner.names.entry(name.to_string()).or_insert(NameState {
             next_allowed: now,
             backoff: ORDER_MIN_INTERVAL,
+            unwanted_since: None,
         });
         if state.next_allowed > now {
             return None;
@@ -386,9 +391,22 @@ impl OrderLimiter {
         self.lock().in_flight.len()
     }
 
-    /// Forgets the names `keep` refuses (they are not served any more).
+    /// Notes which names `keep` refuses (they are not wanted now) and forgets those that have
+    /// been unwanted for [`ORDER_BACKOFF_MAX`], and are not in flight. A name that is wanted
+    /// again before that keeps its wait and its backoff: withdrawing and re-advertising a share
+    /// is not a way past the order interval.
     pub fn retain(&self, keep: impl Fn(&str) -> bool) {
-        self.lock().names.retain(|name, _| keep(name));
+        let now = Instant::now();
+        let mut inner = self.lock();
+        let LimiterInner { names, in_flight } = &mut *inner;
+        names.retain(|name, state| {
+            if keep(name) {
+                state.unwanted_since = None;
+                return true;
+            }
+            let since = *state.unwanted_since.get_or_insert(now);
+            in_flight.contains(name) || now.duration_since(since) < ORDER_BACKOFF_MAX
+        });
     }
 }
 
@@ -623,14 +641,21 @@ async fn order<T>(
             .install_pem(&job.domain, &issued.chain_pem, &issued.key_pem)?;
         Ok(issued)
     });
+    settle(&permit, &job.domain, saved);
+}
+
+/// Records how an order ended in the limiter. A failure doubles the name's wait. So does an
+/// order for a name that stopped being wanted ([`AcmeError::NotWanted`]): a share toggled on and
+/// off makes one order per backoff step, not one per toggle (expose round 3, M2).
+fn settle(permit: &OrderPermit, domain: &str, saved: Result<menzil_acme::Issued, AcmeError>) {
     match saved {
         Ok(issued) => {
-            tracing::info!(domain = %job.domain, not_after = issued.not_after, "ACME: a certificate was issued");
+            tracing::info!(%domain, not_after = issued.not_after, "ACME: a certificate was issued");
             permit.succeeded();
         }
-        Err(AcmeError::NotWanted) => {}
+        Err(AcmeError::NotWanted) => permit.failed(),
         Err(error) => {
-            tracing::warn!(domain = %job.domain, %error, "ACME: no certificate was issued; retrying later");
+            tracing::warn!(%domain, %error, "ACME: no certificate was issued; retrying later");
             permit.failed();
         }
     }
@@ -1306,6 +1331,125 @@ mod tests {
         assert_eq!(
             d.exchange(&hello_bytes(&name, &["acme-tls/1"])).await,
             REFUSAL
+        );
+    }
+
+    // ---- expose round 3, M2: a name toggled on and off keeps its wait ----
+
+    #[tokio::test(start_paused = true)]
+    async fn an_order_for_a_name_no_longer_wanted_counts_as_a_failure() {
+        let limiter = Arc::new(OrderLimiter::default());
+        let name = "web.ali.t.s.example.test";
+        let permit = limiter.try_start(name).expect("first");
+        settle(&permit, name, Err(AcmeError::NotWanted));
+        drop(permit);
+        // The wait doubled: past the least interval, still not due.
+        tokio::time::advance(ORDER_MIN_INTERVAL + Duration::from_secs(1)).await;
+        assert!(
+            limiter.try_start(name).is_none(),
+            "the backoff is 2 minutes"
+        );
+        tokio::time::advance(ORDER_MIN_INTERVAL).await;
+        assert!(limiter.try_start(name).is_some());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_limiter_keeps_a_name_that_is_not_wanted_for_the_longest_backoff() {
+        let limiter = Arc::new(OrderLimiter::default());
+        let name = "web.ali.t.s.example.test";
+        let permit = limiter.try_start(name).expect("first");
+        permit.failed();
+        drop(permit);
+        let wanted = |_: &str| true;
+        let unwanted = |_: &str| false;
+        // Not wanted on one look, wanted again on the next: the wait is still there.
+        limiter.retain(unwanted);
+        assert!(limiter.lock().names.contains_key(name));
+        limiter.retain(wanted);
+        assert!(
+            limiter.try_start(name).is_none(),
+            "still within the backoff"
+        );
+        // Wanted again after the wait: ordered at once (the legitimate path).
+        limiter.retain(unwanted);
+        tokio::time::advance(2 * ORDER_MIN_INTERVAL + Duration::from_secs(1)).await;
+        limiter.retain(wanted);
+        assert!(limiter.try_start(name).is_some(), "due again");
+        // Unwanted for the whole of ORDER_BACKOFF_MAX: forgotten. A look that finds it wanted
+        // in between starts the clock again.
+        limiter.retain(unwanted);
+        tokio::time::advance(ORDER_BACKOFF_MAX - Duration::from_secs(1)).await;
+        limiter.retain(unwanted);
+        assert!(
+            limiter.lock().names.contains_key(name),
+            "just short of the longest backoff"
+        );
+        limiter.retain(wanted);
+        limiter.retain(unwanted);
+        tokio::time::advance(ORDER_BACKOFF_MAX - Duration::from_secs(1)).await;
+        limiter.retain(unwanted);
+        assert!(
+            limiter.lock().names.contains_key(name),
+            "the clock started again"
+        );
+        tokio::time::advance(Duration::from_secs(2)).await;
+        limiter.retain(unwanted);
+        assert!(
+            !limiter.lock().names.contains_key(name),
+            "forgotten after the longest backoff"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_name_in_flight_is_not_forgotten_by_the_limiter() {
+        let limiter = Arc::new(OrderLimiter::default());
+        let name = "web.ali.t.s.example.test";
+        let permit = limiter.try_start(name).expect("first");
+        limiter.retain(|_| false);
+        tokio::time::advance(ORDER_BACKOFF_MAX + Duration::from_secs(1)).await;
+        limiter.retain(|_| false);
+        assert!(limiter.lock().names.contains_key(name));
+        drop(permit);
+    }
+
+    /// A tenant that withdraws and advertises a terminated share over and over, faster than the
+    /// renewal tick, makes the relay order once (the order interval and the backoff hold), not
+    /// once for each toggle at the CA, whose account limits are shared by every tenant.
+    #[tokio::test]
+    async fn a_share_toggled_on_and_off_makes_one_order_not_one_for_each_toggle() {
+        let scratch = Scratch::new();
+        let w = std::sync::Arc::new(world(&["web"], Some(terminated_ali())));
+        w.attach();
+        let acme = acme_for(&scratch.0, &[]);
+        let relay = relay_with(&w, &acme);
+        let ca = FakeCa::new(
+            acme.challenges(),
+            Flags {
+                validation_fails: true,
+                ..Flags::default()
+            },
+        );
+        w.advertise(vec![share("web", ShareMode::Terminated, "http:web", &[])]);
+        let task = tokio::spawn(run(relay, acme.clone(), ca.clone()));
+        let flapper = {
+            let w = std::sync::Arc::clone(&w);
+            tokio::spawn(async move {
+                loop {
+                    w.advertise(vec![share("web", ShareMode::Terminated, "http:web", &[])]);
+                    tokio::time::sleep(Duration::from_millis(7)).await;
+                    w.advertise(vec![]);
+                    tokio::time::sleep(Duration::from_millis(7)).await;
+                }
+            })
+        };
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        flapper.abort();
+        task.abort();
+        let log = ca.state().log.clone();
+        let orders = log.iter().filter(|r| *r == "Post /order").count();
+        assert_eq!(
+            orders, 1,
+            "ORDER_MIN_INTERVAL is {ORDER_MIN_INTERVAL:?}: {log:?}"
         );
     }
 }

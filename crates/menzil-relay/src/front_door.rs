@@ -89,7 +89,7 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::task::{Context, Poll};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use menzil_proto::{OpenMeta, ServiceId, ServiceKind, ShareMode};
+use menzil_proto::{NetworkId, NodeId, OpenMeta, ServiceId, ServiceKind, ShareMode};
 use menzil_stream::Stream;
 use rustls::server::{ClientHello as TlsClientHello, ResolvesServerCert};
 use rustls::sign::CertifiedKey;
@@ -525,7 +525,29 @@ struct Resolved {
     limits: ShareLimits,
 }
 
+/// What a resolved name is served by: the node, the network, the tenant, the mode and the
+/// service. Two resolutions of a name with the same target are the same service for a
+/// connection that is already open.
+#[derive(Debug, PartialEq, Eq)]
+struct Target {
+    node: NodeId,
+    network: NetworkId,
+    tenant: TenantId,
+    mode: ShareMode,
+    service: ServiceId,
+}
+
 impl Resolved {
+    fn target(&self) -> Target {
+        Target {
+            node: self.held.node,
+            network: self.held.network,
+            tenant: self.tenant.clone(),
+            mode: self.held.share.mode,
+            service: self.held.share.service.clone(),
+        }
+    }
+
     /// The node, the network and the service to open, and the `meta` for OPEN.
     fn service(&self) -> ServiceId {
         self.held.share.service.clone()
@@ -834,11 +856,7 @@ impl FrontDoor {
         };
         let client_ip = peer.ip();
         let door = Arc::clone(self);
-        let still = {
-            let (relay, host) = (relay.clone(), host.clone());
-            let door = Arc::clone(self);
-            move || door.resolve_terminated(&relay, &host, &[]).is_some()
-        };
+        let still = Self::still_served(Arc::clone(self), relay.clone(), host.clone(), &resolved);
         let opening = {
             let host = host.clone();
             let resolved = &resolved;
@@ -868,6 +886,24 @@ impl FrontDoor {
         };
         http_term::serve(tls, &host, client_ip, limits, still, opening).await;
         drop(slot);
+    }
+
+    /// The check made before each request of a kept-alive connection: the name must still
+    /// resolve to exactly what the connection's node stream was opened for (node, network,
+    /// tenant, mode, service). A name that moved to another node, network or service, or
+    /// changed its tenant or mode, ends the connection: its requests (cookies, credentials)
+    /// never reach the old holder (protocol.md 6.3).
+    fn still_served(
+        door: Arc<Self>,
+        relay: Relay,
+        host: String,
+        opened_for: &Resolved,
+    ) -> impl FnMut() -> bool + use<> {
+        let opened_for = opened_for.target();
+        move || {
+            door.resolve_terminated(&relay, &host, &[])
+                .is_some_and(|(now, _cert)| now.target() == opened_for)
+        }
     }
 
     /// The TLS configuration of terminated names: the certificate of exactly the name asked
@@ -2732,5 +2768,103 @@ pub(crate) mod tests {
             body_idle: Duration::from_secs(3),
         };
         assert_eq!(config.with_http_limits(set).http, set);
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // Expose round 3 (M1): a kept-alive connection follows the name, not the first holder
+    // -----------------------------------------------------------------------------------------
+
+    /// A kept-alive terminated connection opened for node X must not send a later request
+    /// (cookies, credentials) to X once the label has moved to node Y (protocol.md 6.3): the
+    /// connection ends instead; X, still attached and granted nothing, receives nothing.
+    #[tokio::test]
+    async fn a_kept_alive_terminated_connection_ends_when_the_name_moves_to_another_node() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt, duplex};
+        let (w, relay) = terminated_world();
+        let x = w.node;
+        let y = NodeId::from([8u8; 32]);
+        let (resolved, _) = t_resolve(&w, &relay, T_HOST).expect("resolves");
+        assert_eq!(resolved.held.node, x);
+        let still = FrontDoor::still_served(
+            Arc::clone(&w.door),
+            relay.clone(),
+            T_HOST.to_string(),
+            &resolved,
+        );
+        let (mut c, srv_c) = duplex(1 << 16);
+        let (srv_x, mut node_x) = duplex(1 << 16);
+        let server = tokio::spawn(async move {
+            http_term::serve(
+                srv_c,
+                T_HOST,
+                "203.0.113.7".parse().unwrap(),
+                HttpLimits::default(),
+                still,
+                move || async move { Some(srv_x) },
+            )
+            .await;
+        });
+        let req =
+            format!("GET /secret HTTP/1.1\r\nHost: {T_HOST}\r\nCookie: session=victim\r\n\r\n");
+        let mut buf = vec![0u8; 4096];
+        c.write_all(req.as_bytes()).await.unwrap();
+        let n = node_x.read(&mut buf).await.unwrap();
+        assert!(n > 0, "the first request reaches X");
+        node_x
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+            .await
+            .unwrap();
+        let n = c.read(&mut buf).await.unwrap();
+        assert!(
+            buf[..n].starts_with(b"HTTP/1.1 200"),
+            "the first response arrives"
+        );
+        // The owner moves `web` to Y; Y attaches and takes the name. X stays attached.
+        w.roster(2, &[x, y], &[("web", y), ("app", x)]);
+        w.relay
+            .labels()
+            .release_ungranted(w.relay.rosters(), unix_now());
+        w.attach_node(y);
+        w.advertise_as(
+            y,
+            vec![share("web", ShareMode::Terminated, "http:web", &[])],
+        );
+        let (now, _) = t_resolve(&w, &relay, T_HOST).expect("Y holds the name");
+        assert_eq!(now.held.node, y);
+        // A second request on the same connection is not forwarded to X; the connection ends.
+        c.write_all(req.as_bytes()).await.unwrap();
+        let mut rest = Vec::new();
+        let closed = tokio::time::timeout(Duration::from_secs(5), c.read_to_end(&mut rest)).await;
+        assert!(closed.is_ok(), "the connection must end");
+        let got = tokio::time::timeout(Duration::from_millis(500), node_x.read(&mut buf)).await;
+        assert!(
+            matches!(got, Ok(Ok(0)) | Ok(Err(_))),
+            "node X must not receive the second request: {got:?}"
+        );
+        let _ = server.await;
+    }
+
+    /// The target of a kept-alive connection is node, network, tenant, mode and service: a name
+    /// that resolves to the same target stays served; one that resolves to none, or to a
+    /// different service of the same node, does not.
+    #[tokio::test]
+    async fn still_served_compares_the_whole_target_not_only_that_the_name_resolves() {
+        let (w, relay) = terminated_world();
+        let (resolved, _) = t_resolve(&w, &relay, T_HOST).expect("resolves");
+        let mut still = FrontDoor::still_served(
+            Arc::clone(&w.door),
+            relay.clone(),
+            T_HOST.to_string(),
+            &resolved,
+        );
+        assert!(still(), "the same target is still served");
+        // the same node re-advertises `web` with another service
+        w.advertise(vec![share("web", ShareMode::Terminated, "http:other", &[])]);
+        let (now, _) = t_resolve(&w, &relay, T_HOST).expect("still resolves");
+        assert_ne!(now.service(), resolved.service(), "the test's premise");
+        assert!(
+            !still(),
+            "another service of the same name ends the connection"
+        );
     }
 }

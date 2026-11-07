@@ -73,6 +73,18 @@ impl Fixture {
 
     /// `start` with another per-request deadline in the agent.
     pub async fn start_with_timeout(timeout: Option<std::time::Duration>) -> Self {
+        Self::start_with(timeout, None).await
+    }
+
+    /// `start` with other connection limits in the server.
+    pub async fn start_with_limits(limits: menzil_relay_admin::ConnLimits) -> Self {
+        Self::start_with(None, Some(limits)).await
+    }
+
+    async fn start_with(
+        timeout: Option<std::time::Duration>,
+        limits: Option<menzil_relay_admin::ConnLimits>,
+    ) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let relay_home = dir.path().join("relay-home");
         let certs = generate(&dir.path().join("certs"), "localhost", "menzil-ui").unwrap();
@@ -81,9 +93,12 @@ impl Fixture {
         if let Some(timeout) = timeout {
             admin = admin.with_request_timeout(timeout);
         }
-        let server = AdminServer::bind("127.0.0.1:0".parse().unwrap(), config, admin.clone())
+        let mut server = AdminServer::bind("127.0.0.1:0".parse().unwrap(), config, admin.clone())
             .await
             .unwrap();
+        if let Some(limits) = limits {
+            server = server.with_limits(limits);
+        }
         let addr = server.local_addr().unwrap();
         let (stop, stop_rx) = tokio::sync::oneshot::channel::<()>();
         let task = tokio::spawn(async move {

@@ -111,8 +111,10 @@ struct Conn<T> {
 }
 
 enum ReadFail {
-    /// End of stream or an I/O error.
-    Closed,
+    /// The peer ended its side cleanly (a read of 0 bytes).
+    Eof,
+    /// An I/O error or a reset: what was read is not known to be complete.
+    Error,
     TimedOut,
 }
 
@@ -129,7 +131,8 @@ impl<T: AsyncRead + Unpin> Conn<T> {
         let mut tmp = [0u8; IO_BUFFER];
         match timeout(wait, self.io.read(&mut tmp)).await {
             Err(_) => Err(ReadFail::TimedOut),
-            Ok(Ok(0) | Err(_)) => Err(ReadFail::Closed),
+            Ok(Ok(0)) => Err(ReadFail::Eof),
+            Ok(Err(_)) => Err(ReadFail::Error),
             Ok(Ok(n)) => {
                 self.buf.extend_from_slice(&tmp[..n]);
                 Ok(n)
@@ -137,25 +140,24 @@ impl<T: AsyncRead + Unpin> Conn<T> {
         }
     }
 
-    /// One line ended by CRLF, without it. A bare CR or LF, or a line over `max`, is malformed.
-    async fn line(&mut self, max: usize, wait: Duration) -> Result<Vec<u8>, BodyFail> {
-        loop {
-            if let Some(lf) = self.buf.iter().position(|b| *b == b'\n') {
-                if lf == 0 || self.buf[lf - 1] != b'\r' || lf - 1 > max {
-                    return Err(BodyFail::Malformed);
-                }
-                let mut line: Vec<u8> = self.buf.drain(..=lf).collect();
-                line.truncate(lf - 1);
-                if line.contains(&b'\r') {
-                    return Err(BodyFail::Malformed);
-                }
-                return Ok(line);
-            }
-            if self.buf.len() > max + 1 {
+    /// One line ended by CRLF, without it, if the buffer holds one (`None`: more bytes are
+    /// needed). A bare CR or LF, or a line over `max`, is malformed.
+    fn take_line(&mut self, max: usize) -> Result<Option<Vec<u8>>, BodyFail> {
+        if let Some(lf) = self.buf.iter().position(|b| *b == b'\n') {
+            if lf == 0 || self.buf[lf - 1] != b'\r' || lf - 1 > max {
                 return Err(BodyFail::Malformed);
             }
-            self.fill(wait).await.map_err(BodyFail::from)?;
+            let mut line: Vec<u8> = self.buf.drain(..=lf).collect();
+            line.truncate(lf - 1);
+            if line.contains(&b'\r') {
+                return Err(BodyFail::Malformed);
+            }
+            return Ok(Some(line));
         }
+        if self.buf.len() > max + 1 {
+            return Err(BodyFail::Malformed);
+        }
+        Ok(None)
     }
 }
 
@@ -253,7 +255,7 @@ async fn read_head<T: AsyncRead + Unpin>(
             Ok(_) => {
                 started.get_or_insert_with(Instant::now);
             }
-            Err(ReadFail::Closed) => return Err(HeadFail::Closed),
+            Err(ReadFail::Eof | ReadFail::Error) => return Err(HeadFail::Closed),
             Err(ReadFail::TimedOut) => {
                 return Err(if started.is_some() {
                     HeadFail::TimedOut
@@ -326,6 +328,10 @@ fn is_token(v: &[u8]) -> bool {
 
 /// Headers that are the hop's own, or that name the client for the node: never passed.
 fn is_stripped(lower: &str) -> bool {
+    // CGI and WSGI servers fold `_` and `-` in header names (`X_Forwarded_For` is
+    // `X-Forwarded-For` to them): the comparison folds them too.
+    let folded = lower.replace('_', "-");
+    let lower = folded.as_str();
     matches!(
         lower,
         "connection"
@@ -645,8 +651,10 @@ fn reason(code: u16) -> &'static str {
 // ---------------------------------------------------------------------------------------------
 
 enum BodyFail {
-    /// The source ended or failed.
+    /// The source ended before the body was complete.
     Closed,
+    /// The source failed (an I/O error or a reset).
+    Failed,
     TimedOut,
     /// The framing is not valid.
     Malformed,
@@ -657,7 +665,8 @@ enum BodyFail {
 impl From<ReadFail> for BodyFail {
     fn from(fail: ReadFail) -> Self {
         match fail {
-            ReadFail::Closed => Self::Closed,
+            ReadFail::Eof => Self::Closed,
+            ReadFail::Error => Self::Failed,
             ReadFail::TimedOut => Self::TimedOut,
         }
     }
@@ -716,41 +725,113 @@ where
             if src.buf.is_empty() {
                 match src.fill(wait).await {
                     Ok(_) => {}
-                    Err(ReadFail::Closed) => return Ok(()),
+                    // Only a clean end of the node's stream ends a body framed by the close;
+                    // a reset is a failure (the client must not take it for a complete body).
+                    Err(ReadFail::Eof) => return Ok(()),
+                    Err(ReadFail::Error) => return Err(BodyFail::Failed),
                     Err(ReadFail::TimedOut) => return Err(BodyFail::TimedOut),
                 }
             }
             let piece = std::mem::take(&mut src.buf);
             put(dst, &piece, wait).await?;
         },
-        Framing::Chunked => loop {
-            let line = src.line(MAX_CHUNK_LINE, wait).await?;
-            if line.is_empty() || line.len() > 16 || !line.iter().all(u8::is_ascii_hexdigit) {
-                return Err(BodyFail::Malformed);
-            }
-            let size = u64::from_str_radix(&String::from_utf8_lossy(&line), 16)
-                .map_err(|_| BodyFail::Malformed)?;
-            if size == 0 {
-                let mut trailer = 0usize;
-                loop {
-                    let line = src.line(MAX_CHUNK_LINE, wait).await?;
-                    if line.is_empty() {
-                        break;
-                    }
-                    trailer += line.len() + 2;
-                    if trailer > MAX_TRAILER {
+        Framing::Chunked => copy_chunked(src, dst, wait).await,
+    }
+}
+
+/// Where `copy_chunked` is in a chunked body.
+enum ChunkState {
+    /// Waiting for a chunk-size line.
+    Size,
+    /// Inside a chunk's data: this many bytes left.
+    Data(u64),
+    /// Waiting for the CRLF after a chunk's data.
+    DataEnd,
+    /// After the last chunk: trailer lines, so many bytes so far.
+    Trailer(usize),
+}
+
+/// Moves a chunked body, re-encoded (no extensions, trailers dropped). The output is gathered
+/// and written once for each read of the source, not once for each piece of each chunk: a body of
+/// one byte chunks costs one write for a read's worth of chunks, not three writes each.
+async fn copy_chunked<S, D>(src: &mut Conn<S>, dst: &mut D, wait: Duration) -> Result<(), BodyFail>
+where
+    S: AsyncRead + Unpin,
+    D: AsyncWrite + Unpin,
+{
+    let mut out: Vec<u8> = Vec::new();
+    let mut state = ChunkState::Size;
+    loop {
+        let progressed = match state {
+            ChunkState::Size => match src.take_line(MAX_CHUNK_LINE)? {
+                None => false,
+                Some(line) => {
+                    if line.is_empty() || line.len() > 16 || !line.iter().all(u8::is_ascii_hexdigit)
+                    {
                         return Err(BodyFail::Malformed);
                     }
+                    let size = u64::from_str_radix(&String::from_utf8_lossy(&line), 16)
+                        .map_err(|_| BodyFail::Malformed)?;
+                    if size == 0 {
+                        state = ChunkState::Trailer(0);
+                    } else {
+                        out.extend_from_slice(format!("{size:x}\r\n").as_bytes());
+                        state = ChunkState::Data(size);
+                    }
+                    true
                 }
-                return put(dst, b"0\r\n\r\n", wait).await;
+            },
+            ChunkState::Data(left) => {
+                if src.buf.is_empty() {
+                    false
+                } else {
+                    let take =
+                        usize::try_from(left).map_or(src.buf.len(), |n| n.min(src.buf.len()));
+                    out.extend(src.buf.drain(..take));
+                    let left = left - take as u64;
+                    state = if left == 0 {
+                        ChunkState::DataEnd
+                    } else {
+                        ChunkState::Data(left)
+                    };
+                    true
+                }
             }
-            put(dst, format!("{size:x}\r\n").as_bytes(), wait).await?;
-            copy_exact(src, dst, size, wait).await?;
-            if !src.line(0, wait).await?.is_empty() {
-                return Err(BodyFail::Malformed);
+            ChunkState::DataEnd => match src.take_line(0)? {
+                None => false,
+                Some(line) => {
+                    if !line.is_empty() {
+                        return Err(BodyFail::Malformed);
+                    }
+                    out.extend_from_slice(b"\r\n");
+                    state = ChunkState::Size;
+                    true
+                }
+            },
+            ChunkState::Trailer(seen) => match src.take_line(MAX_CHUNK_LINE)? {
+                None => false,
+                Some(line) if line.is_empty() => {
+                    out.extend_from_slice(b"0\r\n\r\n");
+                    return put(dst, &out, wait).await;
+                }
+                Some(line) => {
+                    let seen = seen + line.len() + 2;
+                    if seen > MAX_TRAILER {
+                        return Err(BodyFail::Malformed);
+                    }
+                    state = ChunkState::Trailer(seen);
+                    true
+                }
+            },
+        };
+        if !progressed {
+            // Out of input: pass on what is gathered, then read once more.
+            if !out.is_empty() {
+                put(dst, &out, wait).await?;
+                out.clear();
             }
-            put(dst, b"\r\n", wait).await?;
-        },
+            src.fill(wait).await?;
+        }
     }
 }
 
@@ -1715,5 +1796,316 @@ mod tests {
         assert_eq!(d.body_idle, Duration::from_secs(120));
         assert_eq!(MAX_HEAD, 16 * 1024);
         assert_eq!(MAX_HEADERS, 64);
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // Expose round 3: H1 (a reset is not an end), L1 (underscore names), M3 (chunk writes)
+    // -----------------------------------------------------------------------------------------
+
+    mod round3 {
+        use super::*;
+        use std::pin::Pin;
+        use std::task::{Context, Poll};
+
+        /// A node that answers `out`, then ends its stream: with a reset (`reset`) or cleanly.
+        struct EndingNode {
+            out: Vec<u8>,
+            pos: usize,
+            reset: bool,
+        }
+
+        impl AsyncRead for EndingNode {
+            fn poll_read(
+                mut self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+                buf: &mut tokio::io::ReadBuf<'_>,
+            ) -> Poll<std::io::Result<()>> {
+                if self.pos < self.out.len() {
+                    let n = (self.out.len() - self.pos).min(buf.remaining());
+                    let start = self.pos;
+                    buf.put_slice(&self.out[start..start + n]);
+                    self.pos += n;
+                    return Poll::Ready(Ok(()));
+                }
+                if self.reset {
+                    Poll::Ready(Err(std::io::Error::new(
+                        std::io::ErrorKind::ConnectionReset,
+                        "stream reset",
+                    )))
+                } else {
+                    Poll::Ready(Ok(()))
+                }
+            }
+        }
+
+        impl AsyncWrite for EndingNode {
+            fn poll_write(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+                buf: &[u8],
+            ) -> Poll<std::io::Result<usize>> {
+                Poll::Ready(Ok(buf.len()))
+            }
+            fn poll_flush(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+            ) -> Poll<std::io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+            fn poll_shutdown(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+            ) -> Poll<std::io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+        }
+
+        /// The client side; counts the clean closes (over TLS a shutdown is a close_notify).
+        struct ClientSide {
+            inner: DuplexStream,
+            clean: Arc<AtomicUsize>,
+        }
+
+        impl AsyncRead for ClientSide {
+            fn poll_read(
+                mut self: Pin<&mut Self>,
+                cx: &mut Context<'_>,
+                buf: &mut tokio::io::ReadBuf<'_>,
+            ) -> Poll<std::io::Result<()>> {
+                Pin::new(&mut self.inner).poll_read(cx, buf)
+            }
+        }
+
+        impl AsyncWrite for ClientSide {
+            fn poll_write(
+                mut self: Pin<&mut Self>,
+                cx: &mut Context<'_>,
+                buf: &[u8],
+            ) -> Poll<std::io::Result<usize>> {
+                Pin::new(&mut self.inner).poll_write(cx, buf)
+            }
+            fn poll_flush(
+                mut self: Pin<&mut Self>,
+                cx: &mut Context<'_>,
+            ) -> Poll<std::io::Result<()>> {
+                Pin::new(&mut self.inner).poll_flush(cx)
+            }
+            fn poll_shutdown(
+                mut self: Pin<&mut Self>,
+                cx: &mut Context<'_>,
+            ) -> Poll<std::io::Result<()>> {
+                self.clean.fetch_add(1, Ordering::SeqCst);
+                Pin::new(&mut self.inner).poll_shutdown(cx)
+            }
+        }
+
+        /// What the client got, and how often the terminator closed its side cleanly.
+        async fn ending_case(response: &[u8], reset: bool) -> (String, usize) {
+            let (mut c, srv_c) = duplex(1 << 16);
+            let clean = Arc::new(AtomicUsize::new(0));
+            let client_io = ClientSide {
+                inner: srv_c,
+                clean: Arc::clone(&clean),
+            };
+            let node = EndingNode {
+                out: response.to_vec(),
+                pos: 0,
+                reset,
+            };
+            let server = tokio::spawn(async move {
+                serve(
+                    client_io,
+                    HOST,
+                    IP.parse().unwrap(),
+                    limits(),
+                    || true,
+                    move || async move { Some(node) },
+                )
+                .await;
+            });
+            c.write_all(&get("")).await.unwrap();
+            let mut got = Vec::new();
+            let _ = tokio::time::timeout(Duration::from_secs(3), c.read_to_end(&mut got)).await;
+            server.await.unwrap();
+            (
+                String::from_utf8_lossy(&got).to_string(),
+                clean.load(Ordering::SeqCst),
+            )
+        }
+
+        const UNTIL_CLOSE: &[u8] =
+            b"HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\n\r\nPART-OF-A-LARGER-FILE";
+
+        #[tokio::test]
+        async fn a_node_stream_reset_does_not_end_an_until_close_body_cleanly() {
+            let (got, clean) = ending_case(UNTIL_CLOSE, true).await;
+            assert!(got.ends_with("PART-OF-A-LARGER-FILE"), "{got:?}");
+            assert_eq!(
+                clean, 0,
+                "a reset must not look like a complete body: no close_notify"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_clean_end_of_the_node_stream_still_ends_an_until_close_body_cleanly() {
+            let (got, clean) = ending_case(UNTIL_CLOSE, false).await;
+            assert!(got.ends_with("PART-OF-A-LARGER-FILE"), "{got:?}");
+            assert_eq!(clean, 1, "the end of a close framed body is a clean close");
+        }
+
+        #[tokio::test]
+        async fn a_node_stream_reset_inside_a_length_or_chunked_body_is_not_a_clean_close() {
+            let (_, clean) = ending_case(
+                b"HTTP/1.1 200 OK\r\nContent-Length: 1000\r\n\r\nPART-OF-A-LARGER-FILE",
+                true,
+            )
+            .await;
+            assert_eq!(clean, 0);
+            let (_, clean) = ending_case(
+                b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n",
+                true,
+            )
+            .await;
+            assert_eq!(clean, 0);
+            // the clean end of a short length body is no better
+            let (_, clean) = ending_case(
+                b"HTTP/1.1 200 OK\r\nContent-Length: 1000\r\n\r\nPART-OF-A-LARGER-FILE",
+                false,
+            )
+            .await;
+            assert_eq!(clean, 0);
+        }
+
+        #[tokio::test]
+        async fn address_headers_spelled_with_underscores_do_not_reach_the_node() {
+            let out = exchange(
+                &get(
+                    "X-Forwarded_For: 6.6.6.6\r\nX_Forwarded_For: 6.6.6.7\r\nX-Real_IP: 6.6.6.8\r\n\
+                     True_Client_IP: 6.6.6.9\r\nForwarded_For: 6.6.6.10\r\nProxy_Authorization: x\r\n\
+                     Content_Length: 99\r\nTransfer_Encoding: chunked\r\nX_Accepted: yes\r\n",
+                ),
+                OK,
+            )
+            .await;
+            let node = sent(&out);
+            for name in [
+                "6.6.6.6",
+                "6.6.6.7",
+                "6.6.6.8",
+                "6.6.6.9",
+                "Proxy_Authorization",
+                "Content_Length",
+                "Transfer_Encoding",
+            ] {
+                assert!(!node.contains(name), "{name} reached the node:\n{node}");
+            }
+            // an unrelated header with an underscore is still passed
+            assert!(node.contains("X_Accepted: yes\r\n"), "{node}");
+        }
+
+        /// A node stream that counts write calls.
+        struct Counting {
+            inner: DuplexStream,
+            writes: Arc<AtomicUsize>,
+        }
+
+        impl AsyncRead for Counting {
+            fn poll_read(
+                mut self: Pin<&mut Self>,
+                cx: &mut Context<'_>,
+                buf: &mut tokio::io::ReadBuf<'_>,
+            ) -> Poll<std::io::Result<()>> {
+                Pin::new(&mut self.inner).poll_read(cx, buf)
+            }
+        }
+
+        impl AsyncWrite for Counting {
+            fn poll_write(
+                mut self: Pin<&mut Self>,
+                cx: &mut Context<'_>,
+                buf: &[u8],
+            ) -> Poll<std::io::Result<usize>> {
+                let r = Pin::new(&mut self.inner).poll_write(cx, buf);
+                if let Poll::Ready(Ok(_)) = r {
+                    self.writes.fetch_add(1, Ordering::SeqCst);
+                }
+                r
+            }
+            fn poll_flush(
+                mut self: Pin<&mut Self>,
+                cx: &mut Context<'_>,
+            ) -> Poll<std::io::Result<()>> {
+                Pin::new(&mut self.inner).poll_flush(cx)
+            }
+            fn poll_shutdown(
+                mut self: Pin<&mut Self>,
+                cx: &mut Context<'_>,
+            ) -> Poll<std::io::Result<()>> {
+                Pin::new(&mut self.inner).poll_shutdown(cx)
+            }
+        }
+
+        #[tokio::test]
+        async fn many_tiny_chunks_cost_one_node_write_for_each_read_not_three_for_each_chunk() {
+            const N: usize = 10_000;
+            let mut req =
+                format!("POST /x HTTP/1.1\r\nHost: {HOST}\r\nTransfer-Encoding: chunked\r\n\r\n")
+                    .into_bytes();
+            for _ in 0..N {
+                req.extend_from_slice(b"1\r\nx\r\n");
+            }
+            req.extend_from_slice(b"0\r\n\r\n");
+            let (mut test_client, srv_client) = duplex(1 << 22);
+            let (srv_node, mut test_node) = duplex(1 << 22);
+            let writes = Arc::new(AtomicUsize::new(0));
+            let node_io = Counting {
+                inner: srv_node,
+                writes: Arc::clone(&writes),
+            };
+            let server = tokio::spawn(async move {
+                serve(
+                    srv_client,
+                    HOST,
+                    IP.parse().unwrap(),
+                    limits(),
+                    || true,
+                    move || async move { Some(node_io) },
+                )
+                .await;
+            });
+            let node = tokio::spawn(async move {
+                let mut seen = Vec::new();
+                let mut chunk = [0u8; 65536];
+                loop {
+                    match test_node.read(&mut chunk).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            seen.extend_from_slice(&chunk[..n]);
+                            if seen.ends_with(b"0\r\n\r\n") {
+                                let _ = test_node.write_all(OK).await;
+                            }
+                        }
+                    }
+                }
+                seen
+            });
+            test_client.write_all(&req).await.unwrap();
+            test_client.shutdown().await.unwrap();
+            let mut client = Vec::new();
+            let _ =
+                tokio::time::timeout(Duration::from_secs(5), test_client.read_to_end(&mut client))
+                    .await;
+            server.await.unwrap();
+            let seen = node.await.unwrap();
+            assert!(client.starts_with(b"HTTP/1.1 200 OK"), "{client:?}");
+            // the body is the same as before: every chunk, re-encoded
+            let body_start = seen.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+            assert_eq!(&seen[body_start..body_start + 6], b"1\r\nx\r\n");
+            assert!(seen.ends_with(b"1\r\nx\r\n0\r\n\r\n"));
+            assert_eq!(seen.len() - body_start, N * 6 + 5);
+            // the body is 60 KB: a handful of reads of the client's stream, so a handful of writes
+            let writes = writes.load(Ordering::SeqCst);
+            assert!(writes <= 16, "{writes} node writes for {N} chunks");
+        }
     }
 }

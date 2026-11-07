@@ -6,7 +6,7 @@ Status: v0.4 adds public shares as built (the relay principal in 2.3, the front 
 
 - 2.3: the relay principal is an L4 initiator with its own session; what it may open and what it may forge (`meta`) are stated, and that a blind share's content stays unreadable while the relay is passive.
 - 2.7: the unknown name no longer gets a static site but one fixed seven byte alert; the peek flood, refusal indistinguishability (and its timing limit), HTTP request smuggling against terminated shares and ACME abuse are covered with their controls and residual risks.
-- 2.10: a share name resolves to a network only inside its tenant's zone, share traffic is counted per tenant, and a terminated share cannot set a cookie for a parent domain.
+- 2.10: a share name resolves to a network only inside its tenant's zone, share traffic is counted per tenant, and a terminated share cannot set a cookie for a parent domain through a `Set-Cookie` header (page script can, see 5).
 - 5: tests 6, 11 and 13 describe what the code does; tests 22 to 29 are new.
 - 6: open items.
 
@@ -93,7 +93,7 @@ Controls (protocol.md section in brackets):
 
 Residual risks, accepted:
 
-- Until the share domain is on the Public Suffix List and browsers carry the listing, a blind share of one tenant can set cookies for the share domain that browsers send to other tenants' shares (cookie tossing); the relay cannot filter them because it cannot read a blind share. A terminated share cannot: the relay removes from a `Set-Cookie` every `Domain` attribute except the share's own exact name, so such a cookie stays host only (protocol.md 6.3). One tenant's abuse, phishing on a share for example, can get the share domain blocklisted for every tenant; the operator's remedy is to remove that tenant.
+- Until the share domain is on the Public Suffix List and browsers carry the listing, a blind share of one tenant can set cookies for the share domain that browsers send to other tenants' shares (cookie tossing); the relay cannot filter them because it cannot read a blind share. A terminated share cannot do it through a `Set-Cookie` header: the relay removes every `Domain` attribute except the share's own exact name, so such a cookie stays host only (protocol.md 6.3). It can still do it from page script (`document.cookie = "x=y; Domain=t.H"`), which the relay cannot see; only the Public Suffix List stops that (red team round 3, L3). One tenant's abuse, phishing on a share for example, can get the share domain blocklisted for every tenant; the operator's remedy is to remove that tenant.
 - A session counts against the tenant of every network it claims and is refused while any of them is at a session figure. A device that joined a hostile owner's network as well as the victim's can therefore be kept off the victim's network too, for as long as the hostile owner keeps its own tenant full. Listing the device in a Roster is not enough for this: a device claims only the networks it joined, and one that leaves the hostile network out of its HELLO is unaffected.
 - The default tenant has no tenant figures and flat names. A friend's network belongs in a named tenant; a network left in the default tenant is limited only by the global limits.
 - ERROR `over_quota` for a new pair names no destination, so a refused node cannot tell which peer it was; the figures are meant to be reached only by abuse. A relay restart begins a new volume period; only the operator can cause one.

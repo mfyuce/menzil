@@ -30,10 +30,37 @@ use tonic::transport::server::Connected;
 
 use crate::service::Admin;
 
-/// How long a client has to finish the TLS handshake.
-pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
-/// How many connections (handshaking or open) are served at once.
+/// How long a client has to finish the TLS handshake. Short: a client on a LAN or the loopback
+/// needs milliseconds, and the handshake slots are all an unauthenticated peer can hold.
+pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(3);
+/// How many TLS handshakes are in progress at once (a connection past that waits in the
+/// listener's backlog). A handshake slot is given back when the handshake ends, so a peer that
+/// never finishes one costs [`HANDSHAKE_TIMEOUT`] of one slot and nothing else.
+pub const MAX_HANDSHAKES: usize = 64;
+/// How many connections (authenticated, open) are served at once. A client past that is
+/// dropped after its handshake.
 pub const MAX_CONNECTIONS: usize = 64;
+
+/// The connection limits of an [`AdminServer`] (the defaults are the constants above).
+#[derive(Debug, Clone, Copy)]
+pub struct ConnLimits {
+    /// Handshakes in progress at once.
+    pub max_handshakes: usize,
+    /// The time one handshake may take.
+    pub handshake_timeout: Duration,
+    /// Authenticated connections served at once.
+    pub max_connections: usize,
+}
+
+impl Default for ConnLimits {
+    fn default() -> Self {
+        Self {
+            max_handshakes: MAX_HANDSHAKES,
+            handshake_timeout: HANDSHAKE_TIMEOUT,
+            max_connections: MAX_CONNECTIONS,
+        }
+    }
+}
 
 /// The three files the server needs.
 #[derive(Debug, Clone)]
@@ -176,6 +203,7 @@ pub struct AdminServer {
     listener: TcpListener,
     config: Arc<rustls::ServerConfig>,
     admin: Admin,
+    limits: ConnLimits,
 }
 
 impl AdminServer {
@@ -189,7 +217,15 @@ impl AdminServer {
             listener: TcpListener::bind(addr).await?,
             config: Arc::new(config),
             admin,
+            limits: ConnLimits::default(),
         })
+    }
+
+    /// Other connection limits than the defaults.
+    #[must_use]
+    pub fn with_limits(mut self, limits: ConnLimits) -> Self {
+        self.limits = limits;
+        self
     }
 
     /// The address bound.
@@ -204,12 +240,16 @@ impl AdminServer {
     ) -> Result<(), tonic::transport::Error> {
         let (tx, rx) = mpsc::channel::<io::Result<Conn>>(16);
         let acceptor = TlsAcceptor::from(self.config);
-        let slots = Arc::new(Semaphore::new(MAX_CONNECTIONS));
+        let limits = self.limits;
+        let served = Arc::new(Semaphore::new(limits.max_connections));
+        let handshakes = Arc::new(Semaphore::new(limits.max_handshakes));
         let listener = self.listener;
         let accepting = tokio::spawn(async move {
             loop {
-                // A free slot first: beyond the limit a connection waits in the backlog.
-                let Ok(permit) = slots.clone().acquire_owned().await else {
+                // A free handshake slot first: beyond the limit a connection waits in the
+                // backlog. The slot is held through the handshake only; the slot of a served
+                // connection is taken after it (expose round 3, L2).
+                let Ok(handshake_slot) = handshakes.clone().acquire_owned().await else {
                     return;
                 };
                 let (tcp, _) = match listener.accept().await {
@@ -221,19 +261,26 @@ impl AdminServer {
                 };
                 let acceptor = acceptor.clone();
                 let tx = tx.clone();
+                let served = served.clone();
                 tokio::spawn(async move {
                     // A failed handshake (no certificate, a certificate of another CA, plaintext,
-                    // TLS 1.2) ends here: tonic never sees the connection.
-                    if let Ok(Ok(inner)) =
-                        tokio::time::timeout(HANDSHAKE_TIMEOUT, acceptor.accept(tcp)).await
-                    {
-                        let _ = tx
-                            .send(Ok(Conn {
-                                inner,
-                                _permit: permit,
-                            }))
-                            .await;
-                    }
+                    // TLS 1.2, silence) ends here: tonic never sees the connection.
+                    let Ok(Ok(inner)) =
+                        tokio::time::timeout(limits.handshake_timeout, acceptor.accept(tcp)).await
+                    else {
+                        return;
+                    };
+                    drop(handshake_slot);
+                    // A verified client past the served limit is dropped.
+                    let Ok(permit) = served.try_acquire_owned() else {
+                        return;
+                    };
+                    let _ = tx
+                        .send(Ok(Conn {
+                            inner,
+                            _permit: permit,
+                        }))
+                        .await;
                 });
             }
         });
