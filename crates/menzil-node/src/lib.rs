@@ -59,6 +59,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod acme;
 mod admission;
 mod cert_candidates;
 mod cert_index;
@@ -127,6 +128,6 @@ pub use session::{
     run_session_until,
 };
 pub use shares::{
-    ADVERTISE_ACK_TIMEOUT, ADVERTISE_RETRY_DELAY, MAX_SHARES, ShareBook, ShareError, ShareSnapshot,
-    check_name, validate_shares,
+    ACME_ALPN, ADVERTISE_ACK_TIMEOUT, ADVERTISE_RETRY_DELAY, MAX_SHARES, ShareBook, ShareError,
+    ShareSnapshot, check_name, lists_acme_alpn, validate_shares,
 };

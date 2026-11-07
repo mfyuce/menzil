@@ -29,6 +29,17 @@ use menzil_proto::{
 use tokio::sync::watch;
 use tokio::time::Instant;
 
+/// The ALPN identifier of TLS-ALPN-01 validation connections (RFC 8737). A blind share lists it
+/// to receive them (protocol.md 4.4, 6.2); the node answers them only for an order that is
+/// pending ([`crate::acme`]).
+pub const ACME_ALPN: &str = "acme-tls/1";
+
+/// Whether `share` asks the relay to route ACME TLS-ALPN-01 validations to the node: a blind share
+/// whose ALPN list names `acme-tls/1`.
+pub fn lists_acme_alpn(share: &Share) -> bool {
+    share.mode == ShareMode::Blind && share.alpn.iter().any(|alpn| alpn == ACME_ALPN)
+}
+
 /// How many shares one ADVERTISE may carry (protocol.md 4.4: a longer one is refused whole).
 pub const MAX_SHARES: usize = 64;
 

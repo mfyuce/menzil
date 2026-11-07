@@ -476,10 +476,27 @@ impl ServiceHandler<Stream> for LocalServices {
     }
 
     fn handle(&self, stream: Stream, request: OpenRequest, opened: OpenedTarget) -> Self::Handling {
+        self.handle_with_prefix(stream, request, opened, Vec::new())
+    }
+}
+
+impl LocalServices {
+    /// [`ServiceHandler::handle`] for a stream of which the first bytes were already read (the
+    /// ClientHello the ACME responder looked at, `crate::acme`): `prefix` is written to the
+    /// target before the pipe starts, so the target sees the stream whole.
+    pub(crate) fn handle_with_prefix(
+        &self,
+        stream: Stream,
+        request: OpenRequest,
+        opened: OpenedTarget,
+        prefix: Vec<u8>,
+    ) -> Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+        let connect_timeout = self.connect_timeout;
         // A future dropped before it ran drops `stream` and `opened`, which reset themselves.
         Box::pin(async move {
             let mut pipe = Pipe::new(stream, opened);
-            pipe.run(&request.service).await
+            pipe.run_with_prefix(&request.service, &prefix, connect_timeout)
+                .await
         })
     }
 }
@@ -668,6 +685,26 @@ impl Pipe {
         }
     }
 
+    async fn run_with_prefix(&mut self, service: &ServiceId, prefix: &[u8], limit: Duration) {
+        if !prefix.is_empty() {
+            let Some(local) = self.local.as_mut() else {
+                return;
+            };
+            use tokio::io::AsyncWriteExt as _;
+            // The target gets the bytes already read before anything else; one that does not
+            // take them in time is as good as unreachable.
+            if !matches!(
+                tokio::time::timeout(limit, local.write_all(prefix)).await,
+                Ok(Ok(()))
+            ) {
+                tracing::debug!(%service, "the local target did not take the first bytes of a stream");
+                self.abort();
+                return;
+            }
+        }
+        self.run(service).await;
+    }
+
     async fn run(&mut self, service: &ServiceId) {
         let (Some(remote), Some(local)) = (self.remote.as_mut(), self.local.as_mut()) else {
             return;
@@ -727,7 +764,7 @@ fn reset_socket(socket: &TcpStream) {
 
 /// `menzil_stream::Stream` speaks `futures` I/O; tokio's `copy_bidirectional`
 /// wants its own traits.
-struct TokioStream(Stream);
+pub(crate) struct TokioStream(pub(crate) Stream);
 
 impl tokio::io::AsyncRead for TokioStream {
     fn poll_read(
