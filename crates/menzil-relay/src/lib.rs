@@ -7,13 +7,13 @@
 //! here:
 //!
 //! - Anything but the blind front door of the TLS port (`front_door`: protocol.md 6.2 to 6.4,
-//!   SNI routing of blind `tls:` and `tcp:` shares through the relay principal); the static
-//!   site and terminated shares are later slices.
+//!   SNI routing of blind `tls:` and `tcp:` shares through the relay principal, and the TLS of
+//!   terminated shares); the static site is a later slice.
 //! - The relay's own ACME is `acme` (TLS-ALPN-01 for the relay's host name and the names of
 //!   terminated shares, needs the front door); the certificate and key of the relay's own host
 //!   are otherwise supplied to this crate already loaded.
-//! - Relay-terminated HTTP serving for terminated shares (its own
-//!   TODO.md line, protocol.md 6.3).
+//! - `http_term` is the HTTP/1.1 terminator of terminated shares (protocol.md 6.3); WebSocket
+//!   upgrade through it is not built.
 
 #![forbid(unsafe_code)]
 
@@ -27,6 +27,7 @@ mod error;
 mod forward;
 mod front_door;
 mod hello;
+mod http_term;
 mod identity;
 mod listener;
 mod log_throttle;

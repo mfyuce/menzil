@@ -17,6 +17,7 @@ ring = ["rustls/ring", "tokio-rustls/ring", "menzil-acme/ring"]
 ed25519-dalek.workspace = true
 fastrand.workspace = true
 futures-util = { workspace = true, features = ["io"] }
+httparse.workspace = true
 menzil-acme = { path = "../menzil-acme", default-features = false }
 menzil-carrier = { path = "../menzil-carrier" }
 menzil-e2e = { path = "../menzil-e2e" }

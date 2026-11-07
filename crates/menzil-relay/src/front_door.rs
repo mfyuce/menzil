@@ -15,8 +15,14 @@
 //!   or `tcp:` service (decision E5: `tcp:` shares are reached by SNI too), and whose ClientHello
 //!   does not offer ALPN `acme-tls/1` unless the share listed it: the relay principal
 //!   (`crate::principal`) opens the share's service on that node with `meta{client_ip, sni}` and
-//!   the raw bytes, ClientHello included, are piped both ways. Terminated (`http:`) shares are
-//!   not served here.
+//!   the raw bytes, ClientHello included, are piped both ways.
+//! * `<label>.t.H` or `<label>.<slug>.t.H` (the terminated zone, never mixed with the blind one)
+//!   of an accepted `http:` share of a tenant with the `terminated` flag, held by an attached
+//!   node under a grant the Roster still gives, whose network is not held back, and for which the
+//!   relay's ACME holds a certificate for exactly that name (`crate::acme`; the book's fallback
+//!   never answers a share name): the relay terminates TLS and `crate::http_term` serves the
+//!   HTTP, one `http:<label>` stream per client connection. A precondition that is missing is
+//!   the one refusal below, like any other failure.
 //! * anything else: the one static refusal below.
 //!
 //! A hello with ALPN exactly `acme-tls/1` and an SNI that has an order pending in the relay's own
@@ -79,12 +85,14 @@ use std::io;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::task::{Context, Poll};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use menzil_proto::{OpenMeta, ServiceId, ServiceKind, ShareMode};
 use menzil_stream::Stream;
+use rustls::server::{ClientHello as TlsClientHello, ResolvesServerCert};
+use rustls::sign::CertifiedKey;
 use tokio::io::{
     AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf, copy_bidirectional_with_sizes,
 };
@@ -92,9 +100,10 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Semaphore;
 use tokio::time::Instant;
 
-use crate::acme;
+use crate::acme::{self, RelayCertBook};
 use crate::admission::{IpSlot, PeerKey};
 use crate::advertise::HeldName;
+use crate::http_term::{self, HttpLimits};
 use crate::prefixed::PrefixedTcp;
 use crate::principal::Principal;
 use crate::relay::{Accepting, Relay};
@@ -180,6 +189,8 @@ pub struct FrontDoorConfig {
     pub per_v6_48: usize,
     /// The longest a piped connection may live, or be silent, before the node sent a byte.
     pub first_byte_timeout: Duration,
+    /// The terminated shares' HTTP terminator's time limits.
+    http: HttpLimits,
 }
 
 /// A host name or share domain that is not a plain ASCII DNS name.
@@ -236,6 +247,7 @@ impl FrontDoorConfig {
             per_client: FRONT_DOOR_PER_CLIENT,
             per_v6_48: FRONT_DOOR_PER_CLIENT * FRONT_DOOR_V6_48_FACTOR,
             first_byte_timeout: FRONT_DOOR_FIRST_BYTE_TIMEOUT,
+            http: HttpLimits::default(),
         })
     }
 
@@ -332,6 +344,14 @@ impl FrontDoorConfig {
     #[must_use]
     pub fn with_first_byte_timeout(mut self, timeout: Duration) -> Self {
         self.first_byte_timeout = timeout;
+        self
+    }
+
+    /// With `limits` as the time limits of the terminated shares' HTTP terminator (tests).
+    #[must_use]
+    #[cfg(test)]
+    pub(crate) fn with_http_limits(mut self, limits: HttpLimits) -> Self {
+        self.http = limits;
         self
     }
 }
@@ -490,6 +510,8 @@ enum Route {
     Own,
     /// A share that a node holds.
     Share(Box<Resolved>),
+    /// A terminated share: the name, and the certificate the relay holds for exactly it.
+    Terminated(Box<Resolved>, String, Arc<CertifiedKey>),
     /// The static refusal.
     Refuse,
 }
@@ -530,6 +552,10 @@ pub(crate) struct FrontDoor {
     config: FrontDoorConfig,
     /// `.` and the share domain.
     suffix: String,
+    /// `.t.` and the share domain: the terminated zone.
+    terminated_suffix: String,
+    /// The TLS configuration of terminated names, made on first use.
+    terminated_tls: OnceLock<Arc<rustls::ServerConfig>>,
     principal: Principal,
     counters: Arc<ShareCounters>,
     peeks: Arc<Semaphore>,
@@ -543,6 +569,8 @@ impl FrontDoor {
     pub(crate) fn new(relay: &Relay, config: FrontDoorConfig) -> Arc<Self> {
         Arc::new(Self {
             suffix: format!(".{}", config.share_domain),
+            terminated_suffix: format!(".t.{}", config.share_domain),
+            terminated_tls: OnceLock::new(),
             principal: Principal::new(relay),
             counters: Arc::default(),
             peeks: Arc::new(Semaphore::new(config.max_peeks)),
@@ -559,9 +587,65 @@ impl FrontDoor {
 
     /// Resolves `host` (lowercase) as a full name of a share: held now by an attached node
     /// that has accepted a blind `tls:`/`tcp:` share for it, in the zone of the tenant of the
-    /// network that granted it. `alpn` is what the client offered.
+    /// network that granted it. `alpn` is what the client offered. Names of the terminated zone
+    /// (`t.H`) never resolve here.
     fn resolve(&self, relay: &Relay, host: &str, alpn: &[Vec<u8>]) -> Option<Resolved> {
         let name = host.strip_suffix(self.suffix.as_str())?;
+        // A label `t` is the terminated zone's (no slug may be `t`): a blind name never has one.
+        if name.split('.').any(|label| label == "t") {
+            return None;
+        }
+        let resolved = self.resolve_name(relay, name)?;
+        if !routable(resolved.held.share.mode, resolved.held.share.service.kind) {
+            return None;
+        }
+        if alpn.iter().any(|offered| offered == ACME_TLS_ALPN)
+            && !resolved
+                .held
+                .share
+                .alpn
+                .iter()
+                .any(|a| a.as_bytes() == ACME_TLS_ALPN)
+        {
+            return None;
+        }
+        Some(resolved)
+    }
+
+    /// Resolves `host` (lowercase) as the full name of a terminated share (`<label>.t.H`,
+    /// `<label>.<slug>.t.H`): an accepted `http:` share of a tenant with the `terminated` flag,
+    /// held by an attached node under a grant the Roster still gives, whose network is not held
+    /// back, and for which the relay holds a certificate for exactly `host`. Also gives that
+    /// certificate. A hello offering `acme-tls/1` is not a terminated name's business (the
+    /// relay's own pending validations are answered before routing).
+    fn resolve_terminated(
+        &self,
+        relay: &Relay,
+        host: &str,
+        alpn: &[Vec<u8>],
+    ) -> Option<(Resolved, Arc<CertifiedKey>)> {
+        let name = host.strip_suffix(self.terminated_suffix.as_str())?;
+        if name.split('.').any(|label| label == "t") {
+            return None;
+        }
+        if alpn.iter().any(|offered| offered == ACME_TLS_ALPN) {
+            return None;
+        }
+        let resolved = self.resolve_name(relay, name)?;
+        if resolved.held.share.mode != ShareMode::Terminated
+            || resolved.held.share.service.kind != ServiceKind::Http
+            || !relay.tenants().tenant_of(&resolved.held.network).terminated
+        {
+            return None;
+        }
+        let cert = relay.acme()?.certs().get(host)?;
+        Some((resolved, cert))
+    }
+
+    /// What blind and terminated names share: `name` (relative to the zone, `app` or `app.ali`)
+    /// is accepted for a node, granted now, held by an attached node, its network not held back,
+    /// and in the zone of its tenant. The mode of the share is the caller's to judge.
+    fn resolve_name(&self, relay: &Relay, name: &str) -> Option<Resolved> {
         if name.is_empty() || name.split('.').count() > 2 {
             return None;
         }
@@ -593,18 +677,6 @@ impl FrontDoor {
         {
             return None;
         }
-        if !routable(held.share.mode, held.share.service.kind) {
-            return None;
-        }
-        if alpn.iter().any(|offered| offered == ACME_TLS_ALPN)
-            && !held
-                .share
-                .alpn
-                .iter()
-                .any(|a| a.as_bytes() == ACME_TLS_ALPN)
-        {
-            return None;
-        }
         let figures = book.figures_of(&tenant);
         let limits = ShareLimits {
             per_name: figures.map_or(self.config.per_name, |f| {
@@ -632,6 +704,16 @@ impl FrontDoor {
         };
         if sni == self.config.own_host {
             return Route::Own;
+        }
+        // The two zones never mix: a name under `t.H` is judged as a terminated name only, any
+        // other as a blind one only (which refuses every label `t`).
+        if sni.ends_with(self.terminated_suffix.as_str()) {
+            return match self.resolve_terminated(relay, sni, &hello.alpn) {
+                Some((resolved, cert)) => {
+                    Route::Terminated(Box::new(resolved), sni.to_string(), cert)
+                }
+                None => Route::Refuse,
+            };
         }
         match self.resolve(relay, sni, &hello.alpn) {
             Some(resolved) => Route::Share(Box::new(resolved)),
@@ -700,7 +782,109 @@ impl FrontDoor {
                 self.serve_share(tcp, peer, *resolved, sni, bytes, None, decided)
                     .await;
             }
+            Route::Terminated(resolved, host, cert) => {
+                ip_slot.end_handshake();
+                drop(ip_slot);
+                self.serve_terminated(relay, tcp, peer, *resolved, host, cert, bytes, decided)
+                    .await;
+            }
         }
+    }
+
+    /// Terminates TLS for a terminated share with `cert` and serves its HTTP (`crate::http_term`):
+    /// the share counts against its figures like a blind one, a refusal before the handshake is
+    /// the same alert as everywhere, and the node stream is opened only when the first valid
+    /// request is in hand.
+    #[allow(clippy::too_many_arguments)]
+    async fn serve_terminated(
+        self: &Arc<Self>,
+        relay: Relay,
+        tcp: TcpStream,
+        peer: SocketAddr,
+        resolved: Resolved,
+        host: String,
+        _cert: Arc<CertifiedKey>,
+        hello_bytes: Vec<u8>,
+        decided: Instant,
+    ) {
+        let Some(slot) = self.counters.try_acquire(
+            &resolved.name,
+            &resolved.tenant,
+            PeerKey::of(peer.ip()),
+            resolved.limits,
+        ) else {
+            tracing::debug!(name = %resolved.name, "share connection figure reached");
+            self.refuse(tcp, decided, &REFUSAL).await;
+            return;
+        };
+        let Some(config) = self.terminated_config(&relay) else {
+            self.refuse(tcp, decided, &REFUSAL).await;
+            return;
+        };
+        let acceptor = tokio_rustls::TlsAcceptor::from(config);
+        let limits = self.config.http;
+        let accepted = tokio::time::timeout(
+            limits.head_timeout,
+            acceptor.accept(PrefixedTcp::with_prefix(hello_bytes, tcp)),
+        )
+        .await;
+        let Ok(Ok(tls)) = accepted else {
+            tracing::debug!(name = %resolved.name, "the TLS handshake of a terminated name failed");
+            return;
+        };
+        let client_ip = peer.ip();
+        let door = Arc::clone(self);
+        let still = {
+            let (relay, host) = (relay.clone(), host.clone());
+            let door = Arc::clone(self);
+            move || door.resolve_terminated(&relay, &host, &[]).is_some()
+        };
+        let opening = {
+            let host = host.clone();
+            let resolved = &resolved;
+            move || async move {
+                let meta = OpenMeta {
+                    client_ip: Some(client_ip.to_canonical().to_string()),
+                    sni: Some(host),
+                };
+                match door
+                    .principal
+                    .open(
+                        &resolved.tenant,
+                        resolved.held.node,
+                        resolved.held.network,
+                        resolved.service(),
+                        meta,
+                    )
+                    .await
+                {
+                    Ok(stream) => Some(TokioStream(stream)),
+                    Err(error) => {
+                        tracing::debug!(name = %resolved.name, %error, "the share could not be opened");
+                        None
+                    }
+                }
+            }
+        };
+        http_term::serve(tls, &host, client_ip, limits, still, opening).await;
+        drop(slot);
+    }
+
+    /// The TLS configuration of terminated names: the certificate of exactly the name asked
+    /// (the book's own fallback for the relay's host is never offered), ALPN `http/1.1`.
+    fn terminated_config(&self, relay: &Relay) -> Option<Arc<rustls::ServerConfig>> {
+        if let Some(config) = self.terminated_tls.get() {
+            return Some(Arc::clone(config));
+        }
+        let certs = relay.acme()?.certs().clone();
+        crate::tls::ensure_crypto_provider();
+        let mut config = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_cert_resolver(Arc::new(ExactCerts(certs)));
+        config.alpn_protocols = vec![b"http/1.1".to_vec()];
+        Some(Arc::clone(
+            self.terminated_tls.get_or_init(|| Arc::new(config)),
+        ))
     }
 
     /// Opens the share and pipes `first` (the bytes already read from the client) and then the
@@ -1167,6 +1351,17 @@ impl<T: AsyncWrite + Unpin> AsyncWrite for Watched<T> {
 /// `menzil_stream::Stream` speaks `futures` I/O; tokio's `copy_bidirectional` wants its own
 /// traits (the same adapter `menzil-node`'s serving pipe uses).
 struct TokioStream(Stream);
+
+/// Certificates by exact SNI name, with no fallback.
+#[derive(Debug)]
+struct ExactCerts(RelayCertBook);
+
+impl ResolvesServerCert for ExactCerts {
+    fn resolve(&self, client_hello: TlsClientHello<'_>) -> Option<Arc<CertifiedKey>> {
+        self.0
+            .get(&client_hello.server_name()?.to_ascii_lowercase())
+    }
+}
 
 impl AsyncRead for TokioStream {
     fn poll_read(
@@ -2253,5 +2448,289 @@ pub(crate) mod tests {
             .with_max_total(7);
         assert_eq!(small.fd_budget(true), 6 + 5 + 7);
         assert_eq!(small.fd_budget(false), 3 + 5 + 7);
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // Terminated names (S-E9b)
+    // -----------------------------------------------------------------------------------------
+
+    const T_HOST: &str = "web.ali.t.s.example.test";
+
+    fn terminated_ali() -> TenantSpec {
+        let mut spec = ali(&[]);
+        spec.terminated = true;
+        spec
+    }
+
+    /// A relay with ACME and a certificate for each of `hosts`, and the PEMs of the first.
+    fn with_certs(w: &World, hosts: &[&str]) -> Relay {
+        let config =
+            crate::acme::AcmeConfig::new("https://ca.example.test/dir", "/nonexistent").unwrap();
+        let relay = w
+            .relay
+            .clone()
+            .with_acme(crate::acme::RelayAcme::new(config));
+        for host in hosts {
+            let rcgen::CertifiedKey { cert, signing_key } =
+                rcgen::generate_simple_self_signed([host.to_string()]).unwrap();
+            relay
+                .acme()
+                .unwrap()
+                .certs()
+                .install_pem(host, &cert.pem(), &signing_key.serialize_pem())
+                .unwrap();
+        }
+        relay
+    }
+
+    /// Everything a terminated name needs: a flagged tenant, `web` advertised as `http:web`
+    /// and accepted, the holder attached, the grant in the Roster, a certificate.
+    fn terminated_world() -> (World, Relay) {
+        let w = world(&["web", "app"], Some(terminated_ali()));
+        w.attach();
+        w.advertise(vec![
+            share("web", ShareMode::Terminated, "http:web", &[]),
+            share("app", ShareMode::Blind, "tls:app", &[]),
+        ]);
+        let relay = with_certs(&w, &[T_HOST, "app.ali.t.s.example.test"]);
+        (w, relay)
+    }
+
+    fn t_resolve(w: &World, relay: &Relay, host: &str) -> Option<(Resolved, Arc<CertifiedKey>)> {
+        w.door.resolve_terminated(relay, host, &[])
+    }
+
+    fn t_route(w: &World, relay: &Relay, host: &str, alpn: &[&[u8]]) -> Route {
+        w.door.route(relay, &hello(Some(host), alpn))
+    }
+
+    #[tokio::test]
+    async fn a_terminated_name_with_every_precondition_routes() {
+        let (w, relay) = terminated_world();
+        let (resolved, _cert) = t_resolve(&w, &relay, T_HOST).expect("resolves");
+        assert_eq!(resolved.name, "web.ali");
+        assert_eq!(resolved.service().to_string(), "http:web");
+        assert!(matches!(
+            t_route(&w, &relay, T_HOST, &[]),
+            Route::Terminated(_, ref host, _) if host == T_HOST
+        ));
+    }
+
+    #[tokio::test]
+    async fn each_missing_precondition_of_a_terminated_name_is_the_one_refusal() {
+        // (the refusal is `Route::Refuse`: `handle_tls` sends the 7 byte alert for it, like
+        // for every other failure)
+        let refused = |w: &World, relay: &Relay, what: &str| {
+            assert!(
+                matches!(t_route(w, relay, T_HOST, &[]), Route::Refuse),
+                "{what}"
+            );
+        };
+        // the tenant's `terminated` flag
+        let w = world(&["web"], Some(ali(&[])));
+        w.attach();
+        w.advertise(vec![share("web", ShareMode::Terminated, "http:web", &[])]);
+        let relay = with_certs(&w, &[T_HOST]);
+        refused(&w, &relay, "tenant without the flag");
+        // the default tenant never has it
+        let w = world(&["web"], None);
+        w.attach();
+        w.advertise(vec![share("web", ShareMode::Terminated, "http:web", &[])]);
+        let relay = with_certs(&w, &["web.t.s.example.test"]);
+        assert!(matches!(
+            t_route(&w, &relay, "web.t.s.example.test", &[]),
+            Route::Refuse
+        ));
+        // a certificate for exactly that name
+        let (w, _relay) = terminated_world();
+        let no_cert = with_certs(&w, &["other.ali.t.s.example.test"]);
+        refused(&w, &no_cert, "no certificate for the name");
+        let no_acme = w.relay.clone();
+        refused(&w, &no_acme, "no ACME at all");
+        // the fallback certificate of the relay's own host is no certificate for a share name
+        let fallback = with_certs(&w, &[]);
+        let rcgen::CertifiedKey { cert, signing_key } =
+            rcgen::generate_simple_self_signed([OWN.to_string()]).unwrap();
+        fallback
+            .acme()
+            .unwrap()
+            .certs()
+            .set_fallback_pem(&cert.pem(), &signing_key.serialize_pem())
+            .unwrap();
+        refused(&w, &fallback, "only a fallback certificate");
+        // the Roster still granting the label
+        let (w, relay) = terminated_world();
+        w.roster(2, &[w.node], &[]);
+        refused(&w, &relay, "grant withdrawn");
+        // the holder attached
+        let (w, relay) = terminated_world();
+        assert!(w.relay.registry.detach(&w.node, 1));
+        refused(&w, &relay, "holder detached");
+        // the share accepted as `http:` (a blind share under the same label is no terminated one)
+        let w = world(&["web"], Some(terminated_ali()));
+        w.attach();
+        w.advertise(vec![share("web", ShareMode::Blind, "tls:web", &[])]);
+        let relay = with_certs(&w, &[T_HOST]);
+        refused(&w, &relay, "blind share");
+        // a blind share that names an `http:` service is no terminated one either
+        let w = world(&["web"], Some(terminated_ali()));
+        w.attach();
+        w.advertise(vec![share("web", ShareMode::Blind, "http:web", &[])]);
+        let relay = with_certs(&w, &[T_HOST]);
+        refused(&w, &relay, "blind share with an http service");
+        // a certificate for another name serves nothing here
+        let w = world(&["web", "app"], Some(terminated_ali()));
+        w.attach();
+        w.advertise(vec![
+            share("web", ShareMode::Terminated, "http:web", &[]),
+            share("app", ShareMode::Terminated, "http:app", &[]),
+        ]);
+        let relay = with_certs(&w, &[T_HOST]);
+        assert!(matches!(
+            t_route(&w, &relay, T_HOST, &[]),
+            Route::Terminated(..)
+        ));
+        assert!(matches!(
+            t_route(&w, &relay, "app.ali.t.s.example.test", &[]),
+            Route::Refuse
+        ));
+        let w = world(&["web"], Some(terminated_ali()));
+        w.attach();
+        w.advertise(vec![share("web", ShareMode::Terminated, "tcp:web", &[])]);
+        let relay = with_certs(&w, &[T_HOST]);
+        refused(&w, &relay, "terminated share of another service kind");
+        let w = world(&["web"], Some(terminated_ali()));
+        w.attach();
+        let relay = with_certs(&w, &[T_HOST]);
+        refused(&w, &relay, "nothing advertised");
+        // the network not held back
+        let (w, relay) = terminated_world();
+        let mut spec = terminated_ali();
+        spec.networks = vec![w.network];
+        relay.set_tenants(TenantBook::build(
+            vec![spec],
+            Vec::new(),
+            &HashSet::new(),
+            &HashSet::from(["ali".to_string()]),
+        ));
+        assert!(relay.tenants().is_held_back(&w.network));
+        refused(&w, &relay, "network held back");
+        // ALPN `acme-tls/1` offered
+        let (w, relay) = terminated_world();
+        assert!(matches!(
+            t_route(&w, &relay, T_HOST, &[b"acme-tls/1"]),
+            Route::Refuse
+        ));
+    }
+
+    #[tokio::test]
+    async fn the_blind_and_the_terminated_zone_never_resolve_each_others_names() {
+        let (w, relay) = terminated_world();
+        // a terminated share is not blind-routable, and a blind share is not terminated
+        assert!(
+            w.door
+                .resolve(&relay, "web.ali.s.example.test", &[])
+                .is_none()
+        );
+        assert!(
+            t_resolve(&w, &relay, "app.ali.t.s.example.test").is_none(),
+            "a blind share under the terminated zone, with a certificate"
+        );
+        assert!(
+            w.door
+                .resolve(&relay, "app.ali.s.example.test", &[])
+                .is_some()
+        );
+        assert!(matches!(
+            t_route(&w, &relay, "app.ali.t.s.example.test", &[]),
+            Route::Refuse
+        ));
+        assert!(matches!(
+            t_route(&w, &relay, "web.ali.s.example.test", &[]),
+            Route::Refuse
+        ));
+        // the zone label `t` is nobody's blind name
+        for host in [
+            "t.s.example.test",
+            "app.t.s.example.test",
+            "app.ali.t.s.example.test.evil",
+            "ali.t.s.example.test",
+            "x.web.ali.t.s.example.test",
+            "web.t.ali.s.example.test",
+        ] {
+            assert!(w.door.resolve(&relay, host, &[]).is_none(), "{host} blind");
+            assert!(t_resolve(&w, &relay, host).is_none(), "{host} terminated");
+        }
+        // another tenant's zone, and the flat name of the default tenant
+        assert!(t_resolve(&w, &relay, "web.bob.t.s.example.test").is_none());
+        assert!(t_resolve(&w, &relay, "web.t.s.example.test").is_none());
+        // a blind share named like a terminated label of the same tenant is still blind only
+        let w = world(&["web"], Some(terminated_ali()));
+        w.attach();
+        w.advertise(vec![share("web", ShareMode::Blind, "tls:web", &[])]);
+        let relay = with_certs(&w, &[T_HOST]);
+        assert!(
+            w.door
+                .resolve(&relay, "web.ali.s.example.test", &[])
+                .is_some()
+        );
+        assert!(t_resolve(&w, &relay, T_HOST).is_none());
+    }
+
+    #[tokio::test]
+    async fn the_terminated_tls_configuration_serves_exactly_the_name_asked() {
+        use rustls::pki_types::ServerName;
+        let (w, relay) = terminated_world();
+        // the book's fallback (the relay's own host) must never answer a share name
+        let rcgen::CertifiedKey { cert, signing_key } =
+            rcgen::generate_simple_self_signed([OWN.to_string()]).unwrap();
+        relay
+            .acme()
+            .unwrap()
+            .certs()
+            .set_fallback_pem(&cert.pem(), &signing_key.serialize_pem())
+            .unwrap();
+        let config = w.door.terminated_config(&relay).expect("config");
+        assert_eq!(config.alpn_protocols, vec![b"http/1.1".to_vec()]);
+        let (_, held) = t_resolve(&w, &relay, T_HOST).unwrap();
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(held.cert[0].clone()).unwrap();
+        roots.add(cert.der().clone()).unwrap();
+        let mut client = rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        client.alpn_protocols = vec![b"http/1.1".to_vec()];
+        let connector = tokio_rustls::TlsConnector::from(Arc::new(client));
+        let handshake = |name: &'static str| {
+            let acceptor = tokio_rustls::TlsAcceptor::from(Arc::clone(&config));
+            let connector = connector.clone();
+            async move {
+                let (c, s) = tokio::io::duplex(1 << 16);
+                let (server, client) = tokio::join!(
+                    acceptor.accept(s),
+                    connector.connect(ServerName::try_from(name).unwrap(), c)
+                );
+                (server.is_ok(), client.is_ok())
+            }
+        };
+        assert_eq!(handshake("web.ali.t.s.example.test").await, (true, true));
+        // a name with no certificate of its own gets no handshake, not the fallback
+        assert_eq!(
+            handshake("nobody.ali.t.s.example.test").await,
+            (false, false)
+        );
+        assert_eq!(handshake("relay.example.test").await, (false, false));
+    }
+
+    #[test]
+    fn the_http_limits_are_the_terminators_defaults_unless_set() {
+        let config = FrontDoorConfig::new(OWN, H).unwrap();
+        assert_eq!(config.http, HttpLimits::default());
+        let set = HttpLimits {
+            head_timeout: Duration::from_secs(1),
+            keepalive_idle: Duration::from_secs(2),
+            body_idle: Duration::from_secs(3),
+        };
+        assert_eq!(config.with_http_limits(set).http, set);
     }
 }
