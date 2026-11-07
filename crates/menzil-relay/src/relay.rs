@@ -10,18 +10,22 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
-use tokio::sync::Semaphore;
+use tokio::net::TcpListener;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use menzil_proto::{Limits, NodeId, X25519PublicKey};
 
+use crate::admission::IpSlot;
 use crate::admission::{Admission, AdmissionLimits};
 use crate::advertise::LabelRegistry;
 use crate::endpoint::RelayEndpoint;
 use crate::forward::{ForwardTable, RelaySendOutcome};
+use crate::front_door::{FrontDoor, FrontDoorConfig};
 use crate::identity::RelayIdentity;
-use crate::listener::Listener;
+use crate::listener::{Listener, Upgrader};
 use crate::log_throttle::LogThrottle;
 use crate::node_history::NodeHistory;
+use crate::prefixed::PrefixedTcp;
 use crate::principal::PrincipalConfig;
 use crate::rate::SessionRates;
 use crate::registry::SessionRegistry;
@@ -118,6 +122,9 @@ pub struct Relay {
     pub(crate) endpoint: Arc<RelayEndpoint>,
     /// The figures of the relay principal (`crate::principal`), read when a `Principal` is made.
     principal: PrincipalConfig,
+    /// The blind front door of the TLS port (`crate::front_door`); `None` serves the relay's own
+    /// host name on every connection, as before.
+    front_door: Option<Arc<FrontDoorConfig>>,
 }
 
 /// An attached node as the relay's own endpoint needs it: the L3 session it is attached by and
@@ -194,6 +201,7 @@ impl Relay {
             relay_id,
             endpoint: Arc::new(RelayEndpoint::default()),
             principal: PrincipalConfig::default(),
+            front_door: None,
         }
     }
 
@@ -288,6 +296,22 @@ impl Relay {
         self
     }
 
+    /// This relay with the blind front door of `config` on its TLS port: the ClientHello of every
+    /// connection is read, SNI equal to the relay's own host name takes the TLS and WebSocket
+    /// path as before and a share name a node holds is piped to that node (`crate::front_door`
+    /// has the rules). Without it the relay reads nothing before TLS. Call it before
+    /// [`Relay::serve`] and before cloning the relay.
+    #[must_use]
+    pub fn with_front_door(mut self, config: FrontDoorConfig) -> Self {
+        self.front_door = Some(Arc::new(config));
+        self
+    }
+
+    /// The front door's settings, if it is on.
+    pub fn front_door_config(&self) -> Option<&FrontDoorConfig> {
+        self.front_door.as_deref()
+    }
+
     /// The figures a [`crate::Principal`] made from this relay uses.
     pub fn principal_config(&self) -> PrincipalConfig {
         self.principal
@@ -357,9 +381,39 @@ impl Relay {
     /// timed out), not when the session does. A single connection's own
     /// accept or handshake failure is logged and does not stop this
     /// loop; only ending the process does.
+    ///
+    /// With a front door ([`Relay::with_front_door`]) each socket's ClientHello is read first
+    /// and the socket goes to the path its SNI says (`crate::front_door`).
     pub async fn serve_with(&self, listener: &Listener, config: AcceptConfig) {
-        let slots = Arc::new(Semaphore::new(config.max_inflight_handshakes));
-        let upgrader = listener.upgrader();
+        self.serve_with_http(listener, None, config).await
+    }
+
+    /// [`Relay::serve_with`], and plain HTTP on `http` as well if it is given and the relay has
+    /// a front door (`crate::front_door`, "Port 80"): ACME HTTP-01 requests for a name a node
+    /// holds go to that node and every other request is redirected to https. Both stop when
+    /// this future is dropped.
+    pub async fn serve_with_http(
+        &self,
+        listener: &Listener,
+        http: Option<TcpListener>,
+        config: AcceptConfig,
+    ) {
+        let accepting = Arc::new(Accepting {
+            slots: Arc::new(Semaphore::new(config.max_inflight_handshakes)),
+            upgrader: listener.upgrader(),
+            timeout: config.handshake_timeout,
+        });
+        let front = self
+            .front_door
+            .as_ref()
+            .map(|front| FrontDoor::new(self, (**front).clone()));
+        // Port 80 lives as long as this future does.
+        let _http = match (&front, http) {
+            (Some(front), Some(http)) => Some(AbortOnDrop(tokio::spawn(
+                Arc::clone(front).serve_http(self.clone(), http),
+            ))),
+            _ => None,
+        };
         loop {
             let (tcp, peer) = match listener.accept_tcp().await {
                 Ok(accepted) => accepted,
@@ -375,11 +429,27 @@ impl Relay {
             // before TLS, without an answer and without a handshake permit (a permit is for a
             // peer that may handshake; answering a rate limited one with HTTP 429 would cost
             // the TLS handshake first). The slot is held until the session attaches or ends.
-            let Some(mut ip_slot) = self.admission.admit_connection(peer.ip()) else {
+            let Some(ip_slot) = self.admission.admit_connection(peer.ip()) else {
                 tracing::debug!(peer = %peer.ip(), "peer is over its admission share or connection rate; dropping a new connection");
                 continue;
             };
-            let Ok(permit) = Arc::clone(&slots).try_acquire_owned() else {
+            if let Some(front) = &front {
+                // Over the cap on ClientHello reads the connection is dropped quietly too.
+                let Some(peek) = front.try_peek() else {
+                    tracing::debug!("too many ClientHellos being read; dropping a new connection");
+                    continue;
+                };
+                tokio::spawn(Arc::clone(front).handle_tls(
+                    self.clone(),
+                    Arc::clone(&accepting),
+                    tcp,
+                    peer,
+                    ip_slot,
+                    peek,
+                ));
+                continue;
+            }
+            let Ok(permit) = Arc::clone(&accepting.slots).try_acquire_owned() else {
                 tracing::debug!(
                     limit = config.max_inflight_handshakes,
                     "too many handshakes in flight; dropping a new connection"
@@ -388,28 +458,84 @@ impl Relay {
             };
             let session_id = self.next_session_id.next();
             let relay = self.clone();
-            let upgrader = Arc::clone(&upgrader);
-            let timeout = config.handshake_timeout;
+            let accepting = Arc::clone(&accepting);
             tokio::spawn(async move {
-                let handshake = tokio::time::timeout(timeout, upgrader.handshake(tcp)).await;
-                // The permit (and the peer's handshake count) is for the handshake only: free
-                // it before the session starts, not when the session ends.
-                drop(permit);
-                ip_slot.end_handshake();
-                let conn = match handshake {
-                    Ok(Ok(conn)) => conn,
-                    Ok(Err(err)) => {
-                        tracing::debug!(error = %err, "inbound handshake failed");
-                        return;
-                    }
-                    Err(_elapsed) => {
-                        tracing::debug!(?timeout, "inbound handshake timed out");
-                        return;
-                    }
-                };
-                session::handle_connection(conn, relay, session_id, ip_slot).await;
+                relay
+                    .handshake_and_serve(
+                        &accepting,
+                        PrefixedTcp::plain(tcp),
+                        ip_slot,
+                        permit,
+                        session_id,
+                    )
+                    .await;
             });
         }
+    }
+
+    /// The path of the relay's own host name for a connection the front door read the
+    /// ClientHello of: the handshake permit, a session number, then [`Self::handshake_and_serve`].
+    /// Over the handshake cap the connection is dropped, as on the plain path.
+    pub(crate) async fn serve_own_host(
+        &self,
+        accepting: &Accepting,
+        tcp: PrefixedTcp,
+        ip_slot: IpSlot,
+    ) {
+        let Ok(permit) = Arc::clone(&accepting.slots).try_acquire_owned() else {
+            tracing::debug!("too many handshakes in flight; dropping a new connection");
+            return;
+        };
+        let session_id = self.next_session_id.next();
+        self.handshake_and_serve(accepting, tcp, ip_slot, permit, session_id)
+            .await;
+    }
+
+    /// Runs the TLS and WebSocket handshake of `tcp` under the handshake timeout, then the
+    /// session. The permit (and the peer's handshake count) is for the handshake only: it is
+    /// freed before the session starts, not when the session ends.
+    async fn handshake_and_serve(
+        &self,
+        accepting: &Accepting,
+        tcp: PrefixedTcp,
+        mut ip_slot: IpSlot,
+        permit: OwnedSemaphorePermit,
+        session_id: u32,
+    ) {
+        let timeout = accepting.timeout;
+        let handshake =
+            tokio::time::timeout(timeout, accepting.upgrader.handshake_prefixed(tcp)).await;
+        drop(permit);
+        ip_slot.end_handshake();
+        let conn = match handshake {
+            Ok(Ok(conn)) => conn,
+            Ok(Err(err)) => {
+                tracing::debug!(error = %err, "inbound handshake failed");
+                return;
+            }
+            Err(_elapsed) => {
+                tracing::debug!(?timeout, "inbound handshake timed out");
+                return;
+            }
+        };
+        session::handle_connection(conn, self.clone(), session_id, ip_slot).await;
+    }
+}
+
+/// What a connection that is to handshake needs besides itself: the handshake permits, the TLS
+/// and upgrade half of the listener, and the handshake timeout.
+pub(crate) struct Accepting {
+    pub(crate) slots: Arc<Semaphore>,
+    pub(crate) upgrader: Arc<Upgrader>,
+    pub(crate) timeout: Duration,
+}
+
+/// Aborts its task when dropped.
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
     }
 }
 

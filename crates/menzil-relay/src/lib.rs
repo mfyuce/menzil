@@ -6,8 +6,9 @@
 //! shape so a session layer can treat either uniformly. Deliberately not
 //! here:
 //!
-//! - SNI-based routing to advertised blind share names (protocol.md 6.2;
-//!   phase 2 per protocol.md 13).
+//! - Anything but the blind front door of the TLS port (`front_door`: protocol.md 6.2 to 6.4,
+//!   SNI routing of blind `tls:` and `tcp:` shares through the relay principal); the static
+//!   site, terminated shares and the relay's ACME are later slices.
 //! - ACME certificate provisioning (protocol.md 11); certificate and key
 //!   material is supplied to this crate already loaded.
 //! - Relay-terminated HTTP serving for terminated shares (its own
@@ -22,12 +23,14 @@ mod doc;
 mod endpoint;
 mod error;
 mod forward;
+mod front_door;
 mod hello;
 mod identity;
 mod listener;
 mod log_throttle;
 mod names;
 mod node_history;
+mod prefixed;
 mod principal;
 mod rate;
 mod registry;
@@ -37,6 +40,7 @@ mod session;
 #[cfg(test)]
 mod session_tests;
 mod shaping;
+mod sni;
 mod tenant;
 #[cfg(test)]
 mod tests_support;
@@ -52,6 +56,11 @@ pub use connection::InboundConnection;
 pub use endpoint::{InboundFrame, RelayEndpoint};
 pub use error::RelayError;
 pub use forward::RelaySendOutcome;
+pub use front_door::{
+    FRONT_DOOR_FAILURE_DELAY, FRONT_DOOR_IDLE_TIMEOUT, FRONT_DOOR_MAX_ANSWERS,
+    FRONT_DOOR_MAX_TOTAL, FRONT_DOOR_PER_NAME, FRONT_DOOR_PER_TENANT, FrontDoorConfig,
+    FrontDoorConfigError,
+};
 pub use hello::{HelloRejection, check_hello};
 pub use identity::RelayIdentity;
 pub use listener::Listener;

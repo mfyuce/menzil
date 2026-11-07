@@ -2295,3 +2295,88 @@ async fn t5_the_old_quarantine_file_is_validated_and_ended_slugs_are_pruned() {
     assert!(text.contains("quarantine slug ali "), "{text}");
     running.stop();
 }
+
+// ---- The blind front door (expose slice S-E6) ----
+
+/// The share domain needs the relay's own host name, and both must be plain DNS names: nothing
+/// is bound or read before that is judged.
+#[tokio::test]
+async fn the_front_door_needs_a_host_and_plain_names() {
+    let (_o, owner, _id, _) = token_of_a_network();
+    let (dir, relay_home) = home();
+    init(&relay_home, clock()).unwrap();
+    add_network(&relay_home, &relay_token(&owner), clock()).unwrap();
+    let mut options = run_options(dir.path());
+    let front = FrontDoorOptions {
+        share_domain: "s.example".to_string(),
+        http_listen: None,
+    };
+    let error = start_with(&relay_home, &options, Some(&front))
+        .await
+        .err()
+        .expect("no host");
+    assert!(format!("{error:#}").contains("--host"), "{error:#}");
+    options.host = Some("relay.example".to_string());
+    for bad in ["", "s.example.", "bad domain", "relay.example"] {
+        let front = FrontDoorOptions {
+            share_domain: bad.to_string(),
+            http_listen: None,
+        };
+        assert!(
+            start_with(&relay_home, &options, Some(&front))
+                .await
+                .is_err(),
+            "{bad:?}"
+        );
+    }
+}
+
+/// With a share domain the relay answers an unknown share name with the one fixed refusal and
+/// serves port 80 only when asked; without one it reads nothing before TLS.
+#[tokio::test]
+async fn a_relay_with_a_share_domain_refuses_unknown_names_and_serves_port_80_only_when_asked() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let (_o, owner, _id, _) = token_of_a_network();
+    let (dir, relay_home) = home();
+    init(&relay_home, clock()).unwrap();
+    add_network(&relay_home, &relay_token(&owner), clock()).unwrap();
+    let mut options = run_options(dir.path());
+    options.host = Some("relay.example".to_string());
+
+    let front = FrontDoorOptions {
+        share_domain: "s.example".to_string(),
+        http_listen: None,
+    };
+    let running = start_with(&relay_home, &options, Some(&front))
+        .await
+        .unwrap();
+    assert!(
+        running.http_addr.is_none(),
+        "port 80 is off unless asked for"
+    );
+    running.stop();
+
+    let front = FrontDoorOptions {
+        share_domain: "s.example".to_string(),
+        http_listen: Some("127.0.0.1:0".parse().unwrap()),
+    };
+    let running = start_with(&relay_home, &options, Some(&front))
+        .await
+        .unwrap();
+    let http = running.http_addr.expect("asked for");
+    let mut tcp = tokio::net::TcpStream::connect(http).await.unwrap();
+    tcp.write_all(b"GET /x HTTP/1.1\r\nHost: app.s.example\r\n\r\n")
+        .await
+        .unwrap();
+    let mut got = Vec::new();
+    tokio::time::timeout(Duration::from_secs(10), tcp.read_to_end(&mut got))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        String::from_utf8(got).unwrap(),
+        "HTTP/1.1 301 Moved Permanently\r\nLocation: https://app.s.example/x\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+    );
+    running.stop();
+}

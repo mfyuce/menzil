@@ -3,8 +3,10 @@
 //! is handled as section 3").
 //!
 //! SNI-based routing to advertised blind share names (the rest of 6.2) is
-//! phase 2 (protocol.md 13) and not built here: this only completes the
-//! L3 WebSocket upgrade for the relay's own hostname. Accepting many
+//! `crate::front_door`, which reads the ClientHello before this runs: this
+//! only completes the L3 WebSocket upgrade for the relay's own hostname,
+//! on a socket whose first bytes may have been read and put back
+//! (`crate::prefixed`). Accepting many
 //! connections concurrently and driving a session per connection is
 //! session-registry logic for a later crate (TODO.md L3e), not this one
 //! — [`Listener::accept`] hands back one connection at a time for the
@@ -21,6 +23,7 @@ use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 
 use crate::connection::InboundConnection;
 use crate::error::RelayError;
+use crate::prefixed::PrefixedTcp;
 
 /// Accepts inbound connections on one bound address, completing TLS and
 /// the L3 WebSocket upgrade for each.
@@ -143,6 +146,15 @@ impl Upgrader {
     /// TLS, then the WebSocket upgrade. (A peer over its connection rate is not answered at all:
     /// refusing it with HTTP 429 would take the TLS handshake first, see `crate::admission`.)
     pub(crate) async fn handshake(&self, tcp: TcpStream) -> Result<InboundConnection, RelayError> {
+        self.handshake_prefixed(PrefixedTcp::plain(tcp)).await
+    }
+
+    /// [`Self::handshake`] on a socket some of whose first bytes were read already and are put
+    /// back in front (the front door read the ClientHello, `crate::front_door`).
+    pub(crate) async fn handshake_prefixed(
+        &self,
+        tcp: PrefixedTcp,
+    ) -> Result<InboundConnection, RelayError> {
         let tls = self.acceptor.accept(tcp).await?;
         let expected_path = self.expected_path.clone();
         // `validate_upgrade` only has borrowed access to the request

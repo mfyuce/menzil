@@ -122,6 +122,19 @@ struct NodeAdvertisement {
     accept_peers: bool,
 }
 
+/// A held full name as the front door routes it ([`LabelRegistry::held_name`]).
+#[derive(Debug, Clone)]
+pub(crate) struct HeldName {
+    /// The attached node that holds the name.
+    pub(crate) node: NodeId,
+    /// The slug of the tenant of the name's record; `None` is the default tenant.
+    pub(crate) tenant: Option<String>,
+    /// The network whose Roster granted the label when the name was last accepted.
+    pub(crate) network: NetworkId,
+    /// The holder's accepted share for the label.
+    pub(crate) share: Share,
+}
+
 /// What the registry calls with the name state after every change that must reach the disk.
 type OnChange = Arc<dyn Fn(&NameState) + Send + Sync>;
 
@@ -654,6 +667,48 @@ impl LabelRegistry {
             .get(node_id)
             .map(|advertisement| advertisement.accept_peers)
             .unwrap_or(true)
+    }
+
+    /// Who holds the full name `full` (relative to the share domain, lowercase: `app` or
+    /// `app.ali`) right now, for the front door (`crate::front_door`): the attached node whose
+    /// ADVERTISE this session got the name accepted, the tenant slug and network of the name's
+    /// record, and the share of that node whose label the name carries. `None` if nobody holds
+    /// it, if it is not a held name of the durable state, if its first level label is in
+    /// quarantine at `now`, or if the holder's current advertisement no longer lists the share.
+    /// The three answers (unknown, unheld, quarantined) are one on purpose: the front door
+    /// answers them all the same way.
+    pub(crate) fn held_name(&self, full: &str, now: u64) -> Option<HeldName> {
+        let (node, record) = {
+            let guard = self.lock();
+            let node = *guard.holders.get(full)?;
+            let record = guard.state.names.get(full)?.clone();
+            let first_level = full.rsplit('.').next().unwrap_or(full);
+            if guard
+                .state
+                .quarantine
+                .get(first_level)
+                .is_some_and(|q| q.until() > now)
+            {
+                return None;
+            }
+            (node, record)
+        };
+        let label = full.split('.').next().unwrap_or(full);
+        let share = self
+            .by_node
+            .read()
+            .unwrap()
+            .get(&node)?
+            .shares
+            .iter()
+            .find(|share| share.name.eq_ignore_ascii_case(label))?
+            .clone();
+        Some(HeldName {
+            node,
+            tenant: record.tenant,
+            network: record.network,
+            share,
+        })
     }
 
     /// `node_id`'s currently accepted shares — whatever its most recent

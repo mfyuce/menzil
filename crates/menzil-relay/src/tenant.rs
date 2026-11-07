@@ -196,7 +196,8 @@ macro_rules! figures {
         /// The per tenant figures of a class (design 2.3), in the units the tenant file uses
         /// (the key names say which). Enforced so far: the session figures and the Roster figures
         /// (MT7) and the data plane figures (MT8: pairs, destinations, droppable bytes, bandwidth,
-        /// burst, volume, floor) and the name figures (MT9: `names`, `new_names_per_week`).
+        /// burst, volume, floor), the name figures (MT9: `names`, `new_names_per_week`) and the share
+        /// connection figures (S-E6: `share_connections`, `share_connections_per_name`).
         #[derive(Debug, Clone, Copy, PartialEq, Eq)]
         pub struct Figures {
             $($(#[$doc])* pub $field: u64,)*
@@ -283,6 +284,11 @@ figures! {
     names = 20, max 100_000;
     /// Names accepted for the first time in any 7 days.
     new_names_per_week = 5, max 100_000;
+    /// Public connections to the tenant's blind shares at once (the front door,
+    /// protocol.md 6.2); one more is answered like an unknown name.
+    share_connections = 256, max 1_000_000;
+    /// Public connections to one name of the tenant at once.
+    share_connections_per_name = 64, max 1_000_000;
 }
 
 /// What a tenant file says about one tenant, before the book judges it.
@@ -1265,9 +1271,11 @@ mod tests {
                 friend.new_names_per_week,
                 friend.roster_adoptions_per_hour,
                 friend.roster_adoption_burst,
+                friend.share_connections,
+                friend.share_connections_per_name,
             ],
             [
-                3, 256, 64, 16, 64, 32, 16, 100, 256, 250, 30, 5, 20, 5, 20, 5
+                3, 256, 64, 16, 64, 32, 16, 100, 256, 250, 30, 5, 20, 5, 20, 5, 256, 64
             ]
         );
         let mut one = spec("ali", &[1]);

@@ -18,7 +18,10 @@ use std::sync::Arc;
 use anyhow::{Context, Result, anyhow, bail};
 use menzil_proto::trust::{DOC_MAX_LIFETIME, HeldRoster, HeldView, Reason, Verdict, check_bundle};
 use menzil_proto::{Limits, NetworkId, Roster};
-use menzil_relay::{Listener, NameState, Relay, RelayError, RelayIdentity, TenantBook};
+use menzil_relay::{
+    AcceptConfig, FrontDoorConfig, Listener, NameState, Relay, RelayError, RelayIdentity,
+    TenantBook,
+};
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use tokio::task::JoinHandle;
@@ -296,6 +299,18 @@ pub struct RunOptions {
     pub reload_every: std::time::Duration,
 }
 
+/// The blind front door of `menzil relay run` (protocol.md 6.2): off unless a share domain is
+/// given. The relay's own host name (`RunOptions::host`) is then required: the SNI that keeps
+/// its WebSocket path.
+#[derive(Debug, Clone)]
+pub struct FrontDoorOptions {
+    /// The share domain `H`: names are `<label>.H` and `<label>.<tenant>.H`.
+    pub share_domain: String,
+    /// Where to serve plain HTTP for ACME HTTP-01 and the redirect to https (port 80); not
+    /// served when `None`.
+    pub http_listen: Option<SocketAddr>,
+}
+
 /// How long a clean stop waits for the keeper to write the last Roster adopted over DOC.
 pub const STOP_GRACE: std::time::Duration = std::time::Duration::from_secs(3);
 
@@ -311,6 +326,8 @@ pub struct RunningRelay {
     pub connection_info: String,
     /// The networks it serves.
     pub networks: Vec<NetworkId>,
+    /// The address its plain HTTP listener is bound to, if it has one.
+    pub http_addr: Option<SocketAddr>,
     relay: Relay,
     task: JoinHandle<()>,
     reload: JoinHandle<()>,
@@ -408,6 +425,28 @@ fn unix_now() -> u64 {
 
 /// Binds, loads the Rosters and starts serving.
 pub async fn start(home: &Home, options: &RunOptions) -> Result<RunningRelay> {
+    start_with(home, options, None).await
+}
+
+/// [`start`], with the blind front door of `front` on the TLS port if it is given.
+pub async fn start_with(
+    home: &Home,
+    options: &RunOptions,
+    front: Option<&FrontDoorOptions>,
+) -> Result<RunningRelay> {
+    // The front door needs the relay's own host name to tell its nodes from the public, before
+    // anything is bound or read.
+    let front_door = match front {
+        None => None,
+        Some(front) => {
+            let host = options.host.as_deref().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "--share-domain needs --host: the relay's own host name is the SNI its nodes dial"
+                )
+            })?;
+            Some(FrontDoorConfig::new(host, &front.share_domain)?)
+        }
+    };
     let identity = relay_identity(home)?;
     let all_rosters = load_rosters(home)?;
     // The tenant files, before anything is served: a network a tenant file refuses is held
@@ -442,7 +481,22 @@ pub async fn start(home: &Home, options: &RunOptions) -> Result<RunningRelay> {
         &options.path,
         &identity,
     )?;
-    let relay = Relay::new(identity, LIMITS);
+    let http = match front.and_then(|front| front.http_listen) {
+        Some(addr) => Some(
+            tokio::net::TcpListener::bind(addr)
+                .await
+                .with_context(|| format!("listening on {addr} for plain HTTP"))?,
+        ),
+        None => None,
+    };
+    let http_addr = http
+        .as_ref()
+        .map(tokio::net::TcpListener::local_addr)
+        .transpose()?;
+    let mut relay = Relay::new(identity, LIMITS);
+    if let Some(config) = front_door {
+        relay = relay.with_front_door(config);
+    }
     relay.set_tenants(book);
     relay.labels().load_state(&name_state);
     let mut networks = Vec::new();
@@ -549,7 +603,11 @@ pub async fn start(home: &Home, options: &RunOptions) -> Result<RunningRelay> {
             .set_on_change(move |state| names_keeper.submit(state.clone()));
     }
     let serving = relay.clone();
-    let task = tokio::spawn(async move { serving.serve(&listener).await });
+    let task = tokio::spawn(async move {
+        serving
+            .serve_with_http(&listener, http, AcceptConfig::default())
+            .await
+    });
     // `add-network` with a newer token while the relay runs is picked up here; the store keeps
     // the newer of what it holds and what is read (protocol.md 2.3: never a lower `seq`), and
     // members push newer Rosters themselves whenever they attach.
@@ -567,6 +625,7 @@ pub async fn start(home: &Home, options: &RunOptions) -> Result<RunningRelay> {
         addr,
         connection_info: info,
         networks,
+        http_addr,
         relay,
         task,
         reload,

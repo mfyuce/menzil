@@ -248,6 +248,16 @@ enum RelayCommand {
         /// The WebSocket path to answer on.
         #[arg(long, default_value = relay_cmd::DEFAULT_PATH)]
         path: String,
+        /// The share domain: serve public shares by SNI on the TLS port (`<name>.<domain>`,
+        /// `<name>.<tenant>.<domain>`), piped blind to the node that holds the name. Needs
+        /// `--host`, the name this relay's own certificate and nodes use. Off unless given.
+        #[arg(long, value_name = "DOMAIN", requires = "host")]
+        share_domain: Option<String>,
+        /// Also serve plain HTTP here, for ACME HTTP-01 challenges of shares and the redirect
+        /// of every other request to https (usually 0.0.0.0:80). Needs `--share-domain`. Off
+        /// unless given.
+        #[arg(long, value_name = "ADDR", requires = "share_domain")]
+        http_listen: Option<SocketAddr>,
     },
 }
 
@@ -742,9 +752,15 @@ async fn run(cli: Cli) -> Result<()> {
                     tls_key,
                     host,
                     path,
+                    share_domain,
+                    http_listen,
                 },
         } => {
-            let mut relay = relay_cmd::start(
+            let front = share_domain.map(|share_domain| relay_cmd::FrontDoorOptions {
+                share_domain,
+                http_listen,
+            });
+            let mut relay = relay_cmd::start_with(
                 &home()?,
                 &relay_cmd::RunOptions {
                     listen,
@@ -754,10 +770,17 @@ async fn run(cli: Cli) -> Result<()> {
                     host,
                     reload_every: relay_cmd::DEFAULT_RELOAD_EVERY,
                 },
+                front.as_ref(),
             )
             .await?;
             eprintln!("relay listening on {}", relay.addr);
             eprintln!("it serves {} network(s)", relay.networks.len());
+            if let Some(front) = &front {
+                eprintln!("public shares: <name>.{}", front.share_domain);
+                if let Some(http) = relay.http_addr {
+                    eprintln!("plain HTTP (ACME HTTP-01, redirect to https) on {http}");
+                }
+            }
             eprintln!("put this in `relay = ` in the config.toml of every node that uses it:");
             println!("{}", relay.connection_info);
             // Until a signal; the last Roster adopted over DOC is flushed to disk before the
