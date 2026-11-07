@@ -123,6 +123,22 @@ pub async fn validate(book: &ChallengeBook, sni: &str, alpn: &[&str]) -> (Served
     (served, seen)
 }
 
+/// Connects as a CA would (SNI `sni`, ALPN `alpn`) to a listening server at `addr` over TCP.
+pub async fn validate_tcp(addr: std::net::SocketAddr, sni: &str, alpn: &[&str]) -> Option<Seen> {
+    let tcp = tokio::net::TcpStream::connect(addr).await.ok()?;
+    let connector = TlsConnector::from(client_config(alpn));
+    let name = ServerName::try_from(sni.to_string()).unwrap();
+    let tls = tokio::time::timeout(WAIT, connector.connect(name, tcp))
+        .await
+        .ok()?
+        .ok()?;
+    let (_, conn) = tls.get_ref();
+    Some(Seen {
+        leaf: conn.peer_certificates()?[0].as_ref().to_vec(),
+        alpn: conn.alpn_protocol().map(<[u8]>::to_vec),
+    })
+}
+
 pub fn issue_leaf(domain: &str, public: &[u8]) -> String {
     use rcgen::{BasicConstraints, CertifiedIssuer, IsCa};
     let mut ca_params = CertificateParams::new(Vec::<String>::new()).unwrap();
@@ -188,6 +204,9 @@ pub struct Flags {
     pub finalize_processing: bool,
     /// newAccount is refused.
     pub refuse_account: bool,
+    /// Validate by connecting over TCP to this address (a real front door) instead of calling
+    /// the challenge book over an in memory pipe.
+    pub validate_via: Option<std::net::SocketAddr>,
 }
 
 #[derive(Default)]
@@ -376,7 +395,13 @@ impl FakeCa {
             self.state().validated = Some(false);
             return;
         }
-        let (served, seen) = validate(&self.book, &domain, &["acme-tls/1"]).await;
+        let (served, seen) = match self.flags.validate_via {
+            Some(addr) => (
+                Served::Answered,
+                validate_tcp(addr, &domain, &["acme-tls/1"]).await,
+            ),
+            None => validate(&self.book, &domain, &["acme-tls/1"]).await,
+        };
         let digest = seen
             .filter(|_| served == Served::Answered)
             .and_then(|seen| acme_identifier(&seen.leaf))

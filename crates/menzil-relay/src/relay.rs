@@ -433,6 +433,7 @@ impl Relay {
         // The relay's own ACME lives as long as this future does, and only with a front door:
         // without one nothing reads a ClientHello, so no validation could be answered.
         let _acme = match (&front, &self.acme) {
+            (Some(_), Some(acme)) if acme.has_external_runner() => None,
             (Some(_), Some(acme)) => match menzil_acme::HttpsTransport::platform() {
                 Ok(transport) => Some(AbortOnDrop(tokio::spawn(crate::acme::run(
                     self.clone(),

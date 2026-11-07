@@ -252,6 +252,7 @@ pub struct RelayAcme {
     challenges: ChallengeBook,
     limiter: Arc<OrderLimiter>,
     timing: Timing,
+    external_runner: bool,
 }
 
 impl std::fmt::Debug for RelayAcme {
@@ -278,7 +279,21 @@ impl RelayAcme {
             challenges: ChallengeBook::new(),
             limiter: Arc::default(),
             timing: Timing::default(),
+            external_runner: false,
         }
+    }
+
+    /// The caller runs [`run`] itself (with its own transport; tests): the relay's serve loop
+    /// still answers validations of the pending orders but starts no renewal task of its own.
+    #[must_use]
+    pub fn with_external_runner(mut self) -> Self {
+        self.external_runner = true;
+        self
+    }
+
+    /// Whether the caller runs [`run`] itself ([`Self::with_external_runner`]).
+    pub fn has_external_runner(&self) -> bool {
+        self.external_runner
     }
 
     /// With other waits in the client (tests).
