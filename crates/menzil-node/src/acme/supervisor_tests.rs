@@ -7,8 +7,10 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use menzil_acme::testing::{FakeCa, Flags, fast, unb64};
+use menzil_acme::{BACKOFF_MAX, RenewPace};
 use menzil_proto::{AdvertiseAckBody, Share, ShareMode};
 
+use super::supervisor::{PACE_SLACK, Paces};
 use super::*;
 
 const H: &str = "share.test";
@@ -500,4 +502,128 @@ async fn a_certificate_is_obtained_stored_and_reported_valid() {
         CertState::None
     );
     supervisor.abort();
+}
+
+// ---- the failure backoff outlives a renewal task (expose round 4, M2) ----
+
+/// How many orders `app.share.test` gets in three hours from a CA that never validates, with
+/// the attachment kept (`flapping` false) or dropped and made again every two minutes.
+async fn orders_in_three_hours(flapping: bool) -> usize {
+    let shares_list = [blind("app", &["acme-tls/1"])];
+    let one = ack(&["app"], &["app"], Some(H));
+    let scratch = Scratch::new();
+    let ca = Recording::new(never_validates());
+    let shares = ShareBook::new();
+    let supervisor = spawn_renewals(
+        setup(&scratch.0, ca.clone()),
+        shares.clone(),
+        ChallengeBook::new(),
+        AcmeStatus::new(),
+        || None,
+    );
+    if flapping {
+        for _ in 0..90 {
+            shares.note_sent(&shares_list);
+            shares.note_ack(&one);
+            tokio::time::sleep(Duration::from_secs(110)).await;
+            shares.note_detached();
+            tokio::time::sleep(Duration::from_secs(10)).await;
+        }
+    } else {
+        shares.note_sent(&shares_list);
+        shares.note_ack(&one);
+        minutes(180).await;
+    }
+    supervisor.abort();
+    ca.counts().get("app.share.test").copied().unwrap_or(0)
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_attachment_that_flaps_every_two_minutes_does_not_order_faster_than_a_steady_one() {
+    // The waits after failures are 1, 2, 4... minutes up to an hour, each jittered by 0.75 to
+    // 1.25: in three hours a steady attachment makes 8 orders (all waits at their longest) to 9
+    // (all at their shortest), whatever the jitter.
+    let steady = orders_in_three_hours(false).await;
+    assert!((8..=9).contains(&steady), "{steady} orders steady");
+    // A task that came back with a clean sheet each time made some 180 orders: the flapping
+    // attachment stays within the steady figure plus one.
+    let flapping = orders_in_three_hours(true).await;
+    assert!(
+        flapping <= 9 + 1,
+        "{flapping} orders flapping against {steady} steady"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_name_wanted_again_after_its_wait_orders_at_once_and_before_it_waits() {
+    let shares_list = [blind("app", &["acme-tls/1"])];
+    let one = ack(&["app"], &["app"], Some(H));
+    let scratch = Scratch::new();
+    let ca = Recording::new(never_validates());
+    let shares = ShareBook::new();
+    let supervisor = spawn_renewals(
+        setup(&scratch.0, ca.clone()),
+        shares.clone(),
+        ChallengeBook::new(),
+        AcmeStatus::new(),
+        || None,
+    );
+    let orders = || ca.counts().get("app.share.test").copied().unwrap_or(0);
+    shares.note_sent(&shares_list);
+    shares.note_ack(&one);
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    assert_eq!(orders(), 1, "the first order is made at once");
+    // The attachment ends and comes back 20 s later, inside the wait of at least 45 s.
+    shares.note_detached();
+    tokio::time::sleep(Duration::from_secs(20)).await;
+    shares.note_sent(&shares_list);
+    shares.note_ack(&one);
+    tokio::time::sleep(Duration::from_secs(20)).await;
+    assert_eq!(orders(), 1, "the wait of the first failure is not over");
+    // Detached for ten minutes: when it comes back the wait is over and it orders at once.
+    shares.note_detached();
+    minutes(10).await;
+    shares.note_sent(&shares_list);
+    shares.note_ack(&one);
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    assert_eq!(orders(), 2, "wanted again after its wait: an order at once");
+    supervisor.abort();
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_kept_order_timings_are_bounded_and_the_unplanned_ones_leave_first() {
+    let job = |n: usize| AcmeJob {
+        share: "app".to_string(),
+        domain: format!("n{n}.share.test"),
+    };
+    let mut paces = Paces::default();
+    // More names than the map holds, each planned for one look and then never again.
+    for n in 0..(MAX_JOBS + PACE_SLACK + 40) {
+        let planned: BTreeSet<AcmeJob> = [job(n)].into_iter().collect();
+        paces.reconcile(&planned);
+        paces.get(&job(n).domain);
+        assert!(paces.names.len() <= MAX_JOBS + PACE_SLACK);
+    }
+    // A full plan always fits, whatever else is kept, and keeps its own timing.
+    let plan: BTreeSet<AcmeJob> = (1000..1000 + MAX_JOBS).map(job).collect();
+    paces.reconcile(&plan);
+    let kept: Vec<RenewPace> = plan.iter().map(|j| paces.get(&j.domain)).collect();
+    assert!(paces.names.len() <= MAX_JOBS + PACE_SLACK);
+    for (j, pace) in plan.iter().zip(&kept) {
+        paces.reconcile(&plan);
+        assert!(
+            paces.get(&j.domain).is_same(pace),
+            "a planned name keeps its timing"
+        );
+    }
+    // An hour and a second without being planned drops a name; before that it is kept.
+    let kept_one = paces.get(&job(1000).domain);
+    paces.reconcile(&BTreeSet::new());
+    tokio::time::advance(BACKOFF_MAX - Duration::from_secs(1)).await;
+    paces.reconcile(&BTreeSet::new());
+    assert!(paces.get(&job(1000).domain).is_same(&kept_one));
+    paces.reconcile(&BTreeSet::new());
+    tokio::time::advance(Duration::from_secs(2)).await;
+    paces.reconcile(&BTreeSet::new());
+    assert!(paces.names.is_empty(), "{}", paces.names.len());
 }

@@ -39,7 +39,10 @@ pub const ACME_ALPN: &str = "acme-tls/1";
 
 pub use client::{AccountKey, AcmeClient, Issued, Timing};
 pub use http::{AcmeTransport, HttpRequest, HttpResponse, HttpsTransport, Method};
-pub use renew::{AcmeJob, CertStore, Progress, renewal_time, run_renewals, run_renewals_observed};
+pub use renew::{
+    AcmeJob, BACKOFF_MAX, CertStore, Progress, RenewPace, renewal_time, run_renewals,
+    run_renewals_observed,
+};
 
 /// How long an order waits for its validation connection (and so how long its challenge
 /// certificate can be served).

@@ -18,7 +18,9 @@
 //! share that stops being wanted, a name the new ACK no longer lists and the end of the
 //! attachment stop the task at once; the next attachment's ACK starts it again (a certificate
 //! on disk that is not due is not ordered again). The account key is made (0600, atomically) the
-//! first time a job needs it.
+//! first time a job needs it. The failure backoff and the least interval between orders of a name
+//! live in the supervisor ([`Paces`]), not in the task: a task that comes back for a name (a
+//! flapping attachment) waits what is left of the wait, a success resets it.
 //!
 //! What this does not do: pass the certificate on. It is on disk under
 //! `<home>/acme/certs/<name>/{fullchain,privkey}.pem` and the service behind the share reads
@@ -30,10 +32,11 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use menzil_acme::{
-    AccountKey, AcmeClient, AcmeJob, AcmeTransport, CertStore, ChallengeBook, FailureKind,
-    Progress, Timing, check_domain, run_renewals_observed,
+    AccountKey, AcmeClient, AcmeJob, AcmeTransport, BACKOFF_MAX, CertStore, ChallengeBook,
+    FailureKind, Progress, RenewPace, Timing, check_domain, run_renewals_observed,
 };
 use tokio::task::JoinHandle;
+use tokio::time::Instant;
 
 use super::wanted;
 use crate::shares::{MAX_SHARES, ShareBook, ShareSnapshot, lists_acme_alpn};
@@ -45,6 +48,76 @@ pub const MAX_JOBS: usize = MAX_SHARES;
 /// How often the supervisor looks again without a notification: the share domain in config.toml
 /// may have been edited, and a key that could not be made is tried again.
 const RECONCILE_EVERY: Duration = Duration::from_secs(30);
+
+/// How many names the supervisor remembers the order timing of beyond [`MAX_JOBS`], names that
+/// are not planned now (see [`Paces`]).
+pub const PACE_SLACK: usize = 16;
+
+/// The order timing ([`RenewPace`]) of each name, kept by the supervisor so that it outlives a
+/// renewal task: a job that leaves the plan (the attachment ended, the ACK dropped the name, the
+/// share lost `acme-tls/1`) is aborted, and the task that comes back for the same name must not
+/// start with a clean sheet and order at once (expose round 4, M2; the relay's `OrderLimiter`
+/// keeps its names the same way, round 3 M2). A name that has not been planned for
+/// [`BACKOFF_MAX`] has nothing left to remember and is dropped; the map holds at most
+/// [`MAX_JOBS`] planned names plus [`PACE_SLACK`] others (the unplanned one that left first is
+/// dropped when a name does not fit).
+#[derive(Default)]
+pub(super) struct Paces {
+    pub(super) names: HashMap<String, PaceEntry>,
+}
+
+pub(super) struct PaceEntry {
+    pace: RenewPace,
+    /// Since when the name is not planned (`None`: it is planned now).
+    unplanned_since: Option<Instant>,
+}
+
+impl Paces {
+    /// Notes which names are planned now; forgets the old unplanned ones.
+    pub(super) fn reconcile(&mut self, planned: &BTreeSet<AcmeJob>) {
+        let now = Instant::now();
+        self.names.retain(|domain, entry| {
+            if planned.iter().any(|job| &job.domain == domain) {
+                entry.unplanned_since = None;
+                return true;
+            }
+            let since = *entry.unplanned_since.get_or_insert(now);
+            now.duration_since(since) < BACKOFF_MAX
+        });
+    }
+
+    /// The timing of `domain`, a fresh one if none is kept. Call it for planned names only.
+    pub(super) fn get(&mut self, domain: &str) -> RenewPace {
+        if let Some(entry) = self.names.get(domain) {
+            return entry.pace.clone();
+        }
+        // Room: the unplanned names that left first go first (a planned name always fits, the
+        // plan has at most MAX_JOBS names).
+        while self.names.len() >= MAX_JOBS + PACE_SLACK {
+            let oldest = self
+                .names
+                .iter()
+                .filter_map(|(name, entry)| entry.unplanned_since.map(|since| (since, name)))
+                .min()
+                .map(|(_, name)| name.clone());
+            match oldest {
+                Some(name) => {
+                    self.names.remove(&name);
+                }
+                None => break,
+            }
+        }
+        let pace = RenewPace::new();
+        self.names.insert(
+            domain.to_string(),
+            PaceEntry {
+                pace: pace.clone(),
+                unplanned_since: None,
+            },
+        );
+        pace
+    }
+}
 
 /// Where the share domain of config.toml and the relay's differ.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -245,6 +318,7 @@ where
     tokio::spawn(async move {
         let mut changes = shares.subscribe_accepted();
         let mut running = Running::default();
+        let mut paces = Paces::default();
         let mut key_pem: Option<String> = None;
         let mut warned: Option<(String, String)> = None;
         let mut key_failed = false;
@@ -293,6 +367,7 @@ where
                     false
                 }
             });
+            paces.reconcile(&plan.jobs);
             // A name that cannot be ordered because of the mismatch says so; one that no longer
             // is blocked forgets it.
             let blocked: BTreeSet<String> =
@@ -352,6 +427,7 @@ where
                     move || wanted(&task_shares, &share),
                     book.clone(),
                     job.clone(),
+                    paces.get(&job.domain),
                     move |progress| task_status.record(&domain, progress),
                 ));
                 running.0.insert(job.clone(), handle);

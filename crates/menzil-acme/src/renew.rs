@@ -4,7 +4,10 @@
 //! jitter) and the loop that renews.
 
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use tokio::time::Instant;
 
 use x509_parser::extensions::GeneralName;
 
@@ -21,7 +24,86 @@ const UNWANTED_WAIT: Duration = Duration::from_secs(60);
 
 /// The first and the longest wait after a failed attempt.
 const BACKOFF_START: Duration = Duration::from_secs(60);
-const BACKOFF_MAX: Duration = Duration::from_secs(3600);
+/// The longest wait after failed attempts. A [`RenewPace`] that nobody wants for this long has
+/// nothing left to remember.
+pub const BACKOFF_MAX: Duration = Duration::from_secs(3600);
+
+#[derive(Debug)]
+struct PaceState {
+    /// No order for this name before this time.
+    next_allowed: Instant,
+    /// The wait the next failure sets (doubles up to [`BACKOFF_MAX`]).
+    backoff: Duration,
+}
+
+/// When the next order for one name may start, and how long the wait after the next failure is.
+/// It belongs to the name, not to the task that renews it: the caller keeps it while a task
+/// ends and a new one starts (an attachment that goes and comes back, a name the relay drops
+/// and lists again), so that starting a task is not a way past the backoff (expose round 4, M2).
+/// Cloned freely; the clones are one state.
+#[derive(Debug, Clone)]
+pub struct RenewPace {
+    inner: Arc<Mutex<PaceState>>,
+}
+
+impl Default for RenewPace {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl RenewPace {
+    /// A fresh state: an order may start at once, a failure waits [`BACKOFF_START`].
+    pub fn new() -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(PaceState {
+                next_allowed: Instant::now(),
+                backoff: BACKOFF_START,
+            })),
+        }
+    }
+
+    fn state(&self) -> std::sync::MutexGuard<'_, PaceState> {
+        self.inner.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// When the next order may start.
+    pub fn next_allowed(&self) -> Instant {
+        self.state().next_allowed
+    }
+
+    /// Whether `other` is this very state (a clone of it).
+    pub fn is_same(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
+    }
+
+    /// The wait (before jitter) the next failure sets.
+    pub fn backoff(&self) -> Duration {
+        self.state().backoff
+    }
+
+    /// An order starts now: the next one is at least [`BACKOFF_START`] away, however it ends.
+    fn started(&self) {
+        let mut state = self.state();
+        state.next_allowed = state.next_allowed.max(Instant::now() + BACKOFF_START);
+    }
+
+    /// The order failed: the next waits the backoff (with jitter), which then doubles.
+    fn failed(&self) -> Duration {
+        let mut state = self.state();
+        let wait = state.backoff.mul_f64(0.75 + fastrand::f64() / 2.0);
+        state.backoff = (state.backoff * 2).min(BACKOFF_MAX);
+        state.next_allowed = Instant::now() + wait;
+        wait
+    }
+
+    /// The order succeeded: the backoff is back at the start.
+    fn succeeded(&self) {
+        let mut state = self.state();
+        state.backoff = BACKOFF_START;
+        state.next_allowed = Instant::now() + BACKOFF_START;
+    }
+}
 
 fn unix_now() -> u64 {
     SystemTime::now()
@@ -207,7 +289,9 @@ pub enum Progress {
 /// Keeps a certificate for `job.domain` fresh, forever (the caller aborts the task): when none is
 /// stored, or the stored one is past its renewal time, and `wanted()` says so, an
 /// [`AcmeClient::obtain`] is run and its result stored; a failure is logged and retried after
-/// a wait that doubles from one minute to one hour, with jitter.
+/// a wait that doubles from one minute to one hour, with jitter. (The wait lives in a state of
+/// this call only; a caller that restarts the task keeps one [`RenewPace`] per name and uses
+/// [`run_renewals_observed`].)
 pub async fn run_renewals<T: AcmeTransport>(
     client: AcmeClient<T>,
     store: CertStore,
@@ -215,20 +299,22 @@ pub async fn run_renewals<T: AcmeTransport>(
     book: ChallengeBook,
     job: AcmeJob,
 ) {
-    run_renewals_observed(client, store, wanted, book, job, |_| {}).await
+    run_renewals_observed(client, store, wanted, book, job, RenewPace::new(), |_| {}).await
 }
 
 /// [`run_renewals`] that also tells `observe` what it is doing: [`Progress::Renewing`] before
-/// each order, and how the order ended.
+/// each order, and how the order ended. `pace` is the name's order timing: no order starts
+/// before [`RenewPace::next_allowed`], every order start sets it a minute ahead, a failure
+/// sets it by the doubling backoff and a success resets the backoff.
 pub async fn run_renewals_observed<T: AcmeTransport>(
     mut client: AcmeClient<T>,
     store: CertStore,
     wanted: impl Fn() -> bool + Send + Sync,
     book: ChallengeBook,
     job: AcmeJob,
+    pace: RenewPace,
     observe: impl Fn(Progress) + Send + Sync,
 ) {
-    let mut backoff = BACKOFF_START;
     loop {
         let now = unix_now();
         let due = match store.validity(&job.domain) {
@@ -245,6 +331,13 @@ pub async fn run_renewals_observed<T: AcmeTransport>(
             tokio::time::sleep(UNWANTED_WAIT).await;
             continue;
         }
+        // The wait of an earlier task for this name, or of an earlier failure, is not over.
+        let allowed = pace.next_allowed();
+        if allowed > Instant::now() {
+            tokio::time::sleep_until(allowed).await;
+            continue;
+        }
+        pace.started();
         observe(Progress::Renewing);
         let outcome = client.obtain(&job.domain, &book, &wanted).await;
         let wait = match outcome
@@ -252,7 +345,7 @@ pub async fn run_renewals_observed<T: AcmeTransport>(
         {
             Ok(issued) => {
                 tracing::info!(domain = %job.domain, not_after = issued.not_after, "a certificate was issued and stored");
-                backoff = BACKOFF_START;
+                pace.succeeded();
                 observe(Progress::Issued);
                 // However short a lifetime the CA chose, one order a minute at most.
                 BACKOFF_START
@@ -264,9 +357,7 @@ pub async fn run_renewals_observed<T: AcmeTransport>(
             Err(error) => {
                 tracing::warn!(domain = %job.domain, %error, "ACME did not issue a certificate; retrying later");
                 observe(Progress::Failed(error.failure_kind()));
-                let wait = backoff.mul_f64(0.75 + fastrand::f64() / 2.0);
-                backoff = (backoff * 2).min(BACKOFF_MAX);
-                wait
+                pace.failed()
             }
         };
         tokio::time::sleep(wait).await;

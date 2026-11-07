@@ -1065,6 +1065,205 @@ async fn the_renewal_loop_orders_for_a_wanted_name_stores_the_result_and_stays_q
     task.abort();
 }
 
+/// A CA that is unreachable for the first `fail` newOrder posts and then the fake CA; it counts
+/// the newOrder posts it was sent.
+#[derive(Clone)]
+struct FailFirstOrders {
+    ca: Arc<FakeCa>,
+    fail: Arc<std::sync::atomic::AtomicUsize>,
+    orders: Arc<std::sync::atomic::AtomicUsize>,
+    /// How long a newOrder post takes to be answered.
+    order_delay: Duration,
+}
+
+impl FailFirstOrders {
+    fn new(ca: &Arc<FakeCa>, fail: usize) -> Self {
+        Self {
+            ca: ca.clone(),
+            fail: Arc::new(std::sync::atomic::AtomicUsize::new(fail)),
+            orders: Arc::default(),
+            order_delay: Duration::ZERO,
+        }
+    }
+
+    fn orders(&self) -> usize {
+        self.orders.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+impl AcmeTransport for FailFirstOrders {
+    async fn send(&self, request: HttpRequest) -> Result<HttpResponse, AcmeError> {
+        use std::sync::atomic::Ordering::SeqCst;
+        if request.method == Method::Post && request.url.ends_with("/order") {
+            self.orders.fetch_add(1, SeqCst);
+            tokio::time::sleep(self.order_delay).await;
+            // One order at a time reaches here, so a load and a store are enough.
+            let left = self.fail.load(SeqCst);
+            if left > 0 {
+                self.fail.store(left - 1, SeqCst);
+                return Err(AcmeError::Http("unreachable".to_string()));
+            }
+        }
+        self.ca.send(request).await
+    }
+}
+
+fn pace_job() -> AcmeJob {
+    AcmeJob {
+        share: "app".to_string(),
+        domain: DOMAIN.to_string(),
+    }
+}
+
+fn pace_client(transport: FailFirstOrders) -> AcmeClient<FailFirstOrders> {
+    AcmeClient::new(
+        transport,
+        format!("{CA}/dir"),
+        AccountKey::generate().unwrap(),
+        None,
+    )
+    .with_timing(fast())
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_order_pace_outlives_the_task_so_a_new_task_for_a_name_waits_what_is_left() {
+    let scratch = Scratch::new();
+    let book = ChallengeBook::new();
+    let ca = FakeCa::new(&book, Flags::default());
+    let transport = FailFirstOrders::new(&ca, usize::MAX);
+    let pace = RenewPace::new();
+    let spawn = |pace: &RenewPace| {
+        tokio::spawn(run_renewals_observed(
+            pace_client(transport.clone()),
+            CertStore::new(&scratch.0),
+            || true,
+            book.clone(),
+            pace_job(),
+            pace.clone(),
+            |_| {},
+        ))
+    };
+    // The first task orders at once and fails; the next try is a backoff (45 to 75 s) away.
+    let first = spawn(&pace);
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(transport.orders(), 1);
+    first.abort();
+    let _ = first.await;
+    // A new task for the same name does not order before the wait is over.
+    let second = spawn(&pace);
+    tokio::time::sleep(Duration::from_secs(30)).await;
+    assert_eq!(transport.orders(), 1, "30 s into a wait of at least 45 s");
+    // And does when it is: the wait was a minute (jittered), not an hour.
+    tokio::time::sleep_until(pace.next_allowed() + Duration::from_secs(1)).await;
+    assert_eq!(transport.orders(), 2, "the wait is over, one order");
+    // The second failure doubled the backoff, and its own wait (90 to 150 s) is kept by the
+    // state, not by the task: it is more than the least interval of a minute.
+    assert_eq!(pace.backoff(), Duration::from_secs(240));
+    assert!(pace.next_allowed() > tokio::time::Instant::now() + Duration::from_secs(80));
+    second.abort();
+    // A task with a fresh pace of its own orders at once (what the pace is for).
+    let fresh = spawn(&RenewPace::new());
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(transport.orders(), 3);
+    fresh.abort();
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_order_that_ends_because_the_name_is_not_wanted_still_counts_for_the_least_interval() {
+    let scratch = Scratch::new();
+    let book = ChallengeBook::new();
+    let ca = FakeCa::new(&book, Flags::default());
+    let mut transport = FailFirstOrders::new(&ca, 0);
+    transport.order_delay = Duration::from_secs(10);
+    let pace = RenewPace::new();
+    let wanted = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let spawn = || {
+        let wanted = wanted.clone();
+        tokio::spawn(run_renewals_observed(
+            pace_client(transport.clone()),
+            CertStore::new(&scratch.0),
+            move || wanted.load(std::sync::atomic::Ordering::SeqCst),
+            book.clone(),
+            pace_job(),
+            pace.clone(),
+            |_| {},
+        ))
+    };
+    // The order is made; the name stops being wanted while the CA is answering, so the attempt
+    // ends with nothing failed (and nothing issued).
+    let first = spawn();
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    wanted.store(false, std::sync::atomic::Ordering::SeqCst);
+    tokio::time::sleep(Duration::from_secs(10)).await;
+    first.abort();
+    assert_eq!(transport.orders(), 1);
+    assert!(CertStore::new(&scratch.0).validity(DOMAIN).is_none());
+    // Wanted again, a new task: the start of the first order still counts, so the next is not
+    // before a minute after it.
+    wanted.store(true, std::sync::atomic::Ordering::SeqCst);
+    let second = spawn();
+    tokio::time::sleep(Duration::from_secs(20)).await;
+    assert_eq!(transport.orders(), 1, "35 s after the first order began");
+    tokio::time::sleep(Duration::from_secs(40)).await;
+    assert_eq!(transport.orders(), 2, "a minute after it");
+    second.abort();
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_backoff_doubles_up_to_an_hour_and_a_success_resets_it() {
+    let scratch = Scratch::new();
+    let book = ChallengeBook::new();
+    let ca = FakeCa::new(&book, Flags::default());
+    let transport = FailFirstOrders::new(&ca, 2);
+    let pace = RenewPace::new();
+    let progress = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let task = tokio::spawn(run_renewals_observed(
+        pace_client(transport.clone()),
+        CertStore::new(&scratch.0),
+        || true,
+        book.clone(),
+        pace_job(),
+        pace.clone(),
+        {
+            let progress = progress.clone();
+            move |p| progress.lock().unwrap().push(p)
+        },
+    ));
+    // Two failures: 60 s then 120 s (each jittered), so the third order, which succeeds, is
+    // made within five minutes; the failures doubled the backoff to 240 s...
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(pace.backoff(), Duration::from_secs(120));
+    tokio::time::sleep(Duration::from_secs(300)).await;
+    assert!(
+        progress.lock().unwrap().contains(&Progress::Issued),
+        "{:?}",
+        progress.lock().unwrap()
+    );
+    // ...and the success put it back to a minute.
+    assert_eq!(pace.backoff(), Duration::from_secs(60));
+    assert!(CertStore::new(&scratch.0).validity(DOMAIN).is_some());
+    task.abort();
+
+    // The doubling stops at an hour.
+    let pace = RenewPace::new();
+    let transport = FailFirstOrders::new(&ca, usize::MAX);
+    let task = tokio::spawn(run_renewals_observed(
+        pace_client(transport.clone()),
+        CertStore::new(&Scratch::new().0),
+        || true,
+        book.clone(),
+        pace_job(),
+        pace.clone(),
+        |_| {},
+    ));
+    tokio::time::sleep(Duration::from_secs(24 * 3600)).await;
+    assert_eq!(pace.backoff(), BACKOFF_MAX);
+    // A ramp of about seven orders in the first two hours, then one in 45 to 75 minutes: a day
+    // is some thirty orders, not the 1440 of a wait that does not grow.
+    assert!(transport.orders() <= 40, "{}", transport.orders());
+    task.abort();
+}
+
 #[test]
 fn failures_have_fixed_words_and_sentences_that_carry_no_ca_text() {
     use crate::FailureKind::*;

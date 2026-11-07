@@ -90,6 +90,12 @@
 //! buffer in both directions; nothing is held back whole. A read or write that makes no progress
 //! for [`HttpLimits::body_idle`] ends the connection. The node's stream is charged to the
 //! tenant by the principal like any other (`crate::principal`).
+//!
+//! The name is asked whether it is still served before each request and, every
+//! [`HttpLimits::upgrade_recheck`], while a request body goes to the node, while the node's
+//! answer is awaited and while a response body goes to the client (`Watch`, one clock for the
+//! connection): a no ends the connection at once with no `close_notify`, so a long upload, an
+//! event stream or a long poll does not outlive the name's holder.
 
 use std::future::Future;
 use std::net::IpAddr;
@@ -522,9 +528,14 @@ fn process_request(head: &[u8], sni: &str, client_ip: &str) -> Result<RequestPla
                     return Err(501);
                 }
             }
-            "sec-websocket-key" => ws_keys.push(value),
-            "sec-websocket-version" => ws_versions.push(value),
-            _ => {}
+            // CGI and WSGI servers fold `_` and `-` in header names, so `Sec_WebSocket_Key`
+            // counts as the same header (a doubled key or version is a `400`; expose round 4,
+            // N1).
+            other => match other.replace('_', "-").as_str() {
+                "sec-websocket-key" => ws_keys.push(value),
+                "sec-websocket-version" => ws_versions.push(value),
+                _ => {}
+            },
         }
     }
     if length.is_some() && chunked {
@@ -609,7 +620,10 @@ impl WebSocketAsk<'_> {
     fn key(&self) -> Option<String> {
         let no_body = !self.chunked && matches!(self.length, None | Some(0));
         // A `Connection` that names a `Sec-WebSocket-*` header would have the relay strip it.
-        let names_ws = self.named.iter().any(|n| n.starts_with("sec-websocket-"));
+        let names_ws = self
+            .named
+            .iter()
+            .any(|n| n.replace('_', "-").starts_with("sec-websocket-"));
         let [key] = self.keys else { return None };
         if self.method != "GET"
             || !self.connection_upgrade
@@ -1031,6 +1045,8 @@ where
 struct Pace {
     last_moved: Mutex<Instant>,
     first_end: Mutex<Option<Instant>>,
+    /// Woken when a direction ends, so that the drain time is counted from then.
+    ended_signal: tokio::sync::Notify,
 }
 
 impl Pace {
@@ -1038,6 +1054,7 @@ impl Pace {
         Self {
             last_moved: Mutex::new(Instant::now()),
             first_end: Mutex::new(None),
+            ended_signal: tokio::sync::Notify::new(),
         }
     }
 
@@ -1061,6 +1078,7 @@ impl Pace {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .get_or_insert_with(Instant::now);
+        self.ended_signal.notify_one();
     }
 
     fn first_end(&self) -> Option<Instant> {
@@ -1104,13 +1122,58 @@ where
     }
 }
 
+/// Asks whether the name is still served: before each request, and every
+/// [`HttpLimits::upgrade_recheck`] while a body or an upgraded connection moves (expose round 4,
+/// M1: a long exchange must not outlive the name's holder). One clock for the whole connection:
+/// every question, whichever place asks it, puts the next one `every` later.
+struct Watch<F> {
+    every: Duration,
+    due: Instant,
+    still_served: F,
+}
+
+impl<F: FnMut() -> bool> Watch<F> {
+    fn new(every: Duration, still_served: F) -> Self {
+        Self {
+            every,
+            due: Instant::now() + every,
+            still_served,
+        }
+    }
+
+    /// Asks now.
+    fn ask(&mut self) -> bool {
+        self.due = Instant::now() + self.every;
+        (self.still_served)()
+    }
+
+    /// Runs `work`, asking at each due time; `None` if the answer was no (`work` is dropped
+    /// where it stood: the caller ends the connection without a clean close). No task, no
+    /// timer beyond the one `sleep_until` of the wait, so an exchange shorter than the interval
+    /// pays one timer entry and nothing else.
+    async fn run<T>(&mut self, work: impl Future<Output = T>) -> Option<T> {
+        let mut work = std::pin::pin!(work);
+        loop {
+            tokio::select! {
+                biased;
+                () = tokio::time::sleep_until(self.due) => {
+                    if !self.ask() {
+                        return None;
+                    }
+                }
+                out = &mut work => return Some(out),
+            }
+        }
+    }
+}
+
 /// The upgraded connection: `client` and `node` are joined, byte for byte, in both directions,
 /// until both sides have ended (clean: each direction was shut down), one of them fails (no
 /// `close_notify` to the client), nothing moves for [`HttpLimits::upgrade_idle`], one side's end
 /// is not followed by the other's within [`HttpLimits::half_close_drain`], or the name is no
 /// longer served (asked every [`HttpLimits::upgrade_recheck`]). Every end but the clean one drops
 /// both streams as they are.
-async fn pipe<C, N>(client: C, node: N, limits: HttpLimits, still_served: &mut impl FnMut() -> bool)
+async fn pipe<C, N>(client: C, node: N, limits: HttpLimits, watch: &mut Watch<impl FnMut() -> bool>)
 where
     C: AsyncRead + AsyncWrite + Unpin,
     N: AsyncRead + AsyncWrite + Unpin,
@@ -1121,33 +1184,31 @@ where
     let up = pump(&mut client_read, &mut node_write, limits.body_idle, &pace);
     let down = pump(&mut node_read, &mut client_write, limits.body_idle, &pace);
     let mut both = std::pin::pin!(futures_util::future::try_join(up, down));
-    let mut recheck = Instant::now() + limits.upgrade_recheck;
-    loop {
-        let mut wake = (pace.last_moved() + limits.upgrade_idle).min(recheck);
-        if let Some(at) = pace.first_end() {
-            wake = wake.min(at + limits.half_close_drain);
-        }
-        tokio::select! {
-            _ = &mut both => return,
-            _ = tokio::time::sleep_until(wake) => {}
-        }
-        let now = Instant::now();
-        if now >= pace.last_moved() + limits.upgrade_idle {
-            return;
-        }
-        if pace
-            .first_end()
-            .is_some_and(|at| now >= at + limits.half_close_drain)
-        {
-            return;
-        }
-        if now >= recheck {
-            if !still_served() {
+    let moving = async {
+        loop {
+            let mut wake = pace.last_moved() + limits.upgrade_idle;
+            if let Some(at) = pace.first_end() {
+                wake = wake.min(at + limits.half_close_drain);
+            }
+            tokio::select! {
+                _ = &mut both => return,
+                () = pace.ended_signal.notified() => {}
+                _ = tokio::time::sleep_until(wake) => {}
+            }
+            let now = Instant::now();
+            if now >= pace.last_moved() + limits.upgrade_idle {
                 return;
             }
-            recheck = now + limits.upgrade_recheck;
+            if pace
+                .first_end()
+                .is_some_and(|at| now >= at + limits.half_close_drain)
+            {
+                return;
+            }
         }
-    }
+    };
+    // Every end but the clean one is a return; so is a name no longer served.
+    let _ = watch.run(moving).await;
 }
 
 /// Answers `code` with no body and closes.
@@ -1168,14 +1229,16 @@ async fn reply<T: AsyncWrite + Unpin>(io: &mut T, code: u16) {
 /// Serves one client connection (TLS already terminated) for the share named `host` (the SNI
 /// name): reads requests from `client`, forwards them over the node stream `open` gives (called
 /// at most once, when the first valid request is in hand; `None` is a 502), and writes the
-/// responses. `still_served` is asked before each request is forwarded; `false` closes the
-/// connection. Returns when the connection is over.
+/// responses. `still_served` is asked before each request is forwarded and every
+/// [`HttpLimits::upgrade_recheck`] while a body (either way), the node's answer or an upgraded
+/// connection is moving; `false` ends the connection at once, without a `close_notify`. Returns
+/// when the connection is over.
 pub(crate) async fn serve<C, N, O, Fut>(
     client: C,
     host: &str,
     client_ip: IpAddr,
     limits: HttpLimits,
-    mut still_served: impl FnMut() -> bool,
+    still_served: impl FnMut() -> bool,
     open: O,
 ) where
     C: AsyncRead + AsyncWrite + Unpin,
@@ -1187,6 +1250,7 @@ pub(crate) async fn serve<C, N, O, Fut>(
     let mut client = Conn::new(client);
     let mut node: Option<Conn<N>> = None;
     let mut open = Some(open);
+    let mut watch = Watch::new(limits.upgrade_recheck, still_served);
     let mut first = true;
     loop {
         let wait = if first {
@@ -1224,7 +1288,7 @@ pub(crate) async fn serve<C, N, O, Fut>(
             reply(&mut client.io, 400).await;
             return;
         }
-        if !still_served() {
+        if !watch.ask() {
             return;
         }
         if node.is_none() {
@@ -1250,13 +1314,22 @@ pub(crate) async fn serve<C, N, O, Fut>(
             reply(&mut client.io, 502).await;
             return;
         }
-        match copy_body(&mut client, &mut node_conn.io, plan.body, limits.body_idle).await {
-            Ok(()) => {}
-            Err(BodyFail::Malformed) => {
+        match watch
+            .run(copy_body(
+                &mut client,
+                &mut node_conn.io,
+                plan.body,
+                limits.body_idle,
+            ))
+            .await
+        {
+            Some(Ok(())) => {}
+            Some(Err(BodyFail::Malformed)) => {
                 reply(&mut client.io, 400).await;
                 return;
             }
-            Err(_) => return,
+            // A failure, or a name no longer served: no more bytes of the client go to the node.
+            Some(Err(_)) | None => return,
         }
         if timeout(limits.body_idle, node_conn.io.flush())
             .await
@@ -1270,7 +1343,7 @@ pub(crate) async fn serve<C, N, O, Fut>(
             // (or an end) from it closes the connection and nothing of it is forwarded.
             let mut probe = [0u8; 1];
             tokio::select! {
-                head = node_head => head,
+                head = watch.run(node_head) => head,
                 read = client.io.read(&mut probe) => {
                     if matches!(read, Ok(n) if n > 0) {
                         reply(&mut client.io, 400).await;
@@ -1279,8 +1352,10 @@ pub(crate) async fn serve<C, N, O, Fut>(
                 }
             }
         } else {
-            node_head.await
+            watch.run(node_head).await
         };
+        // A node that answers after the name moved away is not heard: nothing of it goes on.
+        let Some(head) = head else { return };
         let head = match head {
             Ok(head) => head,
             Err(_) => {
@@ -1311,13 +1386,20 @@ pub(crate) async fn serve<C, N, O, Fut>(
                 return;
             }
             if let Some(node_conn) = node.take() {
-                pipe(client.io, node_conn.io, limits, &mut still_served).await;
+                pipe(client.io, node_conn.io, limits, &mut watch).await;
             }
             return;
         }
-        if copy_body(node_conn, &mut client.io, response.body, limits.body_idle)
+        // An error, or a name no longer served, ends the connection with no clean close.
+        if !watch
+            .run(copy_body(
+                node_conn,
+                &mut client.io,
+                response.body,
+                limits.body_idle,
+            ))
             .await
-            .is_err()
+            .is_some_and(|copied| copied.is_ok())
         {
             return;
         }
@@ -2787,6 +2869,54 @@ mod tests {
             }
         }
 
+        /// Expose round 4, N1: a CGI backend folds `_` to `-`, so the underscore spellings of the
+        /// handshake headers are the same headers as far as the checks go.
+        #[test]
+        fn underscore_spellings_of_the_handshake_headers_are_the_same_headers() {
+            // Alone, they are the key and the version: the handshake passes.
+            let head = ws_head(
+                "GET",
+                &GOOD,
+                &["Sec-WebSocket-Key", "Sec-WebSocket-Version"],
+                &[
+                    &format!("Sec_WebSocket_Key: {KEY}"),
+                    "SEC_WEBSOCKET_VERSION: 13",
+                ],
+            );
+            let Ok(plan) = process_request(&head, HOST, IP) else {
+                panic!("the handshake is accepted")
+            };
+            assert_eq!(plan.ws_key.as_deref(), Some(KEY));
+            // Beside the others they double them (the table of refusals has the 400s); a lone
+            // wrong underscore version is a wrong version.
+            let head = ws_head(
+                "GET",
+                &GOOD,
+                &["Sec-WebSocket-Version"],
+                &["Sec_WebSocket_Version: 8"],
+            );
+            assert_eq!(process_request(&head, HOST, IP).err(), Some(400));
+            // Protocol and extensions follow the hyphen spelling's rule: they pass as they came.
+            let head = ws_head(
+                "GET",
+                &GOOD,
+                &[],
+                &[
+                    "Sec_WebSocket_Protocol: chat",
+                    "Sec_WebSocket_Extensions: permessage-deflate",
+                ],
+            );
+            let Ok(plan) = process_request(&head, HOST, IP) else {
+                panic!("the handshake is accepted")
+            };
+            let sent = text(&plan.head);
+            assert!(sent.contains("Sec_WebSocket_Protocol: chat\r\n"), "{sent}");
+            assert!(
+                sent.contains("Sec_WebSocket_Extensions: permessage-deflate\r\n"),
+                "{sent}"
+            );
+        }
+
         #[tokio::test]
         async fn a_handshake_is_forwarded_in_canonical_form_and_the_connection_becomes_a_pipe() {
             let mut rig = rig(limits());
@@ -3033,6 +3163,41 @@ mod tests {
                         &GOOD,
                         &[],
                         &["Sec-WebSocket-Key: AQIDBAUGBwgJCgsMDQ4PEA=="],
+                    ),
+                    400,
+                ),
+                (
+                    "an underscore spelling of the key beside the key",
+                    ws_head(
+                        "GET",
+                        &GOOD,
+                        &[],
+                        &["Sec_WebSocket_Key: AQIDBAUGBwgJCgsMDQ4PEA=="],
+                    ),
+                    400,
+                ),
+                (
+                    "an underscore spelling of the version beside the version",
+                    ws_head("GET", &GOOD, &[], &["Sec_WebSocket_Version: 8"]),
+                    400,
+                ),
+                (
+                    "a mixed spelling of the key beside the key",
+                    ws_head(
+                        "GET",
+                        &GOOD,
+                        &[],
+                        &["sec_websocket-KEY: AQIDBAUGBwgJCgsMDQ4PEA=="],
+                    ),
+                    400,
+                ),
+                (
+                    "a Connection that names the underscore spelling of a Sec-WebSocket header",
+                    ws_head(
+                        "GET",
+                        &GOOD,
+                        &["Connection"],
+                        &["Connection: Upgrade, Sec_WebSocket_Key"],
                     ),
                     400,
                 ),
@@ -3536,6 +3701,178 @@ mod tests {
                 settle().await;
             }
             assert!(rig.over().await);
+        }
+
+        // ---- ordinary exchanges are re-checked while a body moves (expose round 4, M1) ----
+        // (the rig and its clock are the WebSocket's: the same `upgrade_recheck` of 30 s)
+
+        const CHUNKED_POST: &[u8] = b"POST /up HTTP/1.1\r\nHost: web.t.s.example.test\r\n\
+            Transfer-Encoding: chunked\r\n\r\n";
+        const LENGTH_POST: &[u8] = b"POST /up HTTP/1.1\r\nHost: web.t.s.example.test\r\n\
+            Content-Length: 100000\r\n\r\n";
+        const GET_EVENTS: &[u8] = b"GET /events HTTP/1.1\r\nHost: web.t.s.example.test\r\n\r\n";
+
+        /// The request is forwarded and the first `body` bytes of it are at the node.
+        async fn upload(rig: &mut Rig, request: &[u8], body: &[u8]) {
+            rig.client.send(request);
+            rig.client.send(body);
+            let head = rig.node.head().await;
+            assert!(head.starts_with(b"POST /up HTTP/1.1\r\n"));
+            assert_eq!(rig.node.take(body.len()).await, body);
+        }
+
+        /// A request body of a name that stops being served ends the connection within the
+        /// interval, whatever the framing, and the bytes sent after that go nowhere.
+        async fn a_request_body_case(request: &[u8], first: &[u8], more: &[u8]) {
+            let mut rig = rig(HttpLimits::default());
+            upload(&mut rig, request, first).await;
+            rig.served.store(false, Ordering::SeqCst);
+            tokio::time::advance(Duration::from_secs(29)).await;
+            assert!(!rig.over().await, "asked every 30 s, not before");
+            tokio::time::advance(Duration::from_secs(2)).await;
+            assert!(rig.over().await, "cut within the interval");
+            rig.client.send(more);
+            assert!(
+                rig.node.pending().await.is_empty(),
+                "nothing of the client reaches the node after the cut"
+            );
+            assert_eq!(rig.client.closes(), 0, "a cut is not a clean end");
+            assert_eq!(rig.node.closes(), 0);
+            assert_eq!(rig.client.pending().await, b"", "and no answer is written");
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn a_chunked_request_body_is_cut_when_the_name_is_no_longer_served() {
+            a_request_body_case(CHUNKED_POST, b"5\r\nhello\r\n", b"6\r\ncookie\r\n").await;
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn a_content_length_request_body_is_cut_when_the_name_is_no_longer_served() {
+            a_request_body_case(LENGTH_POST, b"hello", b"cookie").await;
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn a_request_body_of_a_name_still_served_goes_on_past_many_rechecks() {
+            let mut rig = rig(HttpLimits::default());
+            upload(&mut rig, CHUNKED_POST, b"5\r\nhello\r\n").await;
+            for _ in 0..20 {
+                tokio::time::advance(Duration::from_secs(31)).await;
+                rig.client.send(b"1\r\nx\r\n");
+                assert_eq!(rig.node.take(6).await, b"1\r\nx\r\n");
+            }
+            assert!(!rig.over().await, "ten minutes of upload, asked 20 times");
+            // It ends the way an upload does: the answer, and the connection is kept.
+            rig.client.send(b"0\r\n\r\n");
+            rig.node.take(5).await;
+            rig.node
+                .send(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+            assert!(rig.client.head().await.starts_with(b"HTTP/1.1 200 OK"));
+            assert_eq!(rig.client.take(2).await, b"ok");
+            assert!(!rig.over().await);
+        }
+
+        /// A response body of a name that stops being served ends the connection within the
+        /// interval, whatever the framing, with no clean end.
+        async fn a_response_body_case(response_head: &[u8], first: &[u8], more: &[u8]) {
+            let mut rig = rig(HttpLimits::default());
+            rig.client.send(GET_EVENTS);
+            rig.node.head().await;
+            rig.node.send(response_head);
+            rig.node.send(first);
+            rig.client.head().await;
+            rig.client.take(first.len()).await;
+            rig.served.store(false, Ordering::SeqCst);
+            tokio::time::advance(Duration::from_secs(29)).await;
+            assert!(!rig.over().await, "asked every 30 s, not before");
+            tokio::time::advance(Duration::from_secs(2)).await;
+            assert!(rig.over().await, "cut within the interval");
+            rig.node.send(more);
+            assert!(
+                rig.client.pending().await.is_empty(),
+                "nothing more of the old holder reaches the client"
+            );
+            assert_eq!(rig.client.closes(), 0, "a cut is not a clean end");
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn a_chunked_response_body_is_cut_when_the_name_is_no_longer_served() {
+            a_response_body_case(
+                b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\
+                  Transfer-Encoding: chunked\r\n\r\n",
+                b"5\r\nhello\r\n",
+                b"5\r\nagain\r\n",
+            )
+            .await;
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn a_content_length_response_body_is_cut_when_the_name_is_no_longer_served() {
+            a_response_body_case(
+                b"HTTP/1.1 200 OK\r\nContent-Length: 100000\r\n\r\n",
+                b"hello",
+                b"again",
+            )
+            .await;
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn an_until_close_response_body_is_cut_when_the_name_is_no_longer_served() {
+            a_response_body_case(b"HTTP/1.1 200 OK\r\n\r\n", b"hello", b"again").await;
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn a_response_body_of_a_name_still_served_goes_on_past_many_rechecks() {
+            let mut rig = rig(HttpLimits::default());
+            rig.client.send(GET_EVENTS);
+            rig.node.head().await;
+            rig.node.send(
+                b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\
+                  Transfer-Encoding: chunked\r\n\r\n",
+            );
+            rig.client.head().await;
+            for _ in 0..20 {
+                tokio::time::advance(Duration::from_secs(31)).await;
+                rig.node.send(b"1\r\nx\r\n");
+                assert_eq!(rig.client.take(6).await, b"1\r\nx\r\n");
+            }
+            assert!(!rig.over().await, "ten minutes of events, asked 20 times");
+            rig.node.send(b"0\r\n\r\n");
+            rig.client.take(5).await;
+            assert!(
+                !rig.over().await,
+                "a finished exchange keeps the connection"
+            );
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn a_wait_for_the_nodes_answer_ends_when_the_name_is_no_longer_served() {
+            let mut rig = rig(HttpLimits::default());
+            rig.client.send(GET_EVENTS);
+            rig.node.head().await;
+            rig.served.store(false, Ordering::SeqCst);
+            tokio::time::advance(Duration::from_secs(29)).await;
+            assert!(!rig.over().await, "asked every 30 s, not before");
+            tokio::time::advance(Duration::from_secs(2)).await;
+            assert!(rig.over().await, "well before the 120 s body idle time");
+            rig.node
+                .send(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+            assert!(
+                rig.client.pending().await.is_empty(),
+                "neither an answer of the old holder nor a 502 is written"
+            );
+            assert_eq!(rig.client.closes(), 0);
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn a_wait_for_the_websockets_101_ends_when_the_name_is_no_longer_served() {
+            let mut rig = rig(HttpLimits::default());
+            rig.client.send(&ws_head("GET", &GOOD, &[], &[]));
+            rig.node.head().await;
+            rig.served.store(false, Ordering::SeqCst);
+            tokio::time::advance(Duration::from_secs(31)).await;
+            assert!(rig.over().await);
+            rig.node.send(&accept_reply(ACCEPT, ""));
+            assert!(rig.client.pending().await.is_empty());
         }
 
         #[tokio::test]

@@ -3009,4 +3009,286 @@ pub(crate) mod tests {
             "the pipe must end"
         );
     }
+
+    // ---- ordinary HTTP exchanges are re-checked while they stream (expose round 4, M1) ----
+
+    /// An ordinary (not upgraded) request through `http_term::serve` for the name of
+    /// `terminated_world`, its head already at the node; the door asks every 100 ms whether the
+    /// name is still served. Returns the client end, the node end and the server task.
+    async fn open_http(
+        w: &World,
+        relay: &Relay,
+        request: &str,
+    ) -> (
+        tokio::io::DuplexStream,
+        tokio::io::DuplexStream,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt, duplex};
+        let (resolved, _) = t_resolve(w, relay, T_HOST).expect("resolves");
+        let still = FrontDoor::still_served(
+            Arc::clone(&w.door),
+            relay.clone(),
+            T_HOST.to_string(),
+            &resolved,
+        );
+        let (mut c, srv_c) = duplex(1 << 16);
+        let (srv_x, mut node_x) = duplex(1 << 16);
+        let limits = HttpLimits {
+            upgrade_recheck: Duration::from_millis(100),
+            ..HttpLimits::default()
+        };
+        let server = tokio::spawn(async move {
+            http_term::serve(
+                srv_c,
+                T_HOST,
+                "203.0.113.7".parse().unwrap(),
+                limits,
+                still,
+                move || async move { Some(srv_x) },
+            )
+            .await;
+        });
+        c.write_all(request.as_bytes()).await.unwrap();
+        let mut buf = vec![0u8; 4096];
+        if !request.contains("Content-Length: 0") && request.starts_with("POST") {
+            assert!(node_x.read(&mut buf).await.unwrap() > 0, "the head arrives");
+        }
+        (c, node_x, server)
+    }
+
+    /// Whether the client's connection has ended with no byte more to read.
+    async fn nothing_more(c: &mut tokio::io::DuplexStream) -> bool {
+        use tokio::io::AsyncReadExt;
+        let mut rest = Vec::new();
+        let ended = tokio::time::timeout(Duration::from_secs(1), c.read_to_end(&mut rest))
+            .await
+            .is_ok();
+        ended && rest.is_empty()
+    }
+
+    /// The label `web` moves from the world's node to another one.
+    fn move_label_to_another_node(w: &World) {
+        let x = w.node;
+        let y = NodeId::from([8u8; 32]);
+        w.roster(2, &[x, y], &[("web", y), ("app", x)]);
+        w.relay
+            .labels()
+            .release_ungranted(w.relay.rosters(), unix_now());
+        w.attach_node(y);
+        w.advertise_as(
+            y,
+            vec![share("web", ShareMode::Terminated, "http:web", &[])],
+        );
+    }
+
+    fn suspend_the_tenant(w: &World, relay: &Relay) {
+        let mut spec = terminated_ali();
+        spec.networks = vec![w.network];
+        let mut book = TenantBook::build(vec![spec], Vec::new(), &HashSet::new(), &HashSet::new());
+        book.suspend(&Slug::parse("ali").unwrap());
+        relay.set_tenants(book);
+        assert!(relay.tenants().is_held_back(&w.network));
+    }
+
+    const STREAMING_POST: &str = "POST /up HTTP/1.1\r\nHost: web.ali.t.s.example.test\r\n\
+        Cookie: session=secret\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n";
+    const SSE_REQUEST: &str = "GET /events HTTP/1.1\r\nHost: web.ali.t.s.example.test\r\n\r\n";
+    const SSE_HEAD: &[u8] =
+        b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n";
+
+    /// A chunked upload that goes on while the name is unchanged: several re-checks pass and
+    /// every chunk still reaches the node, then the exchange completes normally.
+    #[tokio::test]
+    async fn a_streaming_request_body_of_a_name_still_served_goes_on_past_several_rechecks() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (w, relay) = terminated_world();
+        let (mut c, mut node_x, server) = open_http(&w, &relay, STREAMING_POST).await;
+        let mut buf = [0u8; 64];
+        for i in 0..6 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            c.write_all(format!("8\r\nchunk-{i:02}\r\n").as_bytes())
+                .await
+                .unwrap();
+            let n = node_x.read(&mut buf).await.unwrap();
+            assert!(n > 0 && !server.is_finished(), "chunk {i} reaches the node");
+        }
+        c.write_all(b"0\r\n\r\n").await.unwrap();
+        let _ = node_x.read(&mut buf).await.unwrap();
+        node_x
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+            .await
+            .unwrap();
+        let mut answer = vec![0u8; 128];
+        let n = c.read(&mut answer).await.unwrap();
+        assert!(answer[..n].ends_with(b"ok"), "the exchange completes");
+        assert!(!server.is_finished(), "and the connection is kept alive");
+    }
+
+    /// A chunked upload to the old holder is cut when the label moves: its cookies stop going to
+    /// it, and the client's connection ends with no clean end.
+    #[tokio::test]
+    async fn a_streaming_request_body_is_cut_when_the_label_moves_to_another_node() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (w, relay) = terminated_world();
+        let (mut c, mut node_x, server) = open_http(&w, &relay, STREAMING_POST).await;
+        move_label_to_another_node(&w);
+        let mut buf = [0u8; 64];
+        let mut bytes_after = 0usize;
+        for i in 0..20 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let _ = c
+                .write_all(format!("8\r\ncookie{i:02}\r\n").as_bytes())
+                .await;
+            if let Ok(Ok(n)) =
+                tokio::time::timeout(Duration::from_millis(50), node_x.read(&mut buf)).await
+            {
+                bytes_after += n;
+            }
+            if server.is_finished() {
+                break;
+            }
+        }
+        assert!(server.is_finished(), "the upload must be cut");
+        assert!(
+            bytes_after <= 5 * 16,
+            "the old holder got {bytes_after} bytes after the move: only what a re-check allows"
+        );
+        assert!(
+            nothing_more(&mut c).await,
+            "the client's connection ends with no more bytes"
+        );
+        assert!(matches!(node_x.read(&mut buf).await, Ok(0) | Err(_)));
+    }
+
+    /// The same for a tenant suspended during an upload of a Content-Length body.
+    #[tokio::test]
+    async fn a_content_length_request_body_is_cut_when_the_tenant_is_suspended() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (w, relay) = terminated_world();
+        let request = "POST /up HTTP/1.1\r\nHost: web.ali.t.s.example.test\r\n\
+            Content-Length: 100000\r\n\r\nstart";
+        let (mut c, mut node_x, server) = open_http(&w, &relay, request).await;
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        assert!(!server.is_finished(), "served: the upload waits for more");
+        suspend_the_tenant(&w, &relay);
+        let _ = c.write_all(b"more-of-the-body").await;
+        assert!(
+            pipe_cut(&mut c, server, Duration::from_secs(5)).await,
+            "the upload must be cut"
+        );
+        let mut buf = [0u8; 256];
+        let mut total = 0;
+        while let Ok(Ok(n)) =
+            tokio::time::timeout(Duration::from_millis(200), node_x.read(&mut buf)).await
+        {
+            if n == 0 {
+                break;
+            }
+            total += n;
+        }
+        assert!(total < 100, "nothing more than the first bytes: {total}");
+    }
+
+    /// A server-sent-events response is cut when the label moves, and stays up while it does
+    /// not (several re-checks pass).
+    #[tokio::test]
+    async fn an_event_stream_is_cut_when_the_label_moves_and_not_before() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (w, relay) = terminated_world();
+        let (mut c, mut node_x, server) = open_http(&w, &relay, SSE_REQUEST).await;
+        let mut buf = [0u8; 4096];
+        assert!(node_x.read(&mut buf).await.unwrap() > 0);
+        node_x.write_all(SSE_HEAD).await.unwrap();
+        assert!(c.read(&mut buf).await.unwrap() > 0);
+        for _ in 0..5 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            node_x
+                .write_all(b"f\r\ndata: tick-ok\n\n\r\n")
+                .await
+                .unwrap();
+            assert!(c.read(&mut buf).await.unwrap() > 0);
+            assert!(!server.is_finished(), "an unchanged name keeps its stream");
+        }
+        move_label_to_another_node(&w);
+        let mut got_after = 0usize;
+        for _ in 0..20 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let _ = node_x.write_all(b"e\r\ndata: from-x\n\n\r\n").await;
+            if let Ok(Ok(n)) =
+                tokio::time::timeout(Duration::from_millis(50), c.read(&mut buf)).await
+            {
+                got_after += n;
+            }
+            if server.is_finished() {
+                break;
+            }
+        }
+        assert!(server.is_finished(), "the stream must be cut");
+        assert!(
+            got_after <= 5 * 20,
+            "the client got {got_after} bytes from the old holder after the move"
+        );
+        assert!(
+            nothing_more(&mut c).await,
+            "no clean end: the client reads nothing more"
+        );
+    }
+
+    /// The same for a suspended tenant.
+    #[tokio::test]
+    async fn an_event_stream_is_cut_when_the_tenant_is_suspended() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (w, relay) = terminated_world();
+        let (mut c, mut node_x, server) = open_http(&w, &relay, SSE_REQUEST).await;
+        let mut buf = [0u8; 4096];
+        assert!(node_x.read(&mut buf).await.unwrap() > 0);
+        node_x.write_all(SSE_HEAD).await.unwrap();
+        assert!(c.read(&mut buf).await.unwrap() > 0);
+        suspend_the_tenant(&w, &relay);
+        for _ in 0..20 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let _ = node_x.write_all(b"e\r\ndata: from-x\n\n\r\n").await;
+            if server.is_finished() {
+                break;
+            }
+        }
+        assert!(server.is_finished(), "the stream must be cut");
+    }
+
+    /// And for a share the node withdrew.
+    #[tokio::test]
+    async fn an_event_stream_is_cut_when_the_share_is_withdrawn() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (w, relay) = terminated_world();
+        let (mut c, mut node_x, server) = open_http(&w, &relay, SSE_REQUEST).await;
+        let mut buf = [0u8; 4096];
+        assert!(node_x.read(&mut buf).await.unwrap() > 0);
+        node_x.write_all(SSE_HEAD).await.unwrap();
+        assert!(c.read(&mut buf).await.unwrap() > 0);
+        w.advertise(vec![share("app", ShareMode::Blind, "tls:app", &[])]);
+        for _ in 0..20 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let _ = node_x.write_all(b"e\r\ndata: from-x\n\n\r\n").await;
+            if server.is_finished() {
+                break;
+            }
+        }
+        assert!(server.is_finished(), "the stream must be cut");
+    }
+
+    /// A long poll: the node has not answered when the label moves; the old holder's answer
+    /// after the next re-check is never delivered (the connection ends instead).
+    #[tokio::test]
+    async fn a_request_waiting_for_the_nodes_answer_is_cut_when_the_label_moves() {
+        let (w, relay) = terminated_world();
+        let (mut c, _node_x, server) = open_http(&w, &relay, SSE_REQUEST).await;
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        assert!(!server.is_finished(), "served: the request waits");
+        move_label_to_another_node(&w);
+        assert!(
+            pipe_cut(&mut c, server, Duration::from_secs(5)).await,
+            "the wait must end, with no answer written"
+        );
+    }
 }
