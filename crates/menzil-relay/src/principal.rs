@@ -382,6 +382,9 @@ struct Shared {
     relay_id: Option<NodeId>,
     config: PrincipalConfig,
     state: Mutex<State>,
+    /// Why each session ended, as `Debug` text (tests only).
+    #[cfg(test)]
+    ends: Mutex<Vec<String>>,
 }
 
 impl Shared {
@@ -468,6 +471,8 @@ impl Principal {
             relay_id: relay.relay_id(),
             config,
             state: Mutex::new(State::default()),
+            #[cfg(test)]
+            ends: Mutex::new(Vec::new()),
         });
         let mut inbound = relay.endpoint().subscribe();
         let weak: Weak<Shared> = Arc::downgrade(&shared);
@@ -491,6 +496,16 @@ impl Principal {
     /// The figures in force.
     pub fn config(&self) -> PrincipalConfig {
         self.shared.config
+    }
+
+    /// Why the sessions that have ended ended, as `Debug` text (tests only).
+    #[cfg(test)]
+    pub(crate) fn session_ends(&self) -> Vec<String> {
+        self.shared
+            .ends
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
     }
 
     /// How many sessions (handshakes included) exist now.
@@ -836,6 +851,12 @@ impl Session {
             end = self.drive(&mut frames, &ready) => end,
         };
         tracing::debug!(node = %self.key.0, ?end, "principal session ended");
+        #[cfg(test)]
+        self.shared
+            .ends
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(format!("{end:?}"));
         // Places first, so a caller woken by the failure below can start a new session.
         self.shared.lock().remove(&self.key, self.index);
         let _ = ready.send(Phase::Failed(end.error()));

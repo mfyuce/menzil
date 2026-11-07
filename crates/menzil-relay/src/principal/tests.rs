@@ -774,21 +774,32 @@ async fn a_frame_of_another_l3_session_never_feeds_the_session() {
 
 #[tokio::test]
 async fn a_frame_of_the_old_l3_session_after_a_reattach_does_not_reach_the_old_session() {
-    let n = network(1);
-    let rig = rig(quick().with_tick(Duration::from_secs(3600)), &[n]);
-    let _stream = rig.open(n, "demo").await.unwrap();
-    let close = rig.attached.seen.forge_close();
+    // The old L4 session may or may not have noticed the reattach by the time the stale frame
+    // arrives: its next send finds the pinned path gone and ends it (`PathChanged`, the specified
+    // behaviour), and that races with this test. So the property checked is the delivery, not
+    // the session's survival: whatever the timing, a CLOSE carried by the old L3 session is never
+    // processed, which would end the session with `PeerClosed`. Many rounds, so that some of
+    // them hit the window where the session is still alive.
+    for round in 0..24 {
+        let n = network(1);
+        let rig = rig(quick().with_tick(Duration::from_secs(3600)), &[n]);
+        let _stream = rig.open(n, "demo").await.unwrap();
+        let close = rig.attached.seen.forge_close();
 
-    // The node attaches again; the old L4 session has not noticed yet (the tick is an hour).
-    let _second = attach(&rig.relay, &rig.node, 8, Behaviour::serving(&[n]));
-    // A frame still carrying the old L3 session id: the node is not attached by it any more.
-    rig.attached.inject_as(&rig.relay, 7, close);
-    settle().await;
-    assert_eq!(
-        rig.principal.session_count(),
-        1,
-        "the stale frame was dropped, not processed"
-    );
+        // The node attaches again; a frame still carrying the old L3 session id follows at once.
+        let _second = attach(&rig.relay, &rig.node, 8, Behaviour::serving(&[n]));
+        rig.attached.inject_as(&rig.relay, 7, close);
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        assert!(
+            !rig.principal
+                .session_ends()
+                .iter()
+                .any(|end| end.contains("PeerClosed")),
+            "round {round}: the stale frame was processed: {:?}",
+            rig.principal.session_ends()
+        );
+        assert!(rig.principal.session_count() <= 1);
+    }
 }
 
 #[tokio::test]
