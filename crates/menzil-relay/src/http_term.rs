@@ -27,9 +27,10 @@
 //!   list is `501`), never both and never a duplicate (`400`). The framing is re-emitted in
 //!   canonical form (`Content-Length: n`, or chunks re-encoded without extensions; trailers are
 //!   read within a bound and dropped), so what the node's server sees is what was checked here.
-//! * `Expect` is refused with `417` (the relay does not do the 100-continue dance), and
-//!   `Upgrade` or `Connection: upgrade` with `501`: WebSocket through the terminator is not in
-//!   this slice.
+//! * `Expect` is refused with `417` (the relay does not do the 100-continue dance). `Upgrade` or
+//!   `Connection: upgrade` is `501`, except a WebSocket handshake that passes every check of
+//!   "WebSocket" below (and a handshake that is a WebSocket one by its `Upgrade` header but
+//!   fails a check is `400`).
 //! * Hop headers the client may have supplied are removed: `Connection` and every header it
 //!   names, `Keep-Alive`, `Proxy-*`, `TE`, `Trailer`, `Upgrade`, `Forwarded`, `X-Forwarded-*`,
 //!   `X-Real-IP`, `Via`, `X-Client-IP`, `True-Client-IP`, `CF-Connecting-IP`,
@@ -48,6 +49,39 @@
 //! only. The cookie itself is kept. A response without framing ends with the node's stream and
 //! so does the client connection.
 //!
+//! # WebSocket
+//!
+//! Only WebSocket (RFC 6455) is switched to: a request is an upgrade only if the method is
+//! `GET`, there is exactly one `Upgrade` header whose whole value is `websocket` (any case), a
+//! `Connection` token list containing `upgrade` (and no `close`, and no `Sec-WebSocket-*` name in
+//! it), exactly one `Sec-WebSocket-Key` that is the base64 of 16 bytes, exactly one
+//! `Sec-WebSocket-Version` of `13`, and no body (no `Transfer-Encoding`, `Content-Length` absent
+//! or 0). Any other `Upgrade` (`h2c`, a list, a second header, another token) is `501`; a
+//! `websocket` upgrade that fails one of the rest is `400`; nothing of either reaches the node.
+//! The relay sends the node `Connection: Upgrade` and `Upgrade: websocket` in canonical form and
+//! passes `Sec-WebSocket-Key`, `-Version`, `-Protocol`, `-Extensions` and `Origin` as they came
+//! (the relay does not interpret them: checking `Origin` against cross-site WebSocket hijacking
+//! is the application's job). The relay computes the `Sec-WebSocket-Accept` it wants itself.
+//!
+//! Anything the client sends after the head and before the node's `101` has been read closes the
+//! connection (nothing of it is forwarded). The node's answer to an upgrade request is a `101`
+//! only if it has `Upgrade: websocket`, `Connection` with `upgrade`, exactly the expected
+//! `Sec-WebSocket-Accept`, no framing header and no `Sec-WebSocket-*` name in `Connection`;
+//! a `101` to a request that was not an upgrade, any other `101`, and every other `1xx` is `502`.
+//! A final answer to an upgrade request (`200`, `401`, `404`...) is an ordinary response and the
+//! connection stays HTTP.
+//!
+//! After a valid `101` the connection is a pipe: what the node sent behind the head goes to the
+//! client first, then each side's bytes go to the other with no more HTTP. End of file on one
+//! side shuts that direction down and the other has [`HttpLimits::half_close_drain`] to finish;
+//! a reset or error on either side ends the client connection without a `close_notify` (a clean
+//! end of both sides is the only one that has it). No bytes either way for
+//! [`HttpLimits::upgrade_idle`] (5 minutes) ends it. There is no cap on the total lifetime. The
+//! name is asked again whether it is still served every [`HttpLimits::upgrade_recheck`] (30
+//! seconds), against the target the connection opened for. The bytes are charged to the tenant
+//! through the node stream like any body, and the client connection keeps its place in the
+//! per client and per name figures of the front door until it ends.
+//!
 //! # Streams and limits
 //!
 //! One node stream per client connection, opened when the first valid request head is in hand
@@ -59,6 +93,7 @@
 
 use std::future::Future;
 use std::net::IpAddr;
+use std::sync::{Mutex, PoisonError};
 use std::time::Duration;
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -76,6 +111,12 @@ const IO_BUFFER: usize = 16 * 1024;
 const MAX_CHUNK_LINE: usize = 128;
 /// The most bytes of trailers read (and dropped) after the last chunk.
 const MAX_TRAILER: usize = 8 * 1024;
+/// No byte either way for this long ends an upgraded connection (WebSocket pings keep it alive).
+pub(crate) const WS_IDLE: Duration = Duration::from_secs(5 * 60);
+/// After one side of an upgraded connection ended, the other direction may go on this long.
+pub(crate) const WS_HALF_CLOSE_DRAIN: Duration = Duration::from_secs(30);
+/// An upgraded connection asks this often whether its name is still served.
+pub(crate) const WS_RECHECK: Duration = Duration::from_secs(30);
 /// How long an error answer may take to be written.
 const REPLY_WRITE: Duration = Duration::from_secs(1);
 
@@ -88,6 +129,12 @@ pub(crate) struct HttpLimits {
     pub keepalive_idle: Duration,
     /// How long a body read or write, or the wait for the node's response, may make no progress.
     pub body_idle: Duration,
+    /// How long an upgraded (WebSocket) connection may move no byte in either direction.
+    pub upgrade_idle: Duration,
+    /// How long one direction of an upgraded connection may go on after the other has ended.
+    pub half_close_drain: Duration,
+    /// How often an upgraded connection asks whether its name is still served.
+    pub upgrade_recheck: Duration,
 }
 
 impl Default for HttpLimits {
@@ -96,6 +143,9 @@ impl Default for HttpLimits {
             head_timeout: Duration::from_secs(10),
             keepalive_idle: Duration::from_secs(60),
             body_idle: Duration::from_secs(120),
+            upgrade_idle: WS_IDLE,
+            half_close_drain: WS_HALF_CLOSE_DRAIN,
+            upgrade_recheck: WS_RECHECK,
         }
     }
 }
@@ -289,6 +339,8 @@ struct RequestPlan {
     /// The client asked to close after this exchange.
     close: bool,
     is_head: bool,
+    /// The `Sec-WebSocket-Key` of a WebSocket handshake that passed every check.
+    ws_key: Option<String>,
 }
 
 /// A response that passed every check, ready for the client.
@@ -297,6 +349,8 @@ struct ResponsePlan {
     body: Framing,
     /// The connection ends after this response.
     close: bool,
+    /// A valid `101` for the WebSocket handshake: the connection becomes a pipe.
+    upgraded: bool,
 }
 
 fn trim_ows(mut v: &[u8]) -> &[u8] {
@@ -430,6 +484,8 @@ fn process_request(head: &[u8], sni: &str, client_ip: &str) -> Result<RequestPla
     let (mut length, mut chunked) = (None, false);
     let mut connection: Vec<Vec<u8>> = Vec::new();
     let mut te_seen = false;
+    let mut upgrade_seen = false;
+    let (mut ws_keys, mut ws_versions): (Vec<&[u8]>, Vec<&[u8]>) = (Vec::new(), Vec::new());
     for header in req.headers.iter() {
         if !value_ok(header.value) {
             return Err(400);
@@ -457,22 +513,48 @@ fn process_request(head: &[u8], sni: &str, client_ip: &str) -> Result<RequestPla
             }
             "connection" => connection.push(value.to_vec()),
             "expect" => return Err(417),
-            "upgrade" => return Err(501),
+            // One header whose whole value is the token `websocket`: anything else is an
+            // upgrade the relay does not do.
+            "upgrade" => {
+                if std::mem::replace(&mut upgrade_seen, true)
+                    || !value.eq_ignore_ascii_case(b"websocket")
+                {
+                    return Err(501);
+                }
+            }
+            "sec-websocket-key" => ws_keys.push(value),
+            "sec-websocket-version" => ws_versions.push(value),
             _ => {}
         }
     }
     if length.is_some() && chunked {
         return Err(400);
     }
-    let (named, close, upgrade) = connection_tokens(&connection).ok_or(400u16)?;
-    if upgrade {
+    let (named, close, connection_upgrade) = connection_tokens(&connection).ok_or(400u16)?;
+    if connection_upgrade && !upgrade_seen {
         return Err(501);
     }
     let host = host_name(host.ok_or(400u16)?).ok_or(400u16)?;
     if host != sni {
         return Err(421);
     }
+    let ws_key = if upgrade_seen {
+        let ask = WebSocketAsk {
+            method,
+            length,
+            chunked,
+            close,
+            connection_upgrade,
+            named: &named,
+            keys: &ws_keys,
+            versions: &ws_versions,
+        };
+        Some(ask.key().ok_or(400u16)?)
+    } else {
+        None
+    };
     let body = match (length, chunked) {
+        _ if ws_key.is_some() => Framing::None,
         (Some(n), _) => Framing::Length(n),
         (None, true) => Framing::Chunked,
         (None, false) => Framing::None,
@@ -490,6 +572,9 @@ fn process_request(head: &[u8], sni: &str, client_ip: &str) -> Result<RequestPla
         out.extend_from_slice(trim_ows(header.value));
         out.extend_from_slice(b"\r\n");
     }
+    if ws_key.is_some() {
+        out.extend_from_slice(b"Connection: Upgrade\r\nUpgrade: websocket\r\n");
+    }
     out.extend_from_slice(format!("X-Forwarded-For: {client_ip}\r\n").as_bytes());
     out.extend_from_slice(b"X-Forwarded-Proto: https\r\n");
     match body {
@@ -503,7 +588,54 @@ fn process_request(head: &[u8], sni: &str, client_ip: &str) -> Result<RequestPla
         body,
         close,
         is_head: method == "HEAD",
+        ws_key,
     })
+}
+
+/// What a request that carries `Upgrade: websocket` has to be to be switched.
+struct WebSocketAsk<'a> {
+    method: &'a str,
+    length: Option<u64>,
+    chunked: bool,
+    close: bool,
+    connection_upgrade: bool,
+    named: &'a [String],
+    keys: &'a [&'a [u8]],
+    versions: &'a [&'a [u8]],
+}
+
+impl WebSocketAsk<'_> {
+    /// The `Sec-WebSocket-Key` if the handshake passes every check (`None` is a `400`).
+    fn key(&self) -> Option<String> {
+        let no_body = !self.chunked && matches!(self.length, None | Some(0));
+        // A `Connection` that names a `Sec-WebSocket-*` header would have the relay strip it.
+        let names_ws = self.named.iter().any(|n| n.starts_with("sec-websocket-"));
+        let [key] = self.keys else { return None };
+        if self.method != "GET"
+            || !self.connection_upgrade
+            || self.close
+            || !no_body
+            || names_ws
+            || self.versions != [&b"13"[..]]
+            || !websocket_key_ok(key)
+        {
+            return None;
+        }
+        String::from_utf8(key.to_vec()).ok()
+    }
+}
+
+/// Whether `key` is the base64 (padded, canonical) of exactly 16 bytes.
+fn websocket_key_ok(key: &[u8]) -> bool {
+    use base64::Engine as _;
+    base64::engine::general_purpose::STANDARD
+        .decode(key)
+        .is_ok_and(|bytes| bytes.len() == 16)
+}
+
+/// The `Sec-WebSocket-Accept` a node must answer for `key` (RFC 6455 4.2.2).
+fn websocket_accept(key: &str) -> String {
+    tokio_tungstenite::tungstenite::handshake::derive_accept_key(key.as_bytes())
 }
 
 /// `value` of a `Set-Cookie` without any `Domain` attribute other than `host` itself.
@@ -538,7 +670,12 @@ fn clean_set_cookie(value: &[u8], host: &str) -> Vec<u8> {
 }
 
 /// Checks a response head and builds what goes to the client; `None` is a 502.
-fn process_response(head: &[u8], is_head: bool, host: &str) -> Option<ResponsePlan> {
+fn process_response(
+    head: &[u8],
+    is_head: bool,
+    host: &str,
+    ws_key: Option<&str>,
+) -> Option<ResponsePlan> {
     let mut storage = [httparse::EMPTY_HEADER; RESPONSE_MAX_HEADERS];
     let mut res = httparse::Response::new(&mut storage);
     match res.parse(head) {
@@ -547,11 +684,12 @@ fn process_response(head: &[u8], is_head: bool, host: &str) -> Option<ResponsePl
     }
     let version = res.version?;
     let code = res.code?;
-    if version > 1 || !(200..=599).contains(&code) {
+    if version > 1 || (code != 101 && !(200..=599).contains(&code)) {
         return None;
     }
     let (mut length, mut chunked, mut te_seen) = (None, false, false);
     let mut connection: Vec<Vec<u8>> = Vec::new();
+    let (mut upgrades, mut accepts): (Vec<&[u8]>, Vec<&[u8]>) = (Vec::new(), Vec::new());
     for header in res.headers.iter() {
         if !value_ok(header.value) {
             return None;
@@ -570,15 +708,33 @@ fn process_response(head: &[u8], is_head: bool, host: &str) -> Option<ResponsePl
                 chunked = true;
             }
             "connection" => connection.push(value.to_vec()),
-            "upgrade" => return None,
+            "upgrade" => upgrades.push(value),
+            "sec-websocket-accept" => accepts.push(value),
             _ => {}
         }
     }
     if length.is_some() && chunked {
         return None;
     }
-    let (named, close_token, upgrade) = connection_tokens(&connection)?;
-    if upgrade {
+    let (named, close_token, connection_upgrade) = connection_tokens(&connection)?;
+    if code == 101 {
+        // Only for a WebSocket handshake the relay itself passed, and only if it is one.
+        let expected = websocket_accept(ws_key?);
+        let valid = version == 1
+            && upgrades.len() == 1
+            && upgrades[0].eq_ignore_ascii_case(b"websocket")
+            && connection_upgrade
+            && !close_token
+            && accepts == [expected.as_bytes()]
+            && length.is_none()
+            && !chunked
+            && !named.iter().any(|n| n.starts_with("sec-websocket-"));
+        if !valid {
+            return None;
+        }
+        return Some(switching_protocols(&res, host, &named));
+    }
+    if !upgrades.is_empty() || connection_upgrade {
         return None;
     }
     let no_body = is_head || code == 204 || code == 304;
@@ -629,7 +785,43 @@ fn process_response(head: &[u8], is_head: bool, host: &str) -> Option<ResponsePl
         head: out,
         body,
         close,
+        upgraded: false,
     })
+}
+
+/// The `101` that goes to the client: the node's head without its hop headers, with
+/// `Upgrade: websocket` and `Connection: Upgrade` in canonical form.
+fn switching_protocols(
+    res: &httparse::Response<'_, '_>,
+    host: &str,
+    named: &[String],
+) -> ResponsePlan {
+    let reason = res
+        .reason
+        .filter(|r| r.bytes().all(|b| b == b'\t' || (0x20..0x7f).contains(&b)))
+        .unwrap_or("");
+    let mut out = format!("HTTP/1.1 101 {reason}\r\n").into_bytes();
+    for header in res.headers.iter() {
+        let lower = header.name.to_ascii_lowercase();
+        if is_stripped(&lower) || named.contains(&lower) {
+            continue;
+        }
+        out.extend_from_slice(header.name.as_bytes());
+        out.extend_from_slice(b": ");
+        if lower == "set-cookie" {
+            out.extend_from_slice(&clean_set_cookie(trim_ows(header.value), host));
+        } else {
+            out.extend_from_slice(trim_ows(header.value));
+        }
+        out.extend_from_slice(b"\r\n");
+    }
+    out.extend_from_slice(b"Upgrade: websocket\r\nConnection: Upgrade\r\n\r\n");
+    ResponsePlan {
+        head: out,
+        body: Framing::None,
+        close: true,
+        upgraded: true,
+    }
 }
 
 fn reason(code: u16) -> &'static str {
@@ -835,6 +1027,129 @@ where
     }
 }
 
+/// When an upgraded connection last moved a byte, and when its first direction ended.
+struct Pace {
+    last_moved: Mutex<Instant>,
+    first_end: Mutex<Option<Instant>>,
+}
+
+impl Pace {
+    fn new() -> Self {
+        Self {
+            last_moved: Mutex::new(Instant::now()),
+            first_end: Mutex::new(None),
+        }
+    }
+
+    fn moved(&self) {
+        *self
+            .last_moved
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Instant::now();
+    }
+
+    fn last_moved(&self) -> Instant {
+        *self
+            .last_moved
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// A direction ended: the first one is noted.
+    fn ended(&self) {
+        self.first_end
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get_or_insert_with(Instant::now);
+    }
+
+    fn first_end(&self) -> Option<Instant> {
+        *self
+            .first_end
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+/// Moves bytes from `src` to `dst` until `src` ends. `Ok` is a clean end (`dst` is shut down, a
+/// `close_notify` on TLS); `Err` is a reset, an error or a stall, and `dst` is left as it is.
+async fn pump<R, W>(src: &mut R, dst: &mut W, stall: Duration, pace: &Pace) -> Result<(), ()>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let mut buf = vec![0u8; IO_BUFFER];
+    loop {
+        match src.read(&mut buf).await {
+            Ok(0) => {
+                pace.ended();
+                return match timeout(stall, dst.shutdown()).await {
+                    Ok(Ok(())) => Ok(()),
+                    _ => Err(()),
+                };
+            }
+            Ok(n) => {
+                pace.moved();
+                let moved = timeout(stall, async {
+                    dst.write_all(&buf[..n]).await?;
+                    dst.flush().await
+                })
+                .await;
+                if !matches!(moved, Ok(Ok(()))) {
+                    return Err(());
+                }
+            }
+            Err(_) => return Err(()),
+        }
+    }
+}
+
+/// The upgraded connection: `client` and `node` are joined, byte for byte, in both directions,
+/// until both sides have ended (clean: each direction was shut down), one of them fails (no
+/// `close_notify` to the client), nothing moves for [`HttpLimits::upgrade_idle`], one side's end
+/// is not followed by the other's within [`HttpLimits::half_close_drain`], or the name is no
+/// longer served (asked every [`HttpLimits::upgrade_recheck`]). Every end but the clean one drops
+/// both streams as they are.
+async fn pipe<C, N>(client: C, node: N, limits: HttpLimits, still_served: &mut impl FnMut() -> bool)
+where
+    C: AsyncRead + AsyncWrite + Unpin,
+    N: AsyncRead + AsyncWrite + Unpin,
+{
+    let (mut client_read, mut client_write) = tokio::io::split(client);
+    let (mut node_read, mut node_write) = tokio::io::split(node);
+    let pace = Pace::new();
+    let up = pump(&mut client_read, &mut node_write, limits.body_idle, &pace);
+    let down = pump(&mut node_read, &mut client_write, limits.body_idle, &pace);
+    let mut both = std::pin::pin!(futures_util::future::try_join(up, down));
+    let mut recheck = Instant::now() + limits.upgrade_recheck;
+    loop {
+        let mut wake = (pace.last_moved() + limits.upgrade_idle).min(recheck);
+        if let Some(at) = pace.first_end() {
+            wake = wake.min(at + limits.half_close_drain);
+        }
+        tokio::select! {
+            _ = &mut both => return,
+            _ = tokio::time::sleep_until(wake) => {}
+        }
+        let now = Instant::now();
+        if now >= pace.last_moved() + limits.upgrade_idle {
+            return;
+        }
+        if pace
+            .first_end()
+            .is_some_and(|at| now >= at + limits.half_close_drain)
+        {
+            return;
+        }
+        if now >= recheck {
+            if !still_served() {
+                return;
+            }
+            recheck = now + limits.upgrade_recheck;
+        }
+    }
+}
+
 /// Answers `code` with no body and closes.
 async fn reply<T: AsyncWrite + Unpin>(io: &mut T, code: u16) {
     let text = format!(
@@ -903,6 +1218,12 @@ pub(crate) async fn serve<C, N, O, Fut>(
                 return;
             }
         };
+        // Bytes behind an upgrade request's head are pipelined: the connection ends before the
+        // request goes anywhere.
+        if plan.ws_key.is_some() && !client.buf.is_empty() {
+            reply(&mut client.io, 400).await;
+            return;
+        }
         if !still_served() {
             return;
         }
@@ -943,14 +1264,32 @@ pub(crate) async fn serve<C, N, O, Fut>(
         {
             return;
         }
-        let head = match read_head(node_conn, limits.body_idle, limits.head_timeout).await {
+        let node_head = read_head(node_conn, limits.body_idle, limits.head_timeout);
+        let head = if plan.ws_key.is_some() {
+            // Until the node's answer is in hand the client has nothing more to say: a byte
+            // (or an end) from it closes the connection and nothing of it is forwarded.
+            let mut probe = [0u8; 1];
+            tokio::select! {
+                head = node_head => head,
+                read = client.io.read(&mut probe) => {
+                    if matches!(read, Ok(n) if n > 0) {
+                        reply(&mut client.io, 400).await;
+                    }
+                    return;
+                }
+            }
+        } else {
+            node_head.await
+        };
+        let head = match head {
             Ok(head) => head,
             Err(_) => {
                 reply(&mut client.io, 502).await;
                 return;
             }
         };
-        let Some(response) = process_response(&head, plan.is_head, host) else {
+        let Some(response) = process_response(&head, plan.is_head, host, plan.ws_key.as_deref())
+        else {
             reply(&mut client.io, 502).await;
             return;
         };
@@ -958,6 +1297,22 @@ pub(crate) async fn serve<C, N, O, Fut>(
             .await
             .is_err()
         {
+            return;
+        }
+        if response.upgraded {
+            // What the node sent behind its head is already the client's: first.
+            let ahead = std::mem::take(&mut node_conn.buf);
+            let moved = timeout(limits.body_idle, async {
+                client.io.write_all(&ahead).await?;
+                client.io.flush().await
+            })
+            .await;
+            if !matches!(moved, Ok(Ok(()))) || !client.buf.is_empty() {
+                return;
+            }
+            if let Some(node_conn) = node.take() {
+                pipe(client.io, node_conn.io, limits, &mut still_served).await;
+            }
             return;
         }
         if copy_body(node_conn, &mut client.io, response.body, limits.body_idle)
@@ -992,6 +1347,7 @@ mod tests {
             head_timeout: Duration::from_millis(400),
             keepalive_idle: Duration::from_millis(600),
             body_idle: Duration::from_millis(800),
+            ..HttpLimits::default()
         }
     }
 
@@ -1319,7 +1675,9 @@ mod tests {
     #[tokio::test]
     async fn expect_and_upgrade_are_refused() {
         refused(&get("Expect: 100-continue\r\n"), 417).await;
-        refused(&get("Upgrade: websocket\r\nConnection: Upgrade\r\n"), 501).await;
+        // A WebSocket handshake that lacks its key and version is no handshake (400, the
+        // checks are in `websocket`); an upgrade to anything else is 501.
+        refused(&get("Upgrade: websocket\r\nConnection: Upgrade\r\n"), 400).await;
         refused(&get("Connection: upgrade\r\n"), 501).await;
         refused(&get("Upgrade: h2c\r\n"), 501).await;
     }
@@ -1794,6 +2152,9 @@ mod tests {
         assert_eq!(d.head_timeout, Duration::from_secs(10));
         assert_eq!(d.keepalive_idle, Duration::from_secs(60));
         assert_eq!(d.body_idle, Duration::from_secs(120));
+        assert_eq!(d.upgrade_idle, Duration::from_secs(300));
+        assert_eq!(d.half_close_drain, Duration::from_secs(30));
+        assert_eq!(d.upgrade_recheck, Duration::from_secs(30));
         assert_eq!(MAX_HEAD, 16 * 1024);
         assert_eq!(MAX_HEADERS, 64);
     }
@@ -2106,6 +2467,1090 @@ mod tests {
             // the body is 60 KB: a handful of reads of the client's stream, so a handful of writes
             let writes = writes.load(Ordering::SeqCst);
             assert!(writes <= 16, "{writes} node writes for {N} chunks");
+        }
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // WebSocket (HTTP/1.1 Upgrade)
+    // -----------------------------------------------------------------------------------------
+
+    mod websocket {
+        use super::*;
+        use std::pin::Pin;
+        use std::sync::atomic::AtomicBool;
+        use std::task::{Context, Poll};
+        use tokio::sync::mpsc;
+        use tokio::task::JoinHandle;
+
+        /// The key and accept of RFC 6455 4.2.2, and a second pair computed independently.
+        const KEY: &str = "dGhlIHNhbXBsZSBub25jZQ==";
+        const ACCEPT: &str = "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=";
+        const KEY2: &str = "AQIDBAUGBwgJCgsMDQ4PEA==";
+        const ACCEPT2: &str = "C/0nmHhBztSRGR1CwL6Tf4ZjwpY=";
+
+        /// What a scripted peer does next.
+        enum Feed {
+            Data(Vec<u8>),
+            Eof,
+            Reset,
+        }
+
+        /// One end of the terminator as the test scripts it: reads what the test feeds, records
+        /// what the terminator writes, and counts the clean shutdowns (a `close_notify` on TLS).
+        struct Chan {
+            rx: mpsc::UnboundedReceiver<Feed>,
+            pending: Vec<u8>,
+            state: Option<bool>,
+            out: mpsc::UnboundedSender<Vec<u8>>,
+            shutdowns: Arc<AtomicUsize>,
+        }
+
+        impl AsyncRead for Chan {
+            fn poll_read(
+                mut self: Pin<&mut Self>,
+                cx: &mut Context<'_>,
+                buf: &mut tokio::io::ReadBuf<'_>,
+            ) -> Poll<std::io::Result<()>> {
+                loop {
+                    if !self.pending.is_empty() {
+                        let n = self.pending.len().min(buf.remaining());
+                        let rest = self.pending.split_off(n);
+                        let head = std::mem::replace(&mut self.pending, rest);
+                        buf.put_slice(&head);
+                        return Poll::Ready(Ok(()));
+                    }
+                    match self.state {
+                        Some(true) => {
+                            return Poll::Ready(Err(std::io::Error::new(
+                                std::io::ErrorKind::ConnectionReset,
+                                "reset",
+                            )));
+                        }
+                        Some(false) => return Poll::Ready(Ok(())),
+                        None => {}
+                    }
+                    match self.rx.poll_recv(cx) {
+                        Poll::Pending => return Poll::Pending,
+                        Poll::Ready(Some(Feed::Data(bytes))) => self.pending = bytes,
+                        Poll::Ready(Some(Feed::Eof) | None) => self.state = Some(false),
+                        Poll::Ready(Some(Feed::Reset)) => self.state = Some(true),
+                    }
+                }
+            }
+        }
+
+        impl AsyncWrite for Chan {
+            fn poll_write(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+                buf: &[u8],
+            ) -> Poll<std::io::Result<usize>> {
+                let _ = self.out.send(buf.to_vec());
+                Poll::Ready(Ok(buf.len()))
+            }
+            fn poll_flush(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+            ) -> Poll<std::io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+            fn poll_shutdown(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+            ) -> Poll<std::io::Result<()>> {
+                self.shutdowns.fetch_add(1, Ordering::SeqCst);
+                Poll::Ready(Ok(()))
+            }
+        }
+
+        /// The test's side of a [`Chan`].
+        struct Ends {
+            feed: mpsc::UnboundedSender<Feed>,
+            out: mpsc::UnboundedReceiver<Vec<u8>>,
+            shutdowns: Arc<AtomicUsize>,
+            seen: Vec<u8>,
+            used: usize,
+        }
+
+        fn chan() -> (Chan, Ends) {
+            let (feed, rx) = mpsc::unbounded_channel();
+            let (out_tx, out) = mpsc::unbounded_channel();
+            let shutdowns = Arc::new(AtomicUsize::new(0));
+            (
+                Chan {
+                    rx,
+                    pending: Vec::new(),
+                    state: None,
+                    out: out_tx,
+                    shutdowns: Arc::clone(&shutdowns),
+                },
+                Ends {
+                    feed,
+                    out,
+                    shutdowns,
+                    seen: Vec::new(),
+                    used: 0,
+                },
+            )
+        }
+
+        impl Ends {
+            fn send(&self, bytes: &[u8]) {
+                let _ = self.feed.send(Feed::Data(bytes.to_vec()));
+            }
+            fn eof(&self) {
+                let _ = self.feed.send(Feed::Eof);
+            }
+            fn reset(&self) {
+                let _ = self.feed.send(Feed::Reset);
+            }
+            fn closes(&self) -> usize {
+                self.shutdowns.load(Ordering::SeqCst)
+            }
+            /// Everything written so far that was not taken yet (waits for nothing).
+            async fn pending(&mut self) -> Vec<u8> {
+                for _ in 0..20 {
+                    tokio::task::yield_now().await;
+                }
+                while let Ok(more) = self.out.try_recv() {
+                    self.seen.extend_from_slice(&more);
+                }
+                let got = self.seen[self.used..].to_vec();
+                self.used = self.seen.len();
+                got
+            }
+            /// Waits until `n` more bytes were written, and takes them.
+            async fn take(&mut self, n: usize) -> Vec<u8> {
+                let waited = tokio::time::timeout(Duration::from_secs(20), async {
+                    while self.seen.len() - self.used < n {
+                        match self.out.recv().await {
+                            Some(more) => self.seen.extend_from_slice(&more),
+                            None => break,
+                        }
+                    }
+                })
+                .await;
+                assert!(waited.is_ok(), "timed out waiting for {n} bytes");
+                assert!(
+                    self.seen.len() - self.used >= n,
+                    "the stream ended with {} of {n} bytes: {:?}",
+                    self.seen.len() - self.used,
+                    String::from_utf8_lossy(&self.seen[self.used..])
+                );
+                let got = self.seen[self.used..self.used + n].to_vec();
+                self.used += n;
+                got
+            }
+            /// Waits until the written bytes contain a blank line, and takes them up to it.
+            async fn head(&mut self) -> Vec<u8> {
+                let waited = tokio::time::timeout(Duration::from_secs(20), async {
+                    loop {
+                        if let Some(at) = self.seen[self.used..]
+                            .windows(4)
+                            .position(|w| w == b"\r\n\r\n")
+                        {
+                            return at + 4;
+                        }
+                        match self.out.recv().await {
+                            Some(more) => self.seen.extend_from_slice(&more),
+                            None => return self.seen.len() - self.used,
+                        }
+                    }
+                })
+                .await
+                .expect("timed out waiting for a head");
+                let got = self.seen[self.used..self.used + waited].to_vec();
+                self.used += waited;
+                got
+            }
+        }
+
+        struct Rig {
+            client: Ends,
+            node: Ends,
+            server: JoinHandle<()>,
+            opened: Arc<AtomicUsize>,
+            served: Arc<AtomicBool>,
+        }
+
+        fn rig(limits: HttpLimits) -> Rig {
+            let (client_io, client) = chan();
+            let (node_io, node) = chan();
+            let opened = Arc::new(AtomicUsize::new(0));
+            let served = Arc::new(AtomicBool::new(true));
+            let counter = Arc::clone(&opened);
+            let still = Arc::clone(&served);
+            let server = tokio::spawn(async move {
+                serve(
+                    client_io,
+                    HOST,
+                    IP.parse().unwrap(),
+                    limits,
+                    move || still.load(Ordering::SeqCst),
+                    move || async move {
+                        counter.fetch_add(1, Ordering::SeqCst);
+                        Some(node_io)
+                    },
+                )
+                .await;
+            });
+            Rig {
+                client,
+                node,
+                server,
+                opened,
+                served,
+            }
+        }
+
+        async fn settle() {
+            for _ in 0..40 {
+                tokio::task::yield_now().await;
+            }
+        }
+
+        impl Rig {
+            /// Whether the connection is over (after the tasks ran as far as they can).
+            async fn over(&mut self) -> bool {
+                settle().await;
+                self.server.is_finished()
+            }
+            /// Sends the handshake, lets the node answer `reply`, and gives what the client got
+            /// of it (its head).
+            async fn switch(&mut self, request: &[u8], reply: &[u8]) -> Vec<u8> {
+                self.client.send(request);
+                let seen = self.node.head().await;
+                assert!(seen.starts_with(b"GET /chat HTTP/1.1\r\n"), "{seen:?}");
+                self.node.send(reply);
+                self.client.head().await
+            }
+            async fn ok(&mut self) -> Vec<u8> {
+                self.switch(&ws_head("GET", &GOOD, &[], &[]), &accept_reply(ACCEPT, ""))
+                    .await
+            }
+        }
+
+        const GOOD: [&str; 4] = [
+            "Upgrade: websocket",
+            "Connection: Upgrade",
+            "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==",
+            "Sec-WebSocket-Version: 13",
+        ];
+
+        /// A handshake request: `base` without the headers named in `skip`, then `add`.
+        fn ws_head(method: &str, base: &[&str], skip: &[&str], add: &[&str]) -> Vec<u8> {
+            let mut head = format!("{method} /chat HTTP/1.1\r\nHost: {HOST}\r\n");
+            for line in base {
+                let name = line.split(':').next().unwrap();
+                if !skip.iter().any(|s| s.eq_ignore_ascii_case(name)) {
+                    head.push_str(line);
+                    head.push_str("\r\n");
+                }
+            }
+            for line in add {
+                head.push_str(line);
+                head.push_str("\r\n");
+            }
+            head.push_str("\r\n");
+            head.into_bytes()
+        }
+
+        fn accept_reply(accept: &str, extra: &str) -> Vec<u8> {
+            format!(
+                "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\
+                 Sec-WebSocket-Accept: {accept}\r\n{extra}\r\n"
+            )
+            .into_bytes()
+        }
+
+        fn text(bytes: &[u8]) -> String {
+            String::from_utf8_lossy(bytes).to_string()
+        }
+
+        #[test]
+        fn the_accept_value_and_the_key_check_are_rfc_6455s() {
+            assert_eq!(websocket_accept(KEY), ACCEPT);
+            assert_eq!(websocket_accept(KEY2), ACCEPT2);
+            assert!(websocket_key_ok(KEY.as_bytes()));
+            assert!(websocket_key_ok(KEY2.as_bytes()));
+            for bad in [
+                "",
+                "AQIDBAUGBwgJCgsMDQ4P",     // 15 bytes
+                "AQIDBAUGBwgJCgsMDQ4PEBE=", // 17 bytes
+                "AQIDBAUGBwgJCgsMDQ4PEA",   // no padding
+                "AQIDBAUGBwgJCgsMDQ4PEB==", // trailing bits set
+                "AQIDBAUGBwgJCgsMDQ4PEA== ",
+                "not base64 at all!!!!!!",
+                "AQIDBAUGBwgJCgsMDQ4PEA==AQIDBAUGBwgJCgsMDQ4PEA==",
+            ] {
+                assert!(!websocket_key_ok(bad.as_bytes()), "{bad:?}");
+            }
+        }
+
+        #[tokio::test]
+        async fn a_handshake_is_forwarded_in_canonical_form_and_the_connection_becomes_a_pipe() {
+            let mut rig = rig(limits());
+            let request = ws_head(
+                "GET",
+                &GOOD,
+                &["Upgrade", "Connection"],
+                &[
+                    "Upgrade: WebSocket",
+                    "Connection: keep-alive, Upgrade, X-Secret",
+                    "X-Secret: s",
+                    "Sec-WebSocket-Protocol: chat, superchat",
+                    "Sec-WebSocket-Extensions: permessage-deflate",
+                    "Origin: https://evil.example",
+                    "X-Forwarded-For: 6.6.6.6",
+                    "X_Forwarded_For: 6.6.6.6",
+                    "Keep-Alive: timeout=5",
+                    "Content-Length: 0",
+                    "X-Keep: kept",
+                ],
+            );
+            rig.client.send(&request);
+            let seen = text(&rig.node.head().await);
+            assert!(seen.starts_with("GET /chat HTTP/1.1\r\n"), "{seen}");
+            assert!(
+                seen.contains("\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n"),
+                "{seen}"
+            );
+            for kept in [
+                &format!("Sec-WebSocket-Key: {KEY}\r\n"),
+                "Sec-WebSocket-Version: 13\r\n",
+                "Sec-WebSocket-Protocol: chat, superchat\r\n",
+                "Sec-WebSocket-Extensions: permessage-deflate\r\n",
+                "Origin: https://evil.example\r\n",
+                "X-Keep: kept\r\n",
+                &format!("X-Forwarded-For: {IP}\r\n"),
+                "X-Forwarded-Proto: https\r\n",
+            ] {
+                assert!(seen.contains(kept), "{kept} missing in {seen}");
+            }
+            let lower = seen.to_ascii_lowercase();
+            assert_eq!(lower.matches("upgrade:").count(), 1, "{seen}");
+            assert_eq!(lower.matches("connection:").count(), 1, "{seen}");
+            for gone in [
+                "6.6.6.6",
+                "keep-alive",
+                "x-secret",
+                "content-length",
+                "websocket\r\nconn",
+            ] {
+                assert!(!lower.contains(gone), "{gone} survived in {seen}");
+            }
+            assert_eq!(lower.matches("x-forwarded-for").count(), 1);
+            // The node answers; bytes of its first frame sit right behind its head, and its own
+            // hop headers, a cookie for a parent domain and a subprotocol are dealt with.
+            let reply = format!(
+                "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n\
+                 Connection: Upgrade, X-Node-Hop\r\nX-Node-Hop: h\r\n\
+                 Sec-WebSocket-Accept: {ACCEPT}\r\nSec-WebSocket-Protocol: chat\r\n\
+                 Set-Cookie: s=1; Domain=evil.example; Path=/\r\n\
+                 Keep-Alive: timeout=1\r\nVia: 1.1 node\r\n\r\n"
+            )
+            .into_bytes();
+            let mut wire = reply.clone();
+            wire.extend_from_slice(b"\x81\x05hello");
+            rig.node.send(&wire);
+            let head = text(&rig.client.head().await);
+            assert!(
+                head.starts_with("HTTP/1.1 101 Switching Protocols\r\n"),
+                "{head}"
+            );
+            assert!(head.contains("\r\nUpgrade: websocket\r\n"));
+            assert!(head.contains("\r\nConnection: Upgrade\r\n"));
+            assert!(head.contains(&format!("Sec-WebSocket-Accept: {ACCEPT}\r\n")));
+            assert!(head.contains("Sec-WebSocket-Protocol: chat\r\n"));
+            assert!(head.contains("Set-Cookie: s=1; Path=/\r\n"), "{head}");
+            let lower = head.to_ascii_lowercase();
+            for gone in ["keep-alive", "via:", "evil.example", "x-node-hop"] {
+                assert!(!lower.contains(gone), "{gone} in {head}");
+            }
+            assert_eq!(rig.client.take(7).await, b"\x81\x05hello");
+            // Frames of several sizes, in both directions, in order, byte for byte.
+            let mut up = Vec::new();
+            let mut down = Vec::new();
+            for (i, size) in [1usize, 2, 125, 126, 16_383, 16_384, 16_385, 100_000]
+                .into_iter()
+                .enumerate()
+            {
+                let frame: Vec<u8> = (0..size).map(|n| (n + i) as u8).collect();
+                rig.client.send(&frame);
+                up.extend_from_slice(&frame);
+                let frame: Vec<u8> = (0..size).map(|n| (n * 3 + i) as u8).collect();
+                rig.node.send(&frame);
+                down.extend_from_slice(&frame);
+            }
+            assert!(rig.node.take(up.len()).await == up, "client to node");
+            assert!(rig.client.take(down.len()).await == down, "node to client");
+            assert_eq!(rig.opened.load(Ordering::SeqCst), 1);
+            assert!(!rig.over().await);
+            assert_eq!(rig.client.closes() + rig.node.closes(), 0);
+        }
+
+        #[tokio::test]
+        async fn the_accept_is_computed_for_the_key_that_was_sent() {
+            // A node that answers the accept of the other key is refused: the relay does not
+            // take the value from the node, it computes it.
+            let mut rig = rig(limits());
+            let request = ws_head(
+                "GET",
+                &GOOD,
+                &["Sec-WebSocket-Key"],
+                &[&format!("Sec-WebSocket-Key: {KEY2}")],
+            );
+            rig.client.send(&request);
+            rig.node.head().await;
+            rig.node.send(&accept_reply(ACCEPT, ""));
+            assert!(text(&rig.client.head().await).starts_with("HTTP/1.1 502"));
+            let mut rig = self::rig(limits());
+            rig.client.send(&request);
+            rig.node.head().await;
+            rig.node.send(&accept_reply(ACCEPT2, ""));
+            assert!(text(&rig.client.head().await).starts_with("HTTP/1.1 101"));
+        }
+
+        #[tokio::test]
+        async fn a_zero_content_length_is_no_body_and_is_not_forwarded() {
+            let mut rig = rig(limits());
+            rig.client
+                .send(&ws_head("GET", &GOOD, &[], &["Content-Length: 0"]));
+            let seen = text(&rig.node.head().await);
+            assert!(
+                !seen.to_ascii_lowercase().contains("content-length"),
+                "{seen}"
+            );
+        }
+
+        #[tokio::test]
+        async fn every_upgrade_that_is_not_a_clean_websocket_handshake_is_refused_before_the_node()
+        {
+            let cases: Vec<(&str, Vec<u8>, u16)> = vec![
+                (
+                    "h2c",
+                    ws_head(
+                        "GET",
+                        &GOOD,
+                        &["Upgrade", "Sec-WebSocket-Key", "Sec-WebSocket-Version"],
+                        &["Upgrade: h2c", "HTTP2-Settings: AAMAAABkAARAAAAAAAIAAAAA"],
+                    ),
+                    501,
+                ),
+                (
+                    "a list",
+                    ws_head("GET", &GOOD, &["Upgrade"], &["Upgrade: websocket, h2c"]),
+                    501,
+                ),
+                (
+                    "another token",
+                    ws_head("GET", &GOOD, &["Upgrade"], &["Upgrade: websockets"]),
+                    501,
+                ),
+                (
+                    "a doubled header",
+                    ws_head("GET", &GOOD, &[], &["Upgrade: websocket"]),
+                    501,
+                ),
+                (
+                    "a doubled header with h2c second",
+                    ws_head("GET", &GOOD, &[], &["Upgrade: h2c"]),
+                    501,
+                ),
+                (
+                    "Connection: upgrade with no Upgrade header",
+                    ws_head("GET", &GOOD, &["Upgrade"], &[]),
+                    501,
+                ),
+                (
+                    "a Content-Length body",
+                    ws_head("GET", &GOOD, &[], &["Content-Length: 4"]),
+                    400,
+                ),
+                (
+                    "chunked",
+                    ws_head("GET", &GOOD, &[], &["Transfer-Encoding: chunked"]),
+                    400,
+                ),
+                (
+                    "a body with a smuggled request behind it",
+                    [
+                        ws_head("GET", &GOOD, &[], &["Content-Length: 31"]),
+                        b"GET /admin HTTP/1.1\r\nHost: x\r\n".to_vec(),
+                    ]
+                    .concat(),
+                    400,
+                ),
+                (
+                    "a key of 15 bytes",
+                    ws_head(
+                        "GET",
+                        &GOOD,
+                        &["Sec-WebSocket-Key"],
+                        &["Sec-WebSocket-Key: AQIDBAUGBwgJCgsMDQ4P"],
+                    ),
+                    400,
+                ),
+                (
+                    "a key of 17 bytes",
+                    ws_head(
+                        "GET",
+                        &GOOD,
+                        &["Sec-WebSocket-Key"],
+                        &["Sec-WebSocket-Key: AQIDBAUGBwgJCgsMDQ4PEBE="],
+                    ),
+                    400,
+                ),
+                (
+                    "a key that is not base64",
+                    ws_head(
+                        "GET",
+                        &GOOD,
+                        &["Sec-WebSocket-Key"],
+                        &["Sec-WebSocket-Key: !!!!!!!!!!!!!!!!!!!!!!=="],
+                    ),
+                    400,
+                ),
+                (
+                    "an empty key",
+                    ws_head(
+                        "GET",
+                        &GOOD,
+                        &["Sec-WebSocket-Key"],
+                        &["Sec-WebSocket-Key:"],
+                    ),
+                    400,
+                ),
+                (
+                    "no key",
+                    ws_head("GET", &GOOD, &["Sec-WebSocket-Key"], &[]),
+                    400,
+                ),
+                (
+                    "two keys",
+                    ws_head(
+                        "GET",
+                        &GOOD,
+                        &[],
+                        &["Sec-WebSocket-Key: AQIDBAUGBwgJCgsMDQ4PEA=="],
+                    ),
+                    400,
+                ),
+                (
+                    "version 12",
+                    ws_head(
+                        "GET",
+                        &GOOD,
+                        &["Sec-WebSocket-Version"],
+                        &["Sec-WebSocket-Version: 12"],
+                    ),
+                    400,
+                ),
+                (
+                    "version 013",
+                    ws_head(
+                        "GET",
+                        &GOOD,
+                        &["Sec-WebSocket-Version"],
+                        &["Sec-WebSocket-Version: 013"],
+                    ),
+                    400,
+                ),
+                (
+                    "a list of versions",
+                    ws_head(
+                        "GET",
+                        &GOOD,
+                        &["Sec-WebSocket-Version"],
+                        &["Sec-WebSocket-Version: 13, 8"],
+                    ),
+                    400,
+                ),
+                (
+                    "two versions",
+                    ws_head("GET", &GOOD, &[], &["Sec-WebSocket-Version: 13"]),
+                    400,
+                ),
+                (
+                    "no version",
+                    ws_head("GET", &GOOD, &["Sec-WebSocket-Version"], &[]),
+                    400,
+                ),
+                (
+                    "no Connection header",
+                    ws_head("GET", &GOOD, &["Connection"], &[]),
+                    400,
+                ),
+                (
+                    "Connection without upgrade",
+                    ws_head("GET", &GOOD, &["Connection"], &["Connection: keep-alive"]),
+                    400,
+                ),
+                (
+                    "Connection: Upgrade, close",
+                    ws_head(
+                        "GET",
+                        &GOOD,
+                        &["Connection"],
+                        &["Connection: Upgrade, close"],
+                    ),
+                    400,
+                ),
+                (
+                    "Connection naming the key",
+                    ws_head(
+                        "GET",
+                        &GOOD,
+                        &["Connection"],
+                        &["Connection: Upgrade, Sec-WebSocket-Key"],
+                    ),
+                    400,
+                ),
+                ("POST", ws_head("POST", &GOOD, &[], &[]), 400),
+                ("HEAD", ws_head("HEAD", &GOOD, &[], &[]), 400),
+                ("OPTIONS", ws_head("OPTIONS", &GOOD, &[], &[]), 400),
+                (
+                    "a handshake with Expect",
+                    ws_head("GET", &GOOD, &[], &["Expect: 100-continue"]),
+                    417,
+                ),
+                (
+                    "the wrong Host",
+                    ws_head("GET", &GOOD, &[], &[]).replace_host("evil.test"),
+                    421,
+                ),
+            ];
+            for (what, request, code) in cases {
+                let out = exchange(&request, OK).await;
+                assert!(
+                    status(&out).starts_with(&format!("HTTP/1.1 {code} ")),
+                    "{what}: wanted {code}, got {:?}",
+                    text(&out.client)
+                );
+                assert_eq!(out.opened, 0, "{what}: the node stream was opened");
+                assert!(out.node.is_empty(), "{what}: the node saw {:?}", out.node);
+            }
+            // HTTP/1.0 with an upgrade is still the version error.
+            let out = exchange(
+                format!(
+                    "GET /chat HTTP/1.0\r\nHost: {HOST}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n"
+                )
+                .as_bytes(),
+                OK,
+            )
+            .await;
+            assert!(status(&out).starts_with("HTTP/1.1 505"));
+        }
+
+        trait ReplaceHost {
+            fn replace_host(self, host: &str) -> Vec<u8>;
+        }
+
+        impl ReplaceHost for Vec<u8> {
+            fn replace_host(self, host: &str) -> Vec<u8> {
+                text(&self).replace(HOST, host).into_bytes()
+            }
+        }
+
+        #[tokio::test]
+        async fn bytes_pipelined_behind_the_handshake_close_the_connection_and_go_nowhere() {
+            // In the same write as the head: the request is not forwarded at all.
+            let out = exchange(
+                &[
+                    ws_head("GET", &GOOD, &[], &[]),
+                    b"\x81\x84abcdsmuggled".to_vec(),
+                ]
+                .concat(),
+                &accept_reply(ACCEPT, ""),
+            )
+            .await;
+            assert!(
+                status(&out).starts_with("HTTP/1.1 400"),
+                "{:?}",
+                text(&out.client)
+            );
+            assert_eq!(out.opened, 0);
+            assert!(out.node.is_empty());
+            // After the head and before the 101: the client is answered 400 and closed; what it
+            // sent is never forwarded, and the 101 that comes later reaches nobody.
+            let mut rig = rig(limits());
+            rig.client.send(&ws_head("GET", &GOOD, &[], &[]));
+            let forwarded = rig.node.head().await;
+            assert!(forwarded.starts_with(b"GET /chat"));
+            rig.client.send(b"\x81\x84abcdsmuggled");
+            assert!(rig.over().await, "the connection must end");
+            assert!(text(&rig.client.pending().await).starts_with("HTTP/1.1 400"));
+            rig.node.send(&accept_reply(ACCEPT, ""));
+            assert!(
+                rig.node.pending().await.is_empty(),
+                "nothing more reached the node"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_client_that_leaves_before_the_101_ends_the_connection() {
+            let mut rig = rig(limits());
+            rig.client.send(&ws_head("GET", &GOOD, &[], &[]));
+            rig.node.head().await;
+            rig.client.eof();
+            assert!(rig.over().await);
+            assert!(
+                rig.client.pending().await.is_empty(),
+                "no answer to a client that left"
+            );
+            // A reset is the same.
+            let mut rig = self::rig(limits());
+            rig.client.send(&ws_head("GET", &GOOD, &[], &[]));
+            rig.node.head().await;
+            rig.client.reset();
+            assert!(rig.over().await);
+        }
+
+        /// The node's answer to a handshake, and what the client got of it.
+        async fn answered(reply: &[u8]) -> String {
+            let mut rig = rig(limits());
+            rig.client.send(&ws_head("GET", &GOOD, &[], &[]));
+            rig.node.head().await;
+            rig.node.send(reply);
+            assert!(rig.over().await, "the connection must end");
+            let got = text(&rig.client.pending().await);
+            assert_eq!(rig.client.closes(), 1, "a refusal is a clean close: {got}");
+            got
+        }
+
+        #[tokio::test]
+        async fn a_101_that_is_not_exactly_the_websocket_answer_is_a_502() {
+            let good = |extra: &str| accept_reply(ACCEPT, extra);
+            let replies: Vec<(&str, Vec<u8>)> = vec![
+                ("a wrong accept", accept_reply("AAAAAAAAAAAAAAAAAAAAAAAAAAA=", "")),
+                (
+                    "an accept of another case",
+                    accept_reply(&ACCEPT.to_ascii_lowercase(), ""),
+                ),
+                (
+                    "no accept",
+                    b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n"
+                        .to_vec(),
+                ),
+                ("two accepts", good(&format!("Sec-WebSocket-Accept: {ACCEPT}\r\n"))),
+                (
+                    "no Upgrade",
+                    format!(
+                        "HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {ACCEPT}\r\n\r\n"
+                    )
+                    .into_bytes(),
+                ),
+                (
+                    "Upgrade: h2c",
+                    format!(
+                        "HTTP/1.1 101 Switching Protocols\r\nUpgrade: h2c\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {ACCEPT}\r\n\r\n"
+                    )
+                    .into_bytes(),
+                ),
+                ("two Upgrades", good("Upgrade: websocket\r\n")),
+                (
+                    "no Connection",
+                    format!(
+                        "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nSec-WebSocket-Accept: {ACCEPT}\r\n\r\n"
+                    )
+                    .into_bytes(),
+                ),
+                (
+                    "Connection: close",
+                    format!(
+                        "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade, close\r\nSec-WebSocket-Accept: {ACCEPT}\r\n\r\n"
+                    )
+                    .into_bytes(),
+                ),
+                (
+                    "Connection naming the accept",
+                    format!(
+                        "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade, Sec-WebSocket-Accept\r\nSec-WebSocket-Accept: {ACCEPT}\r\n\r\n"
+                    )
+                    .into_bytes(),
+                ),
+                ("a Content-Length", good("Content-Length: 0\r\n")),
+                ("a Content-Length of 5", good("Content-Length: 5\r\n")),
+                ("chunked", good("Transfer-Encoding: chunked\r\n")),
+                (
+                    "HTTP/1.0",
+                    format!(
+                        "HTTP/1.0 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {ACCEPT}\r\n\r\n"
+                    )
+                    .into_bytes(),
+                ),
+                ("a bare LF", good("X-A: b\n")),
+                ("102", b"HTTP/1.1 102 Processing\r\n\r\n".to_vec()),
+                ("100", b"HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n".to_vec()),
+                ("103", b"HTTP/1.1 103 Early Hints\r\nLink: </x>\r\n\r\n".to_vec()),
+                ("199", b"HTTP/1.1 199 Odd\r\n\r\n".to_vec()),
+                (
+                    "a 200 that carries the upgrade headers",
+                    format!(
+                        "HTTP/1.1 200 OK\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {ACCEPT}\r\nContent-Length: 0\r\n\r\n"
+                    )
+                    .into_bytes(),
+                ),
+            ];
+            for (what, reply) in replies {
+                let got = answered(&reply).await;
+                assert!(got.starts_with("HTTP/1.1 502"), "{what}: {got}");
+                assert!(!got.contains("101"), "{what}: {got}");
+            }
+        }
+
+        #[tokio::test]
+        async fn a_101_nobody_asked_for_is_a_502() {
+            let valid = accept_reply(ACCEPT, "");
+            // A plain request.
+            let out = exchange(&get(""), &valid).await;
+            assert!(
+                status(&out).starts_with("HTTP/1.1 502"),
+                "{:?}",
+                text(&out.client)
+            );
+            assert!(!text(&out.client).contains("101"));
+            // A request with `Sec-WebSocket-Key` but no `Upgrade` is a plain request too.
+            let out = exchange(&get(&format!("Sec-WebSocket-Key: {KEY}\r\n")), &valid).await;
+            assert!(status(&out).starts_with("HTTP/1.1 502"));
+            // The second request on a connection that had a plain first one: the upgrade
+            // state belongs to the request, not to the connection.
+            let mut rig = rig(limits());
+            rig.client.send(&get(""));
+            rig.node.head().await;
+            rig.node.send(OK);
+            rig.client.take(OK.len()).await;
+            rig.client.send(&get("Sec-WebSocket-Key: x\r\n"));
+            rig.node.head().await;
+            rig.node.send(&valid);
+            assert!(text(&rig.client.head().await).starts_with("HTTP/1.1 502"));
+        }
+
+        #[tokio::test]
+        async fn a_final_answer_to_a_handshake_is_an_ordinary_response_and_the_connection_stays_http()
+         {
+            for reply in [
+                &b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok"[..],
+                b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 2\r\n\r\nno",
+                b"HTTP/1.1 404 Not Found\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nno\r\n0\r\n\r\n",
+            ] {
+                let mut rig = rig(limits());
+                let head = rig.switch(&ws_head("GET", &GOOD, &[], &[]), reply).await;
+                assert!(!text(&head).contains("101"), "{}", text(&head));
+                // The body follows, the connection is kept alive, and the next request is an
+                // ordinary one on the same node stream.
+                let body_len = if reply.starts_with(b"HTTP/1.1 404") {
+                    12
+                } else {
+                    2
+                };
+                rig.client.take(body_len).await;
+                rig.client.send(&get("X-N: 2\r\n"));
+                let second = text(&rig.node.head().await);
+                assert!(second.contains("X-N: 2"), "{second}");
+                assert!(!second.to_ascii_lowercase().contains("upgrade"), "{second}");
+                rig.node.send(OK);
+                assert!(text(&rig.client.head().await).starts_with("HTTP/1.1 200"));
+                assert_eq!(rig.opened.load(Ordering::SeqCst), 1);
+                assert!(!rig.over().await);
+            }
+        }
+
+        #[tokio::test]
+        async fn a_reset_of_the_node_in_the_pipe_ends_the_client_without_a_close_notify() {
+            let mut rig = rig(limits());
+            rig.ok().await;
+            rig.node.send(b"frame");
+            assert_eq!(rig.client.take(5).await, b"frame");
+            rig.node.reset();
+            assert!(rig.over().await);
+            assert_eq!(rig.client.closes(), 0, "a reset is not a clean end");
+        }
+
+        #[tokio::test]
+        async fn a_reset_of_the_client_in_the_pipe_ends_the_connection_without_a_clean_end() {
+            let mut rig = rig(limits());
+            rig.ok().await;
+            rig.client.send(b"frame");
+            assert_eq!(rig.node.take(5).await, b"frame");
+            rig.client.reset();
+            assert!(rig.over().await);
+            assert_eq!(rig.client.closes(), 0);
+            assert_eq!(
+                rig.node.closes(),
+                0,
+                "the node's stream is dropped, not closed"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_reset_right_behind_the_head_still_delivers_what_the_head_carried() {
+            let mut rig = rig(limits());
+            rig.client.send(&ws_head("GET", &GOOD, &[], &[]));
+            rig.node.head().await;
+            let mut wire = accept_reply(ACCEPT, "");
+            wire.extend_from_slice(b"first");
+            rig.node.send(&wire);
+            rig.node.reset();
+            rig.client.head().await;
+            assert_eq!(rig.client.take(5).await, b"first");
+            assert!(rig.over().await);
+            assert_eq!(rig.client.closes(), 0);
+        }
+
+        #[tokio::test]
+        async fn a_clean_end_of_the_node_lets_the_client_finish_and_both_ends_are_clean() {
+            let mut rig = rig(limits());
+            rig.ok().await;
+            rig.node.send(b"bye");
+            rig.node.eof();
+            assert_eq!(rig.client.take(3).await, b"bye");
+            settle().await;
+            assert_eq!(
+                rig.client.closes(),
+                1,
+                "that direction is shut down cleanly"
+            );
+            assert_eq!(rig.node.closes(), 0);
+            assert!(!rig.over().await, "the other direction may still drain");
+            rig.client.send(b"last words");
+            assert_eq!(rig.node.take(10).await, b"last words");
+            rig.client.eof();
+            assert!(rig.over().await);
+            assert_eq!(rig.client.closes(), 1);
+            assert_eq!(rig.node.closes(), 1);
+        }
+
+        #[tokio::test]
+        async fn a_clean_end_of_the_client_lets_the_node_finish() {
+            let mut rig = rig(limits());
+            rig.ok().await;
+            rig.client.eof();
+            settle().await;
+            assert_eq!(rig.node.closes(), 1);
+            assert_eq!(rig.client.closes(), 0);
+            rig.node.send(b"reply");
+            assert_eq!(rig.client.take(5).await, b"reply");
+            rig.node.eof();
+            assert!(rig.over().await);
+            assert_eq!((rig.client.closes(), rig.node.closes()), (1, 1));
+        }
+
+        #[tokio::test]
+        async fn a_reset_after_one_clean_end_is_no_clean_end() {
+            let mut rig = rig(limits());
+            rig.ok().await;
+            rig.node.eof();
+            settle().await;
+            rig.client.reset();
+            assert!(rig.over().await);
+            assert_eq!(rig.node.closes(), 0);
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn the_other_direction_has_the_drain_time_after_one_side_ended() {
+            let mut rig = rig(HttpLimits::default());
+            rig.ok().await;
+            rig.node.eof();
+            settle().await;
+            tokio::time::advance(Duration::from_secs(29)).await;
+            assert!(!rig.over().await, "29 s after the end of one side");
+            tokio::time::advance(Duration::from_secs(2)).await;
+            assert!(rig.over().await, "30 s after the end of one side");
+            assert_eq!(
+                rig.client.closes(),
+                1,
+                "only the clean end of the node's side"
+            );
+            assert_eq!(rig.node.closes(), 0);
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn five_quiet_minutes_end_the_connection_and_traffic_in_either_direction_restarts_them()
+         {
+            let mut rig = rig(HttpLimits::default());
+            rig.ok().await;
+            tokio::time::advance(Duration::from_secs(299)).await;
+            assert!(!rig.over().await, "299 s of silence");
+            // One byte from the node, 299 s in: the count starts again.
+            rig.node.send(b"p");
+            assert_eq!(rig.client.take(1).await, b"p");
+            tokio::time::advance(Duration::from_secs(299)).await;
+            assert!(!rig.over().await);
+            // And one from the client.
+            rig.client.send(b"q");
+            assert_eq!(rig.node.take(1).await, b"q");
+            tokio::time::advance(Duration::from_secs(299)).await;
+            assert!(!rig.over().await);
+            tokio::time::advance(Duration::from_secs(2)).await;
+            assert!(rig.over().await, "300 s without a byte");
+            assert_eq!(
+                rig.client.closes(),
+                0,
+                "the end of an idle connection is not a clean end"
+            );
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn there_is_no_cap_on_the_total_lifetime_of_a_busy_connection() {
+            let mut rig = rig(HttpLimits::default());
+            rig.ok().await;
+            for _ in 0..30 {
+                tokio::time::advance(Duration::from_secs(120)).await;
+                rig.node.send(b"p");
+                assert_eq!(rig.client.take(1).await, b"p");
+            }
+            assert!(!rig.over().await, "an hour of pings");
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn a_name_that_is_no_longer_served_cuts_the_pipe_within_thirty_seconds() {
+            let mut rig = rig(HttpLimits::default());
+            rig.ok().await;
+            rig.node.send(b"p");
+            assert_eq!(rig.client.take(1).await, b"p");
+            rig.served.store(false, Ordering::SeqCst);
+            tokio::time::advance(Duration::from_secs(29)).await;
+            assert!(!rig.over().await, "asked every 30 s, not before");
+            tokio::time::advance(Duration::from_secs(2)).await;
+            assert!(rig.over().await);
+            assert_eq!(rig.client.closes(), 0, "a cut pipe is not a clean end");
+            assert_eq!(rig.node.closes(), 0);
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn a_name_that_is_served_is_asked_again_and_again_and_stays() {
+            let mut rig = rig(HttpLimits::default());
+            rig.ok().await;
+            for _ in 0..20 {
+                tokio::time::advance(Duration::from_secs(31)).await;
+                rig.node.send(b"p");
+                rig.client.take(1).await;
+            }
+            assert!(!rig.over().await);
+            // And it is asked at all while the pipe is busy: a withdrawal during traffic cuts it.
+            rig.served.store(false, Ordering::SeqCst);
+            for _ in 0..2 {
+                tokio::time::advance(Duration::from_secs(16)).await;
+                rig.node.send(b"p");
+                settle().await;
+            }
+            assert!(rig.over().await);
+        }
+
+        #[tokio::test]
+        async fn the_serve_future_lives_as_long_as_the_pipe_so_the_front_doors_slot_is_kept() {
+            // The front door drops its connection slot when `serve` returns.
+            let mut rig = rig(limits());
+            rig.ok().await;
+            for _ in 0..5 {
+                rig.node.send(b"p");
+                rig.client.take(1).await;
+                assert!(!rig.over().await);
+            }
+            rig.client.eof();
+            rig.node.eof();
+            assert!(rig.over().await);
         }
     }
 }

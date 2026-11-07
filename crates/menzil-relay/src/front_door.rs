@@ -2766,6 +2766,7 @@ pub(crate) mod tests {
             head_timeout: Duration::from_secs(1),
             keepalive_idle: Duration::from_secs(2),
             body_idle: Duration::from_secs(3),
+            ..HttpLimits::default()
         };
         assert_eq!(config.with_http_limits(set).http, set);
     }
@@ -2865,6 +2866,147 @@ pub(crate) mod tests {
         assert!(
             !still(),
             "another service of the same name ends the connection"
+        );
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // WebSocket through a terminated share: the open pipe follows the name
+    // -----------------------------------------------------------------------------------------
+
+    const WS_REQUEST: &str = "GET /chat HTTP/1.1\r\nHost: web.ali.t.s.example.test\r\n\
+        Upgrade: websocket\r\nConnection: Upgrade\r\n\
+        Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n";
+    const WS_REPLY: &str = "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n\
+        Connection: Upgrade\r\nSec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\n";
+
+    /// A WebSocket opened through `http_term::serve` for the name of `terminated_world`, its
+    /// pipe up and carrying a byte each way; the door asks every 100 ms whether the name is
+    /// still served.
+    async fn open_websocket(
+        w: &World,
+        relay: &Relay,
+    ) -> (
+        tokio::io::DuplexStream,
+        tokio::io::DuplexStream,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt, duplex};
+        let (resolved, _) = t_resolve(w, relay, T_HOST).expect("resolves");
+        let still = FrontDoor::still_served(
+            Arc::clone(&w.door),
+            relay.clone(),
+            T_HOST.to_string(),
+            &resolved,
+        );
+        let (mut c, srv_c) = duplex(1 << 16);
+        let (srv_x, mut node_x) = duplex(1 << 16);
+        let limits = HttpLimits {
+            upgrade_recheck: Duration::from_millis(100),
+            ..HttpLimits::default()
+        };
+        let server = tokio::spawn(async move {
+            http_term::serve(
+                srv_c,
+                T_HOST,
+                "203.0.113.7".parse().unwrap(),
+                limits,
+                still,
+                move || async move { Some(srv_x) },
+            )
+            .await;
+        });
+        let mut buf = vec![0u8; 4096];
+        c.write_all(WS_REQUEST.as_bytes()).await.unwrap();
+        assert!(node_x.read(&mut buf).await.unwrap() > 0);
+        node_x.write_all(WS_REPLY.as_bytes()).await.unwrap();
+        let n = c.read(&mut buf).await.unwrap();
+        assert!(buf[..n].starts_with(b"HTTP/1.1 101"), "switched");
+        c.write_all(b"up").await.unwrap();
+        assert_eq!(node_x.read(&mut buf).await.unwrap(), 2);
+        node_x.write_all(b"dn").await.unwrap();
+        assert_eq!(c.read(&mut buf).await.unwrap(), 2);
+        (c, node_x, server)
+    }
+
+    /// Whether the server of an open pipe ended within `within`, and what the client then reads
+    /// (an end with no more bytes).
+    async fn pipe_cut(
+        c: &mut tokio::io::DuplexStream,
+        server: tokio::task::JoinHandle<()>,
+        within: Duration,
+    ) -> bool {
+        use tokio::io::AsyncReadExt;
+        let ended = tokio::time::timeout(within, server).await.is_ok();
+        let mut rest = Vec::new();
+        let _ = tokio::time::timeout(Duration::from_secs(1), c.read_to_end(&mut rest)).await;
+        ended && rest.is_empty()
+    }
+
+    /// An open WebSocket is cut within a re-check of the owner moving its label to another node
+    /// (cookies and frames must not go on reaching the old holder), and stays open before that.
+    #[tokio::test]
+    async fn an_open_websocket_is_cut_when_the_label_moves_to_another_node() {
+        let (w, relay) = terminated_world();
+        let x = w.node;
+        let y = NodeId::from([8u8; 32]);
+        let (mut c, mut node_x, server) = open_websocket(&w, &relay).await;
+        // Several re-checks pass while the name is unchanged: the pipe stays up and works.
+        tokio::time::sleep(Duration::from_millis(450)).await;
+        assert!(
+            !server.is_finished(),
+            "an unchanged name keeps its WebSocket"
+        );
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut buf = [0u8; 16];
+        c.write_all(b"still").await.unwrap();
+        assert_eq!(node_x.read(&mut buf).await.unwrap(), 5);
+        w.roster(2, &[x, y], &[("web", y), ("app", x)]);
+        w.relay
+            .labels()
+            .release_ungranted(w.relay.rosters(), unix_now());
+        w.attach_node(y);
+        w.advertise_as(
+            y,
+            vec![share("web", ShareMode::Terminated, "http:web", &[])],
+        );
+        assert!(
+            pipe_cut(&mut c, server, Duration::from_secs(5)).await,
+            "the pipe must end"
+        );
+        assert!(
+            matches!(node_x.read(&mut buf).await, Ok(0) | Err(_)),
+            "the old holder's stream is closed"
+        );
+    }
+
+    /// The same for a tenant that is suspended while its WebSocket is open.
+    #[tokio::test]
+    async fn an_open_websocket_is_cut_when_the_tenant_is_suspended() {
+        let (w, relay) = terminated_world();
+        let (mut c, _node_x, server) = open_websocket(&w, &relay).await;
+        tokio::time::sleep(Duration::from_millis(450)).await;
+        assert!(!server.is_finished());
+        let mut spec = terminated_ali();
+        spec.networks = vec![w.network];
+        let mut book = TenantBook::build(vec![spec], Vec::new(), &HashSet::new(), &HashSet::new());
+        book.suspend(&Slug::parse("ali").unwrap());
+        relay.set_tenants(book);
+        assert!(relay.tenants().is_held_back(&w.network));
+        assert!(
+            pipe_cut(&mut c, server, Duration::from_secs(5)).await,
+            "the pipe must end"
+        );
+    }
+
+    /// And for a share the node withdrew.
+    #[tokio::test]
+    async fn an_open_websocket_is_cut_when_the_share_is_withdrawn() {
+        let (w, relay) = terminated_world();
+        let (mut c, _node_x, server) = open_websocket(&w, &relay).await;
+        w.advertise(vec![share("app", ShareMode::Blind, "tls:app", &[])]);
+        assert!(
+            pipe_cut(&mut c, server, Duration::from_secs(5)).await,
+            "the pipe must end"
         );
     }
 }

@@ -14,6 +14,7 @@ aws-lc-rs = ["rustls/aws-lc-rs", "tokio-rustls/aws-lc-rs", "menzil-acme/aws-lc-r
 ring = ["rustls/ring", "tokio-rustls/ring", "menzil-acme/ring"]
 
 [dependencies]
+base64.workspace = true
 ed25519-dalek.workspace = true
 fastrand.workspace = true
 futures-util = { workspace = true, features = ["io"] }
