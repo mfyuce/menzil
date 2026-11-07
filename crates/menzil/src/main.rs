@@ -11,6 +11,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use menzil_cli::agent::{self, End};
 use menzil_cli::config::Config;
+use menzil_cli::expose::{self, ExposeMode, ExposeSpec};
 use menzil_cli::home::Home;
 use menzil_cli::local::{self, Joined};
 use menzil_cli::stdio::{ClosingStdout, reset_message};
@@ -155,11 +156,20 @@ enum Command {
     /// Run the node: attach to the relay, serve the configured services and answer the agent
     /// socket that `stdio` and `reach` use.
     Node,
-    /// Expose a local port through a node.
-    Expose {
-        /// Local port to expose.
-        port: u16,
-    },
+    /// Make a local port reachable under a public name (`https://<name>.<the relay's domain>`),
+    /// or list or remove such shares.
+    ///
+    /// The node serves the port and advertises the name to its relay, which routes visitors to
+    /// this node by the name in their TLS hello without reading their traffic (blind mode). The
+    /// local program must speak TLS itself, with a certificate for the public name: menzil does
+    /// not make one. A running node picks the change up at once; with no node running only
+    /// config.toml is changed and `menzil node` advertises the share when it starts.
+    #[command(
+        args_conflicts_with_subcommands = true,
+        subcommand_negates_reqs = true,
+        after_help = "Examples:\n  menzil expose 8443 --name app          expose a local HTTPS server\n  menzil expose 22 --name box --mode tcp  reach sshd by name (TLS in front of it)\n  menzil expose list                      what is exposed and what the relay says\n  menzil expose remove app                take it away"
+    )]
+    Expose(ExposeArgs),
     /// Listen on a local port (or a Unix socket) and carry each connection to a service of
     /// another member.
     ///
@@ -200,6 +210,48 @@ enum Command {
     },
     /// Print the menzil version.
     Version,
+}
+
+/// What `menzil expose` takes.
+#[derive(clap::Args)]
+struct ExposeArgs {
+    #[command(subcommand)]
+    command: Option<ExposeCommand>,
+    /// The local port to expose (1 to 65535).
+    #[arg(required = true, value_parser = clap::value_parser!(u16).range(1..))]
+    port: Option<u16>,
+    /// The public label: one lowercase name of letters, digits and hyphens, so the share is
+    /// `<label>.<the relay's share domain>` (the relay adds your tenant's label if it has one).
+    #[arg(long, required = true, value_name = "LABEL")]
+    name: Option<String>,
+    /// blind: the relay forwards the encrypted bytes and the local target speaks TLS itself (the
+    /// default); tcp: the same by name, for any protocol inside the TLS (`tcp:` service);
+    /// terminated: the relay terminates TLS (not built yet).
+    #[arg(long, default_value = "blind", value_name = "MODE", value_parser = ["blind", "tcp", "terminated"])]
+    mode: String,
+    /// The host of the local target. Anything but this machine's loopback shows the target to
+    /// whoever reaches the public name; a warning says so.
+    #[arg(long, default_value = "127.0.0.1", value_name = "HOST")]
+    host: String,
+    /// An ALPN identifier the target terminates (h2, http/1.1, acme-tls/1); may be repeated or
+    /// comma separated. Without any, every ALPN is routed to it.
+    #[arg(long = "alpn", value_name = "ID", value_delimiter = ',')]
+    alpn: Vec<String>,
+    /// Change a share (or a service) that exists already instead of refusing.
+    #[arg(long)]
+    replace: bool,
+}
+
+#[derive(Subcommand)]
+enum ExposeCommand {
+    /// What is exposed, what the relay answered for each (accepted, or rejected with its reason),
+    /// and the public address.
+    List,
+    /// Take a share away: it stops being advertised and served at once.
+    Remove {
+        /// The label of the share.
+        label: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -700,6 +752,11 @@ async fn run(cli: Cli) -> Result<()> {
                     if let Some(cert) = status.cert {
                         print!("{}", cert.render(now()));
                     }
+                    let domain = config.share_domain().ok().flatten();
+                    print!(
+                        "{}",
+                        expose::render_status(&status.shares, domain.as_deref())
+                    );
                 }
             }
         }
@@ -845,7 +902,27 @@ async fn run(cli: Cli) -> Result<()> {
                 }
             }
         }
-        Command::Expose { .. } => not_implemented("expose"),
+        Command::Expose(args) => {
+            let home = home()?;
+            let out = match args.command {
+                Some(ExposeCommand::List) => expose::run_list(&home).await?,
+                Some(ExposeCommand::Remove { label }) => {
+                    expose::run_unexpose(&home, &label).await?
+                }
+                None => {
+                    let spec = ExposeSpec {
+                        label: args.name.context("`--name` is required")?,
+                        mode: ExposeMode::parse(&args.mode).map_err(anyhow::Error::msg)?,
+                        host: args.host,
+                        port: args.port.context("the port to expose is required")?,
+                        alpn: args.alpn,
+                        replace: args.replace,
+                    };
+                    expose::run_expose(&home, spec).await?
+                }
+            };
+            print!("{out}");
+        }
         Command::Proxy { .. } => not_implemented("proxy"),
         Command::Version => println!("menzil {}", env!("CARGO_PKG_VERSION")),
     }
@@ -857,4 +934,107 @@ async fn run(cli: Cli) -> Result<()> {
 fn not_implemented(subcommand: &str) -> ! {
     eprintln!("{subcommand}: not implemented yet");
     std::process::exit(2);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(args: &[&str]) -> Result<Cli, clap::Error> {
+        Cli::try_parse_from(std::iter::once("menzil").chain(args.iter().copied()))
+    }
+
+    fn expose_args(args: &[&str]) -> Result<ExposeArgs, clap::Error> {
+        match parse(args)?.command {
+            Command::Expose(args) => Ok(args),
+            _ => panic!("not expose"),
+        }
+    }
+
+    #[test]
+    fn expose_takes_a_port_a_name_and_the_options_with_their_defaults() {
+        let args = expose_args(&["expose", "8443", "--name", "app"]).unwrap();
+        assert!(args.command.is_none());
+        assert_eq!(args.port, Some(8443));
+        assert_eq!(args.name.as_deref(), Some("app"));
+        assert_eq!(args.mode, "blind");
+        assert_eq!(args.host, "127.0.0.1");
+        assert!(args.alpn.is_empty() && !args.replace);
+        // Options before the port, a mode, a host, ALPN repeated and comma separated.
+        let args = expose_args(&[
+            "expose",
+            "--name",
+            "box",
+            "--mode",
+            "tcp",
+            "--host",
+            "::1",
+            "--alpn",
+            "h2,http/1.1",
+            "--alpn",
+            "acme-tls/1",
+            "--replace",
+            "22",
+        ])
+        .unwrap();
+        assert_eq!(args.port, Some(22));
+        assert_eq!(args.mode, "tcp");
+        assert_eq!(args.host, "::1");
+        assert_eq!(args.alpn, ["h2", "http/1.1", "acme-tls/1"]);
+        assert!(args.replace);
+        // Terminated parses (the command refuses it by name); anything else is clap's.
+        assert_eq!(
+            expose_args(&["expose", "1", "--name", "a", "--mode", "terminated"])
+                .unwrap()
+                .mode,
+            "terminated"
+        );
+        assert!(expose_args(&["expose", "1", "--name", "a", "--mode", "udp"]).is_err());
+    }
+
+    #[test]
+    fn expose_needs_a_port_in_range_and_a_name() {
+        for bad in [
+            &["expose"][..],
+            &["expose", "8443"],
+            &["expose", "--name", "app"],
+            &["expose", "0", "--name", "app"],
+            &["expose", "65536", "--name", "app"],
+            &["expose", "http", "--name", "app"],
+            &["expose", "-1", "--name", "app"],
+        ] {
+            assert!(expose_args(bad).is_err(), "{bad:?}");
+        }
+        assert_eq!(
+            expose_args(&["expose", "65535", "--name", "a"])
+                .unwrap()
+                .port,
+            Some(65535)
+        );
+        assert_eq!(
+            expose_args(&["expose", "1", "--name", "a"]).unwrap().port,
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn expose_list_and_remove_are_subcommands_that_take_no_port() {
+        let args = expose_args(&["expose", "list"]).unwrap();
+        assert!(matches!(args.command, Some(ExposeCommand::List)));
+        let args = expose_args(&["expose", "remove", "app"]).unwrap();
+        assert!(
+            matches!(args.command, Some(ExposeCommand::Remove { ref label }) if label == "app")
+        );
+        assert!(expose_args(&["expose", "remove"]).is_err());
+        // A port together with a subcommand is a mistake, not a guess.
+        assert!(expose_args(&["expose", "8443", "list"]).is_err());
+        assert!(expose_args(&["expose", "list", "--name", "app"]).is_err());
+    }
+
+    #[test]
+    fn the_help_says_the_target_speaks_its_own_tls() {
+        let help = parse(&["expose", "--help"]).err().unwrap().to_string();
+        assert!(help.contains("must speak TLS itself"), "{help}");
+        assert!(help.contains("not built yet"), "{help}");
+    }
 }

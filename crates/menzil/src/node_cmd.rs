@@ -6,7 +6,10 @@
 //! local programs (`menzil stdio`, `menzil reach`) open streams to other members by name.
 //! Updated documents (`menzil join` of a newer token) are picked up while it runs; a network
 //! joined for the first time needs a restart, because the networks a node claims are fixed when
-//! it attaches.
+//! it attaches. Services and shares are not fixed at start: `menzil expose` changes them through
+//! the agent socket, and the reload below applies what a hand edit of `[services]` and
+//! `[[share]]` says (a service taken out by hand needs a restart; `menzil expose remove` takes
+//! one out live).
 
 use std::collections::HashMap;
 use std::fs;
@@ -17,8 +20,8 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow, bail};
 use menzil_carrier::DialConfig;
 use menzil_node::{
-    Adopted, AdoptedDocs, DocStore, EnsureError, LocalIdentity, Node, NodeConfig, NodeError,
-    NodeOpenError, OpenStreamError, PolicyStore, RelayError, RosterStore, SessionConfig,
+    Adopted, AdoptedDocs, DocStore, EnsureError, LocalIdentity, LocalServices, Node, NodeConfig,
+    NodeError, NodeOpenError, OpenStreamError, PolicyStore, RelayError, RosterStore, SessionConfig,
 };
 use menzil_proto::trust::{DOC_MAX_LIFETIME, Reason};
 use menzil_proto::{ErrorCode, NetworkId, NodeId, ServiceId, ServiceKind, Share};
@@ -29,6 +32,7 @@ use tokio::task::JoinHandle;
 use crate::agent::{self, Opener};
 use crate::cert_node::{self, CertRenewer};
 use crate::config::Config;
+use crate::expose::{self, ExposeReply, ExposeSpec, Runtime, ShareView, UnexposeReply};
 use crate::home::{FileLock, Home};
 use crate::local::{keep_documents, load_documents, load_identity};
 use crate::persist::Worker;
@@ -606,6 +610,8 @@ pub struct NodeOpener {
     node: Arc<Node>,
     directory: Arc<RwLock<Directory>>,
     certs: Option<Arc<CertRenewer>>,
+    /// What `expose` and `unexpose` change: the home (for `config.toml`) and the node's services.
+    shares: Option<(Home, LocalServices)>,
 }
 
 impl NodeOpener {
@@ -615,7 +621,15 @@ impl NodeOpener {
             node,
             directory,
             certs: None,
+            shares: None,
         }
+    }
+
+    /// Lets the agent answer `expose` and `unexpose` (they change `config.toml` in `home` and
+    /// `services`, a clone of the handle the node serves from) and list the shares in `status`.
+    pub fn with_shares(mut self, home: Home, services: LocalServices) -> Self {
+        self.shares = Some((home, services));
+        self
     }
 
     /// Lets the agent answer `cert renew` and report the certificate in `status`, through
@@ -734,6 +748,65 @@ impl Opener for NodeOpener {
             None => Err("this node cannot renew its certificate".to_string()),
         }
     }
+
+    async fn shares(&self) -> Vec<ShareView> {
+        match &self.shares {
+            Some((_, services)) => {
+                expose::share_views(self.node.shares(), services, self.node.is_attached())
+            }
+            None => Vec::new(),
+        }
+    }
+
+    async fn expose(&self, spec: ExposeSpec) -> Result<ExposeReply, String> {
+        let Some((home, services)) = self.shares.clone() else {
+            return Err("this node does not manage shares".to_string());
+        };
+        let book = self.node.shares().clone();
+        let attached = self.node.is_attached();
+        let label = spec.label.clone();
+        // The config lock waits for other writers on a thread of its own.
+        tokio::task::spawn_blocking(move || {
+            let runtime = Runtime {
+                services: &services,
+                shares: &book,
+            };
+            let plan =
+                expose::expose(&home, &spec, Some(&runtime)).map_err(|e| format!("{e:#}"))?;
+            let share = expose::share_views(&book, &services, attached)
+                .into_iter()
+                .find(|view| view.label == label)
+                .ok_or_else(|| "the node does not hold the share after it was made".to_string())?;
+            Ok(ExposeReply {
+                changed: plan.changed,
+                share,
+                notes: plan.notes,
+            })
+        })
+        .await
+        .map_err(|e| format!("the change did not finish: {e}"))?
+    }
+
+    async fn unexpose(&self, label: String) -> Result<UnexposeReply, String> {
+        let Some((home, services)) = self.shares.clone() else {
+            return Err("this node does not manage shares".to_string());
+        };
+        let book = self.node.shares().clone();
+        tokio::task::spawn_blocking(move || {
+            let runtime = Runtime {
+                services: &services,
+                shares: &book,
+            };
+            let plan =
+                expose::unexpose(&home, &label, Some(&runtime)).map_err(|e| format!("{e:#}"))?;
+            Ok(UnexposeReply {
+                notes: plan.notes,
+                service_removed: plan.removed_service.is_some(),
+            })
+        })
+        .await
+        .map_err(|e| format!("the change did not finish: {e}"))?
+    }
 }
 
 /// The clock in Unix seconds.
@@ -754,6 +827,8 @@ pub struct RunningNode {
     socket_identity: FileIdentity,
     /// The names this node can resolve.
     pub directory: Arc<RwLock<Directory>>,
+    /// The services this node serves; `menzil expose` and the reload change them while it runs.
+    pub services: LocalServices,
     tasks: Vec<JoinHandle<()>>,
     /// Writes the documents the node adopts over the network to disk (see
     /// [`keep_adopted_documents`]).
@@ -802,6 +877,8 @@ pub async fn start(home: &Home, config: &Config, socket: &Path) -> Result<Runnin
         e2e_protos: vec![0x01],
     };
     let services = config.local_services()?;
+    // The node serves from a clone; `expose` and the reload change the table through this one.
+    let services_handle = services.clone();
     // Checked before anything starts: a bad `[[share]]` stops the node with its reason, as a bad
     // `[services]` entry does.
     let shares = config.shares()?;
@@ -832,23 +909,32 @@ pub async fn start(home: &Home, config: &Config, socket: &Path) -> Result<Runnin
     ));
     let agent_task = tokio::spawn(agent::serve(
         listener,
-        Arc::new(NodeOpener::new(node.clone(), directory.clone()).with_certs(renewer.clone())),
+        Arc::new(
+            NodeOpener::new(node.clone(), directory.clone())
+                .with_certs(renewer.clone())
+                .with_shares(home.clone(), services_handle.clone()),
+        ),
     ));
     // The certificate: a check now and every six hours (renews 60 days before it runs out).
     let cert_task = tokio::spawn(cert_node::run(renewer));
     let reload_task = {
         let (home, directory, node) = (home.clone(), directory.clone(), node.clone());
         let (policies, rosters) = (policies.clone(), rosters.clone());
-        // What this node serves is fixed when it starts, so a share may only point at one of
-        // these.
-        let served = config.services.clone();
+        let services = services_handle.clone();
         tokio::spawn(async move {
             let mut last: HashMap<NetworkId, u64> = HashMap::new();
             loop {
                 let every = crate::cert_renew::test_knob("RELOAD_EVERY")
                     .map_or(RELOAD_EVERY, Duration::from_secs);
                 tokio::time::sleep(every).await;
-                reload_shares(&home, &node, &served);
+                // Takes the config lock, which waits for a writer: not on this task.
+                let reloaded = {
+                    let (home, node, services) = (home.clone(), node.clone(), services.clone());
+                    tokio::task::spawn_blocking(move || reload_shares(&home, &node, &services))
+                };
+                if let Err(error) = reloaded.await {
+                    tracing::warn!(%error, "reloading the shares did not finish");
+                }
                 let mut adopted = Vec::new();
                 match reload_adopting(
                     &home,
@@ -884,6 +970,7 @@ pub async fn start(home: &Home, config: &Config, socket: &Path) -> Result<Runnin
         socket: socket.to_path_buf(),
         socket_identity,
         directory,
+        services: services_handle,
         tasks: vec![agent_task, reload_task, steward_task, cert_task],
         keeper,
         _instance: instance,
@@ -898,13 +985,13 @@ pub(crate) struct ShareReload {
     /// serves, and, for a share of the file that needs a restart, what the node advertises under
     /// that name now (nothing, if it advertises none).
     pub apply: Vec<Share>,
-    /// The shares of the file that point at a service the node did not start with.
+    /// The shares of the file that point at a service the node does not serve.
     pub needs_restart: Vec<Share>,
 }
 
 /// Decides a reload without touching a node. `current` is what the node advertises, `wanted`
-/// what `config.toml` says now, `served` the `[services]` table the node started with (what it
-/// serves is fixed when it starts, so a share may only point at one of these).
+/// what `config.toml` says now, `served` the `[services]` entries the node serves (a share may
+/// only point at one of these).
 ///
 /// Removals and changes of shares whose service is already served apply at once, even when
 /// another share of the same edit needs a restart: that one alone is skipped, and the node
@@ -933,23 +1020,53 @@ pub(crate) fn plan_share_reload(
     }
 }
 
-/// Reads the `[[share]]` entries of `config.toml` again and, when they differ from what the node
-/// advertises, gives the node the new set (it advertises on its live session). A file that does
-/// not parse or a share that is not valid leaves the node advertising what it did, with the
-/// reason in the log: nothing is half applied. `served` is the `[services]` table the node
-/// started with: a share that points at a service the node does not serve yet needs a restart,
-/// which the log says; it alone waits (see [`plan_share_reload`]), the rest of the edit applies.
-fn reload_shares(home: &Home, node: &Node, served: &std::collections::BTreeMap<String, String>) {
-    let shares = match Config::load(home).and_then(|config| config.shares()) {
+/// Reads `[services]` and the `[[share]]` entries of `config.toml` again, under the config lock
+/// (so that it never sees, or undoes, half of an `expose`): services that are new or point
+/// elsewhere are served from now on, and, when the shares differ from what the node advertises,
+/// the node is given the new set (it advertises on its live session). A file that does not
+/// parse or a share that is not valid leaves the node advertising what it did, with the reason
+/// in the log: nothing is half applied. A share whose service could not be set (it names a kind
+/// that cannot be served) is left as it was; the rest of the edit applies (see
+/// [`plan_share_reload`]). A service taken out of the file is not taken out of the node: that is
+/// `menzil expose remove`, or a restart.
+pub(crate) fn reload_shares(home: &Home, node: &Node, services: &LocalServices) {
+    let _lock = match home.lock_config() {
+        Ok(lock) => lock,
+        Err(error) => {
+            tracing::warn!(error = %format!("{error:#}"), "reloading config.toml failed, the node keeps what it has");
+            return;
+        }
+    };
+    let config = match Config::load(home) {
+        Ok(config) => config,
+        Err(error) => {
+            tracing::warn!(error = %format!("{error:#}"), "reloading the shares of config.toml failed, the node keeps advertising the ones it has");
+            return;
+        }
+    };
+    let shares = match config.shares() {
         Ok(shares) => shares,
         Err(error) => {
             tracing::warn!(error = %format!("{error:#}"), "reloading the shares of config.toml failed, the node keeps advertising the ones it has");
             return;
         }
     };
-    let plan = plan_share_reload(&node.shares().configured(), shares, served);
+    for (service, why) in expose::sync_services(&config, services) {
+        tracing::warn!(%service, %why, "a service in config.toml cannot be served, it is left as it was");
+    }
+    let served: std::collections::BTreeMap<String, String> = config
+        .services
+        .iter()
+        .filter(|(service, _)| {
+            service
+                .parse::<ServiceId>()
+                .is_ok_and(|id| services.target(&id).is_some())
+        })
+        .map(|(service, target)| (service.clone(), target.clone()))
+        .collect();
+    let plan = plan_share_reload(&node.shares().configured(), shares, &served);
     for share in &plan.needs_restart {
-        tracing::warn!(share = %share.name, service = %share.service, "a share in config.toml points at a service this node did not start with: restart `menzil node` to serve it; that share is not changed");
+        tracing::warn!(share = %share.name, service = %share.service, "a share in config.toml points at a service this node cannot serve: that share is not changed");
     }
     if let Err(error) = node.shares().set_shares(plan.apply) {
         tracing::warn!(error = %error, "the shares of config.toml are not valid, the node keeps advertising the ones it has");

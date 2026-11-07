@@ -18,6 +18,11 @@
 //! max_connections_per_peer = 64   # served at once for one peer, at most 1000000
 //! connect_timeout_secs = 5        # giving up on a service's local target, at most 9
 //!
+//! # Optional: the relay's share domain H (public names are `<name>.H`, or `<name>.<tenant>.H`).
+//! # Only `menzil expose` and `menzil status` use it, to print `https://<name>.H`; the relay
+//! # operator tells it to you (relay run --share-domain).
+//! # share_domain = "tunnel.example.org"
+//!
 //! # Optional: public names the relay routes to this node (protocol.md 4.4). The service must be
 //! # one of [services]. mode is "blind" (service tls:..., the node terminates TLS), "terminated"
 //! # (http:..., the relay terminates TLS) or "tcp" (tcp:..., reached by name like a blind share).
@@ -60,6 +65,9 @@ pub struct Config {
     pub services: BTreeMap<String, String>,
     /// Where the agent listens; by default under the runtime directory or the home.
     pub agent_socket: Option<PathBuf>,
+    /// The relay's share domain (`H` of protocol.md 4.4), for printing public URLs only: nothing
+    /// is decided from it ([`Self::share_domain`] checks it).
+    pub share_domain: Option<String>,
     /// What this node holds for its peers at most: `[serve]`.
     #[serde(default)]
     pub serve: ServeSettings,
@@ -187,6 +195,7 @@ impl std::fmt::Debug for Config {
             .field("proxy", &self.proxy.as_deref().map(redact_userinfo))
             .field("services", &self.services)
             .field("agent_socket", &self.agent_socket)
+            .field("share_domain", &self.share_domain)
             .field("serve", &self.serve)
             .field("share", &self.share)
             .finish()
@@ -258,24 +267,70 @@ impl Config {
         Ok(shares)
     }
 
-    /// The services to serve, validated.
-    pub fn local_services(&self) -> Result<LocalServices> {
-        let mut services = LocalServices::new();
+    /// The services to serve with the local target of each, validated.
+    pub fn service_targets(&self) -> Result<Vec<(ServiceId, LocalTarget)>> {
+        let mut out = Vec::with_capacity(self.services.len());
         for (service, target) in &self.services {
             let id: ServiceId = service
                 .parse()
                 .map_err(|e| anyhow!("service {service:?} in config.toml: {e}"))?;
             let target = parse_target(target)
                 .with_context(|| format!("target of service {service:?} in config.toml"))?;
+            out.push((id, target));
+        }
+        Ok(out)
+    }
+
+    /// The services to serve, validated.
+    pub fn local_services(&self) -> Result<LocalServices> {
+        let mut services = LocalServices::new();
+        for (id, target) in self.service_targets()? {
             services = services
-                .serve(id, target)
-                .map_err(|e| anyhow!("service {service:?} in config.toml: {e}"))?;
+                .serve(id.clone(), target)
+                .map_err(|e| anyhow!("service {id} in config.toml: {e}"))?;
         }
         services = services.with_limits(self.serve.limits()?);
         if let Some(timeout) = self.serve.connect_timeout()? {
             services = services.with_connect_timeout(timeout);
         }
         Ok(services)
+    }
+
+    /// The relay's share domain in lowercase, if one is configured: a host name of at least two
+    /// labels (letters, digits and hyphens, no trailing dot, at most 253 characters). A value
+    /// that is not one is an error here, since it would be printed as part of a URL.
+    pub fn share_domain(&self) -> Result<Option<String>> {
+        let Some(domain) = self.share_domain.as_deref() else {
+            return Ok(None);
+        };
+        let domain = domain.trim().to_ascii_lowercase();
+        let bad = |why: &str| {
+            bail!("share_domain {domain:?} in config.toml: {why}");
+        };
+        if domain.is_empty() || domain.len() > 253 {
+            return bad("it must be 1 to 253 characters");
+        }
+        let labels: Vec<&str> = domain.split('.').collect();
+        if labels.len() < 2 {
+            return bad(
+                "it must be a domain name with at least two labels, such as tunnel.example.org",
+            );
+        }
+        for label in labels {
+            let ldh = !label.is_empty()
+                && label.len() <= 63
+                && label
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+                && !label.starts_with('-')
+                && !label.ends_with('-');
+            if !ldh {
+                return bad(
+                    "each label is 1 to 63 letters, digits and hyphens, not starting or ending with a hyphen (no scheme, port, path or trailing dot)",
+                );
+            }
+        }
+        Ok(Some(domain))
     }
 }
 

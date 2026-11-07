@@ -56,7 +56,7 @@ use std::collections::HashMap;
 use std::io;
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use std::pin::Pin;
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
@@ -177,10 +177,13 @@ impl Default for ServeLimits {
 /// module documentation.
 ///
 /// A clone shares the connection counts, the lookup limit and the log throttles with the
-/// original (they belong to the node), so run one set per node.
+/// original (they belong to the node), so run one set per node. It shares the table of services
+/// too: [`Self::set_target`] and [`Self::remove_target`] on one handle take effect for every
+/// clone, including the one a running node serves from (`menzil expose` adds and removes a
+/// service while the node runs).
 #[derive(Debug, Clone)]
 pub struct LocalServices {
-    targets: HashMap<ServiceId, LocalTarget>,
+    targets: Arc<RwLock<HashMap<ServiceId, LocalTarget>>>,
     connect_timeout: Duration,
     limits: ServeLimits,
     slots: Arc<Slots>,
@@ -210,7 +213,7 @@ impl LocalServices {
     pub fn new() -> Self {
         let limits = ServeLimits::default();
         Self {
-            targets: HashMap::new(),
+            targets: Arc::new(RwLock::new(HashMap::new())),
             connect_timeout: DEFAULT_CONNECT_TIMEOUT,
             slots: Slots::new(&limits),
             limits,
@@ -224,11 +227,18 @@ impl LocalServices {
     /// Serves `service` from `target`, replacing what it was served from
     /// before. Refused for a kind other than `tcp`, `http` and `tls`, and
     /// for a label that is empty or `*`.
-    pub fn serve(
-        mut self,
+    pub fn serve(self, service: ServiceId, target: LocalTarget) -> Result<Self, ServeConfigError> {
+        self.set_target(service, target)?;
+        Ok(self)
+    }
+
+    /// [`Self::serve`] on a handle that is already in use: the change is seen by every clone, so
+    /// by a running node, from the next OPEN on. A connection already piped is not touched.
+    pub fn set_target(
+        &self,
         service: ServiceId,
         target: LocalTarget,
-    ) -> Result<Self, ServeConfigError> {
+    ) -> Result<(), ServeConfigError> {
         if !matches!(
             service.kind,
             ServiceKind::Tcp | ServiceKind::Http | ServiceKind::Tls
@@ -241,8 +251,24 @@ impl LocalServices {
         if service.label == "*" {
             return Err(ServeConfigError::WildcardLabel(service.label));
         }
-        self.targets.insert(service, target);
-        Ok(self)
+        self.targets_mut().insert(service, target);
+        Ok(())
+    }
+
+    /// Stops serving `service`: the next OPEN for it is refused `unknown_service`. Whether it was
+    /// served. A connection already piped is not touched (a share's streams are reset by the
+    /// node when the share is withdrawn, not here).
+    pub fn remove_target(&self, service: &ServiceId) -> bool {
+        self.targets_mut().remove(service).is_some()
+    }
+
+    fn targets_ref(&self) -> std::sync::RwLockReadGuard<'_, HashMap<ServiceId, LocalTarget>> {
+        // The table is plain data replaced entry by entry: a panic elsewhere leaves it usable.
+        self.targets.read().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn targets_mut(&self) -> std::sync::RwLockWriteGuard<'_, HashMap<ServiceId, LocalTarget>> {
+        self.targets.write().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Gives up on the local connect after `timeout` instead of
@@ -269,18 +295,18 @@ impl LocalServices {
     }
 
     /// The target `service` is served from, if it is.
-    pub fn target(&self, service: &ServiceId) -> Option<&LocalTarget> {
-        self.targets.get(service)
+    pub fn target(&self, service: &ServiceId) -> Option<LocalTarget> {
+        self.targets_ref().get(service).cloned()
     }
 
     /// How many services are configured.
     pub fn len(&self) -> usize {
-        self.targets.len()
+        self.targets_ref().len()
     }
 
     /// Whether nothing is configured.
     pub fn is_empty(&self) -> bool {
-        self.targets.is_empty()
+        self.targets_ref().is_empty()
     }
 
     /// The connect timeout in force.
@@ -367,9 +393,11 @@ impl LocalServices {
         request: &OpenRequest,
         counted: bool,
     ) -> Result<OpenedTarget, OpenRefusal> {
-        let Some(target) = self.targets.get(&request.service) else {
+        // Looked up once, before any await: a service removed meanwhile does not hold the table.
+        let Some(target) = self.target(&request.service) else {
             return Err(refusal(ErrorCode::UnknownService, "no such service"));
         };
+        let target = &target;
         // Before anything is connected to or looked up: a peer past a limit costs the refusal.
         // An open that is counted elsewhere (the relay principal's) takes no place here.
         let slot = if counted {
@@ -1610,6 +1638,49 @@ mod tests {
             matches!(&result, Err(e) if is_reset(e)),
             "a connection nobody piped is a failed one, not an empty clean one: {result:?}"
         );
+    }
+
+    /// `menzil expose` adds and removes a service while the node runs: the handle the node
+    /// serves from is a clone, and a change through another clone is seen by it at once.
+    #[tokio::test]
+    async fn a_service_added_or_removed_on_one_clone_is_seen_by_the_clone_that_serves() {
+        let listener = listener().await;
+        let port = listener.local_addr().unwrap().port();
+        let running = LocalServices::new();
+        let handle = running.clone();
+        let service: ServiceId = "tls:late".parse().unwrap();
+        assert!(matches!(
+            running.open(&request("tls:late", 1)).await,
+            Err(OpenRefusal {
+                code: ErrorCode::UnknownService,
+                ..
+            })
+        ));
+        handle
+            .set_target(service.clone(), LocalTarget::new("127.0.0.1", port))
+            .unwrap();
+        assert_eq!(running.len(), 1);
+        let accept = tokio::spawn(async move { listener.accept().await.map(|_| ()) });
+        let opened = running.open(&request("tls:late", 1)).await.unwrap();
+        timeout(WAIT, accept).await.unwrap().unwrap().unwrap();
+        drop(opened);
+        // A kind or label that cannot be served is refused on a live handle as on a new one.
+        assert_eq!(
+            handle
+                .set_target("udp:x".parse().unwrap(), LocalTarget::new("h", 1))
+                .unwrap_err(),
+            ServeConfigError::UnsupportedKind(ServiceKind::Udp)
+        );
+        assert!(handle.remove_target(&service));
+        assert!(!handle.remove_target(&service), "already gone");
+        assert!(running.is_empty());
+        assert!(matches!(
+            running.open(&request("tls:late", 1)).await,
+            Err(OpenRefusal {
+                code: ErrorCode::UnknownService,
+                ..
+            })
+        ));
     }
 
     /// The same for a handler future that is dropped without ever running: the stream and the

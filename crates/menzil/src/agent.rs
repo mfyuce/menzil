@@ -53,6 +53,19 @@
 //!                   cert_token <menzil1-cert:...>   (one per line), then the connection ends
 //! ```
 //!
+//! Two requests manage the public shares of a running node (`menzil expose`, see [`crate::expose`]):
+//!
+//! ```text
+//! client -> agent   expose name=<label> mode=<blind|tcp> host=<host> port=<port> replace=<0|1> [alpn=<a,b>]\n
+//! client -> agent   unexpose <label>\n
+//! agent  -> client  error <message>\n      or
+//!                   ok\n, then lines: changed yes|no, share <fields>, note <text> (expose);
+//!                   service_removed yes|no, note <text> (unexpose); then the connection ends
+//! ```
+//!
+//! The `status` reply carries one `share <fields>` line per share too (the label, mode, service,
+//! local target, what the relay answered and its reason), up to 64.
+//!
 //! Both directions are framed because a clean end and an abnormal one must stay apart all the
 //! way to the program that uses the stream (protocol.md 5.2, "never with a clean end of
 //! file"), and a Unix socket cannot say it: closing it looks the same whether the program
@@ -79,6 +92,7 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::Semaphore;
 use tokio::time::timeout;
 
+use crate::expose::{ExposeReply, ExposeSpec, MAX_SHARE_LINES, ShareView, UnexposeReply};
 use crate::text;
 use crate::token::decode_cert_request;
 
@@ -106,6 +120,9 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const OPEN_TIMEOUT: Duration = Duration::from_secs(60);
 /// How long the agent spends renewing the node's certificate.
 const RENEW_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long the agent spends on an `expose` or `unexpose`: the wait for the config lock (ten
+/// seconds) and the write of the file.
+const EXPOSE_TIMEOUT: Duration = Duration::from_secs(15);
 /// How many connections the agent serves at once.
 const MAX_CONNECTIONS: usize = 256;
 
@@ -132,6 +149,28 @@ pub trait Opener: Send + Sync + 'static {
     /// the person at the other end of the socket.
     fn renew_cert(&self) -> impl Future<Output = Result<RenewedCert, String>> + Send {
         async { Err("this agent does not renew certificates".to_string()) }
+    }
+
+    /// The public shares of the node and what the relay says about each, for the `status`
+    /// request. An opener that has none says none.
+    fn shares(&self) -> impl Future<Output = Vec<ShareView>> + Send {
+        async { Vec::new() }
+    }
+
+    /// Exposes a local port under a public name, for the `expose` request: changes
+    /// `config.toml` and the running node. The error is a message for the person.
+    fn expose(&self, spec: ExposeSpec) -> impl Future<Output = Result<ExposeReply, String>> + Send {
+        let _ = spec;
+        async { Err("this agent does not manage shares".to_string()) }
+    }
+
+    /// Takes a share away, for the `unexpose` request.
+    fn unexpose(
+        &self,
+        label: String,
+    ) -> impl Future<Output = Result<UnexposeReply, String>> + Send {
+        let _ = label;
+        async { Err("this agent does not manage shares".to_string()) }
     }
 }
 
@@ -255,6 +294,8 @@ pub struct NodeStatus {
     pub relay: RelayStatus,
     /// Its certificate, when the agent said.
     pub cert: Option<CertStatus>,
+    /// Its public shares and what the relay said about each.
+    pub shares: Vec<ShareView>,
 }
 
 /// What the node knows about its relay, as the `status` request carries it. Every part is
@@ -591,6 +632,10 @@ async fn handle<O: Opener>(connection: UnixStream, opener: &O) -> Result<()> {
         if let Some(cert) = opener.cert_status().await {
             reply.push_str(&cert.to_lines());
         }
+        for share in opener.shares().await.iter().take(MAX_SHARE_LINES) {
+            reply.push_str(&share.to_line());
+            reply.push('\n');
+        }
         write.write_all(reply.as_bytes()).await?;
         return Ok(());
     }
@@ -602,6 +647,28 @@ async fn handle<O: Opener>(connection: UnixStream, opener: &O) -> Result<()> {
             ),
             Ok(Err(message)) => format!("error {}\n", error_line(&message)),
             Err(_) => "error the node did not renew the certificate in time\n".to_string(),
+        };
+        write.write_all(reply.as_bytes()).await?;
+        return Ok(());
+    }
+    let request = line.trim_end_matches(['\r', '\n']);
+    if request.starts_with("expose ") {
+        let reply = match ExposeSpec::parse_request_line(request) {
+            Err(message) => format!("error {}\n", error_line(&message)),
+            Ok(spec) => match timeout(EXPOSE_TIMEOUT, opener.expose(spec)).await {
+                Ok(Ok(done)) => format!("ok\n{}", done.to_lines()),
+                Ok(Err(message)) => format!("error {}\n", error_line(&message)),
+                Err(_) => "error the node did not change the share in time\n".to_string(),
+            },
+        };
+        write.write_all(reply.as_bytes()).await?;
+        return Ok(());
+    }
+    if let Some(label) = request.strip_prefix("unexpose ") {
+        let reply = match timeout(EXPOSE_TIMEOUT, opener.unexpose(label.trim().to_string())).await {
+            Ok(Ok(done)) => format!("ok\n{}", done.to_lines()),
+            Ok(Err(message)) => format!("error {}\n", error_line(&message)),
+            Err(_) => "error the node did not remove the share in time\n".to_string(),
         };
         write.write_all(reply.as_bytes()).await?;
         return Ok(());
@@ -831,8 +898,9 @@ where
 /// How long [`query_status`] waits for the agent to answer.
 const STATUS_TIMEOUT: Duration = Duration::from_secs(3);
 
-/// The most lines of a `status` reply a client reads.
-const MAX_STATUS_LINES: usize = 32;
+/// The most lines of a `status` reply a client reads: 32 for the relay and the certificate and
+/// one for each share the agent may list.
+const MAX_STATUS_LINES: usize = 32 + MAX_SHARE_LINES;
 
 /// Asks the agent at `socket` how the node stands with its relay. An error means there is no
 /// agent to ask (none is listening, another user serves the socket, it did not answer, or it
@@ -899,6 +967,11 @@ async fn query_node_status_as(socket: &Path, uid: u32) -> Result<NodeStatus> {
         Ok(NodeStatus {
             relay: RelayStatus::from_lines(&lines),
             cert: CertStatus::from_lines(&lines),
+            shares: lines
+                .iter()
+                .filter_map(|line| ShareView::from_line(line))
+                .take(MAX_SHARE_LINES)
+                .collect(),
         })
     })
     .await
@@ -1016,6 +1089,143 @@ async fn renew_cert_as(socket: &Path, uid: u32) -> Result<RenewedCert, RenewErro
     .await
     .map_err(|_| RenewError::Failed(anyhow!("the agent did not answer in time")))?
     .map_err(RenewError::Failed)
+}
+
+/// Why a request to manage shares did not get an answer from an agent.
+#[derive(Debug)]
+pub enum AskError {
+    /// Nothing listens at the socket (no node runs): the caller may edit `config.toml` itself.
+    NoAgent,
+    /// An agent answered and said no, or something went wrong after it was reached; the file
+    /// must not be changed behind the node's back.
+    Failed(anyhow::Error),
+}
+
+impl std::fmt::Display for AskError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoAgent => write!(f, "no agent is listening"),
+            Self::Failed(error) => write!(f, "{error:#}"),
+        }
+    }
+}
+
+/// The most lines of an `expose` or `unexpose` answer a client reads.
+const MAX_ANSWER_LINES: usize = 32;
+
+/// Sends one request line to the agent at `socket` and returns the lines after `ok`; an
+/// `error` line is the message of [`AskError::Failed`].
+async fn ask_lines(socket: &Path, request: &str, uid: u32) -> Result<Vec<String>, AskError> {
+    crate::node_cmd::check_socket_path_length(socket).map_err(AskError::Failed)?;
+    let connection = match UnixStream::connect(socket).await {
+        Ok(connection) => connection,
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
+            ) =>
+        {
+            return Err(AskError::NoAgent);
+        }
+        Err(error) => {
+            return Err(AskError::Failed(
+                anyhow::Error::new(error).context(format!("connecting to {}", socket.display())),
+            ));
+        }
+    };
+    timeout(EXPOSE_TIMEOUT + Duration::from_secs(5), async {
+        let served_by = connection
+            .peer_cred()
+            .context("asking who runs the agent")?
+            .uid();
+        if served_by != uid {
+            bail!(
+                "the socket {} is served by another user; nothing was sent to it",
+                socket.display()
+            );
+        }
+        let (read, mut write) = connection.into_split();
+        let mut read = BufReader::new(read);
+        write.write_all(format!("{request}\n").as_bytes()).await?;
+        let first = read_line(&mut read, MAX_REPLY_BYTES)
+            .await?
+            .ok_or_else(|| anyhow!("the agent closed the connection without answering"))?;
+        let first = first.trim_end();
+        if let Some(message) = first.strip_prefix("error ") {
+            bail!("{}", error_line(message));
+        }
+        if first != "ok" {
+            bail!(
+                "the agent answered something this client does not understand (an older node that predates `expose`?)"
+            );
+        }
+        let mut lines = Vec::new();
+        while lines.len() < MAX_ANSWER_LINES {
+            let Some(line) = read_line_lenient(&mut read, MAX_REPLY_BYTES).await? else {
+                break;
+            };
+            if let Line::Text(line) = line {
+                lines.push(line.trim_end_matches(['\r', '\n']).to_string());
+            }
+        }
+        Ok(lines)
+    })
+    .await
+    .map_err(|_| AskError::Failed(anyhow!("the agent did not answer in time")))?
+    .map_err(AskError::Failed)
+}
+
+/// Asks the node behind `socket` to expose `spec` (`menzil expose`): it changes `config.toml`
+/// and serves and advertises the share at once. [`AskError::NoAgent`] when nothing listens.
+pub async fn request_expose(socket: &Path, spec: &ExposeSpec) -> Result<ExposeReply, AskError> {
+    let uid = current_uid()
+        .await
+        .context("finding out which user this is")
+        .map_err(AskError::Failed)?;
+    request_expose_as(socket, spec, uid).await
+}
+
+/// [`request_expose`] for a client that expects the agent to run as `uid`.
+async fn request_expose_as(
+    socket: &Path,
+    spec: &ExposeSpec,
+    uid: u32,
+) -> Result<ExposeReply, AskError> {
+    let line = spec.to_request_line();
+    if line.len() >= MAX_REQUEST_BYTES {
+        return Err(AskError::Failed(anyhow!(
+            "the request is longer than the agent takes ({MAX_REQUEST_BYTES} bytes): fewer or shorter --alpn values"
+        )));
+    }
+    let lines = ask_lines(socket, &line, uid).await?;
+    ExposeReply::from_lines(&lines).map_err(AskError::Failed)
+}
+
+/// Asks the node behind `socket` to take the share `label` away (`menzil expose remove`).
+pub async fn request_unexpose(socket: &Path, label: &str) -> Result<UnexposeReply, AskError> {
+    let uid = current_uid()
+        .await
+        .context("finding out which user this is")
+        .map_err(AskError::Failed)?;
+    request_unexpose_as(socket, label, uid).await
+}
+
+/// [`request_unexpose`] for a client that expects the agent to run as `uid`.
+async fn request_unexpose_as(
+    socket: &Path,
+    label: &str,
+    uid: u32,
+) -> Result<UnexposeReply, AskError> {
+    if label.is_empty()
+        || label.len() > 253
+        || label.chars().any(|c| c.is_control() || c.is_whitespace())
+    {
+        return Err(AskError::Failed(anyhow!(
+            "a share label is one lowercase letters, digits and hyphens name"
+        )));
+    }
+    let lines = ask_lines(socket, &format!("unexpose {label}"), uid).await?;
+    Ok(UnexposeReply::from_lines(&lines))
 }
 
 /// How the input side of [`connect_and_bridge`] ended.

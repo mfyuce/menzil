@@ -10,6 +10,7 @@
 //!                                         so the pair is replaced atomically)
 //! <home>/owner/<id>.key            32 secret bytes: the owner key of a network (0600)
 //! <home>/node.lock                 held by a running `menzil node`: one per home
+//! <home>/config.lock               held while `menzil expose` (or the node) changes config.toml
 //! <home>/networks/<id>/.lock       held while a command changes that network's documents
 //! ```
 //!
@@ -252,6 +253,29 @@ impl Home {
                 dir.display()
             )
         })
+    }
+
+    /// Takes the lock that serializes changes to `config.toml`: `menzil expose` reads the file,
+    /// edits it and writes it back, and a running node reads it to reload its shares, so two of
+    /// them at once could lose an edit (or apply a half known one). Waits for the other, up to
+    /// ten seconds. The file itself is never locked, so a person's editor is not held up.
+    pub fn lock_config(&self) -> Result<FileLock> {
+        create_private_dirs(&self.root)?;
+        lock_file(&self.root.join("config.lock"), LOCK_WAIT).with_context(|| {
+            format!(
+                "another menzil command is changing {}; try again in a moment",
+                self.config_path().display()
+            )
+        })
+    }
+
+    /// Writes `config.toml` atomically, readable by its owner only (it may hold a proxy
+    /// password). A `config.toml` that is a symbolic link (dotfiles kept in a repository) is
+    /// written through, so the link stays a link. The caller holds [`Self::lock_config`].
+    pub fn write_config(&self, bytes: &[u8]) -> Result<()> {
+        let path = self.config_path();
+        let target = fs::canonicalize(&path).unwrap_or(path);
+        write_atomically(&target, bytes, true)
     }
 
     /// Takes the lock a running `menzil node` holds: two nodes with one identity would displace

@@ -1389,3 +1389,268 @@ fn a_certificate_status_line_that_is_off_is_skipped_not_believed() {
     assert_eq!(CertStatus::from_lines(&["cert_serial 4".to_string()]), None);
     assert_eq!(CertStatus::from_lines(&[]), None);
 }
+
+// ---- shares (S-E7): `expose`, `unexpose`, and the share lines of `status` ----
+
+use crate::expose::{ExposeMode, ShareState};
+
+fn a_spec(label: &str) -> ExposeSpec {
+    ExposeSpec {
+        label: label.to_string(),
+        mode: ExposeMode::Tcp,
+        host: "::1".to_string(),
+        port: 8443,
+        alpn: vec!["h2".to_string()],
+        replace: true,
+    }
+}
+
+fn a_view(label: &str) -> ShareView {
+    ShareView {
+        label: label.to_string(),
+        mode: "tcp".to_string(),
+        service: format!("tcp:{label}"),
+        target: Some("[::1]:8443".to_string()),
+        alpn: vec!["h2".to_string()],
+        state: ShareState::Accepted,
+        names: vec![label.to_string(), format!("{label}.ali")],
+        reason: None,
+    }
+}
+
+/// An opener that records what it is asked to expose and answers as prepared.
+struct Sharer {
+    views: Vec<ShareView>,
+    exposed: Mutex<Vec<ExposeSpec>>,
+    removed: Mutex<Vec<String>>,
+    refuse: Option<String>,
+}
+
+fn sharer(views: Vec<ShareView>, refuse: Option<&str>) -> Arc<Sharer> {
+    Arc::new(Sharer {
+        views,
+        exposed: Mutex::new(Vec::new()),
+        removed: Mutex::new(Vec::new()),
+        refuse: refuse.map(str::to_string),
+    })
+}
+
+impl Opener for Sharer {
+    async fn open(&self, _target: &str) -> Result<Stream, String> {
+        Err("no streams here".to_string())
+    }
+    async fn shares(&self) -> Vec<ShareView> {
+        self.views.clone()
+    }
+    async fn expose(&self, spec: ExposeSpec) -> Result<ExposeReply, String> {
+        self.exposed.lock().unwrap().push(spec.clone());
+        match &self.refuse {
+            Some(why) => Err(why.clone()),
+            None => Ok(ExposeReply {
+                changed: true,
+                share: a_view(&spec.label),
+                notes: vec!["one note".to_string()],
+            }),
+        }
+    }
+    async fn unexpose(&self, label: String) -> Result<UnexposeReply, String> {
+        self.removed.lock().unwrap().push(label);
+        match &self.refuse {
+            Some(why) => Err(why.clone()),
+            None => Ok(UnexposeReply {
+                notes: vec!["kept tcp:ssh".to_string()],
+                service_removed: true,
+            }),
+        }
+    }
+}
+
+#[tokio::test]
+async fn an_expose_request_reaches_the_node_whole_and_its_answer_comes_back() {
+    let opener = sharer(vec![], None);
+    let spec = a_spec("app");
+    let reply = with_agent(opener.clone(), async |socket, uid| {
+        request_expose_as(socket, &spec, uid).await
+    })
+    .await
+    .unwrap();
+    assert_eq!(opener.exposed.lock().unwrap().as_slice(), [spec]);
+    assert!(reply.changed);
+    assert_eq!(reply.share, a_view("app"));
+    assert_eq!(reply.notes, ["one note"]);
+
+    let gone = with_agent(opener.clone(), async |socket, uid| {
+        request_unexpose_as(socket, "app", uid).await
+    })
+    .await
+    .unwrap();
+    assert_eq!(opener.removed.lock().unwrap().as_slice(), ["app"]);
+    assert!(gone.service_removed);
+    assert_eq!(gone.notes, ["kept tcp:ssh"]);
+}
+
+#[tokio::test]
+async fn a_refusal_of_the_node_comes_back_as_one_line_and_a_bad_request_never_reaches_it() {
+    let opener = sharer(vec![], Some("it said no\nsecond line"));
+    let error = with_agent(opener.clone(), async |socket, uid| {
+        request_expose_as(socket, &a_spec("app"), uid).await
+    })
+    .await
+    .unwrap_err();
+    match error {
+        AskError::Failed(e) => {
+            let shown = format!("{e:#}");
+            assert!(
+                shown.contains("it said no") && !shown.contains('\n'),
+                "{shown:?}"
+            );
+        }
+        AskError::NoAgent => panic!("an agent answered"),
+    }
+    let error = with_agent(opener.clone(), async |socket, uid| {
+        request_unexpose_as(socket, "app", uid).await
+    })
+    .await
+    .unwrap_err();
+    assert!(matches!(error, AskError::Failed(ref e) if format!("{e:#}").contains("it said no")));
+
+    // A request line the agent cannot parse is answered by the agent itself.
+    let untouched = sharer(vec![], None);
+    for (line, wanted) in [
+        ("expose name=a bogus", "key=value"),
+        (
+            "expose name=a mode=blind host=h port=1 replace=0 evil=1",
+            "unknown field",
+        ),
+        (
+            "expose name=a mode=blind host=h port=99999 replace=0",
+            "port",
+        ),
+    ] {
+        let reply = with_agent(untouched.clone(), async |socket, _uid| {
+            let mut connection = UnixStream::connect(socket).await.unwrap();
+            connection
+                .write_all(format!("{line}\n").as_bytes())
+                .await
+                .unwrap();
+            let mut reply = String::new();
+            connection.read_to_string(&mut reply).await.unwrap();
+            reply
+        })
+        .await;
+        assert!(
+            reply.starts_with("error ") && reply.contains(wanted),
+            "{line}: {reply}"
+        );
+    }
+    assert!(untouched.exposed.lock().unwrap().is_empty());
+
+    // An agent that does not manage shares says so; a request too long for the agent is not sent.
+    struct Plain;
+    impl Opener for Plain {
+        async fn open(&self, _target: &str) -> Result<Stream, String> {
+            Err("no".to_string())
+        }
+    }
+    let error = with_agent(Arc::new(Plain), async |socket, uid| {
+        request_expose_as(socket, &a_spec("app"), uid).await
+    })
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(error, AskError::Failed(ref e) if format!("{e:#}").contains("does not manage shares"))
+    );
+    let mut long = a_spec("app");
+    long.alpn = (0..60).map(|n| format!("protocol-{n:04}")).collect();
+    let dir = tempfile::tempdir().unwrap();
+    let uid = current_uid().await.unwrap();
+    let error = request_expose_as(&dir.path().join("none.sock"), &long, uid)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, AskError::Failed(ref e) if format!("{e:#}").contains("longer than the agent takes"))
+    );
+    // A label with a space or a newline does not become two requests.
+    let error = request_unexpose_as(&dir.path().join("none.sock"), "a\nstatus", uid)
+        .await
+        .unwrap_err();
+    assert!(matches!(error, AskError::Failed(_)), "{error}");
+}
+
+#[tokio::test]
+async fn nothing_listening_is_no_agent_for_the_share_requests_too() {
+    let dir = tempfile::tempdir().unwrap();
+    let uid = current_uid().await.unwrap();
+    let missing = dir.path().join("none.sock");
+    assert!(matches!(
+        request_expose_as(&missing, &a_spec("a"), uid).await,
+        Err(AskError::NoAgent)
+    ));
+    assert!(matches!(
+        request_unexpose_as(&missing, "a", uid).await,
+        Err(AskError::NoAgent)
+    ));
+    let stale = dir.path().join("stale.sock");
+    drop(UnixListener::bind(&stale).unwrap());
+    assert!(matches!(
+        request_expose_as(&stale, &a_spec("a"), uid).await,
+        Err(AskError::NoAgent)
+    ));
+}
+
+#[tokio::test]
+async fn the_status_reply_carries_the_shares_and_at_most_sixty_four() {
+    let views: Vec<ShareView> = (0..70).map(|n| a_view(&format!("s{n}"))).collect();
+    let opener = sharer(views.clone(), None);
+    let got = with_agent(opener, async |socket, uid| {
+        query_node_status_as(socket, uid).await
+    })
+    .await
+    .unwrap();
+    assert_eq!(got.shares.len(), MAX_SHARE_LINES);
+    assert_eq!(got.shares[0], views[0]);
+    assert_eq!(got.shares[63], views[63]);
+    // An opener with no shares says none, and the relay part is as before.
+    let got = with_agent(certs(Err("x".into()), None), async |socket, uid| {
+        query_node_status_as(socket, uid).await
+    })
+    .await
+    .unwrap();
+    assert!(got.shares.is_empty());
+}
+
+/// An agent that lies: lines that are not shares, a share with a hostile reason, a line past the
+/// limit. The client keeps what is well formed and shows nothing unprintable.
+#[tokio::test]
+async fn a_status_with_hostile_share_lines_yields_only_the_well_formed_ones() {
+    let mut reply = b"attached yes\nshare label=ok mode=blind service=tls:ok state=rejected reason=bad\x1b[31m red\n".to_vec();
+    reply.extend_from_slice(b"share label=Bad mode=blind service=tls:x state=accepted\n");
+    reply.extend_from_slice(b"share \xff\xfe\n");
+    reply.extend_from_slice(
+        b"share label=two mode=tcp service=tcp:two state=pending names=a.b,evil\x1b\n",
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("raw.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let uid = current_uid().await.unwrap();
+    let agent = tokio::spawn(async move {
+        let (mut connection, _) = listener.accept().await.unwrap();
+        let mut request = [0u8; 64];
+        let _ = connection.read(&mut request).await;
+        let _ = connection.write_all(&reply).await;
+    });
+    let got = timeout(WAIT, query_node_status_as(&socket, uid))
+        .await
+        .unwrap()
+        .unwrap();
+    agent.await.unwrap();
+    assert_eq!(got.shares.len(), 2, "{:?}", got.shares);
+    assert_eq!(got.shares[0].label, "ok");
+    assert_eq!(got.shares[0].state, ShareState::Rejected);
+    let reason = got.shares[0].reason.as_deref().unwrap();
+    assert!(
+        !reason.contains('\u{1b}') && reason.contains("red"),
+        "{reason:?}"
+    );
+    assert_eq!(got.shares[1].names, ["a.b"]);
+}
