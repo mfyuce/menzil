@@ -407,6 +407,8 @@ impl Relay {
             .front_door
             .as_ref()
             .map(|front| FrontDoor::new(self, (**front).clone()));
+        // Holder entries follow the Rosters for as long as the relay serves.
+        let _grants = AbortOnDrop(self.watch_grants());
         // Port 80 lives as long as this future does.
         let _http = match (&front, http) {
             (Some(front), Some(http)) => Some(AbortOnDrop(tokio::spawn(
@@ -473,6 +475,25 @@ impl Relay {
         }
     }
 
+    /// Starts the task that, on every change of a held Roster, drops the label holders whose
+    /// grant is gone ([`LabelRegistry::release_ungranted`], expose round 2, M1). A subscriber
+    /// that fell behind runs the same pass: it judges the state now held, not each notice.
+    pub(crate) fn watch_grants(&self) -> tokio::task::JoinHandle<()> {
+        use tokio::sync::broadcast::error::RecvError;
+        let mut changes = self.rosters.subscribe();
+        let relay = self.clone();
+        tokio::spawn(async move {
+            loop {
+                match changes.recv().await {
+                    Ok(_) | Err(RecvError::Lagged(_)) => {
+                        relay.labels.release_ungranted(&relay.rosters, unix_secs());
+                    }
+                    Err(RecvError::Closed) => return,
+                }
+            }
+        })
+    }
+
     /// The path of the relay's own host name for a connection the front door read the
     /// ClientHello of: the handshake permit, a session number, then [`Self::handshake_and_serve`].
     /// Over the handshake cap the connection is dropped, as on the plain path.
@@ -528,6 +549,12 @@ pub(crate) struct Accepting {
     pub(crate) slots: Arc<Semaphore>,
     pub(crate) upgrader: Arc<Upgrader>,
     pub(crate) timeout: Duration,
+}
+
+fn unix_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
 }
 
 /// Aborts its task when dropped.

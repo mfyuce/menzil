@@ -57,9 +57,10 @@ pub use endpoint::{InboundFrame, RelayEndpoint};
 pub use error::RelayError;
 pub use forward::RelaySendOutcome;
 pub use front_door::{
-    FRONT_DOOR_FAILURE_DELAY, FRONT_DOOR_IDLE_TIMEOUT, FRONT_DOOR_MAX_ANSWERS,
-    FRONT_DOOR_MAX_TOTAL, FRONT_DOOR_PER_NAME, FRONT_DOOR_PER_TENANT, FrontDoorConfig,
-    FrontDoorConfigError,
+    FRONT_DOOR_FAILURE_DELAY, FRONT_DOOR_FIRST_BYTE_TIMEOUT, FRONT_DOOR_IDLE_TIMEOUT,
+    FRONT_DOOR_MAX_ANSWERS, FRONT_DOOR_MAX_TOTAL, FRONT_DOOR_PER_CLIENT,
+    FRONT_DOOR_PER_CLIENT_PER_NAME, FRONT_DOOR_PER_NAME, FRONT_DOOR_PER_TENANT,
+    FRONT_DOOR_V6_48_FACTOR, FrontDoorConfig, FrontDoorConfigError,
 };
 pub use hello::{HelloRejection, check_hello};
 pub use identity::RelayIdentity;

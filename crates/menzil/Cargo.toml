@@ -27,7 +27,7 @@ menzil-stream = { path = "../menzil-stream" }
 futures-util = { version = "0.3.34", default-features = false, features = ["std", "io"] }
 menzil-proto = { path = "../menzil-proto" }
 rustls = { workspace = true }
-rustix = { version = "1", default-features = false, features = ["std", "stdio"] }
+rustix = { version = "1", default-features = false, features = ["std", "stdio", "process"] }
 serde = { workspace = true }
 socket2 = { workspace = true }
 thiserror = { workspace = true }

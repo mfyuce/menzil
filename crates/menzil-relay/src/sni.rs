@@ -242,7 +242,12 @@ fn parse_server_name(data: &[u8]) -> Result<String, Invalid> {
     while l.rest() > 0 {
         let name_type = l.u8().ok_or(bad)?;
         let name = l.vec16().ok_or(bad)?;
-        if name_type == NAME_TYPE_HOST && host.replace(name).is_some() {
+        if name_type != NAME_TYPE_HOST {
+            // An entry of another type: rustls and OpenSSL refuse such a hello, so a name read
+            // from it could be routed on here and refused (or read differently) by the node.
+            return Err(bad);
+        }
+        if host.replace(name).is_some() {
             // Two names: the relay and the node could pick different ones.
             return Err(bad);
         }
@@ -711,14 +716,24 @@ mod tests {
             )),
             Parsed::Invalid(Invalid::Malformed)
         );
-        // An unknown name type next to a host_name is skipped.
-        let mixed = server_name_ext(&[(7, b"ignored"), (0, b"a.example.test")]);
-        assert_eq!(
-            hello_of(&records(&handshake(&body(Some(&mixed))), 16_384))
-                .sni
-                .as_deref(),
-            Some("a.example.test")
-        );
+    }
+
+    /// Expose round 2, N1: an entry of a name type other than host_name makes the hello
+    /// malformed, wherever it stands (rustls and OpenSSL refuse it; this used to skip it and
+    /// route on a later host_name). Changes the earlier test that skipped it, on purpose.
+    #[test]
+    fn a_name_type_other_than_host_name_is_malformed_before_or_after_the_host_name() {
+        for entries in [
+            [(7u8, &b"ignored"[..]), (0, b"a.example.test")],
+            [(0, b"a.example.test"), (7, b"ignored")],
+        ] {
+            let ext = server_name_ext(&entries);
+            assert_eq!(
+                parse(&records(&handshake(&body(Some(&ext))), 16_384)),
+                Parsed::Invalid(Invalid::Malformed),
+                "{entries:?}"
+            );
+        }
     }
 
     #[test]

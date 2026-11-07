@@ -91,6 +91,9 @@ struct StandingIndex {
     members: HashMap<NodeId, Option<u32>>,
     /// Every NodeId in `revoked`.
     revoked: HashSet<NodeId>,
+    /// Every `(lowercase label, NodeId)` pair of `labels`, so that "does this Roster grant this
+    /// label to this node" is one hash lookup (the front door asks it for every connection).
+    granted: HashSet<(String, NodeId)>,
 }
 
 impl StandingIndex {
@@ -110,6 +113,11 @@ impl StandingIndex {
         Self {
             members,
             revoked: body.revoked.iter().map(|r| r.node_id).collect(),
+            granted: body
+                .labels
+                .iter()
+                .map(|label| (label.name.to_ascii_lowercase(), label.node_id))
+                .collect(),
         }
     }
 }
@@ -577,6 +585,22 @@ impl RosterStore {
             }
         }
         granted
+    }
+
+    /// Whether the Roster held now for `network` grants `label` (any case) to `node`, which must
+    /// be an unrevoked member of it: the same test [`Self::labels_granted_by`] applies, for one
+    /// name. `false` if no Roster of the network is held. The front door asks it for every
+    /// public connection (a label the owner moved or dropped stops routing at once) and the
+    /// registry asks it for every holder when a Roster changes.
+    pub fn label_granted(&self, network: &NetworkId, node: &NodeId, label: &str) -> bool {
+        let guard = self.by_network.read().unwrap();
+        guard.get(network).is_some_and(|held| {
+            held.index.is_unrevoked_member(node)
+                && held
+                    .index
+                    .granted
+                    .contains(&(label.to_ascii_lowercase(), *node))
+        })
     }
 
     /// Every label any held Roster lists (for any node), lowercase, with the networks that list

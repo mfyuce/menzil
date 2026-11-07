@@ -2380,3 +2380,51 @@ async fn a_relay_with_a_share_domain_refuses_unknown_names_and_serves_port_80_on
     );
     running.stop();
 }
+
+/// Expose round 2, L3: the soft file descriptor limit goes to the hard one (never past the
+/// ceiling), and a limit that stays below the front door's budget is flagged.
+#[test]
+fn the_file_descriptor_plan_raises_to_the_hard_limit_and_flags_a_shortfall() {
+    let need = 7_168;
+    // The systemd default soft limit, a roomy hard one: raised, enough.
+    assert_eq!(
+        nofile_plan(1_024, 524_288, need),
+        NofilePlan {
+            raise_to: Some(524_288),
+            short: false
+        }
+    );
+    // A hard limit that is itself too low: raised to it, still short.
+    assert_eq!(
+        nofile_plan(1_024, 4_096, need),
+        NofilePlan {
+            raise_to: Some(4_096),
+            short: true
+        }
+    );
+    // Already at the hard limit: nothing to set; short or not by its own figure.
+    assert_eq!(
+        nofile_plan(4_096, 4_096, need),
+        NofilePlan {
+            raise_to: None,
+            short: true
+        }
+    );
+    assert_eq!(
+        nofile_plan(65_536, 65_536, need),
+        NofilePlan {
+            raise_to: None,
+            short: false
+        }
+    );
+    // Soft above the need already, hard higher: still raised (to the hard one), not short.
+    assert_eq!(nofile_plan(8_192, 16_384, need).raise_to, Some(16_384));
+    // An unlimited hard limit is not set as such; the ceiling is.
+    assert_eq!(
+        nofile_plan(1_024, u64::MAX, need).raise_to,
+        Some(NOFILE_CEILING)
+    );
+    // The exact budget is enough, one less is not.
+    assert!(!nofile_plan(need, need, need).short);
+    assert!(nofile_plan(need - 1, need - 1, need).short);
+}

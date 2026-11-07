@@ -116,13 +116,13 @@ impl Default for AdmissionLimits {
 /// What is counted for one peer: an IPv4 address, or the /64 of an IPv6 one (an IPv4 mapped
 /// IPv6 address counts as the IPv4 address).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-enum PeerKey {
+pub(crate) enum PeerKey {
     V4([u8; 4]),
     V6Prefix([u8; 8]),
 }
 
 impl PeerKey {
-    fn of(ip: IpAddr) -> Self {
+    pub(crate) fn of(ip: IpAddr) -> Self {
         match ip {
             IpAddr::V4(v4) => PeerKey::V4(v4.octets()),
             IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
@@ -135,7 +135,7 @@ impl PeerKey {
 
 impl PeerKey {
     /// The IPv6 /48 this peer is in, for the handshake cap; `None` for an IPv4 peer.
-    fn prefix48(self) -> Option<[u8; 6]> {
+    pub(crate) fn prefix48(self) -> Option<[u8; 6]> {
         match self {
             PeerKey::V4(_) => None,
             PeerKey::V6Prefix(prefix) => {

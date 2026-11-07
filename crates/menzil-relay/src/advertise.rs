@@ -556,6 +556,36 @@ impl LabelRegistry {
         guard.notify(changed);
     }
 
+    /// Drops every holder entry whose grant is gone: the Roster now held for the network of the
+    /// name's record no longer lists the label for the holder (dropped, given to another node,
+    /// the node revoked or unlisted, or no Roster of the network held at all). The relay runs it
+    /// on every Roster change ([`crate::Relay`] watches [`RosterStore::subscribe`]), so that a
+    /// label the owner moved stops routing public traffic to the old holder and the new
+    /// grantee's claim is no longer refused `label_taken` (expose round 2, M1). Like
+    /// [`Self::clear_for`] the name is stamped as advertised at `now`: its release clock starts
+    /// when its holder loses it. The holder's session is not touched, and nothing here makes it
+    /// claim again: it does so with its next ADVERTISE, which the Roster decides afresh.
+    /// Returns how many entries were dropped.
+    pub fn release_ungranted(&self, rosters: &RosterStore, now: u64) -> usize {
+        let mut guard = self.lock();
+        let Inner { holders, state, .. } = &mut *guard;
+        let mut changed = false;
+        let before = holders.len();
+        holders.retain(|full, node| {
+            let granted = state.names.get(full).is_some_and(|record| {
+                let label = full.split('.').next().unwrap_or(full);
+                rosters.label_granted(&record.network, node, label)
+            });
+            if !granted {
+                changed |= state.touch(full, now);
+            }
+            granted
+        });
+        let dropped = before - holders.len();
+        guard.notify(changed);
+        dropped
+    }
+
     /// The relay no longer serves `network` (the operator removed it; the caller has removed it
     /// from `rosters` already): every name its Roster granted is released at `now`; a flat one
     /// is quarantined for 180 days, bound to the network, a name in a tenant's zone is simply

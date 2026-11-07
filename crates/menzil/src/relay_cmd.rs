@@ -311,6 +311,100 @@ pub struct FrontDoorOptions {
     pub http_listen: Option<SocketAddr>,
 }
 
+/// The soft `RLIMIT_NOFILE` is never raised above this (Linux refuses a limit over
+/// `fs.nr_open`, 1,048,576 by default, and a hard limit of "unlimited" is no figure to set).
+const NOFILE_CEILING: u64 = 1_048_576;
+
+/// What to do about `RLIMIT_NOFILE` for a front door that may hold `need` descriptors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NofilePlan {
+    /// The soft limit to set, or `None` to leave it (it is at the hard limit or the ceiling).
+    pub raise_to: Option<u64>,
+    /// Whether the limit, after the raise, is still below `need`.
+    pub short: bool,
+}
+
+/// Decides from the soft and hard limits (`u64::MAX` for none) and the `need`: raise the soft
+/// limit to the hard one (at most [`NOFILE_CEILING`]), and flag a limit that stays below `need`.
+pub fn nofile_plan(soft: u64, hard: u64, need: u64) -> NofilePlan {
+    let target = hard.min(NOFILE_CEILING);
+    let raise_to = (target > soft).then_some(target);
+    let after = raise_to.unwrap_or(soft);
+    NofilePlan {
+        raise_to,
+        short: after < need,
+    }
+}
+
+/// The soft and hard `RLIMIT_NOFILE` of this process; `u64::MAX` for none. `None` where it
+/// cannot be read.
+#[cfg(unix)]
+fn read_nofile() -> Option<(u64, u64)> {
+    let limit = rustix::process::getrlimit(rustix::process::Resource::Nofile);
+    Some((
+        limit.current.unwrap_or(u64::MAX),
+        limit.maximum.unwrap_or(u64::MAX),
+    ))
+}
+
+#[cfg(not(unix))]
+fn read_nofile() -> Option<(u64, u64)> {
+    None
+}
+
+/// Sets the soft limit to `soft`, keeping the hard one.
+#[cfg(unix)]
+fn write_nofile(soft: u64, hard: u64) -> bool {
+    let maximum = (hard != u64::MAX).then_some(hard);
+    rustix::process::setrlimit(
+        rustix::process::Resource::Nofile,
+        rustix::process::Rlimit {
+            current: Some(soft),
+            maximum,
+        },
+    )
+    .is_ok()
+}
+
+#[cfg(not(unix))]
+fn write_nofile(_soft: u64, _hard: u64) -> bool {
+    false
+}
+
+/// With a front door the relay can hold thousands of descriptors for the public (see
+/// [`FrontDoorConfig::fd_budget`]); a soft limit of 1,024 (the usual default) would make
+/// `accept` fail at the figures. Raises the soft limit to the hard one and warns if the result
+/// is still below the budget (expose round 2, L3).
+fn raise_nofile_for(config: &FrontDoorConfig, http: bool) {
+    let need = u64::try_from(config.fd_budget(http)).unwrap_or(u64::MAX);
+    let Some((soft, hard)) = read_nofile() else {
+        return;
+    };
+    let plan = nofile_plan(soft, hard, need);
+    let mut now = soft;
+    if let Some(target) = plan.raise_to {
+        if write_nofile(target, hard) {
+            now = target;
+        } else {
+            tracing::warn!(
+                soft,
+                target,
+                "could not raise the soft file descriptor limit"
+            );
+        }
+    }
+    if now < need {
+        tracing::warn!(
+            limit = now,
+            need,
+            "the file descriptor limit is below what the front door may hold; at its figures the relay stops accepting connections, its nodes' included (raise LimitNOFILE or `ulimit -n`)"
+        );
+        eprintln!(
+            "warning: the file descriptor limit ({now}) is below the {need} the front door may hold; raise LimitNOFILE (systemd) or `ulimit -n`"
+        );
+    }
+}
+
 /// How long a clean stop waits for the keeper to write the last Roster adopted over DOC.
 pub const STOP_GRACE: std::time::Duration = std::time::Duration::from_secs(3);
 
@@ -495,6 +589,7 @@ pub async fn start_with(
         .transpose()?;
     let mut relay = Relay::new(identity, LIMITS);
     if let Some(config) = front_door {
+        raise_nofile_for(&config, http.is_some());
         relay = relay.with_front_door(config);
     }
     relay.set_tenants(book);

@@ -74,7 +74,7 @@ use std::collections::HashMap;
 use std::io;
 use std::net::SocketAddr;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::task::{Context, Poll};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -88,7 +88,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Semaphore;
 use tokio::time::Instant;
 
-use crate::admission::IpSlot;
+use crate::admission::{IpSlot, PeerKey};
 use crate::advertise::HeldName;
 use crate::prefixed::PrefixedTcp;
 use crate::principal::Principal;
@@ -124,6 +124,18 @@ pub const FRONT_DOOR_PER_TENANT: usize = 256;
 /// nobody reads (the principal's measurement), so the default is about 1.2 GiB at the worst.
 pub const FRONT_DOOR_MAX_TOTAL: usize = 4_096;
 
+/// Public connections one client (an IPv4 address or an IPv6 /64) may hold to one name at once.
+pub const FRONT_DOOR_PER_CLIENT_PER_NAME: usize = 8;
+/// Public share connections one client may hold at once in all, whatever the names.
+pub const FRONT_DOOR_PER_CLIENT: usize = 32;
+/// How many clients' worth of [`FRONT_DOOR_PER_CLIENT`] one IPv6 /48 may hold at once (a /48
+/// holds 65,536 /64s, each a client of its own above, so a /48 needs a figure of its own).
+pub const FRONT_DOOR_V6_48_FACTOR: usize = 4;
+/// A piped connection that has not had a byte from the node is ended after this long, as a whole
+/// and as silence (the node answers a ClientHello at once; a connection nothing answers is held
+/// for nothing).
+pub const FRONT_DOOR_FIRST_BYTE_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// How long the refusal's bytes may take to be accepted by the peer's socket.
 const REFUSAL_WRITE: Duration = Duration::from_secs(1);
 /// How long a refused peer's remaining bytes are read and discarded after the refusal, so that
@@ -155,6 +167,14 @@ pub struct FrontDoorConfig {
     pub per_tenant: usize,
     /// Connections to shares at once in all.
     pub max_total: usize,
+    /// Connections one client (an IPv4 address, an IPv6 /64) may hold to one name at once.
+    pub per_client_per_name: usize,
+    /// Connections one client may hold to shares at once in all.
+    pub per_client: usize,
+    /// Connections one IPv6 /48 may hold to shares at once in all.
+    pub per_v6_48: usize,
+    /// The longest a piped connection may live, or be silent, before the node sent a byte.
+    pub first_byte_timeout: Duration,
 }
 
 /// A host name or share domain that is not a plain ASCII DNS name.
@@ -170,7 +190,7 @@ pub struct FrontDoorConfigError {
 impl FrontDoorConfig {
     /// A front door for the relay whose own host name is `own_host` (the name its nodes dial
     /// and its certificate covers) serving the share domain `share_domain` (`H`). Both are
-    /// lowercased. The two may not be equal.
+    /// lowercased. The two may not be equal, and the host name may not lie under `H`.
     pub fn new(own_host: &str, share_domain: &str) -> Result<Self, FrontDoorConfigError> {
         let own = normalize_host(own_host.as_bytes()).ok_or_else(|| FrontDoorConfigError {
             what: "the relay's host name",
@@ -187,6 +207,15 @@ impl FrontDoorConfig {
                 name: share_domain.to_string(),
             });
         }
+        if own.ends_with(&format!(".{share}")) {
+            // The relay's own name inside the share domain could be claimed as a share label by a
+            // member (and its port 80 challenges would go to that member): not a setup to start
+            // (expose round 2, L1).
+            return Err(FrontDoorConfigError {
+                what: "the relay's host name, under the share domain,",
+                name: own_host.to_string(),
+            });
+        }
         Ok(Self {
             own_host: own,
             share_domain: share,
@@ -198,7 +227,23 @@ impl FrontDoorConfig {
             per_name: FRONT_DOOR_PER_NAME,
             per_tenant: FRONT_DOOR_PER_TENANT,
             max_total: FRONT_DOOR_MAX_TOTAL,
+            per_client_per_name: FRONT_DOOR_PER_CLIENT_PER_NAME,
+            per_client: FRONT_DOOR_PER_CLIENT,
+            per_v6_48: FRONT_DOOR_PER_CLIENT * FRONT_DOOR_V6_48_FACTOR,
+            first_byte_timeout: FRONT_DOOR_FIRST_BYTE_TIMEOUT,
         })
+    }
+
+    /// The most file descriptors the front door's unauthenticated and piped work can hold at
+    /// once: connections reading a ClientHello (`max_peeks`), the same on port 80 if it is
+    /// served (`http`), refusals in flight (`max_answers`) and piped share connections
+    /// (`max_total`). A relay whose `RLIMIT_NOFILE` is below this accepts nothing further when
+    /// the figures are reached (`accept` fails with `EMFILE`), members' reconnects included.
+    pub fn fd_budget(&self, http: bool) -> usize {
+        let peeks = self.max_peeks.saturating_mul(if http { 2 } else { 1 });
+        peeks
+            .saturating_add(self.max_answers)
+            .saturating_add(self.max_total)
     }
 
     /// The relay's own host name, lowercase.
@@ -261,6 +306,29 @@ impl FrontDoorConfig {
         self.max_total = max;
         self
     }
+
+    /// With `per_name` connections of one client to one name, `per_client` of one client in all
+    /// and `per_v6_48` of one IPv6 /48 in all (a client is an IPv4 address or an IPv6 /64).
+    #[must_use]
+    pub fn with_client_figures(
+        mut self,
+        per_name: usize,
+        per_client: usize,
+        per_v6_48: usize,
+    ) -> Self {
+        self.per_client_per_name = per_name;
+        self.per_client = per_client;
+        self.per_v6_48 = per_v6_48;
+        self
+    }
+
+    /// With `timeout` as the longest a piped connection may live, or be silent, until the node
+    /// has sent a byte.
+    #[must_use]
+    pub fn with_first_byte_timeout(mut self, timeout: Duration) -> Self {
+        self.first_byte_timeout = timeout;
+        self
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -272,6 +340,25 @@ struct Counts {
     per_name: HashMap<String, usize>,
     per_tenant: HashMap<TenantId, usize>,
     total: usize,
+    /// Per client and name, per client, and per IPv6 /48 (expose round 2, M2).
+    per_client_name: HashMap<(PeerKey, String), usize>,
+    per_client: HashMap<PeerKey, usize>,
+    per_v6_48: HashMap<[u8; 6], usize>,
+}
+
+/// One more of `key` in `map`.
+fn bump<K: std::hash::Hash + Eq>(map: &mut HashMap<K, usize>, key: K) {
+    *map.entry(key).or_insert(0) += 1;
+}
+
+/// One less of `key` in `map`; the entry goes with its last.
+fn lower<K: std::hash::Hash + Eq>(map: &mut HashMap<K, usize>, key: &K) {
+    if let Some(n) = map.get_mut(key) {
+        *n = n.saturating_sub(1);
+        if *n == 0 {
+            map.remove(key);
+        }
+    }
 }
 
 /// The live public share connections per name, per tenant and in all.
@@ -286,6 +373,7 @@ pub(crate) struct ShareSlot {
     counters: Arc<ShareCounters>,
     name: String,
     tenant: TenantId,
+    client: PeerKey,
 }
 
 /// The figures one acquisition is held to.
@@ -294,6 +382,11 @@ pub(crate) struct ShareLimits {
     pub(crate) per_name: usize,
     pub(crate) per_tenant: usize,
     pub(crate) total: usize,
+    /// One client (see [`PeerKey`]) to one name, and to all names.
+    pub(crate) per_client_name: usize,
+    pub(crate) per_client: usize,
+    /// One IPv6 /48 to all names.
+    pub(crate) per_v6_48: usize,
 }
 
 impl ShareCounters {
@@ -301,29 +394,48 @@ impl ShareCounters {
         self.counts.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Takes a place for a connection to `name` of `tenant`, unless the name, the tenant or the
-    /// relay is at its figure.
+    /// Takes a place for a connection to `name` of `tenant` from `client`, unless the name, the
+    /// tenant, the relay, the client (to this name or in all) or the client's IPv6 /48 is at its
+    /// figure.
     pub(crate) fn try_acquire(
         self: &Arc<Self>,
         name: &str,
         tenant: &TenantId,
+        client: PeerKey,
         limits: ShareLimits,
     ) -> Option<ShareSlot> {
         let mut counts = self.lock();
+        let of_client_name = counts
+            .per_client_name
+            .get(&(client, name.to_string()))
+            .copied()
+            .unwrap_or(0);
+        let of_v6_48 = client.prefix48().map_or(0, |prefix| {
+            counts.per_v6_48.get(&prefix).copied().unwrap_or(0)
+        });
         if counts.total >= limits.total
             || counts.per_name.get(name).copied().unwrap_or(0) >= limits.per_name
             || counts.per_tenant.get(tenant).copied().unwrap_or(0) >= limits.per_tenant
+            || of_client_name >= limits.per_client_name
+            || counts.per_client.get(&client).copied().unwrap_or(0) >= limits.per_client
+            || (client.prefix48().is_some() && of_v6_48 >= limits.per_v6_48)
         {
             return None;
         }
         counts.total += 1;
-        *counts.per_name.entry(name.to_string()).or_insert(0) += 1;
-        *counts.per_tenant.entry(tenant.clone()).or_insert(0) += 1;
+        bump(&mut counts.per_name, name.to_string());
+        bump(&mut counts.per_tenant, tenant.clone());
+        bump(&mut counts.per_client_name, (client, name.to_string()));
+        bump(&mut counts.per_client, client);
+        if let Some(prefix) = client.prefix48() {
+            bump(&mut counts.per_v6_48, prefix);
+        }
         drop(counts);
         Some(ShareSlot {
             counters: Arc::clone(self),
             name: name.to_string(),
             tenant: tenant.clone(),
+            client,
         })
     }
 
@@ -350,17 +462,15 @@ impl Drop for ShareSlot {
     fn drop(&mut self) {
         let mut counts = self.counters.lock();
         counts.total = counts.total.saturating_sub(1);
-        if let Some(n) = counts.per_name.get_mut(&self.name) {
-            *n = n.saturating_sub(1);
-            if *n == 0 {
-                counts.per_name.remove(&self.name);
-            }
-        }
-        if let Some(n) = counts.per_tenant.get_mut(&self.tenant) {
-            *n = n.saturating_sub(1);
-            if *n == 0 {
-                counts.per_tenant.remove(&self.tenant);
-            }
+        lower(&mut counts.per_name, &self.name);
+        lower(&mut counts.per_tenant, &self.tenant);
+        lower(
+            &mut counts.per_client_name,
+            &(self.client, self.name.clone()),
+        );
+        lower(&mut counts.per_client, &self.client);
+        if let Some(prefix) = self.client.prefix48() {
+            lower(&mut counts.per_v6_48, &prefix);
         }
     }
 }
@@ -451,6 +561,16 @@ impl FrontDoor {
             return None;
         }
         let held = relay.labels().held_name(name, unix_now())?;
+        // The grant is judged now, not when the name was accepted: a label the owner moved to
+        // another node or dropped, or a holder the Roster no longer lists, routes nothing even
+        // while the old holder stays attached (expose round 2, M1).
+        let label = name.split('.').next().unwrap_or(name);
+        if !relay
+            .rosters()
+            .label_granted(&held.network, &held.node, label)
+        {
+            return None;
+        }
         // The gate: the holder is attached now (the principal checks again at `open`).
         relay.attached_node(&held.node)?;
         let book = relay.tenants();
@@ -489,6 +609,9 @@ impl FrontDoor {
                 usize::try_from(f.share_connections).unwrap_or(usize::MAX)
             }),
             total: self.config.max_total,
+            per_client_name: self.config.per_client_per_name,
+            per_client: self.config.per_client,
+            per_v6_48: self.config.per_v6_48,
         };
         Some(Resolved {
             name: name.to_string(),
@@ -580,10 +703,12 @@ impl FrontDoor {
         } else {
             &REFUSAL
         };
-        let Some(slot) =
-            self.counters
-                .try_acquire(&resolved.name, &resolved.tenant, resolved.limits)
-        else {
+        let Some(slot) = self.counters.try_acquire(
+            &resolved.name,
+            &resolved.tenant,
+            PeerKey::of(peer.ip()),
+            resolved.limits,
+        ) else {
             tracing::debug!(name = %resolved.name, "share connection figure reached");
             self.refuse(tcp, decided, refusal).await;
             return;
@@ -637,9 +762,10 @@ impl FrontDoor {
     async fn pipe(&self, tcp: TcpStream, stream: Stream, first: Vec<u8>) {
         let activity = Activity::new();
         let torn_down = stream.torn_down();
-        let mut remote = Watched::new(TokioStream(stream), Arc::clone(&activity));
-        let mut local = Watched::new(tcp, Arc::clone(&activity));
+        let mut remote = Watched::new(TokioStream(stream), Arc::clone(&activity), true);
+        let mut local = Watched::new(tcp, Arc::clone(&activity), false);
         let idle = self.config.idle_timeout;
+        let first_byte = self.config.first_byte_timeout;
         let copy = async {
             remote.write_all(&first).await?;
             remote.flush().await?;
@@ -652,9 +778,9 @@ impl FrontDoor {
                 io::ErrorKind::ConnectionReset,
                 "the stream was torn down under the pipe",
             )),
-            () = went_idle(&activity, idle) => Err(io::Error::new(
+            () = went_idle(&activity, idle, first_byte) => Err(io::Error::new(
                 io::ErrorKind::TimedOut,
-                "no byte moved for the idle timeout",
+                "no byte moved for the idle timeout (or none came from the node in time)",
             )),
         };
         if let Err(error) = outcome {
@@ -712,7 +838,8 @@ impl FrontDoor {
             return;
         };
         let path = head.target.split('?').next().unwrap_or("");
-        if path.starts_with(ACME_PATH) {
+        // The relay's own host is never a share: it is looked at before the challenge branch.
+        if host != self.config.own_host && path.starts_with(ACME_PATH) {
             // A challenge: opened on the holder if it is a blind share's name, refused alike
             // otherwise.
             drop(peek);
@@ -795,32 +922,58 @@ struct HttpHead {
 /// relay can read.
 async fn read_http_head(tcp: &mut TcpStream, deadline: Duration) -> Option<(Vec<u8>, HttpHead)> {
     let read = async {
-        let mut bytes: Vec<u8> = Vec::with_capacity(1024);
+        let mut head = HeadBuffer::default();
         let mut chunk = [0u8; 2048];
         loop {
-            if let Some(end) = find_head_end(&bytes) {
-                let head = parse_head(&bytes[..end])?;
-                return Some((bytes, head));
-            }
-            let room = (HTTP_HEAD_LIMIT - bytes.len()).min(chunk.len());
+            let room = (HTTP_HEAD_LIMIT - head.bytes.len()).min(chunk.len());
             if room == 0 {
                 return None;
             }
             match tcp.read(&mut chunk[..room]).await {
                 Ok(0) | Err(_) => return None,
-                Ok(n) => bytes.extend_from_slice(&chunk[..n]),
+                Ok(n) => {
+                    if let Some(end) = head.push(&chunk[..n]) {
+                        let parsed = parse_head(&head.bytes[..end])?;
+                        return Some((head.bytes, parsed));
+                    }
+                }
             }
         }
     };
     tokio::time::timeout(deadline, read).await.ok().flatten()
 }
 
-/// The length of the head including its blank line, if `bytes` holds one.
-fn find_head_end(bytes: &[u8]) -> Option<usize> {
+/// The bytes of a request head read so far, and the search for its blank line, which looks at
+/// each byte once (expose round 2, L2): a blank line cut by the edge of two reads begins at most
+/// three bytes before the new data, so only those three and the new bytes are scanned.
+#[derive(Default)]
+struct HeadBuffer {
+    bytes: Vec<u8>,
+    /// Positions scanned in all, over every push (tests measure the work with it).
+    #[cfg(test)]
+    scanned: usize,
+}
+
+impl HeadBuffer {
+    /// Adds `chunk`; the length of the head including its blank line, if the bytes hold one.
+    fn push(&mut self, chunk: &[u8]) -> Option<usize> {
+        let from = self.bytes.len().saturating_sub(3);
+        self.bytes.extend_from_slice(chunk);
+        #[cfg(test)]
+        {
+            self.scanned += self.bytes.len() - from;
+        }
+        find_head_end_from(&self.bytes, from)
+    }
+}
+
+/// The length of the head including its blank line, if `bytes` holds one at or after `from`.
+fn find_head_end_from(bytes: &[u8], from: usize) -> Option<usize> {
     bytes
+        .get(from..)?
         .windows(4)
         .position(|w| w == b"\r\n\r\n")
-        .map(|at| at + 4)
+        .map(|at| from + at + 4)
 }
 
 fn parse_head(head: &[u8]) -> Option<HttpHead> {
@@ -880,10 +1033,12 @@ fn host_without_port(value: &str) -> Option<String> {
 // The pipe
 // ---------------------------------------------------------------------------------------------
 
-/// When something last moved through a pipe, as milliseconds since the pipe began.
+/// When something last moved through a pipe, as milliseconds since the pipe began, and whether
+/// the node has sent a byte yet.
 struct Activity {
     began: Instant,
     last_ms: AtomicU64,
+    node_spoke: AtomicBool,
 }
 
 impl Activity {
@@ -891,6 +1046,7 @@ impl Activity {
         Arc::new(Self {
             began: Instant::now(),
             last_ms: AtomicU64::new(0),
+            node_spoke: AtomicBool::new(false),
         })
     }
 
@@ -898,14 +1054,34 @@ impl Activity {
         let ms = u64::try_from(self.began.elapsed().as_millis()).unwrap_or(u64::MAX);
         self.last_ms.store(ms, Ordering::Relaxed);
     }
+
+    /// A byte came from the node (before the touch, so a waiter that sees the touch sees this).
+    fn node_sent(&self) {
+        self.node_spoke.store(true, Ordering::Relaxed);
+    }
 }
 
-/// Completes when nothing has moved for `idle`.
-async fn went_idle(activity: &Activity, idle: Duration) {
+/// Completes when the pipe is to end for want of bytes. Once the node has sent a byte: nothing
+/// moved for `idle`. Before: nothing moved for `idle` or for `first_byte`, whichever is less, or
+/// `first_byte` have passed in all, however busy the client kept it (a client sending to a node
+/// that never answers costs the client nothing, so only the node's first byte makes a pipe
+/// worth the long idle time).
+async fn went_idle(activity: &Activity, idle: Duration, first_byte: Duration) {
     loop {
+        let spoke = activity.node_spoke.load(Ordering::Relaxed);
         let last = activity.last_ms.load(Ordering::Relaxed);
-        tokio::time::sleep_until(activity.began + Duration::from_millis(last) + idle).await;
-        if activity.last_ms.load(Ordering::Relaxed) == last {
+        let since_last = Duration::from_millis(last);
+        let deadline = if spoke {
+            activity.began + since_last + idle
+        } else {
+            (activity.began + since_last + idle.min(first_byte)).min(activity.began + first_byte)
+        };
+        tokio::time::sleep_until(deadline).await;
+        let spoke_now = activity.node_spoke.load(Ordering::Relaxed);
+        if !spoke_now && Instant::now() >= activity.began + first_byte {
+            return;
+        }
+        if spoke_now == spoke && activity.last_ms.load(Ordering::Relaxed) == last {
             return;
         }
     }
@@ -915,11 +1091,17 @@ async fn went_idle(activity: &Activity, idle: Duration) {
 struct Watched<T> {
     inner: T,
     activity: Arc<Activity>,
+    /// Whether the bytes this reads come from the node.
+    from_node: bool,
 }
 
 impl<T> Watched<T> {
-    fn new(inner: T, activity: Arc<Activity>) -> Self {
-        Self { inner, activity }
+    fn new(inner: T, activity: Arc<Activity>, from_node: bool) -> Self {
+        Self {
+            inner,
+            activity,
+            from_node,
+        }
     }
 }
 
@@ -929,8 +1111,12 @@ impl<T: AsyncRead + Unpin> AsyncRead for Watched<T> {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
+        let before = buf.filled().len();
         let poll = Pin::new(&mut self.inner).poll_read(cx, buf);
         if matches!(poll, Poll::Ready(Ok(()))) {
+            if self.from_node && buf.filled().len() > before {
+                self.activity.node_sent();
+            }
             self.activity.touch();
         }
         poll
@@ -1001,6 +1187,8 @@ impl AsyncWrite for TokioStream {
 
 #[cfg(test)]
 mod tests {
+    use std::net::IpAddr;
+
     use super::*;
 
     fn tenant(slug: &str) -> TenantId {
@@ -1012,7 +1200,22 @@ mod tests {
             per_name,
             per_tenant,
             total,
+            per_client_name: usize::MAX,
+            per_client: usize::MAX,
+            per_v6_48: usize::MAX,
         }
+    }
+
+    /// The client at `10.0.0.n`.
+    fn client(n: u8) -> PeerKey {
+        PeerKey::of(IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, n)))
+    }
+
+    /// The client in the /64 `2001:db8:<hi>:<lo>::/64` (so the /48 is `<hi>`'s).
+    fn v6(hi: u16, lo: u16) -> PeerKey {
+        PeerKey::of(IpAddr::V6(std::net::Ipv6Addr::new(
+            0x2001, 0xdb8, hi, lo, 0, 0, 0, 1,
+        )))
     }
 
     #[test]
@@ -1021,24 +1224,32 @@ mod tests {
         let ali = tenant("ali");
         let veli = tenant("veli");
         let l = limits(2, 3, 100);
-        let a1 = counters.try_acquire("app.ali", &ali, l).unwrap();
-        let a2 = counters.try_acquire("app.ali", &ali, l).unwrap();
+        let a1 = counters.try_acquire("app.ali", &ali, client(1), l).unwrap();
+        let a2 = counters.try_acquire("app.ali", &ali, client(1), l).unwrap();
         assert!(
-            counters.try_acquire("app.ali", &ali, l).is_none(),
+            counters
+                .try_acquire("app.ali", &ali, client(1), l)
+                .is_none(),
             "the third connection to one name is over its figure"
         );
-        let b1 = counters.try_acquire("blog.ali", &ali, l).unwrap();
+        let b1 = counters
+            .try_acquire("blog.ali", &ali, client(1), l)
+            .unwrap();
         assert!(
-            counters.try_acquire("wiki.ali", &ali, l).is_none(),
+            counters
+                .try_acquire("wiki.ali", &ali, client(1), l)
+                .is_none(),
             "the fourth connection of one tenant is over its figure"
         );
-        let other = counters.try_acquire("app.veli", &veli, l).unwrap();
+        let other = counters
+            .try_acquire("app.veli", &veli, client(1), l)
+            .unwrap();
         assert_eq!(counters.of_name("app.ali"), 2);
         assert_eq!(counters.of_tenant(&ali), 3);
         assert_eq!(counters.total(), 4);
         drop(a1);
         let again = counters
-            .try_acquire("wiki.ali", &ali, l)
+            .try_acquire("wiki.ali", &ali, client(1), l)
             .expect("a released place is usable at once");
         drop((a2, b1, other, again));
         assert_eq!(counters.total(), 0);
@@ -1055,9 +1266,17 @@ mod tests {
     fn the_relay_wide_figure_holds_across_tenants() {
         let counters = Arc::new(ShareCounters::default());
         let l = limits(10, 10, 2);
-        let _a = counters.try_acquire("a.ali", &tenant("ali"), l).unwrap();
-        let _b = counters.try_acquire("b.veli", &tenant("veli"), l).unwrap();
-        assert!(counters.try_acquire("c.deli", &tenant("deli"), l).is_none());
+        let _a = counters
+            .try_acquire("a.ali", &tenant("ali"), client(1), l)
+            .unwrap();
+        let _b = counters
+            .try_acquire("b.veli", &tenant("veli"), client(1), l)
+            .unwrap();
+        assert!(
+            counters
+                .try_acquire("c.deli", &tenant("deli"), client(1), l)
+                .is_none()
+        );
     }
 
     #[test]
@@ -1164,6 +1383,7 @@ mod tests {
         door: Arc<FrontDoor>,
         node: NodeId,
         network: NetworkId,
+        owner: SigningKey,
     }
 
     fn relay() -> Relay {
@@ -1243,6 +1463,7 @@ mod tests {
             door,
             node,
             network,
+            owner,
         }
     }
 
@@ -1259,6 +1480,58 @@ mod tests {
                 &self.relay.tenants(),
                 &[self.network],
                 &self.node,
+                &AdvertiseBody {
+                    v: PROTOCOL_VERSION,
+                    shares,
+                    accept_peers: true,
+                },
+                unix_now(),
+            )
+        }
+
+        /// The owner's Roster `seq` listing `members` and granting each `(label, node)`.
+        fn roster(&self, seq: u64, members: &[NodeId], labels: &[(&str, NodeId)]) {
+            let body = RosterBody {
+                v: PROTOCOL_VERSION,
+                network_id: self.network,
+                seq,
+                issued: 0,
+                expires: 1_000_000_000,
+                members: members
+                    .iter()
+                    .map(|node_id| RosterMember {
+                        node_id: *node_id,
+                        min_serial: 1,
+                    })
+                    .collect(),
+                revoked: vec![],
+                stewards: vec![],
+                labels: labels
+                    .iter()
+                    .map(|(name, node_id)| Label {
+                        name: name.to_string(),
+                        node_id: *node_id,
+                    })
+                    .collect(),
+            };
+            assert!(
+                self.relay
+                    .rosters()
+                    .set(&Roster::sign(&self.owner, &body).unwrap())
+                    .unwrap()
+            );
+        }
+
+        fn attach_node(&self, node: NodeId) {
+            std::mem::forget(self.relay.registry.attach(node, 1, vec![self.network]));
+        }
+
+        fn advertise_as(&self, node: NodeId, shares: Vec<Share>) -> menzil_proto::AdvertiseAckBody {
+            self.relay.labels().advertise(
+                self.relay.rosters(),
+                &self.relay.tenants(),
+                &[self.network],
+                &node,
                 &AdvertiseBody {
                     v: PROTOCOL_VERSION,
                     shares,
@@ -1503,5 +1776,455 @@ mod tests {
             Some("app.s.example.test"),
             &[b"acme-tls/1"]
         )));
+    }
+    /// Expose round 2, M1: a label the owner moved or dropped stops routing to the old holder
+    /// at once, and the new grantee's claim stops being refused once the stale holder is gone.
+    #[tokio::test]
+    async fn a_label_the_owner_moved_or_dropped_stops_routing_to_the_old_holder() {
+        let w = world(&["app"], None);
+        let x = w.node;
+        let y = NodeId::from([8u8; 32]);
+        w.attach();
+        w.attach_node(y);
+        w.advertise(vec![share("app", ShareMode::Blind, "tls:app", &[])]);
+        assert_eq!(w.resolve("app.s.example.test", &[]).unwrap().held.node, x);
+        // The owner moves the label to Y. X stays attached and never advertises again.
+        w.roster(2, &[x, y], &[("app", y)]);
+        assert!(
+            w.resolve("app.s.example.test", &[]).is_none(),
+            "the old holder is not routed to once the Roster grants the label to another node"
+        );
+        // The stale holder entry still stands until the registry looks at the Rosters.
+        let stale = w.advertise_as(y, vec![share("app", ShareMode::Blind, "tls:app", &[])]);
+        assert_eq!(
+            stale.rejected.len(),
+            1,
+            "label_taken while X is still listed"
+        );
+        assert_eq!(
+            w.relay
+                .labels()
+                .release_ungranted(w.relay.rosters(), unix_now()),
+            1
+        );
+        let ack = w.advertise_as(y, vec![share("app", ShareMode::Blind, "tls:app", &[])]);
+        assert_eq!(ack.accepted, vec!["app".to_string()], "{ack:?}");
+        assert_eq!(w.resolve("app.s.example.test", &[]).unwrap().held.node, y);
+        // The owner drops the label: nobody is routed to, and the next pass releases Y's entry.
+        w.roster(3, &[x, y], &[]);
+        assert!(w.resolve("app.s.example.test", &[]).is_none());
+        assert_eq!(
+            w.relay
+                .labels()
+                .release_ungranted(w.relay.rosters(), unix_now()),
+            1
+        );
+        assert_eq!(
+            w.relay
+                .labels()
+                .release_ungranted(w.relay.rosters(), unix_now()),
+            0
+        );
+    }
+
+    /// A holder the Roster no longer lists (or revokes) is not routed to either.
+    #[tokio::test]
+    async fn a_holder_the_roster_no_longer_lists_is_not_routed_to() {
+        let w = world(&["app"], None);
+        let other = NodeId::from([8u8; 32]);
+        w.attach();
+        w.advertise(vec![share("app", ShareMode::Blind, "tls:app", &[])]);
+        w.roster(2, &[other], &[("app", w.node)]);
+        assert!(w.resolve("app.s.example.test", &[]).is_none());
+        w.roster(3, &[w.node, other], &[("app", w.node)]);
+        assert!(w.resolve("app.s.example.test", &[]).is_some());
+    }
+
+    /// The relay's own watcher runs the pass on every Roster change.
+    #[tokio::test]
+    async fn the_relays_roster_watcher_drops_the_holders_of_a_moved_label() {
+        let w = world(&["app"], None);
+        let y = NodeId::from([8u8; 32]);
+        w.attach();
+        w.advertise(vec![share("app", ShareMode::Blind, "tls:app", &[])]);
+        let watcher = w.relay.watch_grants();
+        w.roster(2, &[w.node, y], &[("app", y)]);
+        let mut freed = false;
+        for _ in 0..200 {
+            if w.relay.labels().held_name("app", unix_now()).is_none() {
+                freed = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        watcher.abort();
+        assert!(freed, "the watcher released the old holder's entry");
+    }
+    // -----------------------------------------------------------------------------------------
+    // Expose round 2: per client figures (M2)
+    // -----------------------------------------------------------------------------------------
+
+    /// The figures of a front door made with the defaults.
+    fn default_limits() -> ShareLimits {
+        let config = FrontDoorConfig::new(OWN, H).unwrap();
+        ShareLimits {
+            per_name: config.per_name,
+            per_tenant: config.max_total,
+            total: config.max_total,
+            per_client_name: config.per_client_per_name,
+            per_client: config.per_client,
+            per_v6_48: config.per_v6_48,
+        }
+    }
+
+    #[test]
+    fn the_defaults_are_the_named_constants() {
+        let config = FrontDoorConfig::new(OWN, H).unwrap();
+        assert_eq!(config.per_client_per_name, FRONT_DOOR_PER_CLIENT_PER_NAME);
+        assert_eq!(config.per_client, FRONT_DOOR_PER_CLIENT);
+        assert_eq!(
+            config.per_v6_48,
+            FRONT_DOOR_PER_CLIENT * FRONT_DOOR_V6_48_FACTOR
+        );
+        assert_eq!(config.first_byte_timeout, FRONT_DOOR_FIRST_BYTE_TIMEOUT);
+        let tuned = config
+            .with_client_figures(1, 2, 3)
+            .with_first_byte_timeout(Duration::from_secs(1));
+        assert_eq!(
+            (tuned.per_client_per_name, tuned.per_client, tuned.per_v6_48),
+            (1, 2, 3)
+        );
+        assert_eq!(tuned.first_byte_timeout, Duration::from_secs(1));
+    }
+
+    #[test]
+    fn one_client_is_held_to_its_figures_to_a_name_and_in_all() {
+        let counters = Arc::new(ShareCounters::default());
+        let ali = tenant("ali");
+        let l = ShareLimits {
+            per_client_name: 2,
+            per_client: 3,
+            ..limits(100, 100, 100)
+        };
+        let a1 = counters.try_acquire("a.ali", &ali, client(1), l).unwrap();
+        let _a2 = counters.try_acquire("a.ali", &ali, client(1), l).unwrap();
+        assert!(
+            counters.try_acquire("a.ali", &ali, client(1), l).is_none(),
+            "a third connection of one client to one name"
+        );
+        let _b = counters.try_acquire("b.ali", &ali, client(1), l).unwrap();
+        assert!(
+            counters.try_acquire("c.ali", &ali, client(1), l).is_none(),
+            "a fourth connection of one client in all"
+        );
+        let _other = counters
+            .try_acquire("a.ali", &ali, client(2), l)
+            .expect("another client is not affected");
+        drop(a1);
+        assert!(counters.try_acquire("c.ali", &ali, client(1), l).is_some());
+    }
+
+    #[test]
+    fn two_clients_cannot_lock_a_name_out_of_sixty_four() {
+        let counters = Arc::new(ShareCounters::default());
+        let ali = tenant("ali");
+        let l = default_limits();
+        let mut held = Vec::new();
+        for who in [1u8, 2] {
+            for _ in 0..FRONT_DOOR_PER_CLIENT_PER_NAME {
+                held.push(
+                    counters
+                        .try_acquire("app.ali", &ali, client(who), l)
+                        .unwrap(),
+                );
+            }
+            assert!(
+                counters
+                    .try_acquire("app.ali", &ali, client(who), l)
+                    .is_none(),
+                "client {who} is at its figure for the name"
+            );
+        }
+        assert!(l.per_name > 2 * FRONT_DOOR_PER_CLIENT_PER_NAME);
+        assert!(
+            counters
+                .try_acquire("app.ali", &ali, client(3), l)
+                .is_some(),
+            "a third client still gets in"
+        );
+    }
+
+    #[test]
+    fn one_ipv6_48_cannot_fill_the_relay_wide_figure() {
+        let counters = Arc::new(ShareCounters::default());
+        let l = default_limits();
+        let mut admitted = Vec::new();
+        // One /48 (many /64s) trying many names, as the round's probe did.
+        for lo in 0..2_000u16 {
+            for name in 0..4 {
+                for _ in 0..FRONT_DOOR_PER_CLIENT_PER_NAME {
+                    let full = format!("n{name}.ali");
+                    if let Some(slot) = counters.try_acquire(&full, &tenant("ali"), v6(1, lo), l) {
+                        admitted.push(slot);
+                    }
+                }
+            }
+        }
+        assert_eq!(admitted.len(), l.per_v6_48, "stopped at the /48 aggregate");
+        assert!(
+            l.per_v6_48 * 8 <= l.total,
+            "far below the relay wide figure"
+        );
+        assert!(
+            counters
+                .try_acquire("n0.ali", &tenant("ali"), v6(2, 0), l)
+                .is_some(),
+            "another /48 is not locked out"
+        );
+        // Addresses of one /64 are one client.
+        let same64 = PeerKey::of(IpAddr::V6(std::net::Ipv6Addr::new(
+            0x2001, 0xdb8, 3, 3, 1, 2, 3, 4,
+        )));
+        assert_eq!(same64, v6(3, 3));
+        // An IPv4 client has no /48.
+        assert!(client(1).prefix48().is_none());
+    }
+
+    #[test]
+    fn every_client_count_is_given_back_whichever_way_the_connection_ends() {
+        let counters = Arc::new(ShareCounters::default());
+        let l = default_limits();
+        let slots: Vec<ShareSlot> = (0..6u16)
+            .map(|i| {
+                let who = if i % 2 == 0 { client(1) } else { v6(1, i) };
+                counters
+                    .try_acquire(&format!("n{}.ali", i % 3), &tenant("ali"), who, l)
+                    .unwrap()
+            })
+            .collect();
+        assert_eq!(counters.total(), 6);
+        // Dropped out of order, as connections end.
+        let mut slots = slots;
+        drop(slots.remove(3));
+        drop(slots.remove(0));
+        drop(slots);
+        let counts = counters.lock();
+        assert_eq!(counts.total, 0);
+        assert!(counts.per_name.is_empty());
+        assert!(counts.per_tenant.is_empty());
+        assert!(counts.per_client_name.is_empty());
+        assert!(counts.per_client.is_empty());
+        assert!(counts.per_v6_48.is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_pipe_the_node_never_answers_ends_at_the_first_byte_timeout_however_busy_the_client()
+    {
+        let activity = Activity::new();
+        let busy = async {
+            loop {
+                tokio::time::sleep(Duration::from_secs(10)).await;
+                activity.touch();
+            }
+        };
+        let began = Instant::now();
+        tokio::select! {
+            () = went_idle(&activity, Duration::from_secs(600), Duration::from_secs(30)) => {}
+            () = busy => unreachable!(),
+        }
+        let took = began.elapsed();
+        assert!(
+            took >= Duration::from_secs(30) && took < Duration::from_secs(31),
+            "{took:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn once_the_node_has_spoken_the_long_idle_time_applies() {
+        let activity = Activity::new();
+        let speaker = async {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            activity.node_sent();
+            activity.touch();
+            std::future::pending::<()>().await;
+        };
+        let began = Instant::now();
+        tokio::select! {
+            () = went_idle(&activity, Duration::from_secs(100), Duration::from_secs(30)) => {}
+            () = speaker => unreachable!(),
+        }
+        let took = began.elapsed();
+        assert!(
+            took >= Duration::from_secs(105) && took < Duration::from_secs(106),
+            "{took:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_idle_time_shorter_than_the_first_byte_time_applies_before_the_node_speaks() {
+        let activity = Activity::new();
+        let began = Instant::now();
+        went_idle(&activity, Duration::from_secs(5), Duration::from_secs(30)).await;
+        assert_eq!(began.elapsed(), Duration::from_secs(5));
+    }
+
+    #[tokio::test]
+    async fn only_bytes_read_from_the_node_count_as_its_first() {
+        use tokio::io::duplex;
+        for from_node in [false, true] {
+            let activity = Activity::new();
+            let (mut far, near) = duplex(64);
+            let mut watched = Watched::new(near, Arc::clone(&activity), from_node);
+            let mut buf = [0u8; 8];
+            // An empty read (the far end closes) is not a byte.
+            far.write_all(b"x").await.unwrap();
+            drop(far);
+            assert_eq!(watched.read(&mut buf).await.unwrap(), 1);
+            assert_eq!(watched.read(&mut buf).await.unwrap(), 0);
+            assert_eq!(
+                activity.node_spoke.load(Ordering::Relaxed),
+                from_node,
+                "from_node {from_node}"
+            );
+        }
+        // And a read of nothing from the node is not one.
+        let activity = Activity::new();
+        let (far, near) = duplex(64);
+        drop(far);
+        let mut watched = Watched::new(near, Arc::clone(&activity), true);
+        assert_eq!(watched.read(&mut [0u8; 8]).await.unwrap(), 0);
+        assert!(!activity.node_spoke.load(Ordering::Relaxed));
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // Expose round 2: the relay's own host (L1)
+    // -----------------------------------------------------------------------------------------
+
+    #[test]
+    fn a_relay_host_under_the_share_domain_is_refused_at_startup() {
+        assert!(FrontDoorConfig::new("edge.s.example.test", "s.example.test").is_err());
+        assert!(FrontDoorConfig::new("Deep.Edge.S.Example.Test", "s.example.test").is_err());
+        // Not under it: a sibling, the parent, a look alike suffix.
+        for own in [
+            "relay.example.test",
+            "example.test",
+            "edge.xs.example.test",
+            "s.example.test.evil.test",
+        ] {
+            assert!(FrontDoorConfig::new(own, "s.example.test").is_ok(), "{own}");
+        }
+    }
+
+    /// One request on port 80 against a door of `w`; what came back.
+    async fn http_exchange(w: &World, request: &[u8]) -> Vec<u8> {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (server, peer) = listener.accept().await.unwrap();
+        let slot = w.relay.admission.admit_connection(peer.ip()).unwrap();
+        let peek = Arc::clone(&w.door.http_peeks).try_acquire_owned().unwrap();
+        let handler = tokio::spawn(Arc::clone(&w.door).handle_http(
+            w.relay.clone(),
+            server,
+            peer,
+            slot,
+            peek,
+        ));
+        client.write_all(request).await.unwrap();
+        let mut response = Vec::new();
+        let _ =
+            tokio::time::timeout(Duration::from_secs(5), client.read_to_end(&mut response)).await;
+        let _ = handler.await;
+        response
+    }
+
+    #[tokio::test]
+    async fn a_challenge_for_the_relays_own_host_is_redirected_not_given_to_a_member() {
+        let w = world(&["app"], None);
+        w.attach();
+        w.advertise(vec![share("app", ShareMode::Blind, "tls:app", &[])]);
+        let own = http_exchange(
+            &w,
+            format!("GET /.well-known/acme-challenge/tok HTTP/1.1\r\nHost: {OWN}\r\n\r\n")
+                .as_bytes(),
+        )
+        .await;
+        assert_eq!(
+            own,
+            redirect(OWN, "/.well-known/acme-challenge/tok").into_bytes(),
+            "{}",
+            String::from_utf8_lossy(&own)
+        );
+        // A challenge for a name nobody holds is still the fixed refusal.
+        let unheld = http_exchange(
+            &w,
+            b"GET /.well-known/acme-challenge/tok HTTP/1.1\r\nHost: nosuch.s.example.test\r\n\r\n",
+        )
+        .await;
+        assert_eq!(unheld, HTTP_REFUSAL);
+    }
+
+    fn redirect(host: &str, path: &str) -> String {
+        redirect_to(host, path)
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // Expose round 2: the head reader's work (L2)
+    // -----------------------------------------------------------------------------------------
+
+    #[test]
+    fn the_incremental_head_scan_finds_what_a_whole_scan_finds_at_every_chunk_size() {
+        let inputs: [&[u8]; 6] = [
+            b"GET / HTTP/1.1\r\nHost: a\r\n\r\n",
+            b"\r\n\r\n",
+            b"GET / HTTP/1.1\r\n\r\r\n\r\n",
+            b"A\r\n\r\r\n\r\nB\r\n\r\n",
+            b"GET / HTTP/1.1\r\nHost: a\r\n",
+            b"\r\n\r\n\r\n\r\n",
+        ];
+        for input in inputs {
+            for chunk in 1..=7usize {
+                let mut head = HeadBuffer::default();
+                let mut found = None;
+                let mut fed = 0usize;
+                for piece in input.chunks(chunk) {
+                    fed += piece.len();
+                    let got = head.push(piece);
+                    let whole = find_head_end_from(&input[..fed], 0);
+                    assert_eq!(got, whole, "chunk {chunk}, {fed} bytes of {input:?}");
+                    if got.is_some() {
+                        found = got;
+                        break;
+                    }
+                }
+                assert_eq!(found, find_head_end_from(input, 0), "chunk {chunk}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_dribbled_head_costs_a_few_scans_per_byte_not_a_rescan_of_everything() {
+        let mut head = HeadBuffer::default();
+        for _ in 0..HTTP_HEAD_LIMIT {
+            assert!(head.push(b"a").is_none());
+        }
+        assert!(
+            head.scanned <= 4 * HTTP_HEAD_LIMIT,
+            "{} positions scanned for {HTTP_HEAD_LIMIT} bytes",
+            head.scanned
+        );
+    }
+    #[test]
+    fn the_descriptor_budget_is_the_sum_of_the_figures() {
+        let config = FrontDoorConfig::new(OWN, H).unwrap();
+        assert_eq!(config.fd_budget(true), 1_024 * 2 + 1_024 + 4_096);
+        assert_eq!(config.fd_budget(false), 1_024 + 1_024 + 4_096);
+        let small = config
+            .with_max_peeks(3)
+            .with_max_answers(5)
+            .with_max_total(7);
+        assert_eq!(small.fd_budget(true), 6 + 5 + 7);
+        assert_eq!(small.fd_budget(false), 3 + 5 + 7);
     }
 }

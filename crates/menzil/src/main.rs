@@ -250,7 +250,12 @@ enum RelayCommand {
         path: String,
         /// The share domain: serve public shares by SNI on the TLS port (`<name>.<domain>`,
         /// `<name>.<tenant>.<domain>`), piped blind to the node that holds the name. Needs
-        /// `--host`, the name this relay's own certificate and nodes use. Off unless given.
+        /// `--host`, the name this relay's own certificate and nodes use, which may not lie under
+        /// the domain. Off unless given. The relay needs file descriptors for it: up to 7,168
+        /// (1,024 ClientHello reads, as many more on port 80, 1,024 refusals and 4,096 piped
+        /// connections) on top of its sessions. It raises its soft limit to the hard one at
+        /// start and warns if that is too low; set `LimitNOFILE` (systemd) or `ulimit -n` to
+        /// cover the sum, 16384 is comfortable.
         #[arg(long, value_name = "DOMAIN", requires = "host")]
         share_domain: Option<String>,
         /// Also serve plain HTTP here, for ACME HTTP-01 challenges of shares and the redirect
