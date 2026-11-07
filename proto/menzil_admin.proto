@@ -1,0 +1,82 @@
+// Sahip: menzil repo'su (proto/menzil_admin.proto). Sürüm 3.1; menzil-ui sürümlü kopya kullanır.
+// TASLAK v3.1 (2026-11-07): v3 kabul edildi (tunnel_yanit_v3.md); D1: kota anahtarları sabit değil, GetFigures eklendi. v2'ye tunnel yanıtı (contract/tunnel_yanit_v2.md, koşullu kabul K1-K3) işlendi.
+// Sınır: menzil rölesi hesap bilmez; kiracı = slug + ağlar (relay/tenants/<slug>.toml). Ajan (tunnel
+// sahibi, mTLS, röle ile aynı makinede) yalnız bu dosyaları yazar; RPC yanıtı "dosya yazıldı"dır,
+// röle en geç 15 sn'de uygular. Düğüm kabulü (admit/revoke) her ağın KENDİ owner anahtarıyla yapılır.
+syntax = "proto3";
+package menzil.admin.v3; // kablo adı v3 kalır (alan numaraları değişmedi)
+
+service TenantAdmin {
+  // `relay add-network <token> --tenant <slug>`. Aynı slug + aynı ağlar = başarı (kopya güvenli);
+  // aynı slug + başka ağlar = ALREADY_EXISTS; karantinadaki (180 gün), ayrılmış ya da default kiracı
+  // adıyla çakışan slug = FAILED_PRECONDITION. idempotency_key YOK SAYILIR.
+  rpc CreateTenant(CreateTenantRequest) returns (Tenant);
+  // Token ile ekler. Ağ kiracıda zaten varsa daha yeni token onu YENİLER (Roster 14 günde sona erer).
+  // Başka kiracıdaki ağ taşınmaz: önce oradan çıkarılmalı. max_networks aşımı FAILED_PRECONDITION.
+  rpc AddNetwork(AddNetworkRequest) returns (Tenant);
+  rpc RemoveNetwork(RemoveNetworkRequest) returns (Tenant);
+  // class, terminated, quota_overrides. Kurallar mesajın yorumunda; ihlal INVALID_ARGUMENT.
+  // Tunnel `tenants::update_tenant` yazana kadar UNIMPLEMENTED olabilir.
+  rpc UpdateTenant(UpdateTenantRequest) returns (Tenant);
+  // Tunnel kiracı dosyasına `suspended = true` anahtarını ekleyene kadar UNIMPLEMENTED (K1).
+  // `terminated` ile ASKIYA ALINMAZ: terminated rölenin TLS sonlandırmasıdır (içeriği okur).
+  rpc SuspendTenant(TenantRef) returns (Tenant);
+  rpc ResumeTenant(TenantRef) returns (Tenant);
+  // `relay remove-tenant`: dosya silinir, oturumlar biter, slug 180 gün karantinada.
+  rpc RemoveTenant(TenantRef) returns (RemoveTenantResponse);
+  rpc GetTenant(TenantRef) returns (Tenant);
+  rpc ListTenants(ListTenantsRequest) returns (ListTenantsResponse);
+  // Rölede sayaçlar bellekte ve dışa aktarma yok: UNIMPLEMENTED (sonra `menzil relay status` JSON).
+  rpc GetUsage(TenantRef) returns (Usage);
+  // Kota anahtarları (menzil `Figures::KEYS`, bugün 18, kodla değişir): form bundan üretilir, istemci sabit tutmaz.
+  // Eski ajanda UNIMPLEMENTED olabilir. Bilinmeyen anahtar UpdateTenant'ta INVALID_ARGUMENT.
+  rpc GetFigures(GetFiguresRequest) returns (GetFiguresResponse);
+}
+
+message TenantRef { string slug = 1; }
+
+message CreateTenantRequest {
+  string slug = 1;                 // Slug::parse: 3-32, küçük ASCII/rakam/tire
+  // `menzil token --for-relay` çıktıları (`menzil1-roster:...`, sahip/steward imzalı Roster).
+  // menzil-ui ham NetworkId göndermez (TBD#13). İlk sürümde tek eleman.
+  repeated string tokens = 2;
+  string class = 3;                // yalnız "personal" ya da "friend"; boş = "friend"
+  string idempotency_key = 4;      // ajan SAKLAMAZ, yok sayılır
+}
+message AddNetworkRequest { string slug = 1; string token = 2; }
+message RemoveNetworkRequest { string slug = 1; string network_id = 2; }  // network_id: 64 hex
+
+message UpdateTenantRequest {
+  string slug = 1;
+  optional string class = 2;       // "personal" | "friend". personal'da quota_overrides YASAK
+  optional bool terminated = 3;    // TLS sonlandırma İZNİ (röle düz metni görür); askı DEĞİL
+  // Verilirse TÜM kümeyi DEĞİŞTİRİR (birleştirmez); boş harita = sınıf varsayılanları.
+  // Anahtar kümesi menzil `Figures::KEYS` (bugün 18, kodla değişir; istemci SABİT KODLAMAZ, GetFigures).
+  // Değer 1..üst sınır (sıfır hata); floor_mbit <= bandwidth_mbit; bilinmeyen anahtar INVALID_ARGUMENT. max_networks bir sınıf rakamı (varsayılan 3), sabit değil.
+  map<string, uint64> quota_overrides = 4;
+  bool replace_quota_overrides = 5; // true ise quota_overrides uygulanır (boş harita ayırt edilsin)
+}
+message Tenant {
+  string slug = 1;
+  repeated string network_ids = 2;
+  string class = 3;
+  bool terminated = 4;
+  bool suspended = 5;              // K1'e kadar hep false
+  int64 added_unix = 6;
+  map<string, uint64> quota_overrides = 7;
+}
+message RemoveTenantResponse { bool existed = 1; }
+message ListTenantsRequest { string page_token = 1; uint32 page_size = 2; }
+message ListTenantsResponse { repeated Tenant tenants = 1; string next_page_token = 2; }
+message Usage {
+  uint32 attached_sessions = 1;
+  uint32 live_pairs = 2;
+  uint64 bytes_period = 3;
+  uint32 names = 4;
+  int64 period_end_unix = 5;
+}
+message GetFiguresRequest {}
+// class_default_personal 0: the personal class has no per-tenant figure (only the relay's global limits);
+// quota_overrides are forbidden for it. max: the largest value the key takes.
+message Figure { string key = 1; uint64 class_default_friend = 2; uint64 class_default_personal = 3; uint64 max = 4; }
+message GetFiguresResponse { repeated Figure figures = 1; }

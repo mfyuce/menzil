@@ -234,7 +234,8 @@ struct ExposeArgs {
     #[arg(long, default_value = "127.0.0.1", value_name = "HOST")]
     host: String,
     /// An ALPN identifier the target terminates (h2, http/1.1, acme-tls/1); may be repeated or
-    /// comma separated. Without any, every ALPN is routed to it.
+    /// comma separated. Without any, every ALPN is routed to it except acme-tls/1, which must be
+    /// listed by name.
     #[arg(long = "alpn", value_name = "ID", value_delimiter = ',')]
     alpn: Vec<String>,
     /// Change a share (or a service) that exists already instead of refusing.

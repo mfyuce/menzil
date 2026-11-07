@@ -11,6 +11,7 @@ members = [
     "crates/menzil-relay",
     "crates/menzil-node",
     "crates/menzil",
+    "crates/menzil-relay-admin",
 ]
 # Third-party source kept byte for byte as published apart from the listed patches; it is
 # built as a path dependency but kept out of the workspace so that `clippy` and `test

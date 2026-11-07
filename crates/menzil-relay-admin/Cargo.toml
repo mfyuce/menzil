@@ -1,0 +1,48 @@
+[package]
+name = "menzil-relay-admin"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "mTLS gRPC admin agent for a menzil relay's tenant files (slice UI-B)"
+
+[features]
+# The generated gRPC client (tests, tools); the agent itself is a server only.
+client = ["tonic/channel"]
+
+[lib]
+name = "menzil_relay_admin"
+path = "src/lib.rs"
+
+[[bin]]
+name = "menzil-relay-admin"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+clap = { workspace = true }
+menzil = { path = "../menzil" }
+menzil-proto = { path = "../menzil-proto" }
+menzil-relay = { path = "../menzil-relay" }
+prost = "0.14"
+rcgen = "0.14.10"
+rustls = { workspace = true, features = ["aws-lc-rs"] }
+time = "0.3"
+tokio = { workspace = true, features = ["net", "sync", "time", "signal"] }
+tokio-rustls = { workspace = true, features = ["aws-lc-rs"] }
+tokio-stream = "0.1"
+tonic = { version = "0.14", default-features = false, features = ["server", "router", "codegen"] }
+tonic-prost = "0.14"
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[build-dependencies]
+protoc-bin-vendored = "3"
+tonic-prost-build = "0.14"
+
+[dev-dependencies]
+hyper-util = { version = "0.1", features = ["tokio"] }
+tempfile = "3"
+menzil-relay-admin = { path = ".", features = ["client"] }
+tower = { version = "0.5", features = ["util"] }
