@@ -1429,3 +1429,56 @@ fn the_not_a_member_explanation_with_a_rejection_fits_the_agent_error_line() {
         "{sent}"
     );
 }
+
+fn share_to(name: &str, service: &str) -> Share {
+    Share {
+        name: name.to_string(),
+        mode: menzil_proto::ShareMode::Blind,
+        service: service.parse().unwrap(),
+        alpn: vec![],
+    }
+}
+
+fn served(services: &[&str]) -> std::collections::BTreeMap<String, String> {
+    services
+        .iter()
+        .map(|s| (s.to_string(), "127.0.0.1:1".to_string()))
+        .collect()
+}
+
+/// Expose round 1, L2: one share that needs a restart used to refuse the whole set, so removing
+/// `db` and adding a share for a service the node does not serve in one edit kept serving `db`.
+#[test]
+fn a_share_that_needs_a_restart_does_not_hold_back_the_removals_of_the_same_edit() {
+    let (web, db) = (share_to("web", "tls:web"), share_to("db", "tls:db"));
+    let current = vec![web.clone(), db];
+    let new = share_to("new", "tls:newservice");
+    let plan = plan_share_reload(
+        &current,
+        vec![web.clone(), new.clone()],
+        &served(&["tls:web", "tls:db"]),
+    );
+    assert_eq!(plan.apply, vec![web], "db is gone, web stays, new waits");
+    assert_eq!(plan.needs_restart, vec![new]);
+}
+
+#[test]
+fn a_changed_share_of_a_served_service_applies_and_one_that_needs_a_restart_keeps_its_old_form() {
+    let old_web = share_to("web", "tls:web");
+    let old_db = share_to("db", "tls:db");
+    let current = vec![old_web.clone(), old_db.clone()];
+    // `web` now points at a served service (applies); `db` at one that is not (keeps what it was).
+    let new_web = share_to("web", "tls:web2");
+    let new_db = share_to("db", "tls:other");
+    let plan = plan_share_reload(
+        &current,
+        vec![new_web.clone(), new_db.clone()],
+        &served(&["tls:web", "tls:web2", "tls:db"]),
+    );
+    assert_eq!(plan.apply, vec![new_web, old_db]);
+    assert_eq!(plan.needs_restart, vec![new_db]);
+    // Nothing to wait for: the file is applied as it is.
+    let plan = plan_share_reload(&current, vec![old_web.clone()], &served(&["tls:web"]));
+    assert_eq!(plan.apply, vec![old_web]);
+    assert!(plan.needs_restart.is_empty());
+}

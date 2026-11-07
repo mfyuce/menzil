@@ -126,4 +126,7 @@ pub use session::{
     Observers, Session, SessionConfig, SessionEvent, run_session, run_session_observed,
     run_session_until,
 };
-pub use shares::{MAX_SHARES, ShareBook, ShareError, ShareSnapshot, check_name, validate_shares};
+pub use shares::{
+    ADVERTISE_ACK_TIMEOUT, ADVERTISE_RETRY_DELAY, MAX_SHARES, ShareBook, ShareError, ShareSnapshot,
+    check_name, validate_shares,
+};

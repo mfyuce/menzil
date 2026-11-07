@@ -17,8 +17,9 @@
 //!   (`client_ip` must parse as an address, `sni` must be a name of an accepted share; else the
 //!   field is dropped), since the relay principal is the one sender whose `meta` is honored, and
 //!   it bounds the streams it holds ([`RelayLimits`]): 64 per share and 256 in all, counted
-//!   apart from [`crate::ServeLimits`]'s per peer figure so that public traffic cannot take the
-//!   slots members need and members cannot take the relay's.
+//!   apart from [`crate::ServeLimits`] (the inner handler is asked through
+//!   `ServiceHandler::open_with_own_limits`, which takes no place in them) so that public traffic
+//!   cannot take the slots members need and members cannot take the relay's.
 //! * `meta` is information for the node's logs and the service behind it, never authorization.
 //!
 //! No document stream, no certificate push and no candidate offer exist for this session, and it
@@ -384,7 +385,9 @@ where
             });
         };
         let request = self.validated(&shares, request);
-        let opened = self.inner.open(&request).await?;
+        // The relay's streams are bounded by `RelayLimits` above, so they take no place in the
+        // limits the inner handler applies to members (expose round 1, L1).
+        let opened = self.inner.open_with_own_limits(&request).await?;
         Ok((opened, permit))
     }
 
@@ -431,7 +434,12 @@ fn serving_names(shares: &[Share], full_names: &[String]) -> Vec<String> {
 /// the canonical text of the address it parses to, else dropped; `sni` in lowercase, of at most
 /// 253 bytes, made of letters, digits, hyphens and dots, and equal to one of `names`, or below
 /// one (`<name>.<the relay's domain>`, which is how the relay composes it from a name relative
-/// to its share domain, or a subdomain of a name that is fully qualified), else dropped.
+/// to its share domain, or a subdomain of a name that is a domain, one with a dot), else dropped.
+///
+/// Known limit: the node does not know the relay's share domain, so `<name>.<anything>` passes
+/// the prefix rule, `app.attacker.example` included. The field is information the relay claims
+/// and never picks a target, so this is accepted; closing it takes the domain in the
+/// ADVERTISE_ACK (a protocol change, expose round 1 N2).
 ///
 /// Dropping is not refusing: `meta` is information the relay claims, never authorization, and a
 /// stream with a bad field is served with that field empty.
@@ -457,7 +465,11 @@ pub(crate) fn validate_meta(meta: &OpenMeta, names: &[String]) -> OpenMeta {
                 !name.is_empty()
                     && (sni == name
                         || sni.starts_with(&format!("{name}."))
-                        || sni.ends_with(&format!(".{name}")))
+                        // Below a name that is a domain of its own (`web.ali` is a zone, and a
+                        // custom domain later is one). A single label (`app`) is relative to the
+                        // relay's share domain and is no domain: `x.app` is somebody else's
+                        // `.app` name, not a subdomain of this share.
+                        || (name.contains('.') && sni.ends_with(&format!(".{name}"))))
             })
         });
     OpenMeta { client_ip, sni }

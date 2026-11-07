@@ -21,11 +21,13 @@
 
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::time::Duration;
 
 use menzil_proto::{
     AdvertiseAckBody, AdvertiseBody, RejectedShare, ServiceId, ServiceKind, Share, ShareMode,
 };
 use tokio::sync::watch;
+use tokio::time::Instant;
 
 /// How many shares one ADVERTISE may carry (protocol.md 4.4: a longer one is refused whole).
 pub const MAX_SHARES: usize = 64;
@@ -193,6 +195,9 @@ struct Inner {
     /// whoever must act when a share is withdrawn (the revalidator of the relay principal's
     /// sessions).
     accepted_changes: watch::Sender<u64>,
+    /// How long the relay has to answer an ADVERTISE and how long a refusal is waited out; the
+    /// two figures of [`AdvertiseWatch`], settable for tests.
+    timing: Mutex<(Duration, Duration)>,
 }
 
 /// The configured shares and the relay's answer. See the module docs.
@@ -226,6 +231,7 @@ impl ShareBook {
                 configured,
                 state: Mutex::new(State::default()),
                 accepted_changes,
+                timing: Mutex::new((ADVERTISE_ACK_TIMEOUT, ADVERTISE_RETRY_DELAY)),
             }),
         }
     }
@@ -252,6 +258,28 @@ impl ShareBook {
             }
         });
         Ok(())
+    }
+
+    /// Other figures than [`ADVERTISE_ACK_TIMEOUT`] and [`ADVERTISE_RETRY_DELAY`], for tests that
+    /// cannot wait that long; takes effect at the next attachment.
+    #[doc(hidden)]
+    pub fn set_advertise_timing(&self, ack_timeout: Duration, retry_delay: Duration) {
+        *self
+            .inner
+            .timing
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = (ack_timeout, retry_delay);
+    }
+
+    /// The bookkeeping of the answers to the ADVERTISE records of one attachment, with this
+    /// book's figures.
+    pub(crate) fn advertise_watch(&self) -> AdvertiseWatch {
+        let (ack_timeout, retry_delay) = *self
+            .inner
+            .timing
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        AdvertiseWatch::with_timing(ack_timeout, retry_delay)
     }
 
     /// The shares the owner configured.
@@ -306,11 +334,26 @@ impl ShareBook {
     }
 
     /// An ADVERTISE with `shares` is about to be sent.
+    ///
+    /// A share the new set no longer holds (same name and an equal [`Share`], so a changed service,
+    /// mode or ALPN counts as withdrawn too) stops being accepted at once, not when the relay's
+    /// answer comes: the owner took it away, and a relay that never answers (or refuses the
+    /// ADVERTISE as over its rate) must not keep it served. The watcher of the accepted set is
+    /// told, so that the streams of the withdrawn share are reset now. A share the new set still
+    /// holds stays accepted until the answer, because the relay's claims do too.
     pub(crate) fn note_sent(&self, shares: &[Share]) {
         let mut state = self.state();
         state.snapshot.sent = shares.to_vec();
-        // The relay's answer to the one before no longer describes what was just asked; the
-        // accepted set stays until the new answer, because the relay's claims do too.
+        let before = state.snapshot.accepted.len();
+        state
+            .snapshot
+            .accepted
+            .retain(|accepted| shares.iter().any(|share| share == accepted));
+        let withdrawn = state.snapshot.accepted.len() != before;
+        drop(state);
+        if withdrawn {
+            self.accepted_changed();
+        }
     }
 
     /// The relay's ADVERTISE_ACK arrived.
@@ -334,6 +377,116 @@ impl ShareBook {
     pub(crate) fn note_detached(&self) {
         self.state().snapshot = ShareSnapshot::default();
         self.accepted_changed();
+    }
+}
+
+/// How long the relay has to answer an ADVERTISE (with its ACK, or an ERROR) before the node
+/// takes the attachment for dead and re-attaches: a relay that never answers must not leave the
+/// node unable to tell what the relay holds for it.
+pub const ADVERTISE_ACK_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How long the node waits before it states its shares again after the relay answered an
+/// ADVERTISE with an ERROR (typically `rate_limited`, which a relay says after ten a minute, so
+/// that the next try finds a token again).
+pub const ADVERTISE_RETRY_DELAY: Duration = Duration::from_secs(10);
+
+/// What became due on an [`AdvertiseWatch`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Due {
+    /// An ADVERTISE got no answer within [`ADVERTISE_ACK_TIMEOUT`]: end the attachment.
+    AckMissing,
+    /// The wait after a refused ADVERTISE is over: state the shares again.
+    Retry,
+}
+
+/// The node's bookkeeping of the answers to its ADVERTISE records in one attachment: how many are
+/// unanswered, when the oldest must be answered by, and when to try again after a refusal. Plain
+/// state with the clock passed in, driven by the relay session loop (`session.rs`).
+#[derive(Debug)]
+pub(crate) struct AdvertiseWatch {
+    unanswered: u32,
+    deadline: Option<Instant>,
+    retry_at: Option<Instant>,
+    ack_timeout: Duration,
+    retry_delay: Duration,
+}
+
+impl AdvertiseWatch {
+    #[cfg(test)]
+    pub(crate) fn new() -> Self {
+        Self::with_timing(ADVERTISE_ACK_TIMEOUT, ADVERTISE_RETRY_DELAY)
+    }
+
+    pub(crate) fn with_timing(ack_timeout: Duration, retry_delay: Duration) -> Self {
+        Self {
+            unanswered: 0,
+            deadline: None,
+            retry_at: None,
+            ack_timeout,
+            retry_delay,
+        }
+    }
+
+    /// An ADVERTISE was written. It supersedes a retry that was waiting.
+    pub(crate) fn sent(&mut self, now: Instant) {
+        self.unanswered += 1;
+        self.retry_at = None;
+        if self.deadline.is_none() {
+            self.deadline = Some(now + self.ack_timeout);
+        }
+    }
+
+    fn answered(&mut self, now: Instant) -> bool {
+        if self.unanswered == 0 {
+            return false;
+        }
+        self.unanswered -= 1;
+        self.deadline = (self.unanswered > 0).then(|| now + self.ack_timeout);
+        true
+    }
+
+    /// An ADVERTISE_ACK came in.
+    pub(crate) fn acked(&mut self, now: Instant) {
+        self.answered(now);
+    }
+
+    /// An ERROR came in. While an ADVERTISE is unanswered it is that one's answer: the relay did
+    /// not take the set (its claims stay as they were), so the node asks again after a while.
+    /// Returns whether the ERROR counted as such an answer.
+    pub(crate) fn refused(&mut self, now: Instant) -> bool {
+        if !self.answered(now) {
+            return false;
+        }
+        self.retry_at = Some(now + self.retry_delay);
+        true
+    }
+
+    /// Whether some ADVERTISE is unanswered.
+    #[cfg(test)]
+    pub(crate) fn waiting(&self) -> bool {
+        self.unanswered > 0
+    }
+
+    /// Resolves when something is due; never resolves while nothing is. The retry is spent by
+    /// being reported, the missing answer is not (the caller ends the attachment).
+    pub(crate) async fn due(&mut self) -> Due {
+        let next = match (self.deadline, self.retry_at) {
+            (None, None) => return std::future::pending().await,
+            (Some(deadline), None) => (deadline, Due::AckMissing),
+            (None, Some(retry)) => (retry, Due::Retry),
+            (Some(deadline), Some(retry)) => {
+                if retry < deadline {
+                    (retry, Due::Retry)
+                } else {
+                    (deadline, Due::AckMissing)
+                }
+            }
+        };
+        tokio::time::sleep_until(next.0).await;
+        if next.1 == Due::Retry {
+            self.retry_at = None;
+        }
+        next.1
     }
 }
 
@@ -500,5 +653,158 @@ mod tests {
         book.note_sent(&[blind("a")]);
         book.note_ack(&ack(&["zzz"], &[], &[]));
         assert!(book.snapshot().accepted.is_empty());
+    }
+
+    #[test]
+    fn a_share_taken_out_of_the_set_stops_being_accepted_before_any_answer() {
+        let book = ShareBook::new();
+        let (a, b) = (blind("a"), blind("b"));
+        book.note_sent(&[a.clone(), b.clone()]);
+        book.note_ack(&ack(&["a", "b"], &[], &[]));
+        let mut watcher = book.subscribe_accepted();
+        watcher.borrow_and_update();
+
+        // `a` leaves the set, and the relay has not answered (or never will).
+        book.note_sent(std::slice::from_ref(&b));
+        assert!(!book.accepted_service(&a.service), "withdrawn means gone");
+        assert!(
+            book.accepted_service(&b.service),
+            "b stays until the answer"
+        );
+        assert!(
+            watcher.has_changed().unwrap(),
+            "the watcher is told at once"
+        );
+        watcher.borrow_and_update();
+
+        // The same set again changes nothing and tells nobody.
+        book.note_sent(std::slice::from_ref(&b));
+        assert!(book.accepted_service(&b.service));
+        assert!(!watcher.has_changed().unwrap());
+    }
+
+    #[test]
+    fn a_share_whose_value_changed_is_not_accepted_under_its_old_value() {
+        let book = ShareBook::new();
+        let old = blind("a");
+        book.note_sent(std::slice::from_ref(&old));
+        book.note_ack(&ack(&["a"], &[], &[]));
+        // Same name, another service behind it: the relay accepted the old one only.
+        let changed = share("a", ShareMode::Blind, "tls:elsewhere");
+        book.note_sent(std::slice::from_ref(&changed));
+        assert!(!book.accepted_service(&old.service));
+        assert!(!book.accepted_service(&changed.service));
+        assert!(book.accepted().is_empty());
+        assert!(book.has_unaccepted());
+    }
+
+    // ---- the answers to ADVERTISE ----------------------------------------------
+
+    use tokio::time::timeout;
+
+    #[tokio::test(start_paused = true)]
+    async fn an_advertise_with_no_answer_is_reported_after_the_ack_timeout() {
+        let mut watch = AdvertiseWatch::new();
+        assert!(
+            timeout(Duration::from_secs(3600), watch.due())
+                .await
+                .is_err(),
+            "nothing is due while nothing is waiting"
+        );
+        watch.sent(Instant::now());
+        assert!(watch.waiting());
+        assert!(
+            timeout(ADVERTISE_ACK_TIMEOUT - Duration::from_secs(1), watch.due())
+                .await
+                .is_err(),
+            "not before the deadline"
+        );
+        let started = Instant::now();
+        assert_eq!(
+            timeout(Duration::from_secs(5), watch.due()).await,
+            Ok(Due::AckMissing)
+        );
+        assert!(Instant::now() - started <= Duration::from_secs(2));
+        assert_eq!(ADVERTISE_ACK_TIMEOUT, Duration::from_secs(30));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_answer_clears_the_deadline_and_a_second_unanswered_one_keeps_it() {
+        let mut watch = AdvertiseWatch::new();
+        watch.sent(Instant::now());
+        tokio::time::sleep(Duration::from_secs(20)).await;
+        watch.acked(Instant::now());
+        assert!(!watch.waiting());
+        assert!(
+            timeout(Duration::from_secs(3600), watch.due())
+                .await
+                .is_err(),
+            "answered in time: nothing is due"
+        );
+
+        // Two out, one answered: the other still has its own deadline, counted from the answer.
+        watch.sent(Instant::now());
+        watch.sent(Instant::now());
+        tokio::time::sleep(Duration::from_secs(20)).await;
+        watch.acked(Instant::now());
+        assert!(watch.waiting());
+        assert!(
+            timeout(ADVERTISE_ACK_TIMEOUT - Duration::from_secs(1), watch.due())
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            timeout(Duration::from_secs(5), watch.due()).await,
+            Ok(Due::AckMissing)
+        );
+        // An ACK nobody asked for is no answer to anything.
+        let mut idle = AdvertiseWatch::new();
+        idle.acked(Instant::now());
+        assert!(!idle.waiting());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_error_while_waiting_is_a_refusal_that_is_retried_once_after_the_delay() {
+        let mut watch = AdvertiseWatch::new();
+        // An ERROR with nothing in flight is not about ADVERTISE.
+        assert!(!watch.refused(Instant::now()));
+        assert!(
+            timeout(Duration::from_secs(3600), watch.due())
+                .await
+                .is_err(),
+            "no retry for an unrelated ERROR"
+        );
+
+        watch.sent(Instant::now());
+        assert!(watch.refused(Instant::now()));
+        assert!(
+            !watch.waiting(),
+            "the refusal is the answer: no ack deadline"
+        );
+        assert!(
+            timeout(ADVERTISE_RETRY_DELAY - Duration::from_secs(1), watch.due())
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            timeout(Duration::from_secs(5), watch.due()).await,
+            Ok(Due::Retry)
+        );
+        assert!(
+            timeout(Duration::from_secs(3600), watch.due())
+                .await
+                .is_err(),
+            "a retry is reported once"
+        );
+
+        // Stating the shares again before the retry came supersedes it.
+        watch.sent(Instant::now());
+        assert!(watch.refused(Instant::now()));
+        watch.sent(Instant::now());
+        assert_eq!(
+            timeout(Duration::from_secs(3600), watch.due()).await,
+            Ok(Due::AckMissing),
+            "only the new ADVERTISE's deadline is left"
+        );
     }
 }

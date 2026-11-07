@@ -53,7 +53,17 @@
 //! [`PrincipalConfig::max_total`] (2,048) in all, handshakes in progress included; a session over
 //! either is refused as [`PrincipalError::TenantCap`] / [`PrincipalError::RelayCap`] and no
 //! handshake is started. Both are settable with [`PrincipalConfig`] builders and
-//! `Relay::with_principal_config`. Streams on one session are bounded by `menzil-stream` (448).
+//! `Relay::with_principal_config`.
+//!
+//! Streams are bounded too, because what a session buffers grows with them (measured, expose
+//! round 1 M2: about 290 KiB a stream held on the relay's side, one 256 KiB window and the
+//! sender queue beside it, so 448 streams of one session are about 126 MiB). One session holds
+//! at most [`PrincipalConfig::max_streams_per_session`] (64) streams (`menzil-stream`'s table
+//! for a principal session is that size, and its receive windows never grow past 256 KiB:
+//! `MuxLimits`), refused as [`PrincipalError::StreamLimit`]; the sessions of one tenant together
+//! at most [`PrincipalConfig::max_streams_per_tenant`] (1,024), refused as
+//! [`PrincipalError::TenantStreamCap`]. A stream gives its place back when it is dropped or its
+//! session ends.
 //!
 //! Inbound frames are held as the `yamux` guard of the record they carry
 //! (`StreamMux::feed_inbound_guarded`), so the node's credit comes back only when `yamux` has
@@ -74,7 +84,7 @@ use menzil_proto::{
     E2eDataBody, E2eFrame, ErrorCode, NetworkId, NodeId, OpenBody, OpenMeta, PROTOCOL_VERSION,
     ServiceId, ServiceKind, X25519PublicKey,
 };
-use menzil_stream::{Mode, OpenError, Stream, StreamMux, StreamMuxError, initiate_open};
+use menzil_stream::{Mode, MuxLimits, OpenError, Stream, StreamMux, StreamMuxError, initiate_open};
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, MissedTickBehavior};
@@ -107,6 +117,11 @@ pub const DEFAULT_OPEN_TIMEOUT: Duration = Duration::from_secs(10);
 pub const DEFAULT_SEND_WAIT: Duration = Duration::from_secs(30);
 /// How often a session looks at its timers and at the node's attachment.
 pub const DEFAULT_TICK: Duration = Duration::from_secs(1);
+/// Streams on one principal session. About 290 KiB each on the relay's side when nobody reads
+/// them (measured, see the module docs): 64 are about 18 MiB.
+pub const DEFAULT_MAX_STREAMS_PER_SESSION: usize = 64;
+/// Streams on all the principal sessions of one tenant: about 290 MiB at the measured cost.
+pub const DEFAULT_MAX_STREAMS_PER_TENANT: usize = 1_024;
 
 /// The figures of the principal. [`Default`] is the design's; tests shorten the times. Every
 /// `with_*` returns the changed copy.
@@ -128,6 +143,11 @@ pub struct PrincipalConfig {
     pub send_wait: Duration,
     /// The period of the timer checks (idle, age, KEEP, REKEY, path pin).
     pub tick: Duration,
+    /// Streams one session holds at once (at least 1, at most `menzil-stream`'s 448); also the
+    /// size of its `yamux` table, with receive windows that never grow.
+    pub max_streams_per_session: usize,
+    /// Streams all the sessions of one tenant hold at once.
+    pub max_streams_per_tenant: usize,
 }
 
 impl Default for PrincipalConfig {
@@ -141,6 +161,8 @@ impl Default for PrincipalConfig {
             open_timeout: DEFAULT_OPEN_TIMEOUT,
             send_wait: DEFAULT_SEND_WAIT,
             tick: DEFAULT_TICK,
+            max_streams_per_session: DEFAULT_MAX_STREAMS_PER_SESSION,
+            max_streams_per_tenant: DEFAULT_MAX_STREAMS_PER_TENANT,
         }
     }
 }
@@ -201,6 +223,30 @@ impl PrincipalConfig {
         self.tick = tick;
         self
     }
+
+    /// What a principal session's `yamux` connection is built with: the session's stream cap
+    /// as its table, and receive windows that never grow (the relay must not be made to buffer
+    /// more than the initial window of each stream).
+    pub(crate) fn mux_limits(&self) -> MuxLimits {
+        MuxLimits {
+            max_live_streams: self.max_streams_per_session,
+            window_growth: false,
+        }
+    }
+
+    /// With `limit` streams per session.
+    #[must_use]
+    pub fn with_max_streams_per_session(mut self, limit: usize) -> Self {
+        self.max_streams_per_session = limit;
+        self
+    }
+
+    /// With `limit` streams per tenant.
+    #[must_use]
+    pub fn with_max_streams_per_tenant(mut self, limit: usize) -> Self {
+        self.max_streams_per_tenant = limit;
+        self
+    }
 }
 
 /// Why [`Principal::open`] gave no stream.
@@ -243,9 +289,15 @@ pub enum PrincipalError {
     /// stream could be opened.
     #[error("the L4 session ended")]
     SessionEnded,
-    /// The session holds as many streams as `menzil-stream` allows.
+    /// The session holds as many streams as [`PrincipalConfig::max_streams_per_session`] allows.
     #[error("the session holds as many streams as it may")]
     StreamLimit,
+    /// The tenant's sessions hold `limit` streams already.
+    #[error("the tenant already holds {limit} principal streams")]
+    TenantStreamCap {
+        /// The figure in force.
+        limit: usize,
+    },
     /// The node answered OPEN_ACK `ok: false`.
     #[error("the node refused the stream: {code:?} {msg}")]
     Refused {
@@ -297,6 +349,8 @@ struct State {
     by_index: HashMap<u32, Route>,
     per_tenant: HashMap<TenantId, usize>,
     total: usize,
+    /// Streams being opened (the place is taken before the stream exists), per tenant.
+    opening: HashMap<TenantId, usize>,
 }
 
 impl State {
@@ -479,11 +533,38 @@ impl Principal {
         let mut retried = false;
         loop {
             let mux = self.session_for(tenant, node, network).await?;
+            let _place = self.reserve_stream(tenant)?;
             match self.open_stream(&mux, &service, &meta).await {
                 Err(PrincipalError::SessionEnded) if !retried => retried = true,
                 other => return other,
             }
         }
+    }
+
+    /// Takes a place among the tenant's streams for one being opened: the streams its sessions
+    /// hold now plus those other callers are opening must be below the cap. The place is given
+    /// back when the open is over (the stream then counts as a live one, or is gone).
+    fn reserve_stream(&self, tenant: &TenantId) -> Result<StreamPlace, PrincipalError> {
+        let limit = self.shared.config.max_streams_per_tenant;
+        let mut state = self.shared.lock();
+        let live: usize = state
+            .sessions
+            .values()
+            .filter(|entry| entry.tenant == *tenant)
+            .map(|entry| match &*entry.ready.borrow() {
+                Phase::Ready(mux) => mux.live_streams(),
+                _ => 0,
+            })
+            .sum();
+        let opening = state.opening.get(tenant).copied().unwrap_or(0);
+        if live + opening >= limit {
+            return Err(PrincipalError::TenantStreamCap { limit });
+        }
+        *state.opening.entry(tenant.clone()).or_insert(0) += 1;
+        Ok(StreamPlace {
+            shared: Arc::clone(&self.shared),
+            tenant: tenant.clone(),
+        })
     }
 
     /// The mux of the ready session for `(node, network)`, started if need be.
@@ -642,6 +723,24 @@ impl Principal {
     }
 }
 
+/// A place among a tenant's streams held while one is being opened; gives it back on drop.
+struct StreamPlace {
+    shared: Arc<Shared>,
+    tenant: TenantId,
+}
+
+impl Drop for StreamPlace {
+    fn drop(&mut self) {
+        let mut state = self.shared.lock();
+        if let Some(count) = state.opening.get_mut(&self.tenant) {
+            *count -= 1;
+            if *count == 0 {
+                state.opening.remove(&self.tenant);
+            }
+        }
+    }
+}
+
 /// Why a session task stopped; for the logs, and for what the waiting callers are told. The
 /// payloads are read by the `Debug` line of `Session::run` only.
 #[derive(Debug)]
@@ -755,7 +854,7 @@ impl Session {
         };
         let max_record = self.shared.relay.limits.max_record;
         let (mux, inbound_streams, mut outbound, driver) =
-            menzil_stream::new(Mode::Client, max_record);
+            menzil_stream::new_with_limits(Mode::Client, max_record, config.mux_limits());
         // The relay serves nothing: a stream the node opens is reset on arrival.
         drop(inbound_streams);
         let mut driver = Box::pin(driver);
@@ -831,7 +930,14 @@ impl Session {
             if !self.path_intact() {
                 return Err(PrincipalError::NotAttached);
             }
-            match relay.send_as_relay(&self.tenant, &node, E2E_PROTO_TAG, 0, init.clone()) {
+            match relay.send_as_relay(
+                &self.tenant,
+                &node,
+                self.l3_session,
+                E2E_PROTO_TAG,
+                0,
+                init.clone(),
+            ) {
                 RelaySendOutcome::Queued => break,
                 RelaySendOutcome::Full | RelaySendOutcome::Throttled => {
                     if Instant::now() >= deadline {
@@ -984,6 +1090,7 @@ impl Session {
         match self.shared.relay.send_as_relay(
             &self.tenant,
             &self.key.0,
+            self.l3_session,
             E2E_PROTO_TAG,
             0,
             bytes.to_vec(),

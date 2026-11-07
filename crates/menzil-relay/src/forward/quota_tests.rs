@@ -996,12 +996,18 @@ impl World {
         reliable: bool,
         len: usize,
     ) -> RelaySendOutcome {
+        // The session the node is attached by now (none: any id, the node is offline anyway).
+        let session_id = self
+            .registry
+            .attachment_of(&dst)
+            .map_or(0, |attachment| attachment.session_id);
         self.table.forward_from_relay(
             &self.registry,
             &self.limits,
             &relay_id(),
             tenant,
             &dst,
+            session_id,
             0x01,
             if reliable { 0x00 } else { 0x01 },
             vec![0u8; len],
@@ -1043,6 +1049,39 @@ fn the_relays_frame_arrives_with_the_relay_as_src_and_needs_no_roster() {
     }
 }
 
+/// Expose round 1, N1: the caller's L4 session is pinned to one L3 session of the node. A
+/// re-attach between its path check and the send makes the frame `PeerOffline`, whatever the
+/// attachment of the same node is now, and nothing is queued or reserved for it.
+#[test]
+fn a_frame_for_an_l3_session_the_node_has_left_is_not_sent_to_the_one_it_has_now() {
+    let mut w = World::new(1024);
+    let node = NodeId::from([0x31; 32]);
+    w.attach(node, vec![]);
+    let old = w.registry.attachment_of(&node).unwrap().session_id;
+    w.attach(node, vec![]);
+    let current = w.registry.attachment_of(&node).unwrap().session_id;
+    assert_ne!(old, current);
+    let send = |session_id: u32| {
+        w.table.forward_from_relay(
+            &w.registry,
+            &w.limits,
+            &relay_id(),
+            &TenantId::Default,
+            &node,
+            session_id,
+            0x01,
+            0x00,
+            vec![0u8; 100],
+        )
+    };
+    assert_eq!(send(old), RelaySendOutcome::PeerOffline);
+    assert!(
+        w.table.pair_figures(&relay_id(), &node).is_none(),
+        "nothing was reserved for the old session's frame"
+    );
+    assert_eq!(send(current), RelaySendOutcome::Queued);
+}
+
 #[test]
 fn a_frame_to_an_unattached_node_or_with_an_unknown_e2e_proto_queues_nothing() {
     let w = World::new(1024);
@@ -1058,6 +1097,7 @@ fn a_frame_to_an_unattached_node_or_with_an_unknown_e2e_proto_queues_nothing() {
         &relay_id(),
         &TenantId::Default,
         &node,
+        0,
         0x7f,
         0,
         vec![],

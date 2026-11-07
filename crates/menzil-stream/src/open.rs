@@ -247,6 +247,18 @@ pub trait ServiceHandler<S> {
         request: &OpenRequest,
     ) -> impl Future<Output = Result<Self::Opened, OpenRefusal>> + Send;
 
+    /// [`Self::open`] for a caller that counts and bounds the connections it asks for with
+    /// limits of its own, and so must not take a place in the limits `open` applies to ordinary
+    /// peers (the relay principal's streams, which have their own figures, must neither use up
+    /// the places members need nor be refused for lack of them). A handler without such limits
+    /// has nothing to skip: the default is `open`.
+    fn open_with_own_limits(
+        &self,
+        request: &OpenRequest,
+    ) -> impl Future<Output = Result<Self::Opened, OpenRefusal>> + Send {
+        self.open(request)
+    }
+
     /// Takes ownership of `stream`, whose OPEN_ACK `ok: true` has already
     /// been written and flushed for this exact `request` (the same one
     /// [`Self::open`] just approved, whose result is `opened`). Any bytes

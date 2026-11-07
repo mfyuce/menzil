@@ -21,7 +21,7 @@ use menzil_node::{
     NodeOpenError, OpenStreamError, PolicyStore, RelayError, RosterStore, SessionConfig,
 };
 use menzil_proto::trust::{DOC_MAX_LIFETIME, Reason};
-use menzil_proto::{ErrorCode, NetworkId, NodeId, ServiceId, ServiceKind};
+use menzil_proto::{ErrorCode, NetworkId, NodeId, ServiceId, ServiceKind, Share};
 use menzil_stream::Stream;
 use tokio::net::{UnixListener, UnixStream};
 use tokio::task::JoinHandle;
@@ -890,12 +890,55 @@ pub async fn start(home: &Home, config: &Config, socket: &Path) -> Result<Runnin
     })
 }
 
+/// What a reload of the `[[share]]` entries does: the set to advertise, and the shares of the
+/// file that must wait for a restart.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ShareReload {
+    /// The complete set to give the node: every share of the file whose service the node already
+    /// serves, and, for a share of the file that needs a restart, what the node advertises under
+    /// that name now (nothing, if it advertises none).
+    pub apply: Vec<Share>,
+    /// The shares of the file that point at a service the node did not start with.
+    pub needs_restart: Vec<Share>,
+}
+
+/// Decides a reload without touching a node. `current` is what the node advertises, `wanted`
+/// what `config.toml` says now, `served` the `[services]` table the node started with (what it
+/// serves is fixed when it starts, so a share may only point at one of these).
+///
+/// Removals and changes of shares whose service is already served apply at once, even when
+/// another share of the same edit needs a restart: that one alone is skipped, and the node
+/// keeps advertising what it did under its name. (A share the owner removed is gone from the
+/// result because it is not in `wanted`, whatever else the edit holds.)
+pub(crate) fn plan_share_reload(
+    current: &[Share],
+    wanted: Vec<Share>,
+    served: &std::collections::BTreeMap<String, String>,
+) -> ShareReload {
+    let mut apply = Vec::new();
+    let mut needs_restart = Vec::new();
+    for share in wanted {
+        if served.contains_key(&share.service.to_string()) {
+            apply.push(share);
+        } else {
+            if let Some(held) = current.iter().find(|held| held.name == share.name) {
+                apply.push(held.clone());
+            }
+            needs_restart.push(share);
+        }
+    }
+    ShareReload {
+        apply,
+        needs_restart,
+    }
+}
+
 /// Reads the `[[share]]` entries of `config.toml` again and, when they differ from what the node
 /// advertises, gives the node the new set (it advertises on its live session). A file that does
 /// not parse or a share that is not valid leaves the node advertising what it did, with the
 /// reason in the log: nothing is half applied. `served` is the `[services]` table the node
 /// started with: a share that points at a service the node does not serve yet needs a restart,
-/// which the log says.
+/// which the log says; it alone waits (see [`plan_share_reload`]), the rest of the edit applies.
 fn reload_shares(home: &Home, node: &Node, served: &std::collections::BTreeMap<String, String>) {
     let shares = match Config::load(home).and_then(|config| config.shares()) {
         Ok(shares) => shares,
@@ -904,14 +947,11 @@ fn reload_shares(home: &Home, node: &Node, served: &std::collections::BTreeMap<S
             return;
         }
     };
-    if let Some(share) = shares
-        .iter()
-        .find(|share| !served.contains_key(&share.service.to_string()))
-    {
-        tracing::warn!(share = %share.name, service = %share.service, "a share in config.toml points at a service this node did not start with: restart `menzil node` to serve it; the shares are not changed");
-        return;
+    let plan = plan_share_reload(&node.shares().configured(), shares, served);
+    for share in &plan.needs_restart {
+        tracing::warn!(share = %share.name, service = %share.service, "a share in config.toml points at a service this node did not start with: restart `menzil node` to serve it; that share is not changed");
     }
-    if let Err(error) = node.shares().set_shares(shares) {
+    if let Err(error) = node.shares().set_shares(plan.apply) {
         tracing::warn!(error = %error, "the shares of config.toml are not valid, the node keeps advertising the ones it has");
     }
 }

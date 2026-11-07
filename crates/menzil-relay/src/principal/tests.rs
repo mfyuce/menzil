@@ -143,6 +143,20 @@ struct Behaviour {
     wrong_cert: bool,
     /// It refuses every OPEN with this code.
     refuse: Option<ErrorCode>,
+    /// What the service behind an accepted OPEN does.
+    service: Scripted,
+}
+
+/// What the scripted node's service does with a stream.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Scripted {
+    /// Reads and writes the bytes back.
+    Echo,
+    /// Never reads and never writes (the relay's writes stop at the window the node granted).
+    Silent,
+    /// Writes as fast as it may and never reads (the node's writes stop at the window the relay
+    /// granted, which is what the relay holds when nobody reads its end).
+    Flood,
 }
 
 impl Behaviour {
@@ -151,6 +165,7 @@ impl Behaviour {
             networks: networks.to_vec(),
             wrong_cert: false,
             refuse: None,
+            service: Scripted::Echo,
         }
     }
 }
@@ -203,10 +218,10 @@ impl Authorizer for Auth {
     }
 }
 
-/// An echo service.
-struct Echo;
+/// The scripted node's service (see [`Scripted`]).
+struct Service(Scripted);
 
-impl ServiceHandler<Stream> for Echo {
+impl ServiceHandler<Stream> for Service {
     type Opened = ();
     type Handling = Pin<Box<dyn Future<Output = ()> + Send>>;
 
@@ -215,7 +230,21 @@ impl ServiceHandler<Stream> for Echo {
     }
 
     fn handle(&self, mut stream: Stream, _request: OpenRequest, _opened: ()) -> Self::Handling {
+        let mode = self.0;
         Box::pin(async move {
+            match mode {
+                Scripted::Echo => {}
+                Scripted::Silent => {
+                    let _stream = stream;
+                    std::future::pending::<()>().await;
+                    return;
+                }
+                Scripted::Flood => {
+                    let chunk = vec![0xa5u8; 16 * 1024];
+                    while stream.write_all(&chunk).await.is_ok() {}
+                    return;
+                }
+            }
             let mut buf = vec![0u8; 16 * 1024];
             loop {
                 match stream.read(&mut buf).await {
@@ -413,6 +442,7 @@ async fn responder(
                 let acceptor = {
                     let seen = Arc::clone(&seen);
                     let refuse = behaviour.refuse;
+                    let service = behaviour.service;
                     tokio::spawn(async move {
                         while let Some(stream) = inbound.accept().await {
                             let seen = Arc::clone(&seen);
@@ -421,9 +451,14 @@ async fn responder(
                                     seen: Arc::clone(&seen),
                                     refuse,
                                 };
-                                if let Ok(Responded::Accepted(handling)) =
-                                    respond_to_open(stream, network_id, relay_id, &auth, &Echo)
-                                        .await
+                                if let Ok(Responded::Accepted(handling)) = respond_to_open(
+                                    stream,
+                                    network_id,
+                                    relay_id,
+                                    &auth,
+                                    &Service(service),
+                                )
+                                .await
                                 {
                                     handling.await;
                                 }
@@ -933,6 +968,150 @@ async fn sessions_are_capped_per_tenant_and_in_all() {
     assert_eq!(principal.session_count(), 3);
 }
 
+/// Opens until it works or the wait is over: a dropped stream's place comes back once `yamux`
+/// has written its reset, not at the drop.
+async fn open_when_a_place_frees(rig: &Rig, network: NetworkId) -> Stream {
+    bounded("a place to come back", async {
+        loop {
+            match rig.open(network, "demo").await {
+                Ok(stream) => return stream,
+                Err(PrincipalError::StreamLimit | PrincipalError::TenantStreamCap { .. }) => {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                Err(other) => panic!("unexpected: {other:?}"),
+            }
+        }
+    })
+    .await
+}
+
+/// Expose round 1, M2: a session holds at most `max_streams_per_session` streams, at that
+/// figure and not at `menzil-stream`'s 448, and a place comes back when a stream is dropped.
+#[tokio::test]
+async fn a_session_holds_at_most_its_stream_cap_and_a_dropped_stream_gives_its_place_back() {
+    let n = network(1);
+    let rig = rig(quick().with_max_streams_per_session(3), &[n]);
+    let a = rig.open(n, "demo").await.expect("first");
+    let _b = rig.open(n, "demo").await.expect("second");
+    let _c = rig.open(n, "demo").await.expect("third");
+    assert_eq!(
+        rig.open(n, "demo").await.expect_err("over the session cap"),
+        PrincipalError::StreamLimit
+    );
+    assert_eq!(rig.principal.session_count(), 1, "the session goes on");
+    drop(a);
+    let _again = open_when_a_place_frees(&rig, n).await;
+    assert_eq!(
+        rig.open(n, "demo").await.expect_err("full again"),
+        PrincipalError::StreamLimit
+    );
+}
+
+/// A principal session's connection has the session's stream cap as its table and receive
+/// windows that never grow (the figures those mean are `menzil-stream`'s own test).
+#[test]
+fn a_principal_session_is_built_with_the_stream_cap_and_without_window_growth() {
+    let limits = PrincipalConfig::default()
+        .with_max_streams_per_session(7)
+        .mux_limits();
+    assert_eq!(limits.max_live_streams, 7);
+    assert!(!limits.window_growth);
+    assert_eq!(
+        PrincipalConfig::default().mux_limits().max_live_streams,
+        DEFAULT_MAX_STREAMS_PER_SESSION
+    );
+}
+
+#[tokio::test]
+async fn the_tenants_streams_are_capped_across_sessions_and_given_back() {
+    let (n1, n2) = (network(1), network(2));
+    let relay = relay_with(limits());
+    let principal = Principal::with_config(
+        &relay,
+        quick()
+            .with_max_streams_per_session(8)
+            .with_max_streams_per_tenant(3),
+    );
+    let node = TestNode::new();
+    let attached = attach(&relay, &node, 7, Behaviour::serving(&[n1, n2]));
+    let rig = Rig {
+        relay,
+        principal,
+        node,
+        attached,
+    };
+    let _a = rig.open(n1, "demo").await.expect("first");
+    let b = rig.open(n1, "demo").await.expect("second");
+    let _c = rig
+        .open(n2, "demo")
+        .await
+        .expect("third, on another session of the tenant");
+    assert_eq!(rig.principal.session_count(), 2);
+    assert_eq!(
+        rig.open(n2, "demo").await.expect_err("over the tenant cap"),
+        PrincipalError::TenantStreamCap { limit: 3 }
+    );
+    assert_eq!(
+        rig.open(n1, "demo").await.expect_err("either session"),
+        PrincipalError::TenantStreamCap { limit: 3 }
+    );
+    // Another tenant has streams of its own (another node: a network's session has one tenant).
+    let other = TestNode::new();
+    let _other_attached = attach(&rig.relay, &other, 11, Behaviour::serving(&[n1]));
+    let ali = TenantId::Named(Slug::parse("friends").unwrap());
+    let _x = bounded(
+        "open",
+        rig.principal
+            .open(&ali, other.node_id, n1, service("demo"), meta()),
+    )
+    .await
+    .expect("another tenant is not held back");
+    // A dropped stream gives its place back.
+    drop(b);
+    let _d = open_when_a_place_frees(&rig, n2).await;
+    assert_eq!(
+        rig.open(n2, "demo").await.expect_err("full again"),
+        PrincipalError::TenantStreamCap { limit: 3 }
+    );
+    // A session that ends gives back every place it held: the node reattaches, and the tenant
+    // opens on a fresh session while the dead streams are still held here.
+    assert!(rig.relay.registry.detach(&rig.node.node_id, 7));
+    eventually("the sessions end", || {
+        rig.principal.tenant_session_count(&TenantId::Default) == 0
+    })
+    .await;
+    let _reattached = attach(&rig.relay, &rig.node, 8, Behaviour::serving(&[n1, n2]));
+    let _fresh = rig
+        .open(n1, "demo")
+        .await
+        .expect("a place on a fresh session");
+}
+
+/// Several opens at once cannot overshoot the tenant's cap: a place is taken before the stream
+/// exists.
+#[tokio::test]
+async fn opens_made_at_once_do_not_overshoot_the_tenants_cap() {
+    let n = network(1);
+    let rig = rig(
+        quick()
+            .with_max_streams_per_session(16)
+            .with_max_streams_per_tenant(3),
+        &[n],
+    );
+    // The session first, so that the opens below race for places and not for the handshake.
+    let first = rig.open(n, "demo").await.expect("first");
+    let results = futures_util::future::join_all((0..8).map(|_| rig.open(n, "demo"))).await;
+    let opened = results.iter().filter(|r| r.is_ok()).count();
+    assert_eq!(opened, 2, "3 places, one already taken: {results:?}");
+    assert!(
+        results
+            .iter()
+            .filter_map(|r| r.as_ref().err())
+            .all(|e| *e == PrincipalError::TenantStreamCap { limit: 3 })
+    );
+    drop(first);
+}
+
 #[tokio::test(start_paused = true)]
 async fn a_session_that_ends_gives_its_place_back_to_the_caps() {
     let n = network(1);
@@ -992,6 +1171,8 @@ async fn the_relays_own_figures_are_the_designs() {
     assert_eq!(config.max_total, 2_048);
     assert_eq!(config.idle_timeout, Duration::from_secs(300));
     assert_eq!(config.max_session_age, Duration::from_secs(24 * 3600));
+    assert_eq!(config.max_streams_per_session, 64);
+    assert_eq!(config.max_streams_per_tenant, 1_024);
 }
 
 #[tokio::test]
@@ -1099,4 +1280,139 @@ async fn dropping_the_principal_ends_its_sessions() {
     assert!(matches!(read, Ok(0) | Err(_)), "{read:?}");
     drop(attached);
     drop(relay);
+}
+
+// ---- what a session buffers (expose round 1, M2) ----
+
+mod heap {
+    //! The resident set of the test process, from `/proc/self/statm` (the relay crate forbids
+    //! `unsafe`, so no counting allocator here; `menzil-stream/tests/small_frames.rs` has one).
+    //! It counts every page of the process, so the measurement runs alone
+    //! (`--ignored --test-threads=1`), and only growth is read from it: freed memory the
+    //! allocator keeps is not subtracted, so a figure is at most what was held at once.
+    pub fn live() -> usize {
+        let statm = std::fs::read_to_string("/proc/self/statm").expect("Linux /proc");
+        let resident_pages: usize = statm
+            .split_whitespace()
+            .nth(1)
+            .and_then(|field| field.parse().ok())
+            .expect("statm has a resident field");
+        resident_pages * 4096
+    }
+}
+
+/// Waits until the resident set has not changed for a second.
+async fn quiet_heap() -> usize {
+    let mut last = heap::live();
+    let mut still = 0;
+    for _ in 0..400 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let now = heap::live();
+        if now.abs_diff(last) < 4096 {
+            still += 1;
+            if still >= 10 {
+                return now;
+            }
+        } else {
+            still = 0;
+        }
+        last = now;
+    }
+    last
+}
+
+/// Opens `streams` streams through one principal session to a scripted node whose service is
+/// `service`, lets every stream fill its window (the relay writes into each in `Silent` mode and
+/// reads nothing; the node writes into each in `Flood` mode and the relay reads nothing), and
+/// returns the resident memory the whole process grew by beyond what it held with the session
+/// up and one stream.
+///
+/// The relay's ends and the scripted node's ends live in one process, so the figure is both ends
+/// of the connection: an upper bound of what the relay holds.
+async fn heap_with_full_streams(service: Scripted, relay_writes: bool, streams: usize) -> usize {
+    let n = network(1);
+    let relay = relay_with(limits());
+    let principal =
+        Principal::with_config(&relay, quick().with_idle_timeout(Duration::from_secs(3600)));
+    let node = TestNode::new();
+    let behaviour = Behaviour {
+        service,
+        ..Behaviour::serving(&[n])
+    };
+    let _attached = attach(&relay, &node, 7, behaviour);
+    let open = |label: String| {
+        principal.open(
+            &TenantId::Default,
+            node.node_id,
+            n,
+            service_named(&label),
+            meta(),
+        )
+    };
+    // One stream to bring the session up, then the baseline.
+    let first = bounded("first open", open("probe0".to_string()))
+        .await
+        .expect("the first stream");
+    let (first_reader, mut first_writer) = first.split();
+    let chunk = vec![0x5au8; 16 * 1024];
+    let mut held = Vec::new();
+    let mut writers = Vec::new();
+    if relay_writes {
+        writers.push(tokio::spawn(async move {
+            while first_writer.write_all(&chunk).await.is_ok() {}
+        }));
+    }
+    held.push(first_reader);
+    let base = quiet_heap().await;
+    for i in 1..streams {
+        let stream = bounded("open", open(format!("probe{i}")))
+            .await
+            .expect("a stream");
+        let (reader, mut writer) = stream.split();
+        if relay_writes {
+            let chunk = vec![0x5au8; 16 * 1024];
+            writers.push(tokio::spawn(async move {
+                while writer.write_all(&chunk).await.is_ok() {}
+            }));
+        } else {
+            held.push(reader);
+            continue;
+        }
+        held.push(reader);
+    }
+    let full = quiet_heap().await;
+    for writer in &writers {
+        writer.abort();
+    }
+    drop(held);
+    full.saturating_sub(base)
+}
+
+fn service_named(label: &str) -> ServiceId {
+    service(label)
+}
+
+/// The measurement behind the principal's stream caps, one configuration a process (a resident
+/// set only grows, so a second run in the same process would reuse what the first freed):
+/// `MEASURE_SERVICE=silent|flood|both MEASURE_STREAMS=64 cargo test -p menzil-relay --lib --
+/// --ignored --nocapture --test-threads=1 measure_what_a_session_buffers`
+#[tokio::test]
+#[ignore = "a measurement: reads the whole process's resident set, run it alone"]
+async fn measure_what_a_session_buffers() {
+    let mode = std::env::var("MEASURE_SERVICE").unwrap_or_default();
+    let service = match mode.as_str() {
+        "flood" | "both" => Scripted::Flood,
+        _ => Scripted::Silent,
+    };
+    let streams: usize = std::env::var("MEASURE_STREAMS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(16);
+    let baseline = heap::live();
+    let grown = heap_with_full_streams(service, mode != "flood", streams).await;
+    println!(
+        "MEASURE {} streams={streams} grew_bytes={grown} per_stream={} process_rss_before={baseline}",
+        if mode.is_empty() { "silent" } else { &mode },
+        grown / streams.saturating_sub(1).max(1)
+    );
 }

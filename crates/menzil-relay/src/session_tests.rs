@@ -5519,6 +5519,7 @@ async fn a_member_cannot_make_a_frame_appear_to_come_from_the_relay() {
         relay.send_as_relay(
             &crate::tenant::TenantId::Default,
             &node_b.clone(),
+            relay.attached_node(&node_b).unwrap().session_id,
             0x01,
             0,
             vec![9u8; 100]
@@ -5568,10 +5569,12 @@ async fn the_relays_pair_toward_a_node_goes_when_the_node_detaches() {
     let relay_id = relay.relay_id().unwrap();
 
     let (mut client, identity) = one_attached_member(&relay, addr, cert, relay_x25519).await;
+    let session_id = relay.attached_node(&identity.node_id).unwrap().session_id;
     assert_eq!(
         relay.send_as_relay(
             &crate::tenant::TenantId::Default,
             &identity.node_id,
+            session_id,
             0x01,
             0,
             vec![1u8; 100]
@@ -5592,6 +5595,7 @@ async fn the_relays_pair_toward_a_node_goes_when_the_node_detaches() {
         relay.send_as_relay(
             &crate::tenant::TenantId::Default,
             &identity.node_id,
+            session_id,
             0x01,
             0,
             vec![1u8; 100]

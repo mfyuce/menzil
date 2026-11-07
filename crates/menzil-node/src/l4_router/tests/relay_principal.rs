@@ -11,8 +11,9 @@
 use super::*;
 use crate::docs_access::{DocsGate, DocsLimits};
 use crate::node::serve_session_with_relay;
-use crate::relay_serve::{RelayAuthorizer, RelayLimits, RelayServing, validate_meta};
+use crate::relay_serve::{RelayAuthorizer, RelayHandler, RelayLimits, RelayServing, validate_meta};
 use crate::revalidate::Revalidator;
+use crate::serve::{LocalServices, LocalTarget, ServeLimits};
 use crate::shares::ShareBook;
 use menzil_proto::{
     AdvertiseAckBody, Label, OpenAckBody, OpenBody, OpenMeta, OpenTarget, RevokedMember, Share,
@@ -711,6 +712,51 @@ async fn a_withdrawn_share_resets_its_stream_and_the_session_keeps_the_others() 
     assert!(ack.ok, "{ack:?}");
 }
 
+/// The probe of expose round 1, M1: the owner takes `app` out of the set and the relay never
+/// answers the ADVERTISE (it is silent, or refused it as over its rate). Nothing but `note_sent`
+/// has run, and `app` must stop being served at once, not stay until an ACK that does not come.
+#[tokio::test(start_paused = true)]
+async fn a_share_the_owner_withdrew_is_not_served_while_the_relay_has_not_answered() {
+    let mut rp = rp(&[blind("app"), blind("other")], &["app", "other"]).await;
+    let mut up = rp.up().await;
+    let reval = rp.revalidator();
+    let relay = rp.serving(None);
+    rp.serve(up.node_ready, Some(&reval), Some(&relay));
+    let (mut app, ack) = open_plain(&up.relay, "tls:app").await;
+    assert!(ack.ok);
+    let (mut other, ack) = open_plain(&up.relay, "tls:other").await;
+    assert!(ack.ok);
+
+    // What the session does when the configured set changes: the book is set and the ADVERTISE
+    // without `app` is about to be written. No ACK follows, whatever the time.
+    rp.book.set_shares(vec![blind("other")]).unwrap();
+    rp.book.note_sent(&[blind("other")]);
+
+    let mut byte = [0u8; 1];
+    let error = timeout(Duration::from_secs(2), app.read(&mut byte))
+        .await
+        .expect("the stream of the withdrawn share is reset at once")
+        .expect_err("a reset, not an end of file");
+    assert_eq!(error.kind(), std::io::ErrorKind::ConnectionReset);
+    tokio::time::sleep(Duration::from_secs(120)).await;
+    let (_stream, ack) = open_plain(&up.relay, "tls:app").await;
+    assert_refused(&ack, ErrorCode::NoGrant, "the withdrawn share, 120 s on");
+    assert!(
+        timeout(Duration::from_secs(1), other.read(&mut byte))
+            .await
+            .is_err(),
+        "the share that stays goes on"
+    );
+    let (_stream, ack) = open_plain(&up.relay, "tls:other").await;
+    assert!(ack.ok, "{ack:?}");
+    assert!(
+        timeout(Duration::from_secs(1), up.relay_ready.acceptor.closed())
+            .await
+            .is_err(),
+        "the session stays"
+    );
+}
+
 #[tokio::test(start_paused = true)]
 async fn losing_every_share_closes_the_session_with_grant_removed() {
     let mut rp = rp(&[blind("app")], &["app"]).await;
@@ -824,6 +870,107 @@ async fn the_relay_principal_has_its_own_limits_per_share_and_in_all() {
     );
 }
 
+/// Expose round 1, L1: the relay's streams are counted by `RelayLimits` only. They take no place
+/// in the members' `ServeLimits` (so 64 of them neither refuse a member nor use up the node-wide
+/// count), and a relay stream is refused at the `RelayLimits` figure, not at the members'
+/// per peer one. Real clock: the targets are real sockets.
+#[tokio::test]
+async fn relay_streams_take_no_place_in_the_members_serve_limits() {
+    use tokio::net::TcpListener;
+    let w = world();
+    let (b, m) = (party(), party());
+    let stores = labeled_stores(&w, &[&b, &m], &[("app", b.id)]);
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((socket, _)) = listener.accept().await {
+            held.push(socket);
+        }
+    });
+    // Members: 2 a peer, 3 in all. The relay: 5 in all, 5 a share.
+    let services = Arc::new(
+        LocalServices::new()
+            .serve(
+                "tls:app".parse().unwrap(),
+                LocalTarget::new("127.0.0.1", port),
+            )
+            .unwrap()
+            .with_limits(ServeLimits {
+                max_connections: 3,
+                max_connections_per_peer: 2,
+                ..ServeLimits::default()
+            }),
+    );
+    let handler = RelayHandler::new(
+        services.clone(),
+        stores.rosters.clone(),
+        RelayServing::with_limits(
+            book_accepting(&[blind("app")]),
+            RelayLimits::with_figures(5, 5),
+        ),
+        w.network,
+        b.id,
+    );
+    let (relay_id, other_member) = (party().id, party().id);
+    let request = |initiator: NodeId| OpenRequest {
+        network_id: w.network,
+        initiator,
+        service: "tls:app".parse().unwrap(),
+        target: None,
+        meta: OpenMeta::default(),
+    };
+
+    // Two streams of one member: its own figure.
+    let _m1 = services
+        .open(&request(m.id))
+        .await
+        .expect("member stream 1");
+    let _m2 = services
+        .open(&request(m.id))
+        .await
+        .expect("member stream 2");
+    assert_eq!(
+        services.open(&request(m.id)).await.err().map(|e| e.code),
+        Some(ErrorCode::RateLimited),
+        "the member's third"
+    );
+    // Five relay streams, more than the members' per peer figure and than the free places of
+    // the node-wide count (1 of 3).
+    let mut relay_held = Vec::new();
+    for n in 0..5 {
+        match handler.open(&request(relay_id)).await {
+            Ok(opened) => relay_held.push(opened),
+            Err(refusal) => panic!("relay stream {n} refused: {refusal:?}"),
+        }
+    }
+    assert_eq!(
+        services.connections(),
+        2,
+        "relay streams hold no member place"
+    );
+    // The sixth is refused at the relay's own figure.
+    assert_eq!(
+        handler.open(&request(relay_id)).await.err().map(|e| e.code),
+        Some(ErrorCode::RateLimited),
+        "the relay's sixth"
+    );
+    // A member of another peer still has the node-wide place the relay did not take.
+    let _other = services
+        .open(&request(other_member))
+        .await
+        .expect("a member is not refused for lack of places the relay holds");
+    assert_eq!(services.connections(), 3);
+    // And the relay is not refused because members hold every place.
+    drop(relay_held.pop());
+    handler
+        .open(&request(relay_id))
+        .await
+        .map(drop)
+        .map_err(|e| e.code)
+        .expect("a relay stream while the members hold the whole node-wide count");
+}
+
 #[tokio::test(start_paused = true)]
 async fn the_relays_meta_is_validated_not_scrubbed() {
     let mut rp = rp(&[blind("app")], &["app"]).await;
@@ -926,7 +1073,7 @@ fn meta_validation_keeps_only_what_holds_up() {
     for good in [
         "app",
         "app.relay.example",
-        "x.app",
+        "x.web.ali",
         "web.ali",
         "web.ali.relay.example",
         "APP.RELAY.EXAMPLE",
@@ -938,6 +1085,9 @@ fn meta_validation_keeps_only_what_holds_up() {
     }
     for bad in [
         "",
+        // A single label names a share relative to the relay's domain: `x.app` is not below it.
+        "x.app",
+        "x.y.app",
         "apple.relay.example",
         "xapp",
         "web.relay.example",

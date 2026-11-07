@@ -297,6 +297,8 @@ pub struct Driver {
     pending_open_reply: Option<OpenReply>,
     inbound_tx: mpsc::UnboundedSender<Stream>,
     streams: Arc<StreamCounters>,
+    /// The most streams the table may hold, see [`MuxLimits::max_live_streams`].
+    max_live: usize,
 }
 
 impl Future for Driver {
@@ -317,8 +319,8 @@ impl Future for Driver {
                 // error and nothing else is touched. The table is counted,
                 // not the handles: a dropped stream stays in it until its
                 // frames are written.
-                if this.connection.num_streams() >= MAX_LIVE_STREAMS {
-                    let _ = reply.send(Err(StreamMuxError::StreamLimit(MAX_LIVE_STREAMS)));
+                if this.connection.num_streams() >= this.max_live {
+                    let _ = reply.send(Err(StreamMuxError::StreamLimit(this.max_live)));
                     continue;
                 }
                 match this.connection.poll_new_outbound(cx) {
@@ -368,7 +370,7 @@ impl Future for Driver {
                 Poll::Ready(Some(Ok(stream))) => {
                     // The new stream is in `yamux`'s table already, so it is
                     // counted: the table may hold `MAX_LIVE_STREAMS` with it.
-                    if this.connection.num_streams() <= MAX_LIVE_STREAMS {
+                    if this.connection.num_streams() <= this.max_live {
                         // A dropped `Inbound` means nobody is listening for
                         // *new* streams anymore; streams already handed out
                         // keep working regardless, so this is not fatal to
@@ -419,11 +421,55 @@ impl Future for Driver {
 /// this connection may buffer — see [`config_for`]'s own doc comment for
 /// the gap that leaves.
 pub fn new(mode: Mode, max_record: u32) -> (StreamMux, Inbound, OutboundFrames, Driver) {
+    new_with_limits(mode, max_record, MuxLimits::default())
+}
+
+/// What one connection may hold, for a caller whose session is not an ordinary member's: see
+/// [`new_with_limits`]. [`Default`] is what [`new`] uses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MuxLimits {
+    /// The most streams the connection holds at once, opened and accepted together, as
+    /// [`MAX_LIVE_STREAMS`] counts them (the table, which keeps a dropped stream until its last
+    /// frames are written). At least 1 and at most [`MAX_LIVE_STREAMS`]. `yamux` is given this
+    /// plus the slack [`MAX_LIVE_STREAMS`] keeps below its own cap.
+    pub max_live_streams: usize,
+    /// Whether a stream's receive window may grow past `yamux`'s initial 256 KiB (up to 16 MiB
+    /// for one stream, protocol.md 5.3). Off, the most the connection can be made to buffer
+    /// unread is `max_live_streams` times 256 KiB plus the slack's, and nothing more.
+    pub window_growth: bool,
+}
+
+impl Default for MuxLimits {
+    fn default() -> Self {
+        Self {
+            max_live_streams: MAX_LIVE_STREAMS,
+            window_growth: true,
+        }
+    }
+}
+
+/// [`new`] with `limits` instead of the defaults: fewer streams and, if asked, receive windows
+/// that never grow. The relay principal uses it, since the relay holds a session for every
+/// public share and is the one party that cannot afford a member's 144 MiB per session.
+pub fn new_with_limits(
+    mode: Mode,
+    max_record: u32,
+    limits: MuxLimits,
+) -> (StreamMux, Inbound, OutboundFrames, Driver) {
+    let max_live = limits.max_live_streams.clamp(1, MAX_LIVE_STREAMS);
     let (record_io, inbound_tx, outbound_rx) = RecordIo::new();
     let (open_tx, open_requests) = mpsc::unbounded();
     let (stream_inbound_tx, stream_inbound_rx) = mpsc::unbounded();
 
-    let connection = Connection::new(record_io, config_for(max_record), mode);
+    let connection = Connection::new(
+        record_io,
+        config_with(
+            max_record,
+            max_live + (MAX_STREAMS - MAX_LIVE_STREAMS),
+            limits.window_growth,
+        ),
+        mode,
+    );
 
     let streams = Arc::new(StreamCounters::default());
     let stream_mux = StreamMux {
@@ -441,6 +487,7 @@ pub fn new(mode: Mode, max_record: u32) -> (StreamMux, Inbound, OutboundFrames, 
         pending_open_reply: None,
         inbound_tx: stream_inbound_tx,
         streams,
+        max_live,
     };
 
     (stream_mux, inbound, outbound, driver)
@@ -518,7 +565,14 @@ pub fn new(mode: Mode, max_record: u32) -> (StreamMux, Inbound, OutboundFrames, 
 /// nothing, 183,028 bytes from `yamux`'s per-stream channel (about 78 MiB
 /// at 448 streams, counted by no budget). `vendor/yamux/PATCHES.md` adds it
 /// up: roughly 540 MiB for one session.
+#[cfg(test)]
 fn config_for(max_record: u32) -> Config {
+    config_with(max_record, MAX_STREAMS, true)
+}
+
+/// [`config_for`] for `table` stream slots in `yamux`'s own table, with or without the growth
+/// budget (without, the connection window is exactly the guaranteed share of every slot).
+fn config_with(max_record: u32, table: usize, window_growth: bool) -> Config {
     let record_budget = menzil_proto::max_e2e_data_plaintext(max_record);
     let max_body_for_this_session = record_budget
         .saturating_sub(1)
@@ -528,8 +582,13 @@ fn config_for(max_record: u32) -> Config {
 
     let mut cfg = Config::default();
     cfg.set_split_send_size(split_send_size);
-    cfg.set_max_num_streams(MAX_STREAMS);
-    cfg.set_max_connection_receive_window(Some(RECEIVE_WINDOW_GRANT));
+    cfg.set_max_num_streams(table);
+    let growth = if window_growth {
+        MAX_STREAM_RECEIVE_WINDOW - yamux::DEFAULT_CREDIT as usize
+    } else {
+        0
+    };
+    cfg.set_max_connection_receive_window(Some(table * yamux::DEFAULT_CREDIT as usize + growth));
     cfg
 }
 
@@ -629,5 +688,43 @@ mod tests {
     fn a_zero_max_record_clamps_to_one_byte_rather_than_panicking() {
         assert_eq!(menzil_proto::max_e2e_data_plaintext(0), 0);
         assert_eq!(configured_split_send_size(&config_for(0)), 1);
+    }
+
+    #[test]
+    fn limits_shrink_the_table_and_can_switch_the_window_growth_off() {
+        let slack = MAX_STREAMS - MAX_LIVE_STREAMS;
+        // The defaults are `config_for`'s.
+        let default = MuxLimits::default();
+        let cfg = config_with(
+            65_535,
+            default.max_live_streams + slack,
+            default.window_growth,
+        );
+        assert_eq!(
+            configured_usize(&cfg, "max_num_streams"),
+            MAX_STREAMS,
+            "the default table is yamux's 512"
+        );
+        assert_eq!(
+            configured_usize(&cfg, "max_connection_receive_window"),
+            RECEIVE_WINDOW_GRANT
+        );
+        // 64 live streams, no growth: 64 + slack slots of 256 KiB and not a byte more.
+        let cfg = config_with(65_535, 64 + slack, false);
+        let slots = configured_usize(&cfg, "max_num_streams");
+        assert_eq!(slots, 64 + slack);
+        assert_eq!(
+            configured_usize(&cfg, "max_connection_receive_window"),
+            slots * yamux::DEFAULT_CREDIT as usize,
+            "no growth budget: a stream never gets more than its initial window"
+        );
+        // With growth the same table keeps the 16 MiB ceiling of one stream.
+        let cfg = config_with(65_535, 64 + slack, true);
+        let growth = configured_usize(&cfg, "max_connection_receive_window")
+            - slots * yamux::DEFAULT_CREDIT as usize;
+        assert_eq!(
+            yamux::DEFAULT_CREDIT as usize + growth,
+            MAX_STREAM_RECEIVE_WINDOW
+        );
     }
 }

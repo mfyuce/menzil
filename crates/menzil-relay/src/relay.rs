@@ -229,10 +229,16 @@ impl Relay {
     /// drain accounting of any pair, and the bandwidth and volume of `tenant`, the tenant of the
     /// name the traffic is for. No Roster is consulted and no pair or destination count is
     /// taken (`ForwardTable::forward_from_relay`).
+    ///
+    /// `session_id` is the L3 session of `dst` the caller checked its path against (see
+    /// [`Self::attached_node`]): a frame goes only if that is still the session `dst` is attached
+    /// by, and is `PeerOffline` otherwise, so that a re-attach between the caller's check and the
+    /// send cannot carry a frame of the old L4 session to the new attachment.
     pub fn send_as_relay(
         &self,
         tenant: &TenantId,
         dst: &NodeId,
+        session_id: u32,
         e2e_proto: u8,
         flags: u8,
         payload: Vec<u8>,
@@ -246,6 +252,7 @@ impl Relay {
             relay_id,
             tenant,
             dst,
+            session_id,
             e2e_proto,
             flags,
             payload,

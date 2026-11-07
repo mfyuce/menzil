@@ -1124,6 +1124,9 @@ impl ForwardTable {
     ///
     /// The tenant of a frame travels with the frame (a pair per node, but a tenant per call), so
     /// two names of one node in two tenants are each charged to their own.
+    ///
+    /// `session_id` is the L3 session of `dst` the caller expects; another one attached now
+    /// makes the frame `PeerOffline` (the L4 session of the caller is pinned to the old one).
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn forward_from_relay(
         &self,
@@ -1132,6 +1135,7 @@ impl ForwardTable {
         relay_id: &NodeId,
         tenant: &TenantId,
         dst: &NodeId,
+        session_id: u32,
         e2e_proto: u8,
         flags: u8,
         payload: Vec<u8>,
@@ -1148,6 +1152,11 @@ impl ForwardTable {
         let Some(target) = registry.attachment_of(dst) else {
             return RelaySendOutcome::PeerOffline;
         };
+        // The caller's L4 session is pinned to one L3 session of `dst`; once that is not the
+        // current attachment the frame is not for the node that is attached now.
+        if target.session_id != session_id {
+            return RelaySendOutcome::PeerOffline;
+        }
         let book = self.book();
         if reliable
             && let Some(figures) = book.figures_of(tenant)

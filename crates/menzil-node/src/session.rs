@@ -75,7 +75,7 @@ use crate::identity::IdentityCell;
 use crate::outbound::{EnqueueOutcome, Epoch, MAX_QUEUED_BYTES, OutboundQueue, OutboundSend};
 use crate::relay_notes::{RelayNotes, listed_in_own_roster};
 use crate::roster_store::RosterStore;
-use crate::shares::{ShareBook, advertise_body};
+use crate::shares::{Due, ShareBook, advertise_body};
 
 /// Everything [`Session::connect`] needs beyond what
 /// [`Carrier::dial`] itself takes.
@@ -1288,6 +1288,9 @@ pub async fn run_session_observed(
         // Whether an ADVERTISE with shares went out in this attachment: a later empty set is
         // then still sent, to drop the claims (a relay keeps the last complete set).
         let mut advertised = false;
+        // The answers to the ADVERTISE records of this attachment: a missing one ends it, a
+        // refusal is tried again.
+        let mut advertise_watch = shares.advertise_watch();
         // Whether this attachment claimed every network the node is configured for.
         let complete = session.claimed_networks().len() == config.networks.len();
         let settle = tokio::time::sleep(notes.settle_after());
@@ -1328,8 +1331,17 @@ pub async fn run_session_observed(
                         Ok(record) => {
                             if let Record::AdvertiseAck(body) = &record {
                                 shares.note_ack(body);
+                                advertise_watch.acked(tokio::time::Instant::now());
                             }
                             if let Record::Error(body) = &record {
+                                // While an ADVERTISE is unanswered an ERROR is its answer: the
+                                // relay did not take the set (its claims stay as they were),
+                                // so the node asks again after a delay. Nothing it held can be
+                                // assumed gone, so a later empty set is still stated.
+                                if advertise_watch.refused(tokio::time::Instant::now()) {
+                                    tracing::warn!(code = ?body.code, msg = %body.msg, "the relay refused the ADVERTISE, stating the shares again shortly");
+                                    advertised = true;
+                                }
                                 // A relay answers `not_member` for a network it does not
                                 // serve exactly as for one that does not list the node
                                 // (isolation rule I2), so it cannot say which. The node can
@@ -1442,7 +1454,10 @@ pub async fn run_session_observed(
                         shares.note_sent(&wanted);
                         let record = Record::Advertise(advertise_body(&wanted));
                         match tokio::time::timeout(SEND_TIMEOUT, session.send(record)).await {
-                            Ok(Ok(())) => advertised = !wanted.is_empty(),
+                            Ok(Ok(())) => {
+                                advertised = !wanted.is_empty();
+                                advertise_watch.sent(tokio::time::Instant::now());
+                            }
                             Ok(Err(err)) => {
                                 tracing::warn!(error = %err, "node session ended while advertising its shares, reconnecting");
                                 break 'attached None;
@@ -1454,6 +1469,19 @@ pub async fn run_session_observed(
                         }
                     }
                 }
+                // An ADVERTISE the relay did not answer in time: the attachment is not one the
+                // node can trust to hold what it asked, so it ends and the next one states the
+                // shares anew. Or the wait after a refusal is over: state them again.
+                due = advertise_watch.due() => match due {
+                    Due::AckMissing => {
+                        tracing::warn!(
+                            after = ?crate::shares::ADVERTISE_ACK_TIMEOUT,
+                            "the relay did not answer an ADVERTISE, reconnecting"
+                        );
+                        break 'attached None;
+                    }
+                    Due::Retry => share_changes.mark_changed(),
+                },
                 // A stop (see the check at the top of the loop for one that came during a write).
                 () = stopped(&mut stop) => {
                     stop_attached(&mut session, &mut outbound, &mut outbound_queue, epoch).await;

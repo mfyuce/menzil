@@ -361,35 +361,41 @@ fn refusal(code: ErrorCode, msg: &str) -> OpenRefusal {
     }
 }
 
-impl ServiceHandler<Stream> for LocalServices {
-    type Opened = OpenedTarget;
-    type Handling = Pin<Box<dyn std::future::Future<Output = ()> + Send>>;
-
-    async fn open(&self, request: &OpenRequest) -> Result<OpenedTarget, OpenRefusal> {
+impl LocalServices {
+    async fn open_target(
+        &self,
+        request: &OpenRequest,
+        counted: bool,
+    ) -> Result<OpenedTarget, OpenRefusal> {
         let Some(target) = self.targets.get(&request.service) else {
             return Err(refusal(ErrorCode::UnknownService, "no such service"));
         };
         // Before anything is connected to or looked up: a peer past a limit costs the refusal.
-        let slot = match self.slots.take(request.initiator) {
-            Ok(slot) => slot,
-            Err(full) => {
-                if let Some(left_out) = self.full_log.permit(Instant::now()) {
-                    tracing::warn!(
-                        service = %request.service,
-                        peer = %request.initiator,
-                        ?full,
-                        left_out,
-                        "refused an OPEN: a limit on served connections is reached"
-                    );
+        // An open that is counted elsewhere (the relay principal's) takes no place here.
+        let slot = if counted {
+            match self.slots.take(request.initiator) {
+                Ok(slot) => Some(slot),
+                Err(full) => {
+                    if let Some(left_out) = self.full_log.permit(Instant::now()) {
+                        tracing::warn!(
+                            service = %request.service,
+                            peer = %request.initiator,
+                            ?full,
+                            left_out,
+                            "refused an OPEN: a limit on served connections is reached"
+                        );
+                    }
+                    return Err(refusal(ErrorCode::RateLimited, "too many connections"));
                 }
-                return Err(refusal(ErrorCode::RateLimited, "too many connections"));
             }
+        } else {
+            None
         };
         let connect = self.connect(target);
         match tokio::time::timeout(self.connect_timeout, connect).await {
             Ok(Ok(socket)) => Ok(OpenedTarget {
                 socket: Some(socket),
-                slot: Some(slot),
+                slot,
             }),
             Ok(Err(error)) => {
                 if let Some(left_out) = self.connect_log.permit(Instant::now()) {
@@ -422,6 +428,24 @@ impl ServiceHandler<Stream> for LocalServices {
             }
         }
     }
+}
+
+impl ServiceHandler<Stream> for LocalServices {
+    type Opened = OpenedTarget;
+    type Handling = Pin<Box<dyn std::future::Future<Output = ()> + Send>>;
+
+    async fn open(&self, request: &OpenRequest) -> Result<OpenedTarget, OpenRefusal> {
+        self.open_target(request, true).await
+    }
+
+    /// Without a place in this node's [`ServeLimits`]: the caller (the relay principal's
+    /// handler) bounds what it holds by figures of its own.
+    async fn open_with_own_limits(
+        &self,
+        request: &OpenRequest,
+    ) -> Result<OpenedTarget, OpenRefusal> {
+        self.open_target(request, false).await
+    }
 
     fn handle(&self, stream: Stream, request: OpenRequest, opened: OpenedTarget) -> Self::Handling {
         // A future dropped before it ran drops `stream` and `opened`, which reset themselves.
@@ -443,13 +467,13 @@ pub struct OpenedTarget {
 }
 
 impl OpenedTarget {
-    /// The socket and the slot, for the pipe, which takes over the duty to reset.
-    fn into_parts(mut self) -> (TcpStream, Slot) {
+    /// The socket and the slot (none for an open counted elsewhere), for the pipe, which takes over the duty to reset.
+    fn into_parts(mut self) -> (TcpStream, Option<Slot>) {
         (
             self.socket
                 .take()
                 .expect("an opened target holds its socket"),
-            self.slot.take().expect("an opened target holds its slot"),
+            self.slot.take(),
         )
     }
 
@@ -603,7 +627,7 @@ impl LogThrottle {
 struct Pipe {
     remote: Option<TokioStream>,
     local: Option<TcpStream>,
-    _slot: Slot,
+    _slot: Option<Slot>,
 }
 
 impl Pipe {

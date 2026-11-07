@@ -104,7 +104,8 @@ mod record_io;
 mod stream;
 
 pub use driver::{
-    Driver, Inbound, MAX_LIVE_STREAMS, OutboundFrames, RECEIVE_WINDOW_GRANT, StreamMux, new,
+    Driver, Inbound, MAX_LIVE_STREAMS, MuxLimits, OutboundFrames, RECEIVE_WINDOW_GRANT, StreamMux,
+    new, new_with_limits,
 };
 pub use error::StreamMuxError;
 pub use frame_format::FrameFormatError;
