@@ -2948,3 +2948,317 @@ fn replacing_on_top_of_a_steward_pair_is_the_owners_pair_that_outranks_it() {
     assert!(next.is_member(&new_cert.decode().unwrap().node_id));
     assert!(!next.is_member(&phone.node_id()));
 }
+
+// ---- labels: add_label, remove_label, check_label ----
+
+fn labels_of(docs: &Documents) -> Vec<(String, NodeId)> {
+    docs.roster_body()
+        .labels
+        .iter()
+        .map(|l| (l.name.clone(), l.node_id))
+        .collect()
+}
+
+#[test]
+fn a_label_is_listed_in_the_roster_by_the_owner_and_every_verifier_accepts_it() {
+    let (owner, phone, _, docs) = with_phone();
+    let laptop = docs.roster_body().members[0].node_id;
+    let next = add_label(&owner, &docs, "app", phone.node_id(), false, NOW + 60).unwrap();
+    assert_eq!(next.seq(), docs.seq() + 1);
+    assert_eq!(labels_of(&next), vec![("app".to_string(), phone.node_id())]);
+    let (rb, pb) = (next.roster_body(), next.policy_body());
+    assert_eq!((rb.issued, rb.expires), (NOW + 60, NOW + 60 + 14 * DAY));
+    assert_eq!(pb.seq, rb.seq);
+    // Nothing but the labels (and the dates and numbers) changed.
+    assert_eq!(rb.members, docs.roster_body().members);
+    assert_eq!(rb.revoked, docs.roster_body().revoked);
+    assert_eq!(pb.members, docs.policy_body().members);
+    assert_eq!(pb.grants, docs.policy_body().grants);
+    assert_eq!(next.verify().unwrap(), Signer::Owner);
+    assert_eq!(
+        adopted_signer(judged(Some(&docs), &next, NOW + 60)),
+        Signer::Owner
+    );
+    // The stores a node and a relay keep take it, and the old pair is as it was.
+    let (rosters, policies) = load(&docs);
+    assert!(rosters.set(next.roster()).unwrap());
+    assert!(policies.set(next.policy()).unwrap());
+    assert!(docs.roster_body().labels.is_empty());
+
+    // A second label for the same member, and one for another member.
+    let more = add_label(&owner, &next, "blog", phone.node_id(), false, NOW + 61).unwrap();
+    let more = add_label(&owner, &more, "home", laptop, false, NOW + 62).unwrap();
+    assert_eq!(
+        labels_of(&more),
+        vec![
+            ("app".to_string(), phone.node_id()),
+            ("blog".to_string(), phone.node_id()),
+            ("home".to_string(), laptop),
+        ]
+    );
+    assert_eq!(more.seq(), docs.seq() + 3);
+}
+
+#[test]
+fn a_label_belongs_to_one_member_unless_the_owner_moves_it() {
+    let (owner, phone, _, docs) = with_phone();
+    let laptop = docs.roster_body().members[0].node_id;
+    let one = add_label(&owner, &docs, "app", phone.node_id(), false, NOW).unwrap();
+
+    // The same member again: nothing to issue, whatever `replace` says.
+    for replace in [false, true] {
+        assert!(matches!(
+            add_label(&owner, &one, "app", phone.node_id(), replace, NOW + 1),
+            Err(AdminError::LabelAlready(name)) if name == "app"
+        ));
+    }
+    // Another member: refused, naming the holder.
+    assert!(matches!(
+        add_label(&owner, &one, "app", laptop, false, NOW + 1),
+        Err(AdminError::LabelTaken { name, holder }) if name == "app" && holder == phone.node_id()
+    ));
+    // A label of the other member is not in the way of a different name.
+    add_label(&owner, &one, "web", laptop, false, NOW + 1).unwrap();
+
+    // The explicit move: one entry, the new member's, and the other labels stay.
+    let two = add_label(&owner, &one, "keep", phone.node_id(), false, NOW + 1).unwrap();
+    let moved = add_label(&owner, &two, "app", laptop, true, NOW + 2).unwrap();
+    assert_eq!(
+        labels_of(&moved),
+        vec![
+            ("keep".to_string(), phone.node_id()),
+            ("app".to_string(), laptop)
+        ]
+    );
+    assert_eq!(moved.seq(), two.seq() + 1);
+    assert_eq!(
+        adopted_signer(judged(Some(&two), &moved, NOW + 2)),
+        Signer::Owner
+    );
+    // `replace` for a name nobody has is a plain add.
+    let fresh = add_label(&owner, &docs, "fresh", laptop, true, NOW + 2).unwrap();
+    assert_eq!(labels_of(&fresh), vec![("fresh".to_string(), laptop)]);
+    // Capital letters in a stored name are the same name: one holder, however it was written.
+    let mut roster = one.roster_body().clone();
+    roster.labels[0].name = "App".into();
+    let shouting = Documents::signed(&owner, roster, one.policy_body().clone()).unwrap();
+    assert!(matches!(
+        add_label(&owner, &shouting, "app", laptop, false, NOW + 3),
+        Err(AdminError::LabelTaken { .. })
+    ));
+    let moved = add_label(&owner, &shouting, "app", laptop, true, NOW + 3).unwrap();
+    assert_eq!(labels_of(&moved), vec![("app".to_string(), laptop)]);
+}
+
+#[test]
+fn a_label_goes_only_to_a_member_in_good_standing() {
+    let (owner, phone, _, docs) = with_phone();
+    let stranger = NodeKeys::generate().node_id();
+    assert!(matches!(
+        add_label(&owner, &docs, "app", stranger, false, NOW),
+        Err(AdminError::NotAMember(id)) if id == stranger
+    ));
+    let revoked = revoke(&owner, &docs, phone.node_id(), NOW + 1).unwrap();
+    assert!(matches!(
+        add_label(&owner, &revoked, "app", phone.node_id(), false, NOW + 2),
+        Err(AdminError::Revoked(id)) if id == phone.node_id()
+    ));
+    // A node revoked ahead of time (not a member) is a revoked one, not an unknown one.
+    let ahead = revoke(&owner, &docs, stranger, NOW + 1).unwrap();
+    assert!(matches!(
+        add_label(&owner, &ahead, "app", stranger, false, NOW + 2),
+        Err(AdminError::Revoked(_))
+    ));
+    // The key must be this network's owner.
+    assert!(matches!(
+        add_label(
+            &OwnerKey::generate(),
+            &docs,
+            "app",
+            phone.node_id(),
+            false,
+            NOW
+        ),
+        Err(AdminError::NotThisOwner)
+    ));
+}
+
+#[test]
+fn revoking_a_member_takes_its_labels_with_it_and_the_names_are_free_again() {
+    let (owner, phone, _, docs) = with_phone();
+    let laptop = docs.roster_body().members[0].node_id;
+    let a = add_label(&owner, &docs, "app", phone.node_id(), false, NOW).unwrap();
+    let b = add_label(&owner, &a, "home", laptop, false, NOW).unwrap();
+    let revoked = revoke(&owner, &b, phone.node_id(), NOW + 1).unwrap();
+    assert_eq!(labels_of(&revoked), vec![("home".to_string(), laptop)]);
+    // The name can be given to another member at once.
+    let again = add_label(&owner, &revoked, "app", laptop, false, NOW + 2).unwrap();
+    assert!(labels_of(&again).contains(&("app".to_string(), laptop)));
+}
+
+#[test]
+fn a_label_is_one_lowercase_ldh_label() {
+    let long = "a".repeat(63);
+    for good in ["a", "app", "my-app", "a1", "1", "x--y", long.as_str()] {
+        check_label(good).unwrap_or_else(|e| panic!("{good:?}: {e}"));
+    }
+    let too_long = "a".repeat(64);
+    for bad in [
+        "",
+        "-a",
+        "a-",
+        "-",
+        "App",
+        "a.b",
+        "a b",
+        "a_b",
+        "a/b",
+        "caf\u{e9}",
+        "a\u{202e}b",
+        "a\nb",
+        "*",
+        too_long.as_str(),
+    ] {
+        assert!(
+            matches!(check_label(bad), Err(AdminError::BadLabel(_))),
+            "{bad:?}"
+        );
+    }
+    // The error text is escaped: no raw control or override character reaches a terminal.
+    let text = check_label("a\u{1b}[31m\u{202e}").unwrap_err().to_string();
+    assert!(
+        !text.contains('\u{1b}') && !text.contains('\u{202e}'),
+        "{text}"
+    );
+    // `add_label` checks it before anything else.
+    let (owner, phone, _, docs) = with_phone();
+    assert!(matches!(
+        add_label(&owner, &docs, "Bad.Name", phone.node_id(), false, NOW),
+        Err(AdminError::BadLabel(_))
+    ));
+}
+
+#[test]
+fn removing_a_label_takes_exactly_the_matching_entries() {
+    let (owner, phone, _, docs) = with_phone();
+    let laptop = docs.roster_body().members[0].node_id;
+    let docs = add_label(&owner, &docs, "app", phone.node_id(), false, NOW).unwrap();
+    let docs = add_label(&owner, &docs, "blog", phone.node_id(), false, NOW).unwrap();
+    let docs = add_label(&owner, &docs, "home", laptop, false, NOW).unwrap();
+
+    let next = remove_label(&owner, &docs, "app", None, NOW + 1).unwrap();
+    assert_eq!(next.seq(), docs.seq() + 1);
+    assert_eq!(
+        labels_of(&next),
+        vec![
+            ("blog".to_string(), phone.node_id()),
+            ("home".to_string(), laptop)
+        ]
+    );
+    assert_eq!(next.verify().unwrap(), Signer::Owner);
+    assert_eq!(
+        adopted_signer(judged(Some(&docs), &next, NOW + 1)),
+        Signer::Owner
+    );
+    assert_eq!(next.roster_body().members, docs.roster_body().members);
+
+    // With a member named, only that member's entry goes, and the name is matched in lowercase.
+    let by_member = remove_label(&owner, &docs, "BLOG", Some(phone.node_id()), NOW + 1).unwrap();
+    assert_eq!(by_member.roster_body().labels.len(), 2);
+    assert!(!labels_of(&by_member).contains(&("blog".to_string(), phone.node_id())));
+
+    // Nothing matched: an error, and no number spent.
+    for (name, node) in [
+        ("nope", None),
+        ("app", Some(laptop)),
+        ("home", Some(phone.node_id())),
+    ] {
+        assert!(
+            matches!(
+                remove_label(&owner, &docs, name, node, NOW + 1),
+                Err(AdminError::NoSuchLabel)
+            ),
+            "{name}"
+        );
+    }
+    // Removing the last entries leaves an empty list.
+    let none = remove_label(&owner, &next, "blog", None, NOW + 2).unwrap();
+    let none = remove_label(&owner, &none, "home", None, NOW + 3).unwrap();
+    assert!(none.roster_body().labels.is_empty());
+}
+
+#[test]
+fn labels_survive_a_steward_reissue_and_a_steward_cannot_change_them() {
+    let s = stewarded();
+    let me = s.base.roster_body().members[0].node_id;
+    let labelled = add_label(&s.owner, &s.base, "app", me, false, NOW + 1).unwrap();
+    // The owner's pair jumps past the steward's span, steward listed or not.
+    assert_eq!(labelled.seq(), s.base.seq() + STEWARD_SEQ_SPAN + 1);
+    assert_eq!(labelled.roster_body().stewards.len(), 1);
+
+    // The steward renews on top of it and the labels stay.
+    let renewed = steward_renew(&s.steward, &labelled, NOW + DAY).unwrap();
+    assert_eq!(labels_of(&renewed), labels_of(&labelled));
+    adopted_signer(judged(Some(&labelled), &renewed, NOW + DAY));
+
+    // A steward signed Roster with another label list is refused by the acceptance predicate
+    // (what `menzil label` being owner only rests on).
+    let current = labelled.clone().into_verified().unwrap();
+    let (mut roster, policy, base) = current.steward_successor(&s.steward, NOW + DAY).unwrap();
+    roster.labels.push(menzil_proto::Label {
+        name: "steal".into(),
+        node_id: me,
+    });
+    assert!(matches!(
+        current.steward_signed(&s.steward, roster, policy, base, NOW + DAY),
+        Err(AdminError::Rejected(Reason::FieldChanged))
+    ));
+    // And removing one is just as much a change.
+    let (mut roster, policy, base) = current.steward_successor(&s.steward, NOW + DAY).unwrap();
+    roster.labels.clear();
+    assert!(matches!(
+        current.steward_signed(&s.steward, roster, policy, base, NOW + DAY),
+        Err(AdminError::Rejected(Reason::FieldChanged))
+    ));
+}
+
+#[test]
+fn labels_stop_where_the_roster_would_be_larger_than_verifiers_accept() {
+    let (owner, phone, _, docs) = with_phone();
+    let node_id = phone.node_id();
+    let label = |i: usize| menzil_proto::Label {
+        name: format!("{i:063}"),
+        node_id,
+    };
+    let sized = |n: usize| {
+        let mut roster = docs.roster_body().clone();
+        roster.labels = (0..n).map(label).collect();
+        Documents::signed(&owner, roster, docs.policy_body().clone()).unwrap()
+    };
+    let (small, big) = (sized(10), sized(110));
+    let per_label = (big.roster().encode().len() - small.roster().encode().len()) / 100;
+    let room = MAX_DOC_BYTES - small.roster().encode().len();
+    let mut full = sized(10 + room / per_label - 3);
+    assert!(full.roster().encode().len() <= MAX_DOC_BYTES);
+    // A few more labels fit, then one does not: refused with the plain size error, nothing signed.
+    let mut next = 10_000_000;
+    let error = loop {
+        match add_label(&owner, &full, &format!("{next}"), node_id, false, NOW) {
+            Ok(docs) => {
+                assert!(docs.roster().encode().len() <= MAX_DOC_BYTES);
+                full = docs;
+                next += 1;
+                assert!(next < 10_000_010, "the cap never came");
+            }
+            Err(error) => break error,
+        }
+    };
+    assert!(
+        matches!(error, AdminError::TooLarge { what: "Roster", len, max } if len > max && max == MAX_DOC_BYTES),
+        "{error:?}"
+    );
+    assert!(error.to_string().contains("bytes verifiers accept"));
+    // Taking one out makes room again.
+    let fewer = remove_label(&owner, &full, &format!("{:063}", 0), None, NOW).unwrap();
+    assert!(fewer.roster().encode().len() <= MAX_DOC_BYTES);
+}

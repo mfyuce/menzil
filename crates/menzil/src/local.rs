@@ -590,6 +590,144 @@ pub fn ungrant(
     Ok(issued(&next, None))
 }
 
+/// Refuses, in plain words, a device that holds only a steward key: labels are the owner's
+/// (`menzil_proto::trust`: a steward signed Roster keeps the labels of its base).
+fn owner_only_labels(home: &Home, network_id: &NetworkId) -> Result<()> {
+    if !home.owner_key_path(network_id).exists() && home.steward_key_path(network_id).exists() {
+        bail!(
+            "only the owner lists or takes back labels (protocol.md 2.3: a steward signed Roster may not change them): ask the owner to run `menzil label`"
+        );
+    }
+    Ok(())
+}
+
+/// A label as `menzil label` reads it: [`menzil_admin::check_label`], and then not one the
+/// protocol reserves (protocol.md 4.4: [`menzil_relay::DEFAULT_RESERVED_LABELS`], the list a
+/// relay refuses for any claim). The operator's own reserved names and tenant names are the
+/// relay's policy and are not known here.
+fn check_new_label(name: &str) -> Result<()> {
+    menzil_admin::check_label(name)?;
+    if menzil_relay::DEFAULT_RESERVED_LABELS.contains(&name) {
+        bail!("the label {name:?} is reserved: a relay refuses it for every claim");
+    }
+    Ok(())
+}
+
+/// What [`label_add`] did.
+#[derive(Debug, Clone)]
+pub struct LabelAdded {
+    /// The new pair.
+    pub issued: Issued,
+    /// The member's name in the Policy.
+    pub member_name: String,
+    /// With `replace`: the name of the member the label was moved away from, when it had a
+    /// place in the Policy.
+    pub moved_from: Option<String>,
+}
+
+/// `menzil label add <name> <member>` (protocol.md 4.4), owner only: lists `name` for `member`
+/// (a name, the start of a node id or a whole node id, as [`grant`] reads it) in the Roster's
+/// `labels`, which is what a relay needs before it accepts the name from the node's ADVERTISE.
+/// A name another member holds is refused unless `replace`, which moves it. A device that holds
+/// only a steward key is told that the owner does this.
+pub fn label_add(
+    home: &Home,
+    network: Option<&str>,
+    name: &str,
+    member: &str,
+    replace: bool,
+    now: u64,
+) -> Result<LabelAdded> {
+    let network_id = resolve_network(home, network)?;
+    let _lock = home.lock_network(&network_id)?;
+    owner_only_labels(home, &network_id)?;
+    check_new_label(name)?;
+    let owner = load_owner(home, &network_id)?;
+    let current = load_documents(home, &network_id)?;
+    let node_id = resolve_member(&current, member)?;
+    let name_of = |id: &NodeId| {
+        current
+            .policy_body()
+            .members
+            .iter()
+            .find(|m| m.node_id == *id)
+            .map(|m| m.name.clone())
+    };
+    let moved_from = if replace {
+        current
+            .roster_body()
+            .labels
+            .iter()
+            .find(|l| l.name.eq_ignore_ascii_case(name) && l.node_id != node_id)
+            .and_then(|l| name_of(&l.node_id))
+    } else {
+        None
+    };
+    let next = menzil_admin::add_label(&owner, &current, name, node_id, replace, now)?;
+    save_documents(home, &next)?;
+    Ok(LabelAdded {
+        issued: issued(&next, Some(node_id)),
+        member_name: name_of(&node_id).unwrap_or_default(),
+        moved_from,
+    })
+}
+
+/// `menzil label remove <name> [<member>]`, owner only: takes the label out of the Roster, for
+/// whoever lists it, or only for `member`. An error (and the documents as they were) when no
+/// entry matches.
+pub fn label_remove(
+    home: &Home,
+    network: Option<&str>,
+    name: &str,
+    member: Option<&str>,
+    now: u64,
+) -> Result<Issued> {
+    let network_id = resolve_network(home, network)?;
+    let _lock = home.lock_network(&network_id)?;
+    owner_only_labels(home, &network_id)?;
+    let owner = load_owner(home, &network_id)?;
+    let current = load_documents(home, &network_id)?;
+    let node_id = member
+        .map(|who| resolve_member(&current, who))
+        .transpose()?;
+    let next = menzil_admin::remove_label(&owner, &current, name, node_id, now)?;
+    save_documents(home, &next)?;
+    Ok(issued(&next, node_id))
+}
+
+/// One line of `menzil label list`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LabelEntry {
+    /// The label.
+    pub name: String,
+    /// The node it is listed for.
+    pub node_id: NodeId,
+    /// That node's name in the Policy, if the Policy names it.
+    pub member: Option<String>,
+}
+
+/// The labels the Roster this device holds lists, in the Roster's order. Any member can ask.
+pub fn label_list(home: &Home, network: Option<&str>) -> Result<(NetworkId, Vec<LabelEntry>)> {
+    let network_id = resolve_network(home, network)?;
+    let docs = load_documents(home, &network_id)?;
+    let entries = docs
+        .roster_body()
+        .labels
+        .iter()
+        .map(|label| LabelEntry {
+            name: label.name.clone(),
+            node_id: label.node_id,
+            member: docs
+                .policy_body()
+                .members
+                .iter()
+                .find(|m| m.node_id == label.node_id)
+                .map(|m| m.name.clone()),
+        })
+        .collect();
+    Ok((network_id, entries))
+}
+
 /// What [`revoke`] did.
 #[derive(Debug, Clone)]
 pub struct Revoked {

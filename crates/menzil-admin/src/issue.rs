@@ -1043,6 +1043,103 @@ pub fn remove_grants(
     Documents::signed(owner, roster, policy)
 }
 
+/// A public label is one LDH label as the relay's ADVERTISE reads it (protocol.md 4.4): 1 to 63
+/// ASCII letters, digits or hyphens, not starting or ending with a hyphen, and written in
+/// lowercase (the relay compares in lowercase, so a Roster that lists one in capitals would
+/// work, but the owner is held to the form it is compared in). A name with a dot is a custom
+/// domain, which phase 1 does not have. Reserved names are the relay's policy and are not
+/// checked here.
+pub fn check_label(name: &str) -> Result<(), AdminError> {
+    let bytes = name.as_bytes();
+    let valid = (1..=63).contains(&bytes.len())
+        && bytes[0] != b'-'
+        && bytes[bytes.len() - 1] != b'-'
+        && bytes
+            .iter()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || *b == b'-');
+    if valid {
+        Ok(())
+    } else {
+        Err(AdminError::BadLabel(menzil_proto::shown(name)))
+    }
+}
+
+/// Lists `name` for `node_id` in the Roster's `labels` (protocol.md 4.4), owner only: the claim
+/// a relay needs before it accepts the name from the node's ADVERTISE. A steward cannot do this
+/// (`trust`: a steward signed Roster may not change `labels`). The node must be a member of
+/// `current` ([`AdminError::Revoked`] when it is revoked, [`AdminError::NotAMember`] otherwise).
+/// A name belongs to at most one node: when another node lists it the answer is
+/// [`AdminError::LabelTaken`], unless `replace`, which moves it (every other entry of the name
+/// goes). When the node has the name already the answer is [`AdminError::LabelAlready`] and no
+/// number is spent. Names are compared in lowercase.
+pub fn add_label(
+    owner: &OwnerKey,
+    current: &Documents,
+    name: &str,
+    node_id: NodeId,
+    replace: bool,
+    now: u64,
+) -> Result<Documents, AdminError> {
+    check_label(name)?;
+    if current
+        .roster_body()
+        .revoked
+        .iter()
+        .any(|revoked| revoked.node_id == node_id)
+    {
+        return Err(AdminError::Revoked(node_id));
+    }
+    if !current.is_member(&node_id) {
+        return Err(AdminError::NotAMember(node_id));
+    }
+    let held = |label: &&menzil_proto::Label| label.name.eq_ignore_ascii_case(name);
+    let labels = &current.roster_body().labels;
+    if labels
+        .iter()
+        .filter(held)
+        .any(|label| label.node_id == node_id)
+    {
+        return Err(AdminError::LabelAlready(name.to_string()));
+    }
+    if !replace && let Some(other) = labels.iter().find(held) {
+        return Err(AdminError::LabelTaken {
+            name: menzil_proto::shown(&other.name),
+            holder: other.node_id,
+        });
+    }
+    let (mut roster, policy) = current.successor(owner, now)?;
+    roster
+        .labels
+        .retain(|label| !label.name.eq_ignore_ascii_case(name));
+    roster.labels.push(menzil_proto::Label {
+        name: name.to_string(),
+        node_id,
+    });
+    Documents::signed(owner, roster, policy)
+}
+
+/// Takes the label `name` out of the Roster (owner only), for every node that lists it, or, with
+/// `node_id`, only for that node. Names are compared in lowercase. When nothing matched the
+/// answer is [`AdminError::NoSuchLabel`] and no number is spent. The node need not be a member:
+/// a label is taken out whoever holds it.
+pub fn remove_label(
+    owner: &OwnerKey,
+    current: &Documents,
+    name: &str,
+    node_id: Option<NodeId>,
+    now: u64,
+) -> Result<Documents, AdminError> {
+    let matches = |label: &menzil_proto::Label| {
+        label.name.eq_ignore_ascii_case(name) && node_id.is_none_or(|node| label.node_id == node)
+    };
+    if !current.roster_body().labels.iter().any(matches) {
+        return Err(AdminError::NoSuchLabel);
+    }
+    let (mut roster, policy) = current.successor(owner, now)?;
+    roster.labels.retain(|label| !matches(label));
+    Documents::signed(owner, roster, policy)
+}
+
 /// Re-issues the same documents with the next `seq` and a fresh lifetime:
 /// what keeps a network from failing closed (protocol.md 7.3).
 pub fn renew(owner: &OwnerKey, current: &Documents, now: u64) -> Result<Documents, AdminError> {

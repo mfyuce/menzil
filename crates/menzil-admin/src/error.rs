@@ -96,6 +96,25 @@ pub enum AdminError {
     /// No grant matches what a removal names (or none of the named services is in one).
     #[error("no grant matches")]
     NoSuchGrant,
+    /// A public label that is not one lowercase LDH label (protocol.md 4.4).
+    #[error(
+        "label {0:?} must be 1 to 63 lowercase ASCII letters, digits or hyphens, not starting or ending with a hyphen (no dots)"
+    )]
+    BadLabel(String),
+    /// The label already belongs to another member, and the caller did not ask to move it.
+    #[error("the label {name:?} belongs to another member already (pass --replace to move it)")]
+    LabelTaken {
+        /// The label, as the Roster lists it.
+        name: String,
+        /// The node that holds it.
+        holder: NodeId,
+    },
+    /// The label is the member's already, so there is nothing to issue.
+    #[error("the label {0:?} is this member's already")]
+    LabelAlready(String),
+    /// No label matches what a removal names.
+    #[error("no label matches")]
+    NoSuchLabel,
     /// A revocation of the node of the device that issues it, which the caller did not confirm.
     #[error(
         "that is this device's own node: revoking it cuts this device off, pass --self to do it"

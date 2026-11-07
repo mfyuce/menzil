@@ -15,7 +15,7 @@ use menzil_cli::expose::{self, ExposeMode, ExposeSpec};
 use menzil_cli::home::Home;
 use menzil_cli::local::{self, Joined};
 use menzil_cli::stdio::{ClosingStdout, reset_message};
-use menzil_cli::{node_cmd, reach, relay_cmd, signals, token};
+use menzil_cli::{node_cmd, reach, relay_cmd, signals, text, token};
 use menzil_proto::ServiceId;
 use tracing_subscriber::EnvFilter;
 
@@ -98,6 +98,17 @@ enum Command {
         /// The network, when this device is in more than one.
         #[arg(long, value_name = "ID")]
         network: Option<String>,
+    },
+    /// Give a member a public share name, take it back, or list them (owner only, except `list`).
+    ///
+    /// A relay accepts `menzil expose --name <name>` from a node only if the network's Roster
+    /// lists that name for that node. `add` and `remove` change the Roster, so the relay (and
+    /// every member) needs the new documents afterwards: a running `menzil node` on this device
+    /// hands them over, and `menzil token --for-relay` prints the Roster for `menzil relay
+    /// add-network`.
+    Label {
+        #[command(subcommand)]
+        command: LabelCommand,
     },
     /// Revoke a member for good (owner only): it is cut off, and a revoked device joins again
     /// only under a new identity.
@@ -253,6 +264,44 @@ enum ExposeCommand {
     Remove {
         /// The label of the share.
         label: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum LabelCommand {
+    /// Let a member use a public name (owner only).
+    Add {
+        /// The name: one lowercase label of letters, digits and hyphens (1 to 63, not starting
+        /// or ending with a hyphen), not one a relay reserves (`www`, `mail`, `admin`, `api`,
+        /// `relay`, `t`).
+        name: String,
+        /// The member: its name, the start of its node id (8 or more hex digits), or a whole
+        /// node id.
+        member: String,
+        /// Move the name from the member that has it to this one. Without it a name that
+        /// belongs to another member is refused.
+        #[arg(long)]
+        replace: bool,
+        /// The network, when this device is in more than one.
+        #[arg(long, value_name = "ID")]
+        network: Option<String>,
+    },
+    /// Take a name back (owner only): from the member that has it, or with no member named
+    /// from whoever lists it.
+    Remove {
+        /// The name.
+        name: String,
+        /// Only if this member has it.
+        member: Option<String>,
+        /// The network, when this device is in more than one.
+        #[arg(long, value_name = "ID")]
+        network: Option<String>,
+    },
+    /// List the names the Roster this device holds gives out.
+    List {
+        /// The network, when this device is in more than one.
+        #[arg(long, value_name = "ID")]
+        network: Option<String>,
     },
 }
 
@@ -432,6 +481,13 @@ fn print_new_documents(token: &str) {
     println!("{token}");
 }
 
+fn print_new_label_documents(token: &str) {
+    println!(
+        "a relay accepts the name only from a Roster that lists it: a `menzil node` running on this device hands the new documents over within 15 seconds; otherwise give every member the token (`menzil join <token>`) and the relay the Roster (`menzil token --for-relay`, then `menzil relay add-network`):"
+    );
+    println!("{token}");
+}
+
 fn now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -602,6 +658,59 @@ async fn run(cli: Cli) -> Result<()> {
             );
             print_new_documents(&issued.token);
         }
+        Command::Label { command } => match command {
+            LabelCommand::Add {
+                name,
+                member,
+                replace,
+                network,
+            } => {
+                let added =
+                    local::label_add(&home()?, network.as_deref(), &name, &member, replace, now())?;
+                println!(
+                    "label {} now belongs to {}: the network's documents are now #{}",
+                    text::one_line(&name, 80),
+                    text::one_line(&added.member_name, 80),
+                    added.issued.seq
+                );
+                if let Some(from) = &added.moved_from {
+                    println!("it was moved from {}", text::one_line(from, 80));
+                }
+                print_new_label_documents(&added.issued.token);
+            }
+            LabelCommand::Remove {
+                name,
+                member,
+                network,
+            } => {
+                let issued = local::label_remove(
+                    &home()?,
+                    network.as_deref(),
+                    &name,
+                    member.as_deref(),
+                    now(),
+                )?;
+                println!(
+                    "took label {} back: the network's documents are now #{}",
+                    text::one_line(&name, 80),
+                    issued.seq
+                );
+                print_new_label_documents(&issued.token);
+            }
+            LabelCommand::List { network } => {
+                let (_, entries) = local::label_list(&home()?, network.as_deref())?;
+                if entries.is_empty() {
+                    println!("no labels");
+                }
+                for entry in entries {
+                    let who = match &entry.member {
+                        Some(name) => text::one_line(name, 80),
+                        None => entry.node_id.to_string(),
+                    };
+                    println!("{}  {who}", text::one_line(&entry.name, 80));
+                }
+            }
+        },
         Command::Revoke {
             member,
             network,
@@ -1012,6 +1121,77 @@ mod tests {
 
     fn parse(args: &[&str]) -> Result<Cli, clap::Error> {
         Cli::try_parse_from(std::iter::once("menzil").chain(args.iter().copied()))
+    }
+
+    fn label_command(args: &[&str]) -> Result<LabelCommand, clap::Error> {
+        match parse(args)?.command {
+            Command::Label { command } => Ok(command),
+            _ => panic!("not label"),
+        }
+    }
+
+    #[test]
+    fn label_add_remove_and_list_parse_with_their_options() {
+        let Ok(LabelCommand::Add {
+            name,
+            member,
+            replace,
+            network,
+        }) = label_command(&["label", "add", "app", "phone"])
+        else {
+            panic!("add");
+        };
+        assert_eq!((name.as_str(), member.as_str()), ("app", "phone"));
+        assert!(!replace && network.is_none());
+        let Ok(LabelCommand::Add {
+            replace, network, ..
+        }) = label_command(&[
+            "label",
+            "add",
+            "app",
+            "phone",
+            "--replace",
+            "--network",
+            "ab",
+        ])
+        else {
+            panic!("add");
+        };
+        assert!(replace);
+        assert_eq!(network.as_deref(), Some("ab"));
+
+        // The member is optional for `remove`, and absent for `list`.
+        let Ok(LabelCommand::Remove { name, member, .. }) =
+            label_command(&["label", "remove", "app"])
+        else {
+            panic!("remove");
+        };
+        assert_eq!((name.as_str(), member), ("app", None));
+        let Ok(LabelCommand::Remove { member, .. }) =
+            label_command(&["label", "remove", "app", "phone"])
+        else {
+            panic!("remove");
+        };
+        assert_eq!(member.as_deref(), Some("phone"));
+        let Ok(LabelCommand::List { network }) =
+            label_command(&["label", "list", "--network", "cd"])
+        else {
+            panic!("list");
+        };
+        assert_eq!(network.as_deref(), Some("cd"));
+
+        for bad in [
+            &["label"][..],
+            &["label", "add"],
+            &["label", "add", "app"],
+            &["label", "add", "app", "phone", "extra"],
+            &["label", "remove"],
+            &["label", "list", "app"],
+            &["label", "remove", "app", "phone", "--replace"],
+            &["label", "list", "--replace"],
+        ] {
+            assert!(label_command(bad).is_err(), "{bad:?}");
+        }
     }
 
     fn expose_args(args: &[&str]) -> Result<ExposeArgs, clap::Error> {
