@@ -315,6 +315,17 @@ enum RelayCommand {
         /// unless given.
         #[arg(long, value_name = "ADDR", requires = "share_domain")]
         http_listen: Option<SocketAddr>,
+        /// Keep certificates by ACME TLS-ALPN-01 for `--host` and for the names of terminated
+        /// shares (`<name>.t.<domain>`), from the CA whose RFC 8555 directory is at this https
+        /// URL. Not set by default and no CA is assumed: name it yourself (for a trial the CA's
+        /// staging directory, such as Let's Encrypt's `https://acme-staging-v02.api.letsencrypt.org/directory`).
+        /// The certificate files given stay the answer until the first one is issued. Needs
+        /// `--share-domain`.
+        #[arg(long, value_name = "URL", requires = "share_domain")]
+        acme_directory: Option<String>,
+        /// The contact for the CA's notices (`mailto:ops@example.org`). Needs `--acme-directory`.
+        #[arg(long, value_name = "URI", requires = "acme_directory")]
+        acme_contact: Option<String>,
     },
 }
 
@@ -816,11 +827,17 @@ async fn run(cli: Cli) -> Result<()> {
                     path,
                     share_domain,
                     http_listen,
+                    acme_directory,
+                    acme_contact,
                 },
         } => {
             let front = share_domain.map(|share_domain| relay_cmd::FrontDoorOptions {
                 share_domain,
                 http_listen,
+                acme: acme_directory.map(|directory_url| relay_cmd::AcmeOptions {
+                    directory_url,
+                    contact: acme_contact,
+                }),
             });
             let mut relay = relay_cmd::start_with(
                 &home()?,

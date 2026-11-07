@@ -741,6 +741,16 @@ impl LabelRegistry {
         })
     }
 
+    /// Every full name held now, as [`LabelRegistry::held_name`] would answer it at `now` (the
+    /// relay's ACME looks for the terminated ones).
+    pub(crate) fn held_names(&self, now: u64) -> Vec<(String, HeldName)> {
+        let fulls: Vec<String> = self.lock().holders.keys().cloned().collect();
+        fulls
+            .into_iter()
+            .filter_map(|full| self.held_name(&full, now).map(|held| (full, held)))
+            .collect()
+    }
+
     /// `node_id`'s currently accepted shares — whatever its most recent
     /// successful [`LabelRegistry::advertise`] call accepted, or empty if
     /// it never has or everything was rejected. TODO.md L3h's (SNI/ALPN

@@ -19,6 +19,10 @@
 //!   not served here.
 //! * anything else: the one static refusal below.
 //!
+//! A hello with ALPN exactly `acme-tls/1` and an SNI that has an order pending in the relay's own
+//! ACME (`crate::acme`) is answered with the challenge certificate before any of the above; the
+//! refusals below are unchanged.
+//!
 //! Without a share domain the relay does none of this: no byte is read before TLS, and every
 //! connection takes the existing path as before.
 //!
@@ -88,6 +92,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Semaphore;
 use tokio::time::Instant;
 
+use crate::acme;
 use crate::admission::{IpSlot, PeerKey};
 use crate::advertise::HeldName;
 use crate::prefixed::PrefixedTcp;
@@ -650,11 +655,11 @@ impl FrontDoor {
         peek: tokio::sync::OwnedSemaphorePermit,
     ) {
         let peeked = sni::read_client_hello(&mut tcp, self.config.peek_deadline).await;
-        drop(peek);
         let decided = Instant::now();
         let (bytes, hello) = match peeked {
             Peeked::Dropped => return,
             Peeked::Invalid(why) => {
+                drop(peek);
                 tracing::debug!(?why, "not a routable ClientHello");
                 drop(ip_slot);
                 self.refuse(tcp, decided, &REFUSAL).await;
@@ -662,6 +667,20 @@ impl FrontDoor {
             }
             Peeked::Hello { bytes, hello } => (bytes, hello),
         };
+        // A TLS-ALPN-01 validation of one of the relay's own pending orders (ALPN exactly
+        // `acme-tls/1`, an SNI with an order pending now) is answered here, before routing; it
+        // keeps the peek permit and the address's share while it is, so it is bounded like a
+        // ClientHello read. Anything else, a failed parse included, goes on as before.
+        if let Some(acme) = relay.acme()
+            && let Some(sni) = hello.sni.as_deref()
+            && acme::is_pending_validation(acme, Some(sni), &hello.alpn)
+            && acme::answer_validation(acme, &mut tcp, &bytes, sni).await == acme::Answered::Done
+        {
+            drop(peek);
+            drop(ip_slot);
+            return;
+        }
+        drop(peek);
         match self.route(&relay, &hello) {
             Route::Own => {
                 relay
@@ -1186,7 +1205,7 @@ impl AsyncWrite for TokioStream {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::net::IpAddr;
 
     use super::*;
@@ -1375,18 +1394,22 @@ mod tests {
     use crate::names::{Quarantine, QuarantineKind};
     use crate::tenant::{Class, Slug, TenantBook, TenantSpec};
 
-    const OWN: &str = "relay.example.test";
-    const H: &str = "s.example.test";
-
-    struct World {
-        relay: Relay,
-        door: Arc<FrontDoor>,
-        node: NodeId,
-        network: NetworkId,
-        owner: SigningKey,
+    pub(crate) const OWN: &str = "relay.example.test";
+    pub(crate) fn tests_unix_now() -> u64 {
+        super::unix_now()
     }
 
-    fn relay() -> Relay {
+    pub(crate) const H: &str = "s.example.test";
+
+    pub(crate) struct World {
+        pub(crate) relay: Relay,
+        pub(crate) door: Arc<FrontDoor>,
+        pub(crate) node: NodeId,
+        pub(crate) network: NetworkId,
+        pub(crate) owner: SigningKey,
+    }
+
+    pub(crate) fn relay() -> Relay {
         let key = SigningKey::generate(&mut rand::rng());
         let body = NodeCertBody {
             v: PROTOCOL_VERSION,
@@ -1409,7 +1432,7 @@ mod tests {
         )
     }
 
-    fn share(name: &str, mode: ShareMode, service: &str, alpn: &[&str]) -> Share {
+    pub(crate) fn share(name: &str, mode: ShareMode, service: &str, alpn: &[&str]) -> Share {
         Share {
             name: name.to_string(),
             mode,
@@ -1418,7 +1441,7 @@ mod tests {
         }
     }
 
-    fn world(labels: &[&str], tenants: Option<TenantSpec>) -> World {
+    pub(crate) fn world(labels: &[&str], tenants: Option<TenantSpec>) -> World {
         // The caller's tenant spec gets this network patched in.
         let owner = SigningKey::generate(&mut rand::rng());
         let network = NetworkId::from(owner.verifying_key().to_bytes());
@@ -1468,13 +1491,13 @@ mod tests {
     }
 
     impl World {
-        fn attach(&self) {
+        pub(crate) fn attach(&self) {
             // Kept alive by leaking the receivers: the registration is what is looked at.
             let held = self.relay.registry.attach(self.node, 1, vec![self.network]);
             std::mem::forget(held);
         }
 
-        fn advertise(&self, shares: Vec<Share>) -> menzil_proto::AdvertiseAckBody {
+        pub(crate) fn advertise(&self, shares: Vec<Share>) -> menzil_proto::AdvertiseAckBody {
             self.relay.labels().advertise(
                 self.relay.rosters(),
                 &self.relay.tenants(),
@@ -1490,7 +1513,7 @@ mod tests {
         }
 
         /// The owner's Roster `seq` listing `members` and granting each `(label, node)`.
-        fn roster(&self, seq: u64, members: &[NodeId], labels: &[(&str, NodeId)]) {
+        pub(crate) fn roster(&self, seq: u64, members: &[NodeId], labels: &[(&str, NodeId)]) {
             let body = RosterBody {
                 v: PROTOCOL_VERSION,
                 network_id: self.network,
@@ -1522,11 +1545,15 @@ mod tests {
             );
         }
 
-        fn attach_node(&self, node: NodeId) {
+        pub(crate) fn attach_node(&self, node: NodeId) {
             std::mem::forget(self.relay.registry.attach(node, 1, vec![self.network]));
         }
 
-        fn advertise_as(&self, node: NodeId, shares: Vec<Share>) -> menzil_proto::AdvertiseAckBody {
+        pub(crate) fn advertise_as(
+            &self,
+            node: NodeId,
+            shares: Vec<Share>,
+        ) -> menzil_proto::AdvertiseAckBody {
             self.relay.labels().advertise(
                 self.relay.rosters(),
                 &self.relay.tenants(),
@@ -1547,7 +1574,7 @@ mod tests {
         }
     }
 
-    fn ali(overrides: &[(&str, u64)]) -> TenantSpec {
+    pub(crate) fn ali(overrides: &[(&str, u64)]) -> TenantSpec {
         TenantSpec {
             slug: Slug::parse("ali").unwrap(),
             networks: Vec::new(),

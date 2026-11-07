@@ -1141,6 +1141,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "menzil-acme"
+version = "0.0.1"
+dependencies = [
+ "base64",
+ "fastrand",
+ "httparse",
+ "menzil-carrier",
+ "rcgen",
+ "ring",
+ "rustls",
+ "serde_json",
+ "sha2 0.11.0",
+ "thiserror",
+ "tokio",
+ "tokio-rustls",
+ "tracing",
+ "url",
+ "x509-parser",
+]
+
+[[package]]
 name = "menzil-admin"
 version = "0.0.1"
 dependencies = [
@@ -1189,11 +1210,10 @@ dependencies = [
 name = "menzil-node"
 version = "0.0.1"
 dependencies = [
- "base64",
  "ed25519-dalek",
  "fastrand",
  "futures-util",
- "httparse",
+ "menzil-acme",
  "menzil-carrier",
  "menzil-e2e",
  "menzil-proto",
@@ -1204,15 +1224,12 @@ dependencies = [
  "rcgen",
  "ring",
  "rustls",
- "serde_json",
- "sha2 0.11.0",
  "snow",
  "socket2",
  "thiserror",
  "tokio",
  "tokio-rustls",
  "tracing",
- "url",
  "x509-parser",
 ]
 
@@ -1236,6 +1253,7 @@ dependencies = [
  "ed25519-dalek",
  "fastrand",
  "futures-util",
+ "menzil-acme",
  "menzil-carrier",
  "menzil-e2e",
  "menzil-proto",

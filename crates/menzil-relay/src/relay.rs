@@ -15,6 +15,7 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use menzil_proto::{Limits, NodeId, X25519PublicKey};
 
+use crate::acme::RelayAcme;
 use crate::admission::IpSlot;
 use crate::admission::{Admission, AdmissionLimits};
 use crate::advertise::LabelRegistry;
@@ -125,6 +126,8 @@ pub struct Relay {
     /// The blind front door of the TLS port (`crate::front_door`); `None` serves the relay's own
     /// host name on every connection, as before.
     front_door: Option<Arc<FrontDoorConfig>>,
+    /// The relay's own ACME (`crate::acme`); `None` answers no validation and orders nothing.
+    acme: Option<RelayAcme>,
 }
 
 /// An attached node as the relay's own endpoint needs it: the L3 session it is attached by and
@@ -202,6 +205,7 @@ impl Relay {
             endpoint: Arc::new(RelayEndpoint::default()),
             principal: PrincipalConfig::default(),
             front_door: None,
+            acme: None,
         }
     }
 
@@ -307,6 +311,23 @@ impl Relay {
         self
     }
 
+    /// This relay with ACME (`crate::acme`): while it serves with a front door it keeps
+    /// certificates for the configured host names and for the names of terminated shares,
+    /// answers TLS-ALPN-01 validations of its own pending orders on the TLS port, and starts no
+    /// order for anything else. Without a front door (no share domain) the relay reads nothing
+    /// before TLS and so cannot answer one: nothing is ordered. Call it before
+    /// [`Relay::serve`] and before cloning the relay.
+    #[must_use]
+    pub fn with_acme(mut self, acme: RelayAcme) -> Self {
+        self.acme = Some(acme);
+        self
+    }
+
+    /// The relay's ACME state, if it has any.
+    pub fn acme(&self) -> Option<&RelayAcme> {
+        self.acme.as_ref()
+    }
+
     /// The front door's settings, if it is on.
     pub fn front_door_config(&self) -> Option<&FrontDoorConfig> {
         self.front_door.as_deref()
@@ -409,6 +430,28 @@ impl Relay {
             .map(|front| FrontDoor::new(self, (**front).clone()));
         // Holder entries follow the Rosters for as long as the relay serves.
         let _grants = AbortOnDrop(self.watch_grants());
+        // The relay's own ACME lives as long as this future does, and only with a front door:
+        // without one nothing reads a ClientHello, so no validation could be answered.
+        let _acme = match (&front, &self.acme) {
+            (Some(_), Some(acme)) => match menzil_acme::HttpsTransport::platform() {
+                Ok(transport) => Some(AbortOnDrop(tokio::spawn(crate::acme::run(
+                    self.clone(),
+                    acme.clone(),
+                    transport,
+                )))),
+                Err(error) => {
+                    tracing::warn!(%error, "ACME: no TLS client for the CA; the relay will not order certificates");
+                    None
+                }
+            },
+            (None, Some(_)) => {
+                tracing::warn!(
+                    "ACME is configured but there is no share domain (front door): nothing is ordered"
+                );
+                None
+            }
+            _ => None,
+        };
         // Port 80 lives as long as this future does.
         let _http = match (&front, http) {
             (Some(front), Some(http)) => Some(AbortOnDrop(tokio::spawn(

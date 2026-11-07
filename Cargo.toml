@@ -7,6 +7,7 @@ members = [
     "crates/menzil-e2e",
     "crates/menzil-stream",
     "crates/menzil-admin",
+    "crates/menzil-acme",
     "crates/menzil-relay",
     "crates/menzil-node",
     "crates/menzil",

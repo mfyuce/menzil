@@ -2310,6 +2310,7 @@ async fn the_front_door_needs_a_host_and_plain_names() {
     let front = FrontDoorOptions {
         share_domain: "s.example".to_string(),
         http_listen: None,
+        acme: None,
     };
     let error = start_with(&relay_home, &options, Some(&front))
         .await
@@ -2321,6 +2322,7 @@ async fn the_front_door_needs_a_host_and_plain_names() {
         let front = FrontDoorOptions {
             share_domain: bad.to_string(),
             http_listen: None,
+            acme: None,
         };
         assert!(
             start_with(&relay_home, &options, Some(&front))
@@ -2328,6 +2330,38 @@ async fn the_front_door_needs_a_host_and_plain_names() {
                 .is_err(),
             "{bad:?}"
         );
+    }
+}
+
+/// The relay's ACME names no CA by itself: a directory that is not an https URL stops the
+/// start, before anything is bound (no network is touched either way).
+#[tokio::test]
+async fn the_relays_acme_directory_must_be_an_https_url() {
+    let (_o, owner, _id, _) = token_of_a_network();
+    let (dir, relay_home) = home();
+    init(&relay_home, clock()).unwrap();
+    add_network(&relay_home, &relay_token(&owner), clock()).unwrap();
+    let mut options = run_options(dir.path());
+    options.host = Some("relay.example".to_string());
+    for bad in [
+        "",
+        "http://ca.example/dir",
+        "ca.example/dir",
+        "ftp://ca.example",
+    ] {
+        let front = FrontDoorOptions {
+            share_domain: "s.example".to_string(),
+            http_listen: None,
+            acme: Some(AcmeOptions {
+                directory_url: bad.to_string(),
+                contact: None,
+            }),
+        };
+        let error = start_with(&relay_home, &options, Some(&front))
+            .await
+            .err()
+            .unwrap_or_else(|| panic!("{bad:?} started"));
+        assert!(format!("{error:#}").contains("https"), "{bad:?}: {error:#}");
     }
 }
 
@@ -2347,6 +2381,7 @@ async fn a_relay_with_a_share_domain_refuses_unknown_names_and_serves_port_80_on
     let front = FrontDoorOptions {
         share_domain: "s.example".to_string(),
         http_listen: None,
+        acme: None,
     };
     let running = start_with(&relay_home, &options, Some(&front))
         .await
@@ -2360,6 +2395,7 @@ async fn a_relay_with_a_share_domain_refuses_unknown_names_and_serves_port_80_on
     let front = FrontDoorOptions {
         share_domain: "s.example".to_string(),
         http_listen: Some("127.0.0.1:0".parse().unwrap()),
+        acme: None,
     };
     let running = start_with(&relay_home, &options, Some(&front))
         .await

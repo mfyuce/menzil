@@ -10,13 +10,14 @@ rust-version.workspace = true
 default = ["aws-lc-rs"]
 # rustls crypto provider, mirroring menzil-carrier's own choice
 # (TOBEDECIDED.md item 3) for the relay's server-side TLS.
-aws-lc-rs = ["rustls/aws-lc-rs", "tokio-rustls/aws-lc-rs"]
-ring = ["rustls/ring", "tokio-rustls/ring"]
+aws-lc-rs = ["rustls/aws-lc-rs", "tokio-rustls/aws-lc-rs", "menzil-acme/aws-lc-rs"]
+ring = ["rustls/ring", "tokio-rustls/ring", "menzil-acme/ring"]
 
 [dependencies]
 ed25519-dalek.workspace = true
 fastrand.workspace = true
 futures-util = { workspace = true, features = ["io"] }
+menzil-acme = { path = "../menzil-acme", default-features = false }
 menzil-carrier = { path = "../menzil-carrier" }
 menzil-e2e = { path = "../menzil-e2e" }
 menzil-proto = { path = "../menzil-proto" }
@@ -30,6 +31,8 @@ tokio-tungstenite.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
+# the in process CA of the ACME tests.
+menzil-acme = { path = "../menzil-acme", default-features = false, features = ["testing"] }
 rand = "0.10.3"
 rcgen = "0.14.10"
 snow = "0.10.0"

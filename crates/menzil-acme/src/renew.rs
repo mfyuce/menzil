@@ -11,13 +11,12 @@ use x509_parser::extensions::GeneralName;
 use super::client::{AcmeClient, Issued};
 use super::http::AcmeTransport;
 use super::{AcmeError, ChallengeBook, check_domain};
-use crate::shares::{ShareBook, lists_acme_alpn};
 
 /// The longest the loop sleeps in one piece, so that a clock that jumped is noticed.
 const MAX_SLEEP: Duration = Duration::from_secs(6 * 3600);
 
-/// How long the loop waits before it looks again when the share is not wanted (not accepted yet,
-/// or no longer listing `acme-tls/1`).
+/// How long the loop waits before it looks again when the share is not wanted (for the node: not accepted
+/// yet, or no longer listing `acme-tls/1`; for the relay: no longer a configured name).
 const UNWANTED_WAIT: Duration = Duration::from_secs(60);
 
 /// The first and the longest wait after a failed attempt.
@@ -191,23 +190,14 @@ pub struct AcmeJob {
     pub domain: String,
 }
 
-/// Whether `job`'s share is one the relay accepted in this attachment and lists `acme-tls/1`:
-/// the only state in which the node asks a CA for anything or answers a validation.
-pub fn wanted(shares: &ShareBook, share: &str) -> bool {
-    shares
-        .accepted()
-        .iter()
-        .any(|accepted| accepted.name == share && lists_acme_alpn(accepted))
-}
-
 /// Keeps a certificate for `job.domain` fresh, forever (the caller aborts the task): when none is
-/// stored, or the stored one is past its renewal time, and the share is [`wanted`], an
+/// stored, or the stored one is past its renewal time, and `wanted()` says so, an
 /// [`AcmeClient::obtain`] is run and its result stored; a failure is logged and retried after
 /// a wait that doubles from one minute to one hour, with jitter.
 pub async fn run_renewals<T: AcmeTransport>(
     mut client: AcmeClient<T>,
     store: CertStore,
-    shares: ShareBook,
+    wanted: impl Fn() -> bool + Send + Sync,
     book: ChallengeBook,
     job: AcmeJob,
 ) {
@@ -224,12 +214,11 @@ pub async fn run_renewals<T: AcmeTransport>(
             tokio::time::sleep(Duration::from_secs(due - now).min(MAX_SLEEP)).await;
             continue;
         }
-        if !wanted(&shares, &job.share) {
+        if !wanted() {
             tokio::time::sleep(UNWANTED_WAIT).await;
             continue;
         }
-        let still_wanted = || wanted(&shares, &job.share);
-        let outcome = client.obtain(&job.domain, &book, &still_wanted).await;
+        let outcome = client.obtain(&job.domain, &book, &wanted).await;
         let wait = match outcome
             .and_then(|issued| store.save(&job.domain, &issued).map(|()| issued))
         {

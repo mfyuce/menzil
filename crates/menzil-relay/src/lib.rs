@@ -8,14 +8,16 @@
 //!
 //! - Anything but the blind front door of the TLS port (`front_door`: protocol.md 6.2 to 6.4,
 //!   SNI routing of blind `tls:` and `tcp:` shares through the relay principal); the static
-//!   site, terminated shares and the relay's ACME are later slices.
-//! - ACME certificate provisioning (protocol.md 11); certificate and key
-//!   material is supplied to this crate already loaded.
+//!   site and terminated shares are later slices.
+//! - The relay's own ACME is `acme` (TLS-ALPN-01 for the relay's host name and the names of
+//!   terminated shares, needs the front door); the certificate and key of the relay's own host
+//!   are otherwise supplied to this crate already loaded.
 //! - Relay-terminated HTTP serving for terminated shares (its own
 //!   TODO.md line, protocol.md 6.3).
 
 #![forbid(unsafe_code)]
 
+mod acme;
 mod admission;
 mod advertise;
 mod connection;
@@ -46,6 +48,10 @@ mod tenant;
 mod tests_support;
 mod tls;
 
+pub use acme::{
+    AcmeConfig, MAX_PENDING_ORDERS, ORDER_BACKOFF_MAX, ORDER_MIN_INTERVAL, OrderLimiter,
+    OrderPermit, RelayAcme, RelayCertBook, run as run_acme,
+};
 pub use admission::{
     AdmissionLimits, CONNECTIONS_PER_IP_PER_MINUTE, MAX_ATTACHED, MAX_HANDSHAKES_PER_IP,
     MAX_HANDSHAKES_PER_V6_48, MAX_TRACKED_PEERS, MAX_UNATTACHED_PER_IP, MAX_UNATTACHED_PER_NODE,

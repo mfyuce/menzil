@@ -309,6 +309,19 @@ pub struct FrontDoorOptions {
     /// Where to serve plain HTTP for ACME HTTP-01 and the redirect to https (port 80); not
     /// served when `None`.
     pub http_listen: Option<SocketAddr>,
+    /// The relay's own ACME (TLS-ALPN-01): certificates for `--host` and for the names of
+    /// terminated shares; off when `None`.
+    pub acme: Option<AcmeOptions>,
+}
+
+/// The relay's ACME settings (`menzil relay run --acme-directory`). There is no default CA:
+/// the operator names the directory (for a trial, the CA's staging directory).
+#[derive(Debug, Clone)]
+pub struct AcmeOptions {
+    /// The RFC 8555 directory URL (https).
+    pub directory_url: String,
+    /// The contact for the CA's notices (`mailto:...`), if any.
+    pub contact: Option<String>,
 }
 
 /// The soft `RLIMIT_NOFILE` is never raised above this (Linux refuses a limit over
@@ -566,7 +579,32 @@ pub async fn start_with(
     if rosters.is_empty() {
         bail!("this relay serves no network: run `menzil relay add-network <token>` first");
     }
-    let tls = tls_from_pem(&options.tls_cert, &options.tls_key)?;
+    // With ACME the relay's own TLS configuration resolves from the certificate book: the
+    // operator's certificate files answer until (and whenever) the book has nothing better.
+    let acme = match (
+        front.and_then(|front| front.acme.as_ref()),
+        options.host.as_deref(),
+    ) {
+        (Some(acme), Some(host)) => {
+            let mut config = menzil_relay::AcmeConfig::new(&acme.directory_url, home.root())?
+                .with_hosts(&[host])?;
+            if let Some(contact) = &acme.contact {
+                config = config.with_contact(contact);
+            }
+            let book = menzil_relay::RelayCertBook::new();
+            let chain = std::fs::read_to_string(&options.tls_cert)
+                .with_context(|| format!("reading {}", options.tls_cert.display()))?;
+            let key = std::fs::read_to_string(&options.tls_key)
+                .with_context(|| format!("reading {}", options.tls_key.display()))?;
+            book.set_fallback_pem(&chain, &key)?;
+            Some(menzil_relay::RelayAcme::with_book(config, book))
+        }
+        _ => None,
+    };
+    let tls = match &acme {
+        Some(acme) => acme.certs().server_config()?,
+        None => tls_from_pem(&options.tls_cert, &options.tls_key)?,
+    };
     let listener = Listener::bind(options.listen, tls, options.path.clone()).await?;
     let addr = listener.local_addr()?;
     let info = connection_info(
@@ -591,6 +629,9 @@ pub async fn start_with(
     if let Some(config) = front_door {
         raise_nofile_for(&config, http.is_some());
         relay = relay.with_front_door(config);
+    }
+    if let Some(acme) = acme {
+        relay = relay.with_acme(acme);
     }
     relay.set_tenants(book);
     relay.labels().load_state(&name_state);

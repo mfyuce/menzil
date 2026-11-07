@@ -1,0 +1,40 @@
+[package]
+name = "menzil-acme"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Generic ACME (RFC 8555) client, TLS-ALPN-01 challenge book and certificate store shared by the menzil node and relay"
+
+[features]
+# The in process CA of `testing` for other crates tests (not for production).
+testing = ["dep:ring_crate"]
+default = ["aws-lc-rs"]
+# rustls crypto provider for the challenge responder and the client, mirroring the other crates.
+aws-lc-rs = ["rustls/aws-lc-rs", "tokio-rustls/aws-lc-rs"]
+ring = ["rustls/ring", "tokio-rustls/ring"]
+
+[dependencies]
+ring_crate = { package = "ring", version = "0.17.14", optional = true }
+base64.workspace = true
+fastrand.workspace = true
+httparse.workspace = true
+menzil-carrier = { path = "../menzil-carrier" }
+# the challenge certificate (id-pe-acmeIdentifier), the account key and the CSR.
+rcgen = "0.14.10"
+rustls.workspace = true
+# the key authorization digest and the JWK thumbprint.
+sha2 = "0.11.0"
+serde_json = "1"
+thiserror.workspace = true
+tokio = { workspace = true, features = ["sync", "time", "net", "io-util", "fs"] }
+tokio-rustls.workspace = true
+tracing.workspace = true
+url.workspace = true
+# the validity of an issued certificate, for the renewal time.
+x509-parser = "0.18.1"
+
+[dev-dependencies]
+ring_crate = { package = "ring", version = "0.17.14" }
+tokio = { workspace = true, features = ["test-util"] }

@@ -10,41 +10,36 @@ rust-version.workspace = true
 default = ["aws-lc-rs"]
 # rustls crypto provider for the ACME challenge responder and client, mirroring menzil-relay's
 # own choice.
-aws-lc-rs = ["rustls/aws-lc-rs", "tokio-rustls/aws-lc-rs"]
-ring = ["rustls/ring", "tokio-rustls/ring"]
+aws-lc-rs = ["rustls/aws-lc-rs", "tokio-rustls/aws-lc-rs", "menzil-acme/aws-lc-rs"]
+ring = ["rustls/ring", "tokio-rustls/ring", "menzil-acme/ring"]
 
 [dependencies]
-base64.workspace = true
 ed25519-dalek.workspace = true
 fastrand.workspace = true
 futures-util = { version = "0.3.34", default-features = false, features = ["std", "io"] }
+menzil-acme = { path = "../menzil-acme", default-features = false }
 menzil-carrier = { path = "../menzil-carrier" }
 menzil-e2e = { path = "../menzil-e2e" }
 menzil-proto = { path = "../menzil-proto" }
 menzil-session = { path = "../menzil-session" }
 menzil-stream = { path = "../menzil-stream" }
-# acme.rs: the challenge certificate (id-pe-acmeIdentifier), the account key and the CSR.
 rcgen = "0.14.10"
 rustls.workspace = true
-# acme.rs: the key authorization digest and the JWK thumbprint.
-sha2 = "0.11.0"
-serde_json = "1"
 socket2.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["sync", "time", "net", "io-util", "fs"] }
 tokio-rustls.workspace = true
 tracing.workspace = true
-url.workspace = true
-httparse.workspace = true
-# acme.rs: the validity of an issued certificate, for the renewal time.
-x509-parser = "0.18.1"
 
 [dev-dependencies]
+# the in process CA of the renewal wrapper test.
+menzil-acme = { path = "../menzil-acme", default-features = false, features = ["testing"] }
 # menzil-relay, rcgen, rustls: tests/live_session.rs's in-process relay and
 # its self-signed test certificate.
 menzil-relay = { path = "../menzil-relay" }
 rand = "0.10.3"
 # acme tests: the fake CA verifies the ES256 signature of each JWS.
 ring = "0.17.14"
+x509-parser = "0.18.1"
 snow = "0.10.0"
 tokio = { workspace = true, features = ["test-util"] }
