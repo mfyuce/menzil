@@ -325,6 +325,10 @@ pub struct Tenant {
     pub networks: Vec<NetworkId>,
     /// Whether terminated shares are allowed for it.
     pub terminated: bool,
+    /// Whether the operator suspended it ([`TenantBook::suspend`]): its networks are held back
+    /// (not served), its name, figures and `terminated` stay as they are. Always false for the
+    /// default tenant.
+    pub suspended: bool,
     /// The flat names the operator granted it.
     pub extra_names: Vec<String>,
     /// When it was added (Unix seconds), 0 for the default tenant.
@@ -339,6 +343,7 @@ impl Tenant {
             figures: None,
             networks: Vec::new(),
             terminated: false,
+            suspended: false,
             extra_names: Vec::new(),
             added: 0,
         }
@@ -577,6 +582,7 @@ impl TenantBook {
             figures,
             networks: Vec::new(),
             terminated: spec.terminated,
+            suspended: false,
             extra_names,
             added: spec.added,
         })
@@ -641,6 +647,18 @@ impl TenantBook {
     /// Whether `network_id` is in a tenant file the book refused: such a network is not served.
     pub fn is_held_back(&self, network_id: &NetworkId) -> bool {
         self.held_back.contains(network_id)
+    }
+
+    /// Suspends the named tenant `slug` (a tenant file with `suspended = true`): its networks
+    /// are held back exactly like those of a refused file, so the relay does not serve them and
+    /// never gives them to the default tenant, while the tenant itself stays in the book (its
+    /// name, flat names and figures stay reserved, `terminated` is untouched). A slug the book
+    /// does not hold (a refused file, whose networks are held back already) changes nothing.
+    pub fn suspend(&mut self, slug: &Slug) {
+        if let Some(tenant) = self.named.get_mut(slug) {
+            tenant.suspended = true;
+            self.held_back.extend(tenant.networks.iter().copied());
+        }
     }
 
     /// The tenant files that were refused.
@@ -1721,6 +1739,32 @@ mod tests {
         assert_eq!(refusal.name, "ali");
         assert!(refusal.reason.contains("quarantine"), "{}", refusal.reason);
         assert_eq!(refusal.networks, vec![net(1)]);
+    }
+
+    /// UI-A (K1): a suspended tenant's networks are held back (not served, never the default
+    /// tenant's), while the tenant, its figures and `terminated` stay in the book.
+    #[test]
+    fn a_suspended_tenants_networks_are_held_back_and_the_tenant_stays() {
+        let mut ali = spec("ali", &[1, 2]);
+        ali.terminated = true;
+        ali.overrides = BTreeMap::from([("names".to_string(), 7)]);
+        let mut book = build(vec![ali, spec("veli", &[3])]);
+        assert!(!book.is_held_back(&net(1)) && !book.named("ali").unwrap().suspended);
+        book.suspend(&slug("ali"));
+        let tenant = book.named("ali").expect("the tenant stays in the book");
+        assert!(tenant.suspended);
+        assert!(tenant.terminated, "suspending does not touch `terminated`");
+        assert_eq!(tenant.figures.unwrap().names, 7, "quota is kept");
+        assert!(book.is_held_back(&net(1)) && book.is_held_back(&net(2)));
+        assert!(!book.is_held_back(&net(3)), "another tenant is served");
+        assert!(!book.named("veli").unwrap().suspended);
+        // Its slug stays reserved for the default tenant's names.
+        assert!(book.reserves_flat_name("ali"));
+        // The tenant that owns a network is still ali: no fall back to the default tenant.
+        assert_eq!(book.id_of(&net(1)), &TenantId::Named(slug("ali")));
+        // A slug the book does not hold changes nothing.
+        book.suspend(&slug("nobody"));
+        assert!(!book.is_held_back(&net(3)));
     }
 
     #[test]

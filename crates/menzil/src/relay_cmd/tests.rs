@@ -2464,3 +2464,435 @@ fn the_file_descriptor_plan_raises_to_the_hard_limit_and_flags_a_shortfall() {
     assert!(!nofile_plan(need, need, need).short);
     assert!(nofile_plan(need - 1, need - 1, need).short);
 }
+
+// ---- UI-A: `suspended` and the typed tenant operations ----
+
+use super::tenants::{
+    TenantError, UpdateTenant, get_tenant, list_tenants, set_suspended, update_tenant,
+};
+use menzil_relay::Class;
+use std::collections::BTreeMap;
+
+fn overrides(pairs: &[(&str, u64)]) -> BTreeMap<String, u64> {
+    pairs.iter().map(|(k, v)| (k.to_string(), *v)).collect()
+}
+
+fn with_overrides(map: BTreeMap<String, u64>) -> UpdateTenant {
+    UpdateTenant {
+        quota_overrides: Some(map),
+        ..UpdateTenant::default()
+    }
+}
+
+#[tokio::test]
+async fn a_suspended_tenants_networks_are_dropped_at_reload_and_resume_restores_them() {
+    let (_a, _oa, id_a, token_a) = another_network();
+    let (_b, _ob, id_b, token_b) = another_network();
+    let (dir, relay) = relay_machine();
+    add_network_to(&relay, &token_a, clock(), Some("ali")).unwrap();
+    add_network_to(&relay, &token_b, clock(), Some("veli")).unwrap();
+    // `terminated` is on, and suspending leaves it so.
+    update_tenant(
+        &relay,
+        "ali",
+        UpdateTenant {
+            terminated: Some(true),
+            ..UpdateTenant::default()
+        },
+    )
+    .unwrap();
+    let running = running_on(dir.path(), &relay).await;
+    assert_eq!(running.roster_seq(&id_a), Some(1));
+
+    let info = set_suspended(&relay, "ali", true).unwrap();
+    assert!(info.suspended && info.terminated);
+    assert!(read_tenant_file(&relay, "ali").contains("suspended = true"));
+    reload_once(&running.relay, &relay, &mut Vec::new());
+    assert_eq!(running.roster_seq(&id_a), None, "not served");
+    assert_eq!(running.roster_seq(&id_b), Some(1), "another tenant is");
+    assert!(roster_path(&relay, &id_a).exists(), "the Roster file stays");
+    // Not the default tenant's: it is held back and still ali's.
+    let book = running.relay.tenants();
+    assert!(book.is_held_back(&id_a) && !book.is_held_back(&id_b));
+    assert_eq!(
+        book.id_of(&id_a),
+        &TenantId::Named(menzil_relay::Slug::parse("ali").unwrap())
+    );
+    assert!(
+        book.named("ali").unwrap().terminated,
+        "terminated is untouched"
+    );
+    // And again after another reload: it does not creep back in.
+    reload_once(&running.relay, &relay, &mut Vec::new());
+    assert_eq!(running.roster_seq(&id_a), None);
+
+    let info = set_suspended(&relay, "ali", false).unwrap();
+    assert!(!info.suspended && info.terminated);
+    assert!(!read_tenant_file(&relay, "ali").contains("suspended"));
+    reload_once(&running.relay, &relay, &mut Vec::new());
+    assert_eq!(running.roster_seq(&id_a), Some(1), "resume restores");
+    assert!(!running.relay.tenants().is_held_back(&id_a));
+    running.stop();
+}
+
+#[test]
+fn a_suspended_tenant_keeps_its_networks_out_of_the_default_tenant_and_takes_no_new_one() {
+    let (_a, _oa, id_a, token_a) = another_network();
+    let (_b, _ob, _id_b, token_b) = another_network();
+    let (_d, relay) = relay_machine();
+    add_network_to(&relay, &token_a, clock(), Some("ali")).unwrap();
+    set_suspended(&relay, "ali", true).unwrap();
+
+    // A renewal without `--tenant` leaves the network in ali, held back.
+    let renewed = add_network_to(&relay, &token_a, clock() + 1, None).unwrap();
+    assert_eq!(renewed.tenant.as_deref(), Some("ali"));
+    let book = load_book(&relay, &load_rosters(&relay).unwrap()).unwrap();
+    assert!(book.is_held_back(&id_a));
+    assert_eq!(
+        book.id_of(&id_a),
+        &TenantId::Named(menzil_relay::Slug::parse("ali").unwrap())
+    );
+    assert!(read_tenant_file(&relay, "ali").contains("suspended = true"));
+
+    // A new network cannot go into the suspended tenant, and a listed one cannot move away.
+    let error = add_network_to(&relay, &token_b, clock(), Some("ali"))
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("suspended"), "{error}");
+    let error = add_network_to(&relay, &token_a, clock(), Some("veli"))
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("already in tenant ali"), "{error}");
+
+    // `remove-network` keeps the key.
+    remove_network(&relay, &id_a.to_hex()).unwrap();
+    assert!(read_tenant_file(&relay, "ali").contains("suspended = true"));
+
+    // The listing says so.
+    let listing = render_tenants(&relay, clock()).unwrap();
+    assert!(listing.contains("suspended"), "{listing}");
+}
+
+#[test]
+fn suspend_and_resume_are_idempotent_and_name_their_errors() {
+    let (_a, _oa, _id, token_a) = another_network();
+    let (_d, relay) = relay_machine();
+    add_network_to(&relay, &token_a, clock(), Some("ali")).unwrap();
+    assert!(!set_suspended(&relay, "ali", false).unwrap().suspended);
+    assert!(set_suspended(&relay, "ali", true).unwrap().suspended);
+    assert!(set_suspended(&relay, "ali", true).unwrap().suspended);
+    assert_eq!(
+        set_suspended(&relay, "nobody", true).unwrap_err(),
+        TenantError::NotFound
+    );
+    assert!(matches!(
+        set_suspended(&relay, "Not A Name", true).unwrap_err(),
+        TenantError::Invalid(_)
+    ));
+}
+
+#[test]
+fn an_update_or_a_renewal_never_lifts_a_suspension() {
+    let (_a, _oa, _id, token_a) = another_network();
+    let (_d, relay) = relay_machine();
+    add_network_to(&relay, &token_a, clock(), Some("ali")).unwrap();
+    set_suspended(&relay, "ali", true).unwrap();
+
+    // Every writer that rewrites the tenant file keeps the flag.
+    let info = update_tenant(
+        &relay,
+        "ali",
+        UpdateTenant {
+            terminated: Some(true),
+            quota_overrides: Some(overrides(&[("names", 7)])),
+            ..UpdateTenant::default()
+        },
+    )
+    .unwrap();
+    assert!(info.suspended && info.terminated, "{info:?}");
+    assert!(get_tenant(&relay, "ali").unwrap().suspended);
+    // A renewal of the same network without `--tenant` leaves the tenant suspended too.
+    add_network_to(&relay, &token_a, clock() + 10, None).unwrap();
+    assert!(get_tenant(&relay, "ali").unwrap().suspended);
+    // Resume lifts it, and only resume.
+    assert!(!set_suspended(&relay, "ali", false).unwrap().suspended);
+}
+
+#[test]
+fn get_and_list_tenants_report_what_the_file_says() {
+    let (_a, _oa, id_a, token_a) = another_network();
+    let (_b, _ob, id_b, token_b) = another_network();
+    let (_d, relay) = relay_machine();
+    assert_eq!(list_tenants(&relay).unwrap(), vec![]);
+    add_network_to(&relay, &token_a, clock(), Some("ali")).unwrap();
+    add_network_to(&relay, &token_b, clock() + 5, Some("veli")).unwrap();
+    update_tenant(&relay, "veli", with_overrides(overrides(&[("names", 9)]))).unwrap();
+    set_suspended(&relay, "veli", true).unwrap();
+
+    let ali = get_tenant(&relay, "ali").unwrap();
+    assert_eq!(ali.slug, "ali");
+    assert_eq!(ali.network_ids, vec![id_a]);
+    assert_eq!(ali.class, Class::Friend);
+    assert!(!ali.terminated && !ali.suspended);
+    assert_eq!(ali.added_unix, clock());
+    assert!(ali.quota_overrides.is_empty());
+    let veli = get_tenant(&relay, "veli").unwrap();
+    assert_eq!(veli.network_ids, vec![id_b]);
+    assert!(veli.suspended);
+    assert_eq!(veli.added_unix, clock() + 5);
+    assert_eq!(veli.quota_overrides, overrides(&[("names", 9)]));
+    let all = list_tenants(&relay).unwrap();
+    assert_eq!(all, vec![ali, veli]);
+    assert_eq!(
+        get_tenant(&relay, "nobody").unwrap_err(),
+        TenantError::NotFound
+    );
+    assert!(matches!(
+        get_tenant(&relay, "x").unwrap_err(),
+        TenantError::Invalid(_)
+    ));
+    // A file the relay refuses is not NotFound.
+    fs::write(tenant_file(&relay, "bad"), "class = \"gold\"\n").unwrap();
+    assert!(matches!(
+        get_tenant(&relay, "bad").unwrap_err(),
+        TenantError::Precondition(_)
+    ));
+    assert_eq!(list_tenants(&relay).unwrap().len(), 2);
+}
+
+#[test]
+fn update_tenant_round_trips_through_the_file_and_replaces_the_override_set() {
+    let (_a, _oa, _id, token_a) = another_network();
+    let (_d, relay) = relay_machine();
+    add_network_to(&relay, &token_a, clock(), Some("ali")).unwrap();
+    let info = update_tenant(
+        &relay,
+        "ali",
+        UpdateTenant {
+            terminated: Some(true),
+            quota_overrides: Some(overrides(&[("names", 9), ("bandwidth_mbit", 50)])),
+            class: None,
+        },
+    )
+    .unwrap();
+    assert!(info.terminated);
+    assert_eq!(
+        info.quota_overrides,
+        overrides(&[("names", 9), ("bandwidth_mbit", 50)])
+    );
+    // The file says it and the book reads it the same.
+    let text = read_tenant_file(&relay, "ali");
+    assert!(
+        text.contains("names = 9") && text.contains("terminated = true"),
+        "{text}"
+    );
+    let book = load_book(&relay, &load_rosters(&relay).unwrap()).unwrap();
+    let figures = book.named("ali").unwrap().figures.unwrap();
+    assert_eq!((figures.names, figures.bandwidth_mbit), (9, 50));
+    assert!(book.refused().is_empty());
+
+    // `Some` REPLACES: only `roster_kib` is left, `names` is back to the default.
+    update_tenant(
+        &relay,
+        "ali",
+        with_overrides(overrides(&[("roster_kib", 4)])),
+    )
+    .unwrap();
+    let info = get_tenant(&relay, "ali").unwrap();
+    assert_eq!(info.quota_overrides, overrides(&[("roster_kib", 4)]));
+    assert!(info.terminated, "a field left None is kept");
+    // None keeps the set; an empty set goes back to the class defaults.
+    update_tenant(
+        &relay,
+        "ali",
+        UpdateTenant {
+            terminated: Some(false),
+            ..UpdateTenant::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        get_tenant(&relay, "ali").unwrap().quota_overrides,
+        overrides(&[("roster_kib", 4)])
+    );
+    update_tenant(&relay, "ali", with_overrides(BTreeMap::new())).unwrap();
+    let info = get_tenant(&relay, "ali").unwrap();
+    assert!(info.quota_overrides.is_empty() && !info.terminated);
+    // The class changes both ways.
+    let personal = UpdateTenant {
+        class: Some(Class::Personal),
+        ..UpdateTenant::default()
+    };
+    assert_eq!(
+        update_tenant(&relay, "ali", personal).unwrap().class,
+        Class::Personal
+    );
+    assert_eq!(
+        get_tenant(&relay, "ali").unwrap().class,
+        Class::Personal,
+        "{}",
+        read_tenant_file(&relay, "ali")
+    );
+    let friend = UpdateTenant {
+        class: Some(Class::Friend),
+        ..UpdateTenant::default()
+    };
+    assert_eq!(
+        update_tenant(&relay, "ali", friend).unwrap().class,
+        Class::Friend
+    );
+}
+
+#[test]
+fn update_tenant_refuses_a_personal_tenant_with_overrides_in_either_order() {
+    let (_a, _oa, _id, token_a) = another_network();
+    let (_d, relay) = relay_machine();
+    add_network_to(&relay, &token_a, clock(), Some("ali")).unwrap();
+    // Overrides on a personal tenant.
+    update_tenant(
+        &relay,
+        "ali",
+        UpdateTenant {
+            class: Some(Class::Personal),
+            ..UpdateTenant::default()
+        },
+    )
+    .unwrap();
+    let before = read_tenant_file(&relay, "ali");
+    let error =
+        update_tenant(&relay, "ali", with_overrides(overrides(&[("names", 9)]))).unwrap_err();
+    assert!(matches!(error, TenantError::Invalid(_)), "{error:?}");
+    // Class and overrides together.
+    let both = UpdateTenant {
+        class: Some(Class::Personal),
+        quota_overrides: Some(overrides(&[("names", 9)])),
+        ..UpdateTenant::default()
+    };
+    assert!(matches!(
+        update_tenant(&relay, "ali", both).unwrap_err(),
+        TenantError::Invalid(_)
+    ));
+    // An empty set on a personal tenant is fine.
+    update_tenant(&relay, "ali", with_overrides(BTreeMap::new())).unwrap();
+    assert_eq!(
+        before.lines().count(),
+        read_tenant_file(&relay, "ali").lines().count()
+    );
+
+    // The other order: a friend with overrides cannot become personal.
+    update_tenant(
+        &relay,
+        "ali",
+        UpdateTenant {
+            class: Some(Class::Friend),
+            quota_overrides: Some(overrides(&[("names", 9)])),
+            ..UpdateTenant::default()
+        },
+    )
+    .unwrap();
+    let before = read_tenant_file(&relay, "ali");
+    let error = update_tenant(
+        &relay,
+        "ali",
+        UpdateTenant {
+            class: Some(Class::Personal),
+            ..UpdateTenant::default()
+        },
+    )
+    .unwrap_err();
+    assert!(matches!(error, TenantError::Invalid(_)), "{error:?}");
+    assert_eq!(
+        read_tenant_file(&relay, "ali"),
+        before,
+        "nothing was written"
+    );
+    assert_eq!(get_tenant(&relay, "ali").unwrap().class, Class::Friend);
+}
+
+#[test]
+fn update_tenant_judges_every_figure_with_the_relays_rules() {
+    let (_a, _oa, _id, token_a) = another_network();
+    let (_d, relay) = relay_machine();
+    add_network_to(&relay, &token_a, clock(), Some("ali")).unwrap();
+    let before = read_tenant_file(&relay, "ali");
+    let invalid = |map: BTreeMap<String, u64>| {
+        let error = update_tenant(&relay, "ali", with_overrides(map)).unwrap_err();
+        assert!(matches!(error, TenantError::Invalid(_)), "{error:?}");
+    };
+    invalid(overrides(&[("no_such_figure", 3)]));
+    invalid(overrides(&[("names", 0)]));
+    let (name, max) = menzil_relay::Figures::KEYS[3];
+    invalid(overrides(&[(name, max + 1)]));
+    // The floor above the bandwidth, set together or against the default bandwidth of 100.
+    invalid(overrides(&[("bandwidth_mbit", 10), ("floor_mbit", 11)]));
+    invalid(overrides(&[("floor_mbit", 101)]));
+    assert_eq!(
+        read_tenant_file(&relay, "ali"),
+        before,
+        "nothing was written"
+    );
+    // Every key the relay knows, at its maximum, is accepted (and `max_networks` at the
+    // maximum is no problem).
+    let all: BTreeMap<String, u64> = menzil_relay::Figures::KEYS
+        .iter()
+        .map(|(k, max)| (k.to_string(), *max))
+        .collect();
+    // Floor at the maximum equals the bandwidth at the maximum, which is allowed.
+    update_tenant(&relay, "ali", with_overrides(all.clone())).unwrap();
+    assert_eq!(get_tenant(&relay, "ali").unwrap().quota_overrides, all);
+    // A lowered bandwidth alone is judged as the relay does: the default floor follows it down.
+    update_tenant(
+        &relay,
+        "ali",
+        with_overrides(overrides(&[("bandwidth_mbit", 1)])),
+    )
+    .unwrap();
+    let book = load_book(&relay, &load_rosters(&relay).unwrap()).unwrap();
+    assert!(book.refused().is_empty(), "{:?}", book.refused());
+    // Unknown slug and bad slug.
+    assert_eq!(
+        update_tenant(&relay, "nobody", UpdateTenant::default()).unwrap_err(),
+        TenantError::NotFound
+    );
+    assert!(matches!(
+        update_tenant(&relay, "Not A Name", UpdateTenant::default()).unwrap_err(),
+        TenantError::Invalid(_)
+    ));
+}
+
+#[test]
+fn update_tenant_refuses_max_networks_below_the_networks_it_has() {
+    let (_a, _oa, _ia, token_a) = another_network();
+    let (_b, _ob, _ib, token_b) = another_network();
+    let (_d, relay) = relay_machine();
+    add_network_to(&relay, &token_a, clock(), Some("ali")).unwrap();
+    add_network_to(&relay, &token_b, clock(), Some("ali")).unwrap();
+    let before = read_tenant_file(&relay, "ali");
+    let error = update_tenant(
+        &relay,
+        "ali",
+        with_overrides(overrides(&[("max_networks", 1)])),
+    )
+    .unwrap_err();
+    assert!(matches!(error, TenantError::Precondition(_)), "{error:?}");
+    assert_eq!(read_tenant_file(&relay, "ali"), before);
+    // Equal to the count is fine.
+    update_tenant(
+        &relay,
+        "ali",
+        with_overrides(overrides(&[("max_networks", 2)])),
+    )
+    .unwrap();
+    // A change that does not touch the figures is not held up by one that already exceeds.
+    let file = read_tenant_file(&relay, "ali").replace("max_networks = 2", "max_networks = 1");
+    fs::write(tenant_file(&relay, "ali"), file).unwrap();
+    update_tenant(
+        &relay,
+        "ali",
+        UpdateTenant {
+            terminated: Some(true),
+            ..UpdateTenant::default()
+        },
+    )
+    .unwrap();
+}

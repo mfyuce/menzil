@@ -281,6 +281,18 @@ enum RelayCommand {
         /// The tenant name.
         name: String,
     },
+    /// Stop serving a tenant's networks without removing it: the tenant file, its name, its
+    /// figures and its Roster files stay. A running relay drops the networks at its next reload
+    /// and ends their sessions; they are not served as the default tenant's.
+    SuspendTenant {
+        /// The tenant name.
+        name: String,
+    },
+    /// Serve a suspended tenant's networks again (from the Roster files kept here).
+    ResumeTenant {
+        /// The tenant name.
+        name: String,
+    },
     /// List the tenants of this relay, their networks and what the relay makes of their files.
     Tenants,
     /// Run the relay until interrupted and print the connection information for nodes.
@@ -813,6 +825,26 @@ async fn run(cli: Cli) -> Result<()> {
                 networks.len()
             );
             eprintln!("a running relay drops them at its next reload");
+        }
+        Command::Relay {
+            command: RelayCommand::SuspendTenant { name },
+        } => {
+            let info = relay_cmd::tenants::set_suspended(&home()?, &name, true)?;
+            println!(
+                "suspended tenant {name}: its {} network(s) are not served",
+                info.network_ids.len()
+            );
+            eprintln!("a running relay drops them at its next reload");
+        }
+        Command::Relay {
+            command: RelayCommand::ResumeTenant { name },
+        } => {
+            let info = relay_cmd::tenants::set_suspended(&home()?, &name, false)?;
+            println!(
+                "resumed tenant {name}: its {} network(s) are served again",
+                info.network_ids.len()
+            );
+            eprintln!("a running relay serves them at its next reload");
         }
         Command::Relay {
             command: RelayCommand::Tenants,

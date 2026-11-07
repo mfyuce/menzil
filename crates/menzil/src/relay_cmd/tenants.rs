@@ -9,10 +9,15 @@
 //! networks = ["<64 hex digits>", ...]
 //! class = "friend"          # or "personal"; absent means friend
 //! terminated = false
+//! suspended = false         # true: the relay does not serve the tenant's networks (see below)
 //! extra_names = []          # exact flat names the operator grants this tenant
 //! added = 1790000000        # Unix seconds
 //! names = 30                # optional: any figure of the class (menzil_relay::Figures::KEYS)
 //! ```
+//!
+//! `suspended = true` (`relay suspend-tenant`, `resume-tenant`) holds the tenant's networks back
+//! like a refused file: not served, their sessions end at the relay's next reload, and they never
+//! fall to the default tenant. The file, the slug, the figures and `terminated` stay as they are.
 //!
 //! A network no tenant file lists belongs to the default tenant (flat names, `personal` class),
 //! so a relay directory without tenant files is the relay it was before tenants. Nothing here
@@ -62,6 +67,8 @@ struct TenantFile {
     #[serde(default)]
     terminated: bool,
     #[serde(default)]
+    suspended: bool,
+    #[serde(default)]
     extra_names: Vec<String>,
     #[serde(default)]
     added: u64,
@@ -106,6 +113,9 @@ impl TenantFile {
             networks: spec.networks.iter().map(NetworkId::to_hex).collect(),
             class: Some(spec.class.as_str().to_string()),
             terminated: spec.terminated,
+            // A spec says nothing of suspension: the callers that rewrite from a spec refuse a
+            // suspended tenant first.
+            suspended: false,
             extra_names: spec.extra_names.clone(),
             added: spec.added,
             figures: spec.overrides.clone(),
@@ -129,6 +139,9 @@ impl TenantFile {
             let _ = writeln!(out, "class = {class:?}");
         }
         let _ = writeln!(out, "terminated = {}", self.terminated);
+        if self.suspended {
+            out.push_str("suspended = true\n");
+        }
         let _ = writeln!(out, "extra_names = [{}]", quoted(&self.extra_names));
         let _ = writeln!(out, "added = {}", self.added);
         for (key, value) in &self.figures {
@@ -169,6 +182,15 @@ fn salvage_networks(text: &str) -> Result<Vec<NetworkId>> {
 /// error for the whole call: its networks are unknown, and serving them as the default
 /// tenant's would hand them the most generous class. No directory is no tenants.
 pub fn read_specs(home: &Home) -> Result<(Vec<TenantSpec>, Vec<Refusal>)> {
+    let (files, refused) = read_files(home)?;
+    Ok((files.into_iter().map(|(spec, _)| spec).collect(), refused))
+}
+
+/// [`read_specs`] with, for each spec, whether its file says `suspended = true`.
+/// A tenant file that made a spec, with whether it says `suspended = true`.
+type SpecFile = (TenantSpec, bool);
+
+fn read_files(home: &Home) -> Result<(Vec<SpecFile>, Vec<Refusal>)> {
     let dir = tenants_dir(home);
     let entries = match fs::read_dir(&dir) {
         Ok(entries) => entries,
@@ -200,10 +222,10 @@ pub fn read_specs(home: &Home) -> Result<(Vec<TenantSpec>, Vec<Refusal>)> {
             .map_err(|e| anyhow!("{e}"))
             .and_then(|slug| {
                 let file: TenantFile = toml::from_str(&text).map_err(|e| anyhow!("{e}"))?;
-                file.spec(slug)
+                file.spec(slug).map(|spec| (spec, file.suspended))
             });
         match judged {
-            Ok(spec) => specs.push(spec),
+            Ok(pair) => specs.push(pair),
             Err(error) => refused.push(Refusal {
                 name,
                 reason: format!("{error:#}"),
@@ -216,7 +238,7 @@ pub fn read_specs(home: &Home) -> Result<(Vec<TenantSpec>, Vec<Refusal>)> {
             }),
         }
     }
-    specs.sort_by(|a, b| a.slug.cmp(&b.slug));
+    specs.sort_by(|a, b| a.0.slug.cmp(&b.0.slug));
     refused.sort_by(|a, b| a.name.cmp(&b.name));
     Ok((specs, refused))
 }
@@ -236,12 +258,23 @@ fn listed_networks(specs: &[TenantSpec], refused: &[Refusal]) -> HashSet<Network
 /// what the operator wrote (see [`read_specs`]): at start the relay does not run, at a reload
 /// it keeps the book it has.
 pub fn load_book(home: &Home, _rosters: &[StoredRoster]) -> Result<TenantBook> {
-    let (specs, refused) = read_specs(home)?;
+    let (files, refused) = read_files(home)?;
+    let suspended: Vec<Slug> = files
+        .iter()
+        .filter(|(_, suspended)| *suspended)
+        .map(|(spec, _)| spec.slug.clone())
+        .collect();
+    let specs = files.into_iter().map(|(spec, _)| spec).collect();
     let names = FlatNames::read(home)?;
     // Removed slugs still in quarantine: a file that brings one back is refused (design 2.2,
     // rule 1; round T4, N5).
     let removed: HashSet<String> = quarantined(home, super::unix_now())?.into_keys().collect();
-    Ok(names.build(specs, refused, &removed))
+    let mut book = names.build(specs, refused, &removed);
+    // A suspended tenant stays in the book; its networks are held back (K1).
+    for slug in &suspended {
+        book.suspend(slug);
+    }
+    Ok(book)
 }
 
 /// What the operator should hear about the book: refused files, conflicts, and tenants that list
@@ -358,7 +391,16 @@ pub fn add_network_to(home: &Home, token: &str, now: u64, tenant: Option<&str>) 
         }
         Some(text) => {
             let slug = Slug::parse(text).map_err(|e| anyhow!("{e}"))?;
-            let (mut specs, refused) = read_specs(home)?;
+            let (files, refused) = read_files(home)?;
+            if files
+                .iter()
+                .any(|(spec, suspended)| *suspended && spec.slug == slug)
+            {
+                bail!(
+                    "tenant {slug} is suspended: `menzil relay resume-tenant {slug}` first (a network added now would not be served)"
+                );
+            }
+            let mut specs: Vec<TenantSpec> = files.into_iter().map(|(spec, _)| spec).collect();
             if let Some(other) = specs
                 .iter()
                 .find(|s| s.networks.contains(&network_id) && s.slug != slug)
@@ -692,6 +734,9 @@ fn tenant_heading(tenant: &Tenant, count: usize) -> String {
     if tenant.terminated {
         line.push_str("  terminated");
     }
+    if tenant.suspended {
+        line.push_str("  suspended (networks not served)");
+    }
     if tenant.added > 0 {
         let _ = write!(line, "  added {}", tenant.added);
     }
@@ -700,4 +745,219 @@ fn tenant_heading(tenant: &Tenant, count: usize) -> String {
         let _ = writeln!(line, "  grants: {}", tenant.extra_names.join(", "));
     }
     line
+}
+
+// ---------------------------------------------------------------------------------------------
+// Library operations for the admin agent (slice UI-A): typed errors, no text to parse.
+// ---------------------------------------------------------------------------------------------
+
+/// Why a tenant operation failed, for a caller that maps the kind (the admin agent: `NotFound`
+/// to NOT_FOUND, `AlreadyExists` to ALREADY_EXISTS, `Invalid` to INVALID_ARGUMENT, `Precondition`
+/// to FAILED_PRECONDITION, `Io` to INTERNAL). Used by the functions below only; the older
+/// commands keep their `anyhow` errors.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TenantError {
+    /// No tenant has this slug.
+    NotFound,
+    /// A tenant with this slug exists already.
+    AlreadyExists,
+    /// The request is wrong whatever the state (bad slug, class, figure, combination).
+    Invalid(String),
+    /// The request is fine but the state refuses it (more networks than the new figure, a tenant
+    /// file the relay does not use).
+    Precondition(String),
+    /// The directory could not be read or written, or a file could not be understood.
+    Io(String),
+}
+
+impl std::fmt::Display for TenantError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotFound => f.write_str("no such tenant"),
+            Self::AlreadyExists => f.write_str("a tenant with this name exists already"),
+            Self::Invalid(why) | Self::Precondition(why) | Self::Io(why) => f.write_str(why),
+        }
+    }
+}
+
+impl std::error::Error for TenantError {}
+
+impl TenantError {
+    fn io(error: &anyhow::Error) -> Self {
+        Self::Io(format!("{error:#}"))
+    }
+}
+
+/// A tenant as the admin agent reads it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TenantInfo {
+    /// The slug.
+    pub slug: String,
+    /// The networks its file lists.
+    pub network_ids: Vec<NetworkId>,
+    /// Its class.
+    pub class: Class,
+    /// Whether terminated shares are allowed for it.
+    pub terminated: bool,
+    /// Whether it is suspended.
+    pub suspended: bool,
+    /// When it was added (Unix seconds).
+    pub added_unix: u64,
+    /// The figure overrides in its file (empty: the class defaults).
+    pub quota_overrides: BTreeMap<String, u64>,
+}
+
+impl TenantInfo {
+    fn of(spec: &TenantSpec, suspended: bool) -> Self {
+        Self {
+            slug: spec.slug.to_string(),
+            network_ids: spec.networks.clone(),
+            class: spec.class,
+            terminated: spec.terminated,
+            suspended,
+            added_unix: spec.added,
+            quota_overrides: spec.overrides.clone(),
+        }
+    }
+}
+
+/// What `update_tenant` changes; `None` leaves a field as it is.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct UpdateTenant {
+    /// The new class (`personal` or `friend`).
+    pub class: Option<Class>,
+    /// Whether terminated shares are allowed.
+    pub terminated: Option<bool>,
+    /// `Some` REPLACES the whole set of figure overrides; `Some(empty)` goes back to the class
+    /// defaults.
+    pub quota_overrides: Option<BTreeMap<String, u64>>,
+}
+
+fn parse_slug(slug: &str) -> Result<Slug, TenantError> {
+    Slug::parse(slug).map_err(|e| TenantError::Invalid(e.to_string()))
+}
+
+/// The tenant `slug`, as its file says. A file the relay does not use (see `relay tenants`) is a
+/// `Precondition` error with the relay's reason.
+pub fn get_tenant(home: &Home, slug: &str) -> Result<TenantInfo, TenantError> {
+    let slug = parse_slug(slug)?;
+    let (files, refused) = read_files(home).map_err(|e| TenantError::io(&e))?;
+    if let Some((spec, suspended)) = files.iter().find(|(spec, _)| spec.slug == slug) {
+        return Ok(TenantInfo::of(spec, *suspended));
+    }
+    match refused.iter().find(|r| r.name == slug.as_str()) {
+        Some(refusal) => Err(TenantError::Precondition(format!(
+            "tenant file {slug}.toml is not used: {}",
+            refusal.reason
+        ))),
+        None => Err(TenantError::NotFound),
+    }
+}
+
+/// Every tenant file the relay can read, by slug. Files the relay refuses are not listed (see
+/// `relay tenants` for them).
+pub fn list_tenants(home: &Home) -> Result<Vec<TenantInfo>, TenantError> {
+    let (files, _) = read_files(home).map_err(|e| TenantError::io(&e))?;
+    Ok(files
+        .iter()
+        .map(|(spec, suspended)| TenantInfo::of(spec, *suspended))
+        .collect())
+}
+
+/// Reads the tenant file `slug` for a change (`NotFound` when there is none).
+fn read_file_for_change(
+    home: &Home,
+    slug: &Slug,
+) -> Result<(std::path::PathBuf, TenantFile), TenantError> {
+    let path = tenant_path(home, slug.as_str());
+    let text = match fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == ErrorKind::NotFound => return Err(TenantError::NotFound),
+        Err(e) => return Err(TenantError::Io(format!("reading {}: {e}", path.display()))),
+    };
+    let file: TenantFile = toml::from_str(&text).map_err(|e| {
+        TenantError::Precondition(format!(
+            "{} cannot be changed, repair it first: {e}",
+            path.display()
+        ))
+    })?;
+    Ok((path, file))
+}
+
+/// `relay suspend-tenant` (`suspend = true`) and `relay resume-tenant` (`false`): sets the
+/// `suspended` key of the tenant's file under `lock_relay`. Idempotent. A running relay applies
+/// it at its next reload (within 15 seconds): suspended networks are not served and their
+/// sessions end; resumed ones are adopted again from their Roster files, which are never touched.
+/// The file is rewritten (its comments are not kept, as with every command).
+pub fn set_suspended(home: &Home, slug: &str, suspend: bool) -> Result<TenantInfo, TenantError> {
+    let slug = parse_slug(slug)?;
+    let lock = home.lock_relay().map_err(|e| TenantError::io(&e))?;
+    let (path, mut file) = read_file_for_change(home, &slug)?;
+    if file.suspended != suspend {
+        file.suspended = suspend;
+        home.write_public(&path, file.render().as_bytes())
+            .map_err(|e| TenantError::io(&e))?;
+    }
+    drop(lock);
+    get_tenant(home, slug.as_str())
+}
+
+/// `update_tenant`: changes class, `terminated` and the figure overrides of a tenant under
+/// `lock_relay`, writing the file atomically (its comments are not kept). Refused, writing
+/// nothing: a class other than `personal` or `friend` cannot be expressed (the type); `personal`
+/// with any override (also when the class changes to `personal` while overrides stay, or
+/// overrides are set on a `personal` tenant) and a figure that is unknown, zero, above its
+/// maximum or a floor above the bandwidth are `Invalid`; a `max_networks` below the number of
+/// networks the tenant has, when the change touches the class or the overrides, is `Precondition`.
+/// As the relay judges a file, a lowered `bandwidth_mbit` alone pulls the default floor down with
+/// it and is accepted. Returns the tenant as it is now.
+pub fn update_tenant(
+    home: &Home,
+    slug: &str,
+    update: UpdateTenant,
+) -> Result<TenantInfo, TenantError> {
+    let slug = parse_slug(slug)?;
+    let lock = home.lock_relay().map_err(|e| TenantError::io(&e))?;
+    let (path, mut file) = read_file_for_change(home, &slug)?;
+    let current_class = file
+        .class()
+        .map_err(|e| TenantError::Precondition(format!("{e:#}")))?;
+    let class = update.class.unwrap_or(current_class);
+    let touches_figures =
+        update.class.is_some_and(|c| c != current_class) || update.quota_overrides.is_some();
+    let overrides = update
+        .quota_overrides
+        .clone()
+        .unwrap_or_else(|| file.figures.clone());
+    match class {
+        Class::Personal => {
+            if !overrides.is_empty() {
+                return Err(TenantError::Invalid(
+                    "figures can be set only for the friend class".to_string(),
+                ));
+            }
+        }
+        Class::Friend => {
+            let figures = Figures::friend()
+                .with_overrides(&overrides)
+                .map_err(TenantError::Invalid)?;
+            let count = file.networks.len() as u64;
+            if touches_figures && count > figures.max_networks {
+                return Err(TenantError::Precondition(format!(
+                    "max_networks {} is below the {count} network(s) the tenant has: remove some first",
+                    figures.max_networks
+                )));
+            }
+        }
+    }
+    // Nothing is written before every rule has passed.
+    file.class = Some(class.as_str().to_string());
+    file.figures = overrides;
+    if let Some(terminated) = update.terminated {
+        file.terminated = terminated;
+    }
+    home.write_public(&path, file.render().as_bytes())
+        .map_err(|e| TenantError::io(&e))?;
+    drop(lock);
+    get_tenant(home, slug.as_str())
 }
