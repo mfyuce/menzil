@@ -12,7 +12,7 @@ use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::Message;
 
 use crate::error::RelayError;
-use crate::prefixed::PrefixedTcp;
+use crate::prefixed::{PrefixedTcp, Replay};
 
 /// How long one send may take before the peer is taken to have stopped reading and the
 /// connection is closed (round T3, M2). One send is one record of at most 64 KiB, so this asks
@@ -22,7 +22,7 @@ pub(crate) const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// One accepted, upgraded connection to the relay's own hostname.
 pub struct InboundConnection {
-    ws: WebSocketStream<TlsStream<PrefixedTcp>>,
+    ws: WebSocketStream<Replay<TlsStream<PrefixedTcp>>>,
     /// The exact `Sec-WebSocket-Protocol` request header value the client
     /// sent, byte for byte. The L3 Noise prologue (protocol.md 4.1) binds
     /// this in; it must match whatever string the client itself used to
@@ -51,7 +51,7 @@ pub struct InboundConnection {
 
 impl InboundConnection {
     pub(crate) fn new(
-        ws: WebSocketStream<TlsStream<PrefixedTcp>>,
+        ws: WebSocketStream<Replay<TlsStream<PrefixedTcp>>>,
         offered_subprotocol: String,
         selected_subprotocol: String,
     ) -> Self {
@@ -84,7 +84,7 @@ impl InboundConnection {
     /// Whether the underlying TCP socket has Nagle's algorithm turned off.
     #[cfg(test)]
     pub(crate) fn tcp_nodelay(&self) -> std::io::Result<bool> {
-        self.ws.get_ref().get_ref().0.nodelay()
+        self.ws.get_ref().get_ref().get_ref().0.nodelay()
     }
 
     /// Sends one binary L3 record (protocol.md 3.3: "one message is one

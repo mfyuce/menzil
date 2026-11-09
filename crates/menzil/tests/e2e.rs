@@ -154,6 +154,7 @@ async fn a_phone_reaches_a_service_on_a_laptop_through_a_relay() {
             path: DEFAULT_PATH.to_string(),
             host: Some("localhost".to_string()),
             reload_every: relay_cmd::DEFAULT_RELOAD_EVERY,
+            fallback_page: None,
         },
     )
     .await

@@ -298,6 +298,10 @@ pub struct RunOptions {
     /// How often the relay looks for newer Rosters on disk (what `add-network` writes while the
     /// relay runs).
     pub reload_every: std::time::Duration,
+    /// A static HTML file (at most 64 KiB, read once at start) to answer a plain HTTP request to
+    /// the relay's own host name with, such as a browser opening `https://<host>/`. Without it
+    /// such a request gets no answer. A WebSocket upgrade is not affected.
+    pub fallback_page: Option<PathBuf>,
 }
 
 /// The blind front door of `menzil relay run` (protocol.md 6.2): off unless a share domain is
@@ -619,7 +623,14 @@ pub(crate) async fn start_with_status_every(
         Some(acme) => acme.certs().server_config()?,
         None => tls_from_pem(&options.tls_cert, &options.tls_key)?,
     };
-    let listener = Listener::bind(options.listen, tls, options.path.clone()).await?;
+    let mut listener = Listener::bind(options.listen, tls, options.path.clone()).await?;
+    if let Some(path) = &options.fallback_page {
+        let html = std::fs::read(path)
+            .with_context(|| format!("reading the fallback page {}", path.display()))?;
+        let page = menzil_relay::FallbackPage::new(html)
+            .with_context(|| format!("the fallback page {}", path.display()))?;
+        listener = listener.with_fallback_page(page);
+    }
     let addr = listener.local_addr()?;
     let info = connection_info(
         options.host.as_deref().unwrap_or("RELAY-HOST"),

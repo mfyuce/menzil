@@ -261,6 +261,7 @@ async fn a_relay_starts_with_its_networks_and_says_how_to_reach_it() {
         path: DEFAULT_PATH.to_string(),
         host: Some("localhost".to_string()),
         reload_every: Duration::from_millis(100),
+        fallback_page: None,
     };
 
     // No network yet: a relay that would refuse everyone does not start.
@@ -321,6 +322,7 @@ async fn one_damaged_roster_file_does_not_stop_the_reload_of_the_others() {
             path: DEFAULT_PATH.to_string(),
             host: None,
             reload_every: Duration::from_millis(50),
+            fallback_page: None,
         },
     )
     .await
@@ -367,6 +369,7 @@ async fn a_running_relay_picks_up_a_newer_roster_added_to_its_directory() {
             path: DEFAULT_PATH.to_string(),
             host: None,
             reload_every: Duration::from_millis(50),
+            fallback_page: None,
         },
     )
     .await
@@ -417,6 +420,7 @@ async fn an_expired_roster_on_disk_is_held_but_forwards_nothing() {
         path: DEFAULT_PATH.to_string(),
         host: Some("localhost".to_string()),
         reload_every: Duration::from_millis(100),
+        fallback_page: None,
     };
     let running = start(&relay_home, &options)
         .await
@@ -606,6 +610,7 @@ async fn a_relay_starts_and_reloads_with_a_steward_signed_roster() {
         path: DEFAULT_PATH.to_string(),
         host: Some("localhost".to_string()),
         reload_every: Duration::from_millis(100),
+        fallback_page: None,
     };
     // The relay got the owner's Roster first; the steward's, made from it, is added later.
     add_network(&relay_home, &relay_token(&owner), clock()).unwrap();
@@ -643,6 +648,7 @@ fn run_options(dir: &Path) -> RunOptions {
         path: DEFAULT_PATH.to_string(),
         host: None,
         reload_every: Duration::from_secs(3600),
+        fallback_page: None,
     }
 }
 
@@ -2974,4 +2980,33 @@ async fn a_running_relay_exports_its_counters_and_stops_with_the_relay() {
         stopped,
         "the status export went on after the relay stopped"
     );
+}
+
+/// `--fallback-page`: the file is read at start, so a missing, empty or oversize one is a start
+/// error that names it, and a good one starts the relay.
+#[tokio::test]
+async fn a_relay_reads_its_fallback_page_at_start_and_refuses_a_bad_one() {
+    let (_o, owner, _id, _) = token_of_a_network();
+    let (dir, relay_home) = home();
+    init(&relay_home, clock()).unwrap();
+    add_network(&relay_home, &relay_token(&owner), clock()).unwrap();
+    let mut options = run_options(dir.path());
+
+    options.fallback_page = Some(dir.path().join("missing.html"));
+    let error = start(&relay_home, &options).await.err().unwrap();
+    assert!(format!("{error:#}").contains("fallback page"), "{error:#}");
+
+    let page = dir.path().join("index.html");
+    options.fallback_page = Some(page.clone());
+    fs::write(&page, b"").unwrap();
+    let error = start(&relay_home, &options).await.err().unwrap();
+    assert!(format!("{error:#}").contains("fallback page"), "{error:#}");
+
+    fs::write(&page, vec![b'x'; menzil_relay::FALLBACK_PAGE_MAX_BYTES + 1]).unwrap();
+    let error = start(&relay_home, &options).await.err().unwrap();
+    assert!(format!("{error:#}").contains("fallback page"), "{error:#}");
+
+    fs::write(&page, b"<h1>hi</h1>").unwrap();
+    let running = start(&relay_home, &options).await.unwrap();
+    running.stop();
 }

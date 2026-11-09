@@ -72,7 +72,7 @@ pub use front_door::{
 };
 pub use hello::{HelloRejection, check_hello};
 pub use identity::RelayIdentity;
-pub use listener::Listener;
+pub use listener::{FALLBACK_PAGE_MAX_BYTES, FallbackPage, Listener};
 pub use names::{
     Claim, NEW_NAMES_WINDOW_DAYS, NameFigures, NameRecord, NameRefusal, NameState, NamesStateError,
     Quarantine, QuarantineKind, RELEASE_DAYS, TOUCH_SECS,

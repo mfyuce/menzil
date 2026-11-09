@@ -37,6 +37,11 @@ pub enum RelayError {
     },
 
     /// The underlying connection closed.
+    /// A plain HTTP request (not a WebSocket upgrade) arrived on the relay's own host name and
+    /// was answered with the fallback page, or refused; no session follows.
+    #[error("a plain HTTP request was answered, not a WebSocket upgrade")]
+    AnsweredPlainHttp,
+
     #[error("relay connection closed")]
     Closed,
 

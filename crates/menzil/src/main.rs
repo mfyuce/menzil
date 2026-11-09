@@ -305,6 +305,8 @@ enum LabelCommand {
     },
 }
 
+// `Run` has many options and the enum is parsed once at start, so the size gap costs nothing.
+#[allow(clippy::large_enum_variant)]
 #[derive(Subcommand)]
 enum RelayCommand {
     /// Serve a network: keep the Roster in a relay token the network's owner gave you.
@@ -397,6 +399,13 @@ enum RelayCommand {
         /// The contact for the CA's notices (`mailto:ops@example.org`). Needs `--acme-directory`.
         #[arg(long, value_name = "URI", requires = "acme_directory")]
         acme_contact: Option<String>,
+        /// A static HTML file (at most 64 KiB, read once at start) to answer a plain HTTPS
+        /// request to this relay's own host name with, such as a browser opening
+        /// `https://<host>/`: `GET` and `HEAD` of `/` get the page, other paths 404, other
+        /// methods 405. Without it such a request gets no answer at all. Connections that ask
+        /// for the WebSocket upgrade are not affected.
+        #[arg(long, value_name = "FILE")]
+        fallback_page: Option<PathBuf>,
     },
 }
 
@@ -991,6 +1000,7 @@ async fn run(cli: Cli) -> Result<()> {
                     http_listen,
                     acme_directory,
                     acme_contact,
+                    fallback_page,
                 },
         } => {
             let front = share_domain.map(|share_domain| relay_cmd::FrontDoorOptions {
@@ -1010,6 +1020,7 @@ async fn run(cli: Cli) -> Result<()> {
                     path,
                     host,
                     reload_every: relay_cmd::DEFAULT_RELOAD_EVERY,
+                    fallback_page,
                 },
                 front.as_ref(),
             )

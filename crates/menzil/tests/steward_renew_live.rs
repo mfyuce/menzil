@@ -97,6 +97,7 @@ async fn a_steward_node_renews_by_itself_and_a_member_adopts_without_a_restart()
             path: DEFAULT_PATH.to_string(),
             host: Some("localhost".to_string()),
             reload_every: relay_cmd::DEFAULT_RELOAD_EVERY,
+            fallback_page: None,
         },
     )
     .await

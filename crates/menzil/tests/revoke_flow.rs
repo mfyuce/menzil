@@ -296,6 +296,7 @@ async fn ungrant_and_revoke_cut_a_running_phone_off_and_the_status_goes_on_worki
             path: DEFAULT_PATH.to_string(),
             host: Some("localhost".to_string()),
             reload_every: relay_cmd::DEFAULT_RELOAD_EVERY,
+            fallback_page: None,
         },
     )
     .await

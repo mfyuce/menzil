@@ -15,6 +15,7 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::TlsAcceptor;
 use tokio_tungstenite::tungstenite::handshake::server::{ErrorResponse, Request, Response};
@@ -23,7 +24,7 @@ use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 
 use crate::connection::InboundConnection;
 use crate::error::RelayError;
-use crate::prefixed::PrefixedTcp;
+use crate::prefixed::{PrefixedTcp, Replay};
 
 /// Accepts inbound connections on one bound address, completing TLS and
 /// the L3 WebSocket upgrade for each.
@@ -38,6 +39,8 @@ pub struct Listener {
 pub(crate) struct Upgrader {
     acceptor: TlsAcceptor,
     expected_path: String,
+    /// The page to answer a plain HTTP request with; without one such a request is dropped.
+    fallback: Option<FallbackPage>,
 }
 
 impl Listener {
@@ -57,6 +60,7 @@ impl Listener {
             upgrader: Arc::new(Upgrader {
                 acceptor: TlsAcceptor::from(tls_config),
                 expected_path: expected_path.into(),
+                fallback: None,
             }),
         })
     }
@@ -80,8 +84,19 @@ impl Listener {
             upgrader: Arc::new(Upgrader {
                 acceptor: TlsAcceptor::from(tls_config),
                 expected_path: expected_path.into(),
+                fallback: None,
             }),
         })
+    }
+
+    /// Answers a plain HTTP request on this listener (one that is not a WebSocket upgrade, such
+    /// as a browser opening the relay's name) with `page`. Call it right after `bind`, before the
+    /// listener is shared. A WebSocket upgrade is handled exactly as without a page.
+    pub fn with_fallback_page(mut self, page: FallbackPage) -> Self {
+        Arc::get_mut(&mut self.upgrader)
+            .expect("the listener is not shared yet")
+            .fallback = Some(page);
+        self
     }
 
     /// The address actually bound; useful when `addr` used an ephemeral
@@ -142,6 +157,108 @@ fn websocket_config() -> WebSocketConfig {
         .max_frame_size(Some(menzil_carrier::MAX_MESSAGE_BYTES))
 }
 
+/// The most a fallback page may be.
+pub const FALLBACK_PAGE_MAX_BYTES: usize = 64 * 1024;
+
+/// The most bytes read to find out what an inbound request is (the head of an HTTP request).
+const SNIFF_HEAD_MAX: usize = 8 * 1024;
+
+/// A static HTML page for a plain HTTP request to the relay's own host name (a browser opening
+/// `https://<relay>/`, or a site rating crawler), so the name is not an empty reply. Only `GET`
+/// and `HEAD` of `/` and `/index.html` are answered with it; any other path is a bare 404 and any
+/// other method 405. A WebSocket upgrade never sees it. The page is read once, at start.
+#[derive(Clone)]
+pub struct FallbackPage {
+    html: Arc<Vec<u8>>,
+}
+
+impl FallbackPage {
+    /// A page of at most [`FALLBACK_PAGE_MAX_BYTES`] that is not empty.
+    pub fn new(html: Vec<u8>) -> Result<Self, RelayError> {
+        if html.is_empty() || html.len() > FALLBACK_PAGE_MAX_BYTES {
+            return Err(RelayError::TlsSetup(format!(
+                "the fallback page must be 1 to {FALLBACK_PAGE_MAX_BYTES} bytes, it is {}",
+                html.len()
+            )));
+        }
+        Ok(Self {
+            html: Arc::new(html),
+        })
+    }
+
+    /// Reads the head of the first request on `tls`. A WebSocket upgrade request goes on to the
+    /// upgrade with its bytes put back; anything else is answered here and ends in
+    /// [`RelayError::AnsweredPlainHttp`]; a head that is not one complete, parseable request
+    /// within [`SNIFF_HEAD_MAX`] bytes is dropped without an answer.
+    async fn sniff<S>(&self, mut tls: S) -> Result<Replay<S>, RelayError>
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    {
+        let mut head: Vec<u8> = Vec::with_capacity(1024);
+        let mut chunk = [0u8; 1024];
+        loop {
+            if head.windows(4).any(|w| w == b"\r\n\r\n") {
+                break;
+            }
+            if head.len() >= SNIFF_HEAD_MAX {
+                return Err(RelayError::Closed);
+            }
+            let n = tls.read(&mut chunk).await?;
+            if n == 0 {
+                return Err(RelayError::Closed);
+            }
+            head.extend_from_slice(&chunk[..n]);
+        }
+        let mut storage = [httparse::EMPTY_HEADER; 64];
+        let mut req = httparse::Request::new(&mut storage);
+        let parsed = req.parse(&head);
+        if !matches!(parsed, Ok(httparse::Status::Complete(_))) {
+            return Err(RelayError::Closed);
+        }
+        let upgrades = req.headers.iter().any(|h| {
+            h.name.eq_ignore_ascii_case("upgrade")
+                && std::str::from_utf8(h.value).is_ok_and(|v| {
+                    v.split(',')
+                        .any(|t| t.trim().eq_ignore_ascii_case("websocket"))
+                })
+        });
+        if upgrades {
+            return Ok(Replay::new(head, tls));
+        }
+        let answer = self.answer(req.method.unwrap_or(""), req.path.unwrap_or(""));
+        tls.write_all(&answer).await?;
+        tls.flush().await?;
+        let _ = tls.shutdown().await;
+        Err(RelayError::AnsweredPlainHttp)
+    }
+
+    /// The whole HTTP/1.1 response to a plain request, always `Connection: close`.
+    fn answer(&self, method: &str, path: &str) -> Vec<u8> {
+        const COMMON: &str = "Connection: close\r\nX-Content-Type-Options: nosniff\r\nReferrer-Policy: no-referrer\r\nContent-Security-Policy: default-src 'none'; style-src 'unsafe-inline'\r\n";
+        let head_only = method == "HEAD";
+        if method != "GET" && !head_only {
+            return format!(
+                "HTTP/1.1 405 Method Not Allowed\r\nAllow: GET, HEAD\r\nContent-Length: 0\r\n{COMMON}\r\n"
+            )
+            .into_bytes();
+        }
+        let path = path.split(['?', '#']).next().unwrap_or("");
+        if path != "/" && path != "/index.html" {
+            return format!("HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n{COMMON}\r\n")
+                .into_bytes();
+        }
+        let mut out = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nCache-Control: max-age=300\r\n{COMMON}\r\n",
+            self.html.len()
+        )
+        .into_bytes();
+        if !head_only {
+            out.extend_from_slice(&self.html);
+        }
+        out
+    }
+}
+
 impl Upgrader {
     /// TLS, then the WebSocket upgrade. (A peer over its connection rate is not answered at all:
     /// refusing it with HTTP 429 would take the TLS handshake first, see `crate::admission`.)
@@ -156,6 +273,10 @@ impl Upgrader {
         tcp: PrefixedTcp,
     ) -> Result<InboundConnection, RelayError> {
         let tls = self.acceptor.accept(tcp).await?;
+        let tls = match &self.fallback {
+            None => Replay::new(Vec::new(), tls),
+            Some(page) => page.sniff(tls).await?,
+        };
         let expected_path = self.expected_path.clone();
         // `validate_upgrade` only has borrowed access to the request
         // inside the callback tungstenite drives; the offered
@@ -389,5 +510,210 @@ mod tests {
             ),
             "one byte over the limit must be a capacity error, got {over:?}"
         );
+    }
+
+    /// One TLS connection to `addr` that sends `request` and returns what comes back until the
+    /// relay ends it (what a failed read leaves is what was read).
+    async fn raw_exchange(
+        addr: SocketAddr,
+        cert: rustls::pki_types::CertificateDer<'static>,
+        request: &[u8],
+    ) -> Vec<u8> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let mut tls = crate::tests_support::test_tls_connector(cert)
+            .connect(
+                rustls::pki_types::ServerName::try_from("localhost").unwrap(),
+                tcp,
+            )
+            .await
+            .unwrap();
+        tls.write_all(request).await.unwrap();
+        let mut out = Vec::new();
+        let mut chunk = [0u8; 4096];
+        loop {
+            match tls.read(&mut chunk).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => out.extend_from_slice(&chunk[..n]),
+            }
+        }
+        out
+    }
+
+    fn page() -> FallbackPage {
+        FallbackPage::new(b"<h1>hello</h1>".to_vec()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_plain_request_gets_the_fallback_page_and_other_requests_get_bare_answers() {
+        let (listener, cert) = bind_test_listener().await;
+        let listener = listener.with_fallback_page(page());
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            for _ in 0..6 {
+                let r = listener.accept().await;
+                assert!(
+                    matches!(r, Err(RelayError::AnsweredPlainHttp)),
+                    "a plain request ends the handshake without a session"
+                );
+            }
+        });
+        let get = raw_exchange(
+            addr,
+            cert.clone(),
+            b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        )
+        .await;
+        let get = String::from_utf8(get).unwrap();
+        assert!(get.starts_with("HTTP/1.1 200 OK\r\n"), "{get}");
+        assert!(get.contains("Content-Length: 14\r\n"), "{get}");
+        assert!(get.contains("Connection: close\r\n"), "{get}");
+        assert!(get.ends_with("\r\n\r\n<h1>hello</h1>"), "{get}");
+
+        let query = raw_exchange(
+            addr,
+            cert.clone(),
+            b"GET /index.html?x=1 HTTP/1.1\r\nHost: h\r\n\r\n",
+        )
+        .await;
+        assert!(
+            String::from_utf8(query)
+                .unwrap()
+                .starts_with("HTTP/1.1 200 OK")
+        );
+
+        let head = String::from_utf8(
+            raw_exchange(addr, cert.clone(), b"HEAD / HTTP/1.1\r\nHost: h\r\n\r\n").await,
+        )
+        .unwrap();
+        assert!(head.starts_with("HTTP/1.1 200 OK"), "{head}");
+        assert!(
+            head.contains("Content-Length: 14\r\n"),
+            "a HEAD names the length"
+        );
+        assert!(!head.contains("<h1>"), "a HEAD carries no body");
+
+        let other = String::from_utf8(
+            raw_exchange(
+                addr,
+                cert.clone(),
+                b"GET /admin HTTP/1.1\r\nHost: h\r\n\r\n",
+            )
+            .await,
+        )
+        .unwrap();
+        assert!(other.starts_with("HTTP/1.1 404 Not Found"), "{other}");
+        assert!(!other.contains("<h1>"));
+
+        let post = String::from_utf8(
+            raw_exchange(
+                addr,
+                cert.clone(),
+                b"POST / HTTP/1.1\r\nHost: h\r\nContent-Length: 0\r\n\r\n",
+            )
+            .await,
+        )
+        .unwrap();
+        assert!(
+            post.starts_with("HTTP/1.1 405 Method Not Allowed"),
+            "{post}"
+        );
+        assert!(post.contains("Allow: GET, HEAD\r\n"), "{post}");
+
+        // A WebSocket upgrade key without the `websocket` token is a plain request too.
+        let upgrade_other = String::from_utf8(
+            raw_exchange(
+                addr,
+                cert,
+                b"GET / HTTP/1.1\r\nHost: h\r\nUpgrade: h2c\r\n\r\n",
+            )
+            .await,
+        )
+        .unwrap();
+        assert!(
+            upgrade_other.starts_with("HTTP/1.1 200 OK"),
+            "{upgrade_other}"
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn the_websocket_upgrade_is_unchanged_with_a_fallback_page() {
+        let (listener, cert) = bind_test_listener().await;
+        let listener = listener.with_fallback_page(page());
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let mut conn = listener.accept().await.unwrap();
+            assert!(conn.tcp_nodelay().unwrap());
+            assert_eq!(conn.recv().await.unwrap(), b"hello from client");
+            conn.send(b"hello from relay".to_vec()).await.unwrap();
+        });
+        let mut client = test_client(addr, cert, "/_menzil/v1").await;
+        client
+            .send(Message::Binary(b"hello from client".to_vec().into()))
+            .await
+            .unwrap();
+        let reply = client.next().await.unwrap().unwrap();
+        assert_eq!(reply.into_data(), b"hello from relay".as_slice());
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_wrong_path_websocket_still_gets_404_with_a_fallback_page() {
+        let (listener, cert) = bind_test_listener().await;
+        let listener = listener.with_fallback_page(page());
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { listener.accept().await });
+        let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let tls = crate::tests_support::test_tls_connector(cert)
+            .connect(
+                rustls::pki_types::ServerName::try_from("localhost").unwrap(),
+                tcp,
+            )
+            .await
+            .unwrap();
+        let result = tokio_tungstenite::client_async("wss://localhost/not-menzil", tls).await;
+        assert!(result.is_err());
+        assert!(server.await.unwrap().is_err());
+    }
+
+    #[tokio::test]
+    async fn without_a_page_a_plain_request_gets_no_answer_at_all() {
+        let (listener, cert) = bind_test_listener().await;
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { listener.accept().await });
+        let answer = raw_exchange(addr, cert, b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n").await;
+        assert!(answer.is_empty(), "nothing is sent: {answer:?}");
+        assert!(server.await.unwrap().is_err());
+    }
+
+    #[tokio::test]
+    async fn an_oversize_or_unparseable_head_is_dropped_without_an_answer() {
+        let (listener, cert) = bind_test_listener().await;
+        let listener = listener.with_fallback_page(page());
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            for _ in 0..2 {
+                let r = listener.accept().await;
+                assert!(matches!(r, Err(RelayError::Closed)), "not a plain close");
+            }
+        });
+        // 9000 bytes without the end of a head.
+        let big = vec![b'a'; 9000];
+        assert!(raw_exchange(addr, cert.clone(), &big).await.is_empty());
+        // The end of a head, but not a request.
+        assert!(
+            raw_exchange(addr, cert, b"\x01\x02 not http\r\n\r\n")
+                .await
+                .is_empty()
+        );
+        server.await.unwrap();
+    }
+
+    #[test]
+    fn the_fallback_page_must_be_between_one_byte_and_the_cap() {
+        assert!(FallbackPage::new(Vec::new()).is_err());
+        assert!(FallbackPage::new(vec![b'x'; FALLBACK_PAGE_MAX_BYTES]).is_ok());
+        assert!(FallbackPage::new(vec![b'x'; FALLBACK_PAGE_MAX_BYTES + 1]).is_err());
     }
 }

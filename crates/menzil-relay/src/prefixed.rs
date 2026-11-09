@@ -77,3 +77,69 @@ impl AsyncWrite for PrefixedTcp {
         Pin::new(&mut self.tcp).poll_shutdown(cx)
     }
 }
+
+/// `prefix`, then `inner`: bytes already read from a stream (the head of an HTTP request read
+/// to see whether it is a WebSocket upgrade, `crate::listener`) put back in front of it. Writes
+/// go straight to `inner`. With an empty prefix this is `inner`.
+pub(crate) struct Replay<S> {
+    prefix: Vec<u8>,
+    taken: usize,
+    inner: S,
+}
+
+impl<S> Replay<S> {
+    /// `inner` with `prefix` read first.
+    pub(crate) fn new(prefix: Vec<u8>, inner: S) -> Self {
+        Self {
+            prefix,
+            taken: 0,
+            inner,
+        }
+    }
+
+    /// The stream underneath.
+    #[cfg(test)]
+    pub(crate) fn get_ref(&self) -> &S {
+        &self.inner
+    }
+}
+
+impl<S: AsyncRead + Unpin> AsyncRead for Replay<S> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let this = &mut *self;
+        if this.taken < this.prefix.len() {
+            let rest = &this.prefix[this.taken..];
+            let n = rest.len().min(buf.remaining());
+            buf.put_slice(&rest[..n]);
+            this.taken += n;
+            if this.taken == this.prefix.len() {
+                this.prefix = Vec::new();
+                this.taken = 0;
+            }
+            return Poll::Ready(Ok(()));
+        }
+        Pin::new(&mut this.inner).poll_read(cx, buf)
+    }
+}
+
+impl<S: AsyncWrite + Unpin> AsyncWrite for Replay<S> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
