@@ -625,7 +625,13 @@ pub(crate) async fn start_with_status_every(
     };
     let mut listener = Listener::bind(options.listen, tls, options.path.clone()).await?;
     if let Some(path) = &options.fallback_page {
-        let html = std::fs::read(path)
+        use std::io::Read as _;
+        let mut html = Vec::new();
+        std::fs::File::open(path)
+            .and_then(|f| {
+                f.take(menzil_relay::FALLBACK_PAGE_MAX_BYTES as u64 + 1)
+                    .read_to_end(&mut html)
+            })
             .with_context(|| format!("reading the fallback page {}", path.display()))?;
         let page = menzil_relay::FallbackPage::new(html)
             .with_context(|| format!("the fallback page {}", path.display()))?;

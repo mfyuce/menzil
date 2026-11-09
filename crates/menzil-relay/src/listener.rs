@@ -161,7 +161,13 @@ fn websocket_config() -> WebSocketConfig {
 pub const FALLBACK_PAGE_MAX_BYTES: usize = 64 * 1024;
 
 /// The most bytes read to find out what an inbound request is (the head of an HTTP request).
-const SNIFF_HEAD_MAX: usize = 8 * 1024;
+/// tungstenite's own head limit (64 KiB), so a head it would take is not refused here.
+const SNIFF_HEAD_MAX: usize = 64 * 1024;
+/// Header slots, as in tungstenite (`MAX_HEADERS`).
+const SNIFF_MAX_HEADERS: usize = 124;
+/// Slow head rule, as tungstenite's: after this many reads the average must reach the minimum.
+const SNIFF_SLOW_READS: usize = 64;
+const SNIFF_SLOW_AVG: usize = 128;
 
 /// A static HTML page for a plain HTTP request to the relay's own host name (a browser opening
 /// `https://<relay>/`, or a site rating crawler), so the name is not an empty reply. Only `GET`
@@ -196,10 +202,8 @@ impl FallbackPage {
     {
         let mut head: Vec<u8> = Vec::with_capacity(1024);
         let mut chunk = [0u8; 1024];
-        loop {
-            if head.windows(4).any(|w| w == b"\r\n\r\n") {
-                break;
-            }
+        let mut reads = 0usize;
+        let (upgrades, method, path) = loop {
             if head.len() >= SNIFF_HEAD_MAX {
                 return Err(RelayError::Closed);
             }
@@ -207,25 +211,44 @@ impl FallbackPage {
             if n == 0 {
                 return Err(RelayError::Closed);
             }
+            reads += 1;
             head.extend_from_slice(&chunk[..n]);
-        }
-        let mut storage = [httparse::EMPTY_HEADER; 64];
-        let mut req = httparse::Request::new(&mut storage);
-        let parsed = req.parse(&head);
-        if !matches!(parsed, Ok(httparse::Status::Complete(_))) {
-            return Err(RelayError::Closed);
-        }
-        let upgrades = req.headers.iter().any(|h| {
-            h.name.eq_ignore_ascii_case("upgrade")
-                && std::str::from_utf8(h.value).is_ok_and(|v| {
-                    v.split(',')
-                        .any(|t| t.trim().eq_ignore_ascii_case("websocket"))
-                })
-        });
+            // tungstenite's slow head rule: more than 64 reads averaging under 128 bytes.
+            if reads > SNIFF_SLOW_READS && head.len() < reads * SNIFF_SLOW_AVG {
+                return Err(RelayError::Closed);
+            }
+            // Parse only when a line end arrived (httparse also takes bare LF), so a head that
+            // dribbles in is not rescanned byte by byte.
+            if !chunk[..n].contains(&b'\n') {
+                continue;
+            }
+            // The same parser and header count as tungstenite's, so what it would upgrade is
+            // what is sniffed as an upgrade.
+            let mut storage = [httparse::EMPTY_HEADER; SNIFF_MAX_HEADERS];
+            let mut req = httparse::Request::new(&mut storage);
+            match req.parse(&head) {
+                Ok(httparse::Status::Complete(_)) => {
+                    let upgrades = req.headers.iter().any(|h| {
+                        h.name.eq_ignore_ascii_case("upgrade")
+                            && std::str::from_utf8(h.value).is_ok_and(|v| {
+                                v.split(',')
+                                    .any(|t| t.trim().eq_ignore_ascii_case("websocket"))
+                            })
+                    });
+                    break (
+                        upgrades,
+                        req.method.unwrap_or("").to_owned(),
+                        req.path.unwrap_or("").to_owned(),
+                    );
+                }
+                Ok(httparse::Status::Partial) => {}
+                Err(_) => return Err(RelayError::Closed),
+            }
+        };
         if upgrades {
             return Ok(Replay::new(head, tls));
         }
-        let answer = self.answer(req.method.unwrap_or(""), req.path.unwrap_or(""));
+        let answer = self.answer(&method, &path);
         tls.write_all(&answer).await?;
         tls.flush().await?;
         let _ = tls.shutdown().await;
@@ -540,6 +563,34 @@ mod tests {
         out
     }
 
+    /// Like [`raw_exchange`] but returns as soon as the answer's head is complete, without
+    /// waiting for the relay to end the connection.
+    async fn head_of_answer(
+        addr: SocketAddr,
+        cert: rustls::pki_types::CertificateDer<'static>,
+        request: &[u8],
+    ) -> Vec<u8> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let mut tls = crate::tests_support::test_tls_connector(cert)
+            .connect(
+                rustls::pki_types::ServerName::try_from("localhost").unwrap(),
+                tcp,
+            )
+            .await
+            .unwrap();
+        tls.write_all(request).await.unwrap();
+        let mut out = Vec::new();
+        let mut chunk = [0u8; 1024];
+        while !out.windows(4).any(|w| w == b"\r\n\r\n") {
+            match tls.read(&mut chunk).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => out.extend_from_slice(&chunk[..n]),
+            }
+        }
+        out
+    }
+
     fn page() -> FallbackPage {
         FallbackPage::new(b"<h1>hello</h1>".to_vec()).unwrap()
     }
@@ -698,8 +749,8 @@ mod tests {
                 assert!(matches!(r, Err(RelayError::Closed)), "not a plain close");
             }
         });
-        // 9000 bytes without the end of a head.
-        let big = vec![b'a'; 9000];
+        // 70000 bytes without the end of a head.
+        let big = vec![b'a'; 70_000];
         assert!(raw_exchange(addr, cert.clone(), &big).await.is_empty());
         // The end of a head, but not a request.
         assert!(
@@ -708,6 +759,80 @@ mod tests {
                 .is_empty()
         );
         server.await.unwrap();
+    }
+
+    /// A raw upgrade request to the menzil path; `eol` is the line end, `extra` more header lines.
+    fn upgrade_head(eol: &str, extra: &str) -> Vec<u8> {
+        format!(
+            "GET /_menzil/v1 HTTP/1.1{eol}Host: localhost{eol}Upgrade: websocket{eol}Connection: Upgrade{eol}Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ=={eol}Sec-WebSocket-Version: 13{eol}Sec-WebSocket-Protocol: {sub}{eol}{extra}{eol}",
+            sub = menzil_carrier::SUBPROTOCOL
+        )
+        .into_bytes()
+    }
+
+    /// Round 5 L1: heads tungstenite takes (bare LF, 70 more headers, a 10 KB head) still
+    /// upgrade with a page set.
+    #[tokio::test]
+    async fn heads_that_tungstenite_takes_still_upgrade_with_a_fallback_page() {
+        let (listener, cert) = bind_test_listener().await;
+        let listener = listener.with_fallback_page(page());
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let mut held = Vec::new();
+            for _ in 0..3 {
+                held.push(listener.accept().await);
+            }
+            std::future::pending::<()>().await;
+        });
+        let many: String = (0..70).map(|i| format!("X-{i}: v\r\n")).collect();
+        let big = format!("X-Big: {}\r\n", "a".repeat(10_000));
+        for head in [
+            upgrade_head("\n", ""),
+            upgrade_head("\r\n", &many),
+            upgrade_head("\r\n", &big),
+        ] {
+            let answer = tokio::time::timeout(
+                std::time::Duration::from_secs(20),
+                head_of_answer(addr, cert.clone(), &head),
+            )
+            .await
+            .expect("an answer within 20 s");
+            assert!(
+                answer.starts_with(b"HTTP/1.1 101"),
+                "{:?}",
+                String::from_utf8_lossy(&answer)
+            );
+        }
+        server.abort();
+    }
+
+    /// Round 5 L2: a head that dribbles in one byte a record is cut like tungstenite does.
+    #[tokio::test]
+    async fn a_dribbled_head_is_cut_after_64_small_reads() {
+        use tokio::io::AsyncWriteExt;
+        let (listener, cert) = bind_test_listener().await;
+        let listener = listener.with_fallback_page(page());
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { listener.accept().await });
+        let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let mut tls = crate::tests_support::test_tls_connector(cert)
+            .connect(
+                rustls::pki_types::ServerName::try_from("localhost").unwrap(),
+                tcp,
+            )
+            .await
+            .unwrap();
+        for _ in 0..200 {
+            if tls.write_all(b"a").await.is_err() || tls.flush().await.is_err() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(3)).await;
+        }
+        let r = tokio::time::timeout(std::time::Duration::from_secs(5), server)
+            .await
+            .expect("cut well before the cap")
+            .unwrap();
+        assert!(matches!(r, Err(RelayError::Closed)));
     }
 
     #[test]
