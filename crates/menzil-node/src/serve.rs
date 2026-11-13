@@ -14,7 +14,11 @@
 //!   itself speaks) is between the peer and the target. Terminating TLS for
 //!   public shares, `udp:`, `egress:`, `acme-http:` and `menzil:docs` are
 //!   other items' work; configuring one of them is refused, and an OPEN for
-//!   one is answered `unknown_service`.
+//!   one is answered `unknown_service`. `egress:*` is the exception that is not a table
+//!   entry: with an [`EgressExecutor`] ([`LocalServices::with_egress`]) a counted peer OPEN
+//!   for it is dialled by the executor's own rules (protocol.md 8, `crate::egress`), with
+//!   the same slots and pipe; the relay principal's path, and a node without an enabled
+//!   executor, answer it `unknown_service`.
 //! * **The local connect comes before the OPEN_ACK.** [`Self::open`]
 //!   (`ServiceHandler::open`) connects to the target inside the caller's 10
 //!   second OPEN timeout, with its own, shorter limit
@@ -68,6 +72,7 @@ use tokio::io::{ReadBuf, copy_bidirectional_with_sizes};
 use tokio::net::{TcpSocket, TcpStream};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
+use crate::egress::EgressExecutor;
 use crate::l5_stream::OPEN_TIMEOUT;
 
 /// How long [`LocalServices`] waits for the local connect by default. Well
@@ -97,7 +102,7 @@ pub const DEFAULT_SOCKET_BUFFER: u32 = 128 * 1024;
 const MAX_CONCURRENT_LOOKUPS: usize = 4;
 
 /// The least time between two log lines for the same kind of refusal.
-const LOG_INTERVAL: Duration = Duration::from_secs(10);
+pub(crate) const LOG_INTERVAL: Duration = Duration::from_secs(10);
 
 /// The size of each direction's copy buffer: one `yamux` data frame
 /// (`menzil-stream` keeps its 16 KiB default).
@@ -193,12 +198,14 @@ pub struct LocalServices {
     full_log: Arc<LogThrottle>,
     connect_log: Arc<LogThrottle>,
     resolve: Resolve,
+    /// The exit side of `egress:*` ([`Self::with_egress`]); none serves no egress.
+    egress: Option<Arc<EgressExecutor>>,
 }
 
 /// Resolves a host name to addresses. Blocking, so it runs on a blocking thread.
 type Resolve = fn(&str, u16) -> io::Result<Vec<SocketAddr>>;
 
-fn system_resolve(host: &str, port: u16) -> io::Result<Vec<SocketAddr>> {
+pub(crate) fn system_resolve(host: &str, port: u16) -> io::Result<Vec<SocketAddr>> {
     Ok((host, port).to_socket_addrs()?.collect())
 }
 
@@ -221,6 +228,7 @@ impl LocalServices {
             full_log: Arc::new(LogThrottle::new(LOG_INTERVAL)),
             connect_log: Arc::new(LogThrottle::new(LOG_INTERVAL)),
             resolve: system_resolve,
+            egress: None,
         }
     }
 
@@ -276,6 +284,15 @@ impl LocalServices {
     /// gives up on its OPEN after 10 seconds, and a refusal that arrives later is lost.
     pub fn with_connect_timeout(mut self, timeout: Duration) -> Self {
         self.connect_timeout = timeout.min(MAX_CONNECT_TIMEOUT);
+        self
+    }
+
+    /// Serves `egress:*` through `executor` (protocol.md 8), for counted peer OPENs only: the
+    /// relay principal's path refuses it. An executor that is not [`EgressExecutor::enabled`]
+    /// serves nothing, like none. It takes its places from the same [`ServeLimits`] as the
+    /// local services. A local service table never maps egress ([`Self::set_target`] refuses it).
+    pub fn with_egress(mut self, executor: EgressExecutor) -> Self {
+        self.egress = Some(Arc::new(executor));
         self
     }
 
@@ -366,7 +383,7 @@ impl LocalServices {
 /// A socket connected to `addr`, with fixed `buffer` sizes. The sizes are set before the
 /// connect: that is what stops the kernel from tuning them upward, and it fixes the window the
 /// connection starts with.
-async fn connect_addr(addr: SocketAddr, buffer: u32) -> io::Result<TcpStream> {
+pub(crate) async fn connect_addr(addr: SocketAddr, buffer: u32) -> io::Result<TcpStream> {
     let socket = if addr.is_ipv4() {
         TcpSocket::new_v4()?
     } else {
@@ -388,37 +405,72 @@ fn refusal(code: ErrorCode, msg: &str) -> OpenRefusal {
 }
 
 impl LocalServices {
+    /// Takes the place a counted open holds, before anything is connected to or looked up: a
+    /// peer past a limit costs the refusal. An open that is counted elsewhere (the relay
+    /// principal's) takes no place here.
+    fn take_slot(&self, request: &OpenRequest, counted: bool) -> Result<Option<Slot>, OpenRefusal> {
+        if !counted {
+            return Ok(None);
+        }
+        match self.slots.take(request.initiator) {
+            Ok(slot) => Ok(Some(slot)),
+            Err(full) => {
+                if let Some(left_out) = self.full_log.permit(Instant::now()) {
+                    tracing::warn!(
+                        service = %request.service,
+                        peer = %request.initiator,
+                        ?full,
+                        left_out,
+                        "refused an OPEN: a limit on served connections is reached"
+                    );
+                }
+                Err(refusal(ErrorCode::RateLimited, "too many connections"))
+            }
+        }
+    }
+
+    /// An `egress:*` OPEN (protocol.md 8). Only a counted peer open reaches the executor; the
+    /// relay principal's, and every open while egress is off, is `unknown_service`, the answer
+    /// for a service this node does not serve.
+    async fn open_egress(
+        &self,
+        request: &OpenRequest,
+        counted: bool,
+    ) -> Result<OpenedTarget, OpenRefusal> {
+        let Some(executor) = self
+            .egress
+            .as_ref()
+            .filter(|executor| counted && executor.enabled())
+        else {
+            return Err(refusal(ErrorCode::UnknownService, "no such service"));
+        };
+        if request.service.label != "*" {
+            return Err(refusal(ErrorCode::UnknownService, "no such service"));
+        }
+        let slot = self.take_slot(request, counted)?;
+        let socket = executor
+            .dial(request, self.limits.socket_buffer, self.connect_timeout)
+            .await?;
+        Ok(OpenedTarget {
+            socket: Some(socket),
+            slot,
+        })
+    }
+
     async fn open_target(
         &self,
         request: &OpenRequest,
         counted: bool,
     ) -> Result<OpenedTarget, OpenRefusal> {
+        if request.service.kind == ServiceKind::Egress {
+            return self.open_egress(request, counted).await;
+        }
         // Looked up once, before any await: a service removed meanwhile does not hold the table.
         let Some(target) = self.target(&request.service) else {
             return Err(refusal(ErrorCode::UnknownService, "no such service"));
         };
         let target = &target;
-        // Before anything is connected to or looked up: a peer past a limit costs the refusal.
-        // An open that is counted elsewhere (the relay principal's) takes no place here.
-        let slot = if counted {
-            match self.slots.take(request.initiator) {
-                Ok(slot) => Some(slot),
-                Err(full) => {
-                    if let Some(left_out) = self.full_log.permit(Instant::now()) {
-                        tracing::warn!(
-                            service = %request.service,
-                            peer = %request.initiator,
-                            ?full,
-                            left_out,
-                            "refused an OPEN: a limit on served connections is reached"
-                        );
-                    }
-                    return Err(refusal(ErrorCode::RateLimited, "too many connections"));
-                }
-            }
-        } else {
-            None
-        };
+        let slot = self.take_slot(request, counted)?;
         let connect = self.connect(target);
         match tokio::time::timeout(self.connect_timeout, connect).await {
             Ok(Ok(socket)) => Ok(OpenedTarget {
@@ -630,7 +682,7 @@ impl Drop for Slot {
 
 /// Lets one log line through per interval, and says how many it held back since the last.
 #[derive(Debug)]
-struct LogThrottle {
+pub(crate) struct LogThrottle {
     interval: Duration,
     state: Mutex<ThrottleState>,
 }
@@ -642,7 +694,7 @@ struct ThrottleState {
 }
 
 impl LogThrottle {
-    fn new(interval: Duration) -> Self {
+    pub(crate) fn new(interval: Duration) -> Self {
         Self {
             interval,
             state: Mutex::new(ThrottleState::default()),
@@ -651,7 +703,7 @@ impl LogThrottle {
 
     /// `Some(n)` when a line may be written at `now`, `n` being the ones left out since the
     /// last; `None` when it may not.
-    fn permit(&self, now: Instant) -> Option<u64> {
+    pub(crate) fn permit(&self, now: Instant) -> Option<u64> {
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         match state.last {
             Some(last) if now.duration_since(last) < self.interval => {
@@ -2147,6 +2199,254 @@ mod tests {
                 .await
                 .map(drop)
                 .unwrap();
+        }
+    }
+
+    /// `egress:*` through [`LocalServices::with_egress`] (protocol.md 8, the dial itself is
+    /// `crate::egress`'s): what reaches the executor, the slots and the pipe.
+    mod egress {
+        use menzil_proto::{EgressRule, HostPortPattern, OpenTarget};
+        use tokio::sync::Notify;
+
+        use super::*;
+
+        /// An executor with the test only floor (127.0.0.0/8 may be dialled) whose rule allows
+        /// `allow`, no resolver needed and no own addresses.
+        fn executor(allow: &[&str], enabled: bool) -> EgressExecutor {
+            let rule = EgressRule {
+                node_id: NodeId::from([7u8; 32]),
+                allow: allow.iter().map(|t| HostPortPattern((*t).into())).collect(),
+                deny: vec![],
+            };
+            EgressExecutor::new(enabled, Arc::new(move |_: &NetworkId| Some(rule.clone())))
+                .with_own_addresses(|| Ok(Vec::new()))
+                .narrowed_floor_for_tests()
+        }
+
+        fn egress_request(port: u16) -> OpenRequest {
+            OpenRequest {
+                target: Some(OpenTarget {
+                    host: "127.0.0.1".to_owned(),
+                    port,
+                }),
+                ..request("egress:*", 1)
+            }
+        }
+
+        async fn nothing_accepted(listener: &TcpListener) {
+            assert!(
+                timeout(Duration::from_millis(150), listener.accept())
+                    .await
+                    .is_err(),
+                "the target was connected to"
+            );
+        }
+
+        impl Rig {
+            async fn open_egress(
+                &self,
+                service: &str,
+                host: &str,
+                port: u16,
+            ) -> (Stream, menzil_proto::OpenAckBody) {
+                let mut stream = self.client.open().await.unwrap();
+                let body = OpenBody {
+                    target: Some(OpenTarget {
+                        host: host.to_owned(),
+                        port,
+                    }),
+                    ..open_body(service)
+                };
+                let ack = initiate_open(&mut stream, &body).await.unwrap();
+                (stream, ack)
+            }
+        }
+
+        #[tokio::test]
+        async fn an_egress_open_on_the_relay_principals_path_is_refused_even_when_egress_is_on() {
+            let listener = listener().await;
+            let port = listener.local_addr().unwrap().port();
+            // The rules would let this dial through (loopback is open to the test floor), so the
+            // refusal below is the path's own.
+            let services = LocalServices::new().with_egress(executor(&["127.0.0.0/8"], true));
+            let refused = services
+                .open_with_own_limits(&egress_request(port))
+                .await
+                .map(drop)
+                .unwrap_err();
+            assert_eq!(refused.code, ErrorCode::UnknownService);
+            nothing_accepted(&listener).await;
+            assert_eq!(services.connections(), 0);
+            // The same executor serves a counted peer open.
+            services
+                .open(&egress_request(port))
+                .await
+                .map(drop)
+                .expect("a counted peer OPEN is dialled");
+            timeout(WAIT, listener.accept()).await.unwrap().unwrap();
+        }
+
+        #[tokio::test]
+        async fn without_an_enabled_executor_an_egress_open_is_unknown_service() {
+            let listener = listener().await;
+            let port = listener.local_addr().unwrap().port();
+            let none = LocalServices::new();
+            let disabled = LocalServices::new().with_egress(executor(&["127.0.0.0/8"], false));
+            for (what, services) in [("none", none), ("disabled", disabled)] {
+                let refused = services
+                    .open(&egress_request(port))
+                    .await
+                    .map(drop)
+                    .unwrap_err();
+                assert_eq!(refused.code, ErrorCode::UnknownService, "{what}");
+            }
+            // Over the wire too, with the OPEN exchange on a stream.
+            let rig = Rig::new(LocalServices::new());
+            let (_stream, ack) = rig.open_egress("egress:*", "127.0.0.1", port).await;
+            assert!(!ack.ok);
+            assert_eq!(ack.code, ErrorCode::UnknownService);
+            nothing_accepted(&listener).await;
+        }
+
+        #[tokio::test]
+        async fn only_the_literal_egress_star_is_served() {
+            let listener = listener().await;
+            let port = listener.local_addr().unwrap().port();
+            let services = LocalServices::new().with_egress(executor(&["127.0.0.0/8"], true));
+            let mut other = egress_request(port);
+            other.service = "egress:other".parse().unwrap();
+            let refused = services.open(&other).await.map(drop).unwrap_err();
+            assert_eq!(refused.code, ErrorCode::UnknownService);
+            nothing_accepted(&listener).await;
+        }
+
+        #[tokio::test]
+        async fn the_local_service_table_never_maps_egress() {
+            let services = LocalServices::new().with_egress(executor(&["127.0.0.0/8"], true));
+            assert_eq!(
+                services
+                    .set_target(
+                        "egress:*".parse().unwrap(),
+                        LocalTarget::new("127.0.0.1", 1)
+                    )
+                    .unwrap_err(),
+                ServeConfigError::UnsupportedKind(ServiceKind::Egress)
+            );
+            assert!(services.is_empty());
+        }
+
+        #[tokio::test]
+        async fn an_egress_open_is_ok_only_after_the_connect_and_the_pipe_carries_bytes_both_ways()
+        {
+            let listener = listener().await;
+            let port = listener.local_addr().unwrap().port();
+            let gate = Arc::new(Notify::new());
+            let connector_gate = gate.clone();
+            let services = LocalServices::new().with_egress(
+                executor(&["127.0.0.0/8"], true).with_connector(move |addr, buffer| {
+                    let gate = connector_gate.clone();
+                    async move {
+                        gate.notified().await;
+                        connect_addr(addr, buffer).await
+                    }
+                }),
+            );
+            let counted = services.clone();
+            let rig = Rig::new(services);
+            let target = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut buf = [0u8; 64];
+                loop {
+                    let n = socket.read(&mut buf).await.unwrap();
+                    if n == 0 {
+                        break;
+                    }
+                    socket.write_all(&buf[..n]).await.unwrap();
+                }
+                socket.shutdown().await.unwrap();
+            });
+
+            let opening = rig.open_egress("egress:*", "127.0.0.1", port);
+            tokio::pin!(opening);
+            // While the connect is held there is no answer, ok or otherwise.
+            assert!(
+                timeout(Duration::from_millis(200), &mut opening)
+                    .await
+                    .is_err(),
+                "the OPEN was answered before the connect finished"
+            );
+            gate.notify_one();
+            let (mut stream, ack) = timeout(WAIT, &mut opening).await.unwrap();
+            assert!(ack.ok, "{ack:?}");
+            // It holds a slot of the node like any served connection.
+            assert_eq!(counted.connections(), 1);
+
+            stream.write_all(b"hello egress").await.unwrap();
+            let mut back = [0u8; 12];
+            timeout(WAIT, stream.read_exact(&mut back))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(&back, b"hello egress");
+            stream.close().await.unwrap();
+            let mut rest = Vec::new();
+            timeout(WAIT, stream.read_to_end(&mut rest))
+                .await
+                .unwrap()
+                .expect("a clean end");
+            assert!(rest.is_empty());
+            timeout(WAIT, target).await.unwrap().unwrap();
+            // The slot comes back with the pipe.
+            for _ in 0..50 {
+                if counted.connections() == 0 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            assert_eq!(counted.connections(), 0);
+        }
+
+        #[tokio::test]
+        async fn a_refused_egress_target_is_answered_in_the_ack_and_costs_no_slot() {
+            let listener = listener().await;
+            let port = listener.local_addr().unwrap().port();
+            // The production floor: loopback is refused.
+            let rule = EgressRule {
+                node_id: NodeId::from([7u8; 32]),
+                allow: vec![HostPortPattern("0.0.0.0/0".into())],
+                deny: vec![],
+            };
+            let production =
+                EgressExecutor::new(true, Arc::new(move |_: &NetworkId| Some(rule.clone())))
+                    .with_own_addresses(|| Ok(Vec::new()));
+            let services = LocalServices::new().with_egress(production);
+            let counted = services.clone();
+            let rig = Rig::new(services);
+            let (_stream, ack) = rig.open_egress("egress:*", "127.0.0.1", port).await;
+            assert!(!ack.ok);
+            assert_eq!(ack.code, ErrorCode::Forbidden);
+            let (_stream, ack) = rig.open_egress("egress:*", "127.1", port).await;
+            assert_eq!(ack.code, ErrorCode::InvalidTarget);
+            nothing_accepted(&listener).await;
+            assert_eq!(counted.connections(), 0);
+        }
+
+        #[tokio::test]
+        async fn egress_opens_share_the_slots_of_the_node_and_are_refused_past_them() {
+            let listener = listener().await;
+            let port = listener.local_addr().unwrap().port();
+            let services = LocalServices::new()
+                .with_limits(limits(1, 1))
+                .with_egress(executor(&["127.0.0.0/8"], true));
+            let first = services.open(&egress_request(port)).await.unwrap();
+            assert_eq!(services.connections(), 1);
+            assert_rate_limited(services.open(&egress_request(port)).await, "egress");
+            drop(first);
+            services
+                .open(&egress_request(port))
+                .await
+                .map(drop)
+                .expect("a slot is free again");
         }
     }
 }

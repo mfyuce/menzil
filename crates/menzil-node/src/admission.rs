@@ -886,6 +886,13 @@ impl PolicyAuthorizer {
         }
     }
 
+    /// Whether the held Policy has exactly one `egress` entry for this node ([`crate::egress::rule_of`]).
+    fn has_egress_rule(&self) -> bool {
+        self.policies
+            .body(&self.network_id)
+            .is_some_and(|body| crate::egress::rule_of(&body, &self.to_node).is_some())
+    }
+
     fn no_grant() -> OpenDecision {
         OpenDecision::Deny(OpenRefusal {
             code: ErrorCode::NoGrant,
@@ -925,7 +932,7 @@ impl Authorizer for PolicyAuthorizer {
             return Self::no_grant();
         }
         let now = unix_now();
-        if self.policies.has_grant(
+        if !self.policies.has_grant(
             &self.rosters,
             &self.network_id,
             &request.initiator,
@@ -933,10 +940,15 @@ impl Authorizer for PolicyAuthorizer {
             Some(&request.service),
             now,
         ) {
-            OpenDecision::Allow
-        } else {
-            Self::no_grant()
+            return Self::no_grant();
         }
+        // protocol.md 8: an `egress:*` stream also needs the owner's `egress` entry for this
+        // node, looked up on every call, so that the live recheck (it passes the stored request,
+        // target included) resets the streams of a rule that was removed.
+        if request.service.kind == ServiceKind::Egress && !self.has_egress_rule() {
+            return Self::no_grant();
+        }
+        OpenDecision::Allow
     }
 }
 
@@ -1759,6 +1771,105 @@ mod tests {
             OpenDecision::Allow => panic!("must not evaluate grants for a different network"),
         }
     }
+    // --- egress needs the owner's entry for this node (protocol.md 8) ------------------
+
+    fn egress_entry(node_id: NodeId) -> menzil_proto::EgressRule {
+        menzil_proto::EgressRule {
+            node_id,
+            allow: vec![menzil_proto::HostPortPattern("0.0.0.0/0".to_string())],
+            deny: vec![],
+        }
+    }
+
+    /// The OPEN a peer makes (and the request a live recheck stores and asks about again).
+    fn egress_open_request(ids: &Ids) -> OpenRequest {
+        OpenRequest {
+            service: "egress:*".parse().unwrap(),
+            target: Some(menzil_proto::OpenTarget {
+                host: "example.com".to_string(),
+                port: 443,
+            }),
+            ..open_request(ids)
+        }
+    }
+
+    #[test]
+    fn an_egress_open_needs_the_egress_entry_for_this_node_as_well_as_the_grant() {
+        let f = fixture(vec![]);
+        let mut egress_grant = allowing_grant(&f.ids);
+        egress_grant.services = vec!["egress:*".parse().unwrap(), "tcp:ssh".parse().unwrap()];
+        let (authorizer, _, policies) = authorizer_of(&f);
+        edit_policy_in(&f.ids, &policies, |body| body.grants = vec![egress_grant]);
+        let request = egress_open_request(&f.ids);
+        let denied =
+            |authorizer: &PolicyAuthorizer, what: &str| match authorizer.authorize(&request) {
+                OpenDecision::Deny(refusal) => {
+                    assert_eq!(refusal.code, ErrorCode::NoGrant, "{what}");
+                    assert!(!refusal.msg.is_empty());
+                }
+                OpenDecision::Allow => panic!("{what}: must be a denial"),
+            };
+
+        // The grant is there and the Policy has no egress entry: refused like a missing grant,
+        // while a service that is not egress is not affected.
+        denied(&authorizer, "grant but no egress entry");
+        assert!(matches!(
+            authorizer.authorize(&open_request(&f.ids)),
+            OpenDecision::Allow
+        ));
+
+        // An entry for another node is not this node's.
+        let other = NodeId::from([0x77u8; 32]);
+        edit_policy_in(&f.ids, &policies, |body| {
+            body.egress = vec![egress_entry(other)];
+        });
+        denied(&authorizer, "entry for another node");
+
+        // An entry for this node: allowed (its rules are the executor's business).
+        let this_node = f.ids.responder_node_id;
+        edit_policy_in(&f.ids, &policies, |body| {
+            body.egress = vec![egress_entry(other), egress_entry(this_node)];
+        });
+        assert!(matches!(
+            authorizer.authorize(&request),
+            OpenDecision::Allow
+        ));
+
+        // Two entries for one node are ambiguous: no rule.
+        edit_policy_in(&f.ids, &policies, |body| {
+            body.egress = vec![egress_entry(this_node), egress_entry(this_node)];
+        });
+        denied(&authorizer, "two entries for this node");
+
+        // The rule comes back and then is removed again: the same authorizer follows the
+        // Policy on every call, which is what the live recheck relies on to reset the streams
+        // of a rule that was removed (it asks about the stored request, target included).
+        edit_policy_in(&f.ids, &policies, |body| {
+            body.egress = vec![egress_entry(this_node)];
+        });
+        assert!(matches!(
+            authorizer.authorize(&request),
+            OpenDecision::Allow
+        ));
+        edit_policy_in(&f.ids, &policies, |body| body.egress = vec![]);
+        denied(&authorizer, "rule removed while a stream is live");
+    }
+
+    #[test]
+    fn an_egress_entry_without_the_grant_still_denies() {
+        let f = fixture(vec![]);
+        let (authorizer, _, policies) = authorizer_of(&f);
+        let this_node = f.ids.responder_node_id;
+        // An entry for this node, and no grant at all.
+        edit_policy_in(&f.ids, &policies, |body| {
+            body.egress = vec![egress_entry(this_node)];
+        });
+        assert!(matches!(
+            authorizer.authorize(&egress_open_request(&f.ids)),
+            OpenDecision::Deny(_)
+        ));
+    }
+
     // --- docs only admission, the docs exemption (protocol.md 5.1, 5.5) ----
 
     /// Replaces the fixture's Roster by `edit` of it at the next seq.

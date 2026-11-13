@@ -67,6 +67,9 @@ pub mod docs;
 mod docs_access;
 mod docs_store;
 mod docs_sync;
+/// The exit side of `egress:*` streams (protocol.md 8): canonical targets, host/port patterns,
+/// the floor and the executor that dials.
+pub mod egress;
 mod error;
 mod identity;
 mod l4_router;

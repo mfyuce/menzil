@@ -465,7 +465,7 @@ default deny (written at network creation):
 and the port  *:25
 ```
 
-Of that list, the exit enforces without exception (not liftable by any `allow`): the floor above, and `100.64.0.0/10`, `198.18.0.0/15`, `240.0.0.0/4`, `192.0.0.0/24`, `192.88.99.0/24`, `::/96`, `fc00::/7`, `64:ff9b::/96`, `64:ff9b:1::/48`, `2001::/32` and `2002::/16` (cloud metadata and transition ranges). Port 25 is denied by default and an owner can lift it with an `allow` of `*:25` (a pattern with a port beats `*`).
+Of that list, the exit enforces without exception (not liftable by any `allow`): the floor above, and `100.64.0.0/10`, `198.18.0.0/15`, `240.0.0.0/4`, `192.0.0.0/24`, `192.88.99.0/24`, `::/96`, `fc00::/7`, `64:ff9b::/96`, `64:ff9b:1::/48`, `2001::/32` and `2002::/16` (cloud metadata and transition ranges). Port 25 is denied by default (`*:25`). An `allow` of `*:25` ties with it and the deny wins, so an owner lifts port 25 only for a destination network, with an `allow` of a longer prefix on that port (for example `203.0.113.0/24:25`).
 
 Refusals. A target that fails the rules is refused `forbidden` when the refusal rests on the target name or a literal address in the OPEN, and `target_unreachable` when a name resolved only to addresses the rules or the floor refuse, the same answer as a name that does not exist (so a member cannot map the exit's internal DNS; the exit's log says which). A node without egress enabled or without the `egress` entry answers an egress OPEN `unknown_service`, after the grant check. The relay principal can never open an egress service (section 6).
 
