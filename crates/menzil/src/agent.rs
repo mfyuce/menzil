@@ -23,6 +23,8 @@
 //! agent  -> client  lines "<key> <text>\n", then the connection ends. Keys:
 //!                     attached yes|no
 //!                     attached_since <Unix seconds>   when that last changed (optional)
+//!                     share_domain <domain>           the relay's share domain from its
+//!                                                     ADVERTISE_ACK (informational; optional)
 //!                     rejected_at <Unix seconds>      the relay's last rejection (below)
 //!                     rejected_code <name>            the ERROR code, e.g. revoked
 //!                     rejected_message <text>         the ERROR text
@@ -308,6 +310,9 @@ pub struct RelayStatus {
     /// Unix seconds when `attached` last changed; with it `status` says for how long the node
     /// has been attached or detached.
     pub since: Option<u64>,
+    /// The share domain the relay named in its last ADVERTISE_ACK, if any. Informational: a
+    /// `share_domain` in config.toml wins over it (see [`Self::usable_share_domain`]).
+    pub share_domain: Option<String>,
     /// The last time the relay turned the node away, if it has not been cleared by a good
     /// attachment since.
     pub rejected: Option<Rejected>,
@@ -344,6 +349,9 @@ impl RelayStatus {
         if let Some(since) = self.since {
             out.push_str(&format!("attached_since {since}\n"));
         }
+        if let Some(domain) = &self.share_domain {
+            out.push_str(&format!("share_domain {}\n", one_line(domain)));
+        }
         if let Some(rejected) = &self.rejected {
             out.push_str(&format!("rejected_at {}\n", rejected.at));
             if let Some(code) = &rejected.code {
@@ -377,6 +385,7 @@ impl RelayStatus {
             match key {
                 "attached" => status.attached = Some(value == "yes"),
                 "attached_since" => status.since = value.trim().parse().ok(),
+                "share_domain" => status.share_domain = Some(value.trim().to_string()),
                 "rejected_at" => {
                     rejected.at = value.trim().parse().unwrap_or(0);
                 }
@@ -397,6 +406,25 @@ impl RelayStatus {
             status.rejected = Some(rejected);
         }
         status
+    }
+
+    /// The relay's share domain when it is fit to build an address from: lowercase letters,
+    /// digits, hyphens and dots only, 253 bytes at most, no empty label. Whatever the relay sent
+    /// that is not, is not used (the text came over the network).
+    pub fn usable_share_domain(&self) -> Option<&str> {
+        let domain = self.share_domain.as_deref()?;
+        let fit = !domain.is_empty()
+            && domain.len() <= 253
+            && domain.split('.').all(|label| {
+                !label.is_empty()
+                    && label.len() <= 63
+                    && !label.starts_with('-')
+                    && !label.ends_with('-')
+                    && label
+                        .bytes()
+                        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+            });
+        fit.then_some(domain)
     }
 
     /// The `relay: ...` line (with a newline; empty when the agent did not say), with how long

@@ -790,6 +790,7 @@ async fn the_status_request_carries_the_rejection_and_whether_the_node_is_attach
     let sent = RelayStatus {
         attached: Some(false),
         since: None,
+        share_domain: None,
         rejected: Some(rejected("revoked")),
     };
     assert_eq!(ask(sent.clone()).await.unwrap(), sent);
@@ -798,12 +799,14 @@ async fn the_status_request_carries_the_rejection_and_whether_the_node_is_attach
     let attached = RelayStatus {
         attached: Some(true),
         since: None,
+        share_domain: None,
         rejected: None,
     };
     assert_eq!(ask(attached.clone()).await.unwrap(), attached);
     let bare = RelayStatus {
         attached: None,
         since: None,
+        share_domain: None,
         rejected: Some(Rejected {
             at: 5,
             code: Some("not_member".to_string()),
@@ -817,6 +820,7 @@ async fn the_status_request_carries_the_rejection_and_whether_the_node_is_attach
     let listed = RelayStatus {
         attached: None,
         since: None,
+        share_domain: None,
         rejected: Some(Rejected {
             at: 5,
             code: Some("not_member".to_string()),
@@ -829,6 +833,7 @@ async fn the_status_request_carries_the_rejection_and_whether_the_node_is_attach
     let goaway_only = RelayStatus {
         attached: Some(true),
         since: None,
+        share_domain: None,
         rejected: Some(Rejected {
             at: 6,
             code: None,
@@ -842,6 +847,7 @@ async fn the_status_request_carries_the_rejection_and_whether_the_node_is_attach
     let timed = RelayStatus {
         attached: Some(false),
         since: Some(1_700_000_000),
+        share_domain: None,
         rejected: None,
     };
     assert_eq!(ask(timed.clone()).await.unwrap(), timed);
@@ -868,6 +874,7 @@ async fn what_the_agent_says_in_a_status_reply_never_reaches_the_terminal_unesca
     let sent = RelayStatus {
         attached: Some(false),
         since: None,
+        share_domain: None,
         rejected: Some(Rejected {
             at: 1,
             code: Some("revoked\u{1b}[2J".to_string()),
@@ -982,6 +989,7 @@ fn status_is_rendered_with_the_reason_in_words() {
     let text = RelayStatus {
         attached: Some(false),
         since: None,
+        share_domain: None,
         rejected: Some(rejected("revoked")),
     }
     .render(now);
@@ -998,6 +1006,7 @@ fn status_is_rendered_with_the_reason_in_words() {
     let text = RelayStatus {
         attached: Some(true),
         since: None,
+        share_domain: None,
         rejected: None,
     }
     .render(now);
@@ -1012,6 +1021,7 @@ fn the_agent_and_the_client_each_make_the_status_text_printable() {
     let dirty = RelayStatus {
         attached: Some(false),
         since: None,
+        share_domain: None,
         rejected: Some(Rejected {
             at: 1,
             code: Some("re\u{1b}[2Jvoked\nattached yes".to_string()),
@@ -1082,6 +1092,7 @@ async fn four_byte_relay_text_does_not_hide_the_status() {
     let sent = RelayStatus {
         attached: Some(false),
         since: None,
+        share_domain: None,
         rejected: Some(Rejected {
             at: kept.at,
             code: Some("revoked".to_string()),
@@ -1678,6 +1689,7 @@ fn the_relay_line_says_for_how_long_the_node_has_been_detached_or_attached() {
     let detached = RelayStatus {
         attached: Some(false),
         since: Some(1_000),
+        share_domain: None,
         rejected: None,
     };
     assert_eq!(
@@ -1687,6 +1699,7 @@ fn the_relay_line_says_for_how_long_the_node_has_been_detached_or_attached() {
     let attached = RelayStatus {
         attached: Some(true),
         since: Some(1_000),
+        share_domain: None,
         rejected: None,
     };
     assert_eq!(attached.attach_line(1_045), "relay: attached (for 45 s)\n");
@@ -1694,6 +1707,7 @@ fn the_relay_line_says_for_how_long_the_node_has_been_detached_or_attached() {
     let old = RelayStatus {
         attached: Some(false),
         since: None,
+        share_domain: None,
         rejected: None,
     };
     assert_eq!(old.attach_line(5), "relay: not attached\n");
@@ -1701,4 +1715,53 @@ fn the_relay_line_says_for_how_long_the_node_has_been_detached_or_attached() {
     assert_eq!(RelayStatus::default().attach_line(5), "");
     assert_eq!(crate::text::age(90_000), "1 d 1 h");
     assert_eq!(crate::text::age(300), "5 min");
+}
+
+#[tokio::test]
+async fn the_status_request_carries_the_relays_share_domain_and_a_hostile_one_is_not_used() {
+    let sent = RelayStatus {
+        attached: Some(true),
+        share_domain: Some("tunnel.example.org".to_string()),
+        ..RelayStatus::default()
+    };
+    let got = ask(sent.clone()).await.unwrap();
+    assert_eq!(got, sent);
+    assert_eq!(got.usable_share_domain(), Some("tunnel.example.org"));
+    for bad in [
+        "",
+        "UPPER.example.org",
+        "a b.example.org",
+        "evil.example.org/x",
+        "a..b",
+        "-a.example.org",
+        "a-.example.org",
+        "ünï.example.org",
+        &format!("{}.org", "a".repeat(64)),
+        &format!(
+            "{}.{}.{}.{}.org",
+            "a".repeat(63),
+            "b".repeat(63),
+            "c".repeat(63),
+            "d".repeat(63)
+        ),
+    ] {
+        let status = RelayStatus {
+            share_domain: Some(bad.to_string()),
+            ..RelayStatus::default()
+        };
+        assert_eq!(status.usable_share_domain(), None, "{bad:?}");
+    }
+    // The configured domain wins over the relay's; the relay's fills in when there is none.
+    assert_eq!(
+        crate::expose::domain_for(Some("mine.example".to_string()), &sent),
+        Some("mine.example".to_string())
+    );
+    assert_eq!(
+        crate::expose::domain_for(None, &sent),
+        Some("tunnel.example.org".to_string())
+    );
+    assert_eq!(
+        crate::expose::domain_for(None, &RelayStatus::default()),
+        None
+    );
 }

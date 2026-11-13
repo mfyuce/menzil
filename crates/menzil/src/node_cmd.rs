@@ -789,6 +789,7 @@ impl Opener for NodeOpener {
         agent::RelayStatus {
             attached: Some(self.node.is_attached()),
             since: Some(self.node.attach_state_since()),
+            share_domain: self.node.shares().share_domain(),
             rejected: self.node.last_relay_error().map(rejected_of),
         }
     }

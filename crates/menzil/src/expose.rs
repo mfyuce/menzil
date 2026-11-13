@@ -1285,6 +1285,12 @@ impl UnexposeReply {
 // ---------------------------------------------------------------------------------------------
 // Text for the person
 
+/// The share domain to print addresses with: the one in config.toml, else the one the relay
+/// named in its ADVERTISE_ACK if it is fit to use (informational, see protocol.md 12).
+pub fn domain_for(configured: Option<String>, relay: &crate::agent::RelayStatus) -> Option<String> {
+    configured.or_else(|| relay.usable_share_domain().map(str::to_string))
+}
+
 /// The public address of a share, in words, for what is known: the names the relay accepted,
 /// the share domain `domain` if configured.
 pub fn public_address(view: &ShareView, domain: Option<&str>) -> String {
@@ -1502,16 +1508,23 @@ fn setup(home: &Home) -> Result<(Config, std::path::PathBuf)> {
 pub async fn run_expose(home: &Home, spec: ExposeSpec) -> Result<String> {
     spec.validate()?;
     let (config, socket) = setup(home)?;
-    let domain = config.share_domain()?;
+    let mut domain = config.share_domain()?;
     match crate::agent::request_expose(&socket, &spec).await {
-        Ok(reply) => Ok(render_exposed(
-            &spec,
-            reply.changed,
-            &reply.share,
-            &reply.notes,
-            true,
-            domain.as_deref(),
-        )),
+        Ok(reply) => {
+            if domain.is_none()
+                && let Ok(status) = crate::agent::query_node_status(&socket).await
+            {
+                domain = domain_for(None, &status.relay);
+            }
+            Ok(render_exposed(
+                &spec,
+                reply.changed,
+                &reply.share,
+                &reply.notes,
+                true,
+                domain.as_deref(),
+            ))
+        }
         Err(crate::agent::AskError::Failed(error)) => Err(error),
         Err(crate::agent::AskError::NoAgent) => {
             let home = home.clone();
@@ -1563,6 +1576,7 @@ pub async fn run_list(home: &Home) -> Result<String> {
                 .duration_since(std::time::UNIX_EPOCH)
                 .map_or(0, |d| d.as_secs());
             out.push_str(&status.relay.attach_line(now));
+            let domain = domain_for(domain, &status.relay);
             out.push_str(&render_list(&status.shares, domain.as_deref()));
             Ok(out)
         }

@@ -903,7 +903,11 @@ async fn run(cli: Cli) -> Result<()> {
                     if let Some(cert) = status.cert {
                         print!("{}", cert.render(now()));
                     }
-                    let domain = config.share_domain().ok().flatten();
+                    let domain = config
+                        .share_domain()
+                        .ok()
+                        .flatten()
+                        .or_else(|| status.relay.usable_share_domain().map(str::to_string));
                     print!(
                         "{}",
                         expose::render_status(&status.shares, domain.as_deref())
