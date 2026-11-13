@@ -77,9 +77,25 @@ use crate::roster_store::RosterStore;
 use crate::tenant::{TenantBook, TenantId};
 
 /// protocol.md 4.4's fixed reserved list ("`www`, `mail`, `admin`, `api`,
-/// `relay`, `t`"); "the operator's own names" is the config-surface
+/// `relay`, `t`", and, added 2026-11-13, the service host names `app`, `dashboard`,
+/// `console`, `status`, `docs`, `login`, `static`, so a share can never take the name of a
+/// page the relay's operator serves under the same domain); "the operator's own names" is the config-surface
 /// extension this module's doc comment flags as not yet built.
-pub const DEFAULT_RESERVED_LABELS: &[&str] = &["www", "mail", "admin", "api", "relay", "t"];
+pub const DEFAULT_RESERVED_LABELS: &[&str] = &[
+    "www",
+    "mail",
+    "admin",
+    "api",
+    "relay",
+    "t",
+    "app",
+    "dashboard",
+    "console",
+    "status",
+    "docs",
+    "login",
+    "static",
+];
 
 /// A defensive, implementation-only bound — protocol.md never states one
 /// — on how many shares a single ADVERTISE may carry. Without it, a
@@ -1470,9 +1486,9 @@ mod tests {
         let rosters = RosterStore::new();
         let (mut flat, mut ali, mut bob) = (Net::new(), Net::new(), Net::new());
         let (n_flat, n_ali, n_bob) = (node(1), node(2), node(3));
-        flat.publish(&rosters, &[n_flat], &[("app", n_flat)]);
-        ali.publish(&rosters, &[n_ali], &[("app", n_ali)]);
-        bob.publish(&rosters, &[n_bob], &[("blog", n_bob), ("app", n_bob)]);
+        flat.publish(&rosters, &[n_flat], &[("myapp", n_flat)]);
+        ali.publish(&rosters, &[n_ali], &[("myapp", n_ali)]);
+        bob.publish(&rosters, &[n_bob], &[("blog", n_bob), ("myapp", n_bob)]);
         let book = book(vec![
             ("ali", vec![ali.id], &[], &[]),
             ("bob", vec![bob.id], &[], &["blog"]),
@@ -1484,28 +1500,36 @@ mod tests {
             &book,
             &[flat.id],
             &n_flat,
-            &["app"],
+            &["myapp"],
             NOW,
         );
         assert_eq!(
             (a.accepted, a.names),
-            (vec!["app".to_string()], vec!["app".to_string()])
+            (vec!["myapp".to_string()], vec!["myapp".to_string()])
         );
-        let a = at(&registry, &rosters, &book, &[ali.id], &n_ali, &["App"], NOW);
-        assert_eq!(a.accepted, vec!["App"]);
-        assert_eq!(a.names, vec!["app.ali"]);
+        let a = at(
+            &registry,
+            &rosters,
+            &book,
+            &[ali.id],
+            &n_ali,
+            &["Myapp"],
+            NOW,
+        );
+        assert_eq!(a.accepted, vec!["Myapp"]);
+        assert_eq!(a.names, vec!["myapp.ali"]);
         let a = at(
             &registry,
             &rosters,
             &book,
             &[bob.id],
             &n_bob,
-            &["app", "blog"],
+            &["myapp", "blog"],
             NOW,
         );
         assert_eq!(
             a.names,
-            vec!["app.bob", "blog"],
+            vec!["myapp.bob", "blog"],
             "an operator grant is the flat name"
         );
         assert!(a.rejected.is_empty());
@@ -1524,9 +1548,9 @@ mod tests {
             alpha.publish(
                 &rosters,
                 &[a1, a2],
-                &[("app", a1), ("app", a2), ("one", a1), ("two", a1)],
+                &[("myapp", a1), ("myapp", a2), ("one", a1), ("two", a1)],
             );
-            beta.publish(&rosters, &[b1], &[("app", b1)]);
+            beta.publish(&rosters, &[b1], &[("myapp", b1)]);
             // The same short figures for both tenants.
             let figures: &[(&str, u64)] = &[("names", 3), ("new_names_per_week", 3)];
             let book = book(vec![
@@ -1544,17 +1568,25 @@ mod tests {
                         &book,
                         &[alpha.id],
                         &a1,
-                        &["app", "one", "two"],
+                        &["myapp", "one", "two"],
                         NOW
                     )
                     .names
                     .len(),
                     3
                 );
-                let taken = at(&registry, &rosters, &book, &[alpha.id], &a2, &["app"], NOW);
+                let taken = at(
+                    &registry,
+                    &rosters,
+                    &book,
+                    &[alpha.id],
+                    &a2,
+                    &["myapp"],
+                    NOW,
+                );
                 assert_eq!(
                     reasons(&taken),
-                    [("app".to_string(), "label_taken".to_string())]
+                    [("myapp".to_string(), "label_taken".to_string())]
                 );
             }
             let ack = at(
@@ -1563,7 +1595,7 @@ mod tests {
                 &book,
                 &[beta.id],
                 &b1,
-                &["app", "nope"],
+                &["myapp", "nope"],
                 NOW + 5,
             );
             // Its own grant of `app` is only ever in its own zone.
@@ -1576,7 +1608,7 @@ mod tests {
         };
         let quiet = ask(false);
         let busy = ask(true);
-        assert_eq!(quiet.names, vec!["app.beta"]);
+        assert_eq!(quiet.names, vec!["myapp.beta"]);
         assert_eq!(
             quiet, busy,
             "beta's answer does not depend on alpha's state"
@@ -1622,26 +1654,43 @@ mod tests {
         let rosters = RosterStore::new();
         let (mut alpha, mut beta) = (Net::new(), Net::new());
         let (a1, a2, b1) = (node(1), node(2), node(3));
-        alpha.publish(&rosters, &[a1, a2], &[("app", a1), ("app", a2)]);
-        beta.publish(&rosters, &[b1], &[("app", b1)]);
+        alpha.publish(&rosters, &[a1, a2], &[("myapp", a1), ("myapp", a2)]);
+        beta.publish(&rosters, &[b1], &[("myapp", b1)]);
         let book = book(vec![
             ("alpha", vec![alpha.id], &[], &[]),
             ("beta", vec![beta.id], &[], &[]),
         ]);
         let registry = LabelRegistry::new();
         assert_eq!(
-            at(&registry, &rosters, &book, &[alpha.id], &a1, &["app"], NOW).names,
-            ["app.alpha"]
+            at(
+                &registry,
+                &rosters,
+                &book,
+                &[alpha.id],
+                &a1,
+                &["myapp"],
+                NOW
+            )
+            .names,
+            ["myapp.alpha"]
         );
-        let second = at(&registry, &rosters, &book, &[alpha.id], &a2, &["app"], NOW);
+        let second = at(
+            &registry,
+            &rosters,
+            &book,
+            &[alpha.id],
+            &a2,
+            &["myapp"],
+            NOW,
+        );
         assert!(second.names.is_empty());
         assert_eq!(
             reasons(&second),
-            [("app".to_string(), "label_taken".to_string())]
+            [("myapp".to_string(), "label_taken".to_string())]
         );
         assert_eq!(
-            at(&registry, &rosters, &book, &[beta.id], &b1, &["app"], NOW).names,
-            ["app.beta"]
+            at(&registry, &rosters, &book, &[beta.id], &b1, &["myapp"], NOW).names,
+            ["myapp.beta"]
         );
     }
 
@@ -1834,18 +1883,18 @@ mod tests {
         let rosters = RosterStore::new();
         let (mut flat, mut other, mut ali) = (Net::new(), Net::new(), Net::new());
         let (f, o, a) = (node(1), node(2), node(3));
-        flat.publish(&rosters, &[f], &[("app", f)]);
-        other.publish(&rosters, &[o], &[("app", o)]);
-        ali.publish(&rosters, &[a], &[("app", a)]);
+        flat.publish(&rosters, &[f], &[("myapp", f)]);
+        other.publish(&rosters, &[o], &[("myapp", o)]);
+        ali.publish(&rosters, &[a], &[("myapp", a)]);
         let book = book(vec![("ali", vec![ali.id], &[], &[])]);
         let registry = LabelRegistry::new();
         assert_eq!(
-            at(&registry, &rosters, &book, &[flat.id], &f, &["app"], NOW).names,
-            ["app"]
+            at(&registry, &rosters, &book, &[flat.id], &f, &["myapp"], NOW).names,
+            ["myapp"]
         );
         assert_eq!(
-            at(&registry, &rosters, &book, &[ali.id], &a, &["app"], NOW).names,
-            ["app.ali"]
+            at(&registry, &rosters, &book, &[ali.id], &a, &["myapp"], NOW).names,
+            ["myapp.ali"]
         );
         registry.clear_for(&f, NOW);
         registry.clear_for(&a, NOW);
@@ -1857,8 +1906,8 @@ mod tests {
         registry.sweep(&rosters, &book, t90);
         let state = registry.state();
         assert!(state.names.is_empty(), "{state:?}");
-        assert_eq!(state.quarantine["app"].kind, QuarantineKind::Flat);
-        assert!(!state.quarantine.contains_key("app.ali"));
+        assert_eq!(state.quarantine["myapp"].kind, QuarantineKind::Flat);
+        assert!(!state.quarantine.contains_key("myapp.ali"));
 
         // A different network cannot take the flat name for 180 days; the one that held it can.
         let theirs = at(
@@ -1867,23 +1916,41 @@ mod tests {
             &book,
             &[other.id],
             &o,
-            &["app"],
+            &["myapp"],
             t90 + 1,
         );
         assert_eq!(
             reasons(&theirs),
-            [("app".to_string(), "quarantined".to_string())]
+            [("myapp".to_string(), "quarantined".to_string())]
         );
         // The zone name was free at once.
         assert_eq!(
-            at(&registry, &rosters, &book, &[ali.id], &a, &["app"], t90 + 1).names,
-            ["app.ali"]
+            at(
+                &registry,
+                &rosters,
+                &book,
+                &[ali.id],
+                &a,
+                &["myapp"],
+                t90 + 1
+            )
+            .names,
+            ["myapp.ali"]
         );
         registry.clear_for(&a, t90 + 1);
         let after = t90 + 180 * DAY;
         assert_eq!(
-            at(&registry, &rosters, &book, &[other.id], &o, &["app"], after).names,
-            ["app"]
+            at(
+                &registry,
+                &rosters,
+                &book,
+                &[other.id],
+                &o,
+                &["myapp"],
+                after
+            )
+            .names,
+            ["myapp"]
         );
     }
 
@@ -1894,20 +1961,20 @@ mod tests {
         let rosters = RosterStore::new();
         let mut flat = Net::new();
         let f = node(1);
-        flat.publish(&rosters, &[f], &[("app", f)]);
+        flat.publish(&rosters, &[f], &[("myapp", f)]);
         let book = TenantBook::default();
         let registry = LabelRegistry::new();
-        at(&registry, &rosters, &book, &[flat.id], &f, &["app"], NOW);
+        at(&registry, &rosters, &book, &[flat.id], &f, &["myapp"], NOW);
         let long = NOW + 200 * DAY;
         registry.sweep(&rosters, &book, long);
         assert_eq!(
-            registry.state().names["app"].last,
+            registry.state().names["myapp"].last,
             long,
             "stamped while held"
         );
         registry.clear_for(&f, long + 10 * DAY);
         registry.sweep(&rosters, &book, long + 10 * DAY + RELEASE_DAYS * DAY - 1);
-        assert!(registry.state().names.contains_key("app"));
+        assert!(registry.state().names.contains_key("myapp"));
         registry.sweep(&rosters, &book, long + 10 * DAY + RELEASE_DAYS * DAY);
         assert!(registry.state().names.is_empty());
     }
@@ -1919,7 +1986,7 @@ mod tests {
         let rosters = RosterStore::new();
         let mut ali = Net::new();
         let n = node(1);
-        ali.publish(&rosters, &[n], &[("app", n), ("keep", n)]);
+        ali.publish(&rosters, &[n], &[("myapp", n), ("keep", n)]);
         let book = book(vec![("ali", vec![ali.id], &[], &[])]);
         let registry = LabelRegistry::new();
         at(
@@ -1928,7 +1995,7 @@ mod tests {
             &book,
             &[ali.id],
             &n,
-            &["app", "keep"],
+            &["myapp", "keep"],
             NOW,
         );
         ali.publish(&rosters, &[n], &[("keep", n)]);
@@ -1951,12 +2018,12 @@ mod tests {
         let rosters = RosterStore::new();
         let (mut flat, mut ali) = (Net::new(), Net::new());
         let (f, a) = (node(1), node(2));
-        flat.publish(&rosters, &[f], &[("app", f)]);
-        ali.publish(&rosters, &[a], &[("app", a)]);
+        flat.publish(&rosters, &[f], &[("myapp", f)]);
+        ali.publish(&rosters, &[a], &[("myapp", a)]);
         let book = book(vec![("ali", vec![ali.id], &[], &[])]);
         let registry = LabelRegistry::new();
-        at(&registry, &rosters, &book, &[flat.id], &f, &["app"], NOW);
-        at(&registry, &rosters, &book, &[ali.id], &a, &["app"], NOW);
+        at(&registry, &rosters, &book, &[flat.id], &f, &["myapp"], NOW);
+        at(&registry, &rosters, &book, &[ali.id], &a, &["myapp"], NOW);
         // The removal ends the sessions that claimed the networks; their names are free then.
         registry.clear_for(&f, NOW);
         registry.clear_for(&a, NOW);
@@ -1964,7 +2031,7 @@ mod tests {
         registry.network_removed(&rosters, &book, &ali.id, NOW + 1);
         let state = registry.state();
         assert!(state.names.is_empty());
-        assert_eq!(state.quarantine["app"].network, Some(flat.id));
+        assert_eq!(state.quarantine["myapp"].network, Some(flat.id));
         assert_eq!(state.quarantine.len(), 1);
     }
 
@@ -1975,7 +2042,7 @@ mod tests {
         let rosters = RosterStore::new();
         let mut flat = Net::new();
         let f = node(1);
-        flat.publish(&rosters, &[f], &[("app", f)]);
+        flat.publish(&rosters, &[f], &[("myapp", f)]);
         let seen: std::sync::Arc<StdMutex<Vec<NameState>>> = Default::default();
         let registry = LabelRegistry::new();
         {
@@ -1983,9 +2050,9 @@ mod tests {
             registry.set_on_change(move |state| seen.lock().unwrap().push(state.clone()));
         }
         let book = TenantBook::default();
-        at(&registry, &rosters, &book, &[flat.id], &f, &["app"], NOW);
+        at(&registry, &rosters, &book, &[flat.id], &f, &["myapp"], NOW);
         assert_eq!(seen.lock().unwrap().len(), 1);
-        assert!(seen.lock().unwrap()[0].names.contains_key("app"));
+        assert!(seen.lock().unwrap()[0].names.contains_key("myapp"));
         // An hour later, the same ADVERTISE: nothing new to keep.
         at(
             &registry,
@@ -1993,7 +2060,7 @@ mod tests {
             &book,
             &[flat.id],
             &f,
-            &["app"],
+            &["myapp"],
             NOW + 3600,
         );
         assert_eq!(seen.lock().unwrap().len(), 1);
@@ -2004,11 +2071,11 @@ mod tests {
             &book,
             &[flat.id],
             &f,
-            &["app"],
+            &["myapp"],
             NOW + DAY,
         );
         assert_eq!(seen.lock().unwrap().len(), 2);
-        assert_eq!(seen.lock().unwrap()[1].names["app"].last, NOW + DAY);
+        assert_eq!(seen.lock().unwrap()[1].names["myapp"].last, NOW + DAY);
     }
 
     /// A state loaded at start is what the registry judges with: a quarantine from before the
@@ -2018,11 +2085,11 @@ mod tests {
         let rosters = RosterStore::new();
         let (mut flat, mut other) = (Net::new(), Net::new());
         let (f, o) = (node(1), node(2));
-        flat.publish(&rosters, &[f], &[("app", f)]);
-        other.publish(&rosters, &[o], &[("app", o)]);
+        flat.publish(&rosters, &[f], &[("myapp", f)]);
+        other.publish(&rosters, &[o], &[("myapp", o)]);
         let book = TenantBook::default();
         let first = LabelRegistry::new();
-        at(&first, &rosters, &book, &[flat.id], &f, &["app"], NOW);
+        at(&first, &rosters, &book, &[flat.id], &f, &["myapp"], NOW);
         first.clear_for(&f, NOW);
         first.sweep(&rosters, &book, NOW + RELEASE_DAYS * DAY);
         let text = first.state().render();
@@ -2036,16 +2103,25 @@ mod tests {
             &book,
             &[other.id],
             &o,
-            &["app"],
+            &["myapp"],
             later,
         );
         assert_eq!(
             reasons(&theirs),
-            [("app".to_string(), "quarantined".to_string())]
+            [("myapp".to_string(), "quarantined".to_string())]
         );
         assert_eq!(
-            at(&restarted, &rosters, &book, &[flat.id], &f, &["app"], later).names,
-            ["app"]
+            at(
+                &restarted,
+                &rosters,
+                &book,
+                &[flat.id],
+                &f,
+                &["myapp"],
+                later
+            )
+            .names,
+            ["myapp"]
         );
     }
 
@@ -2103,8 +2179,8 @@ mod tests {
         let rosters = RosterStore::new();
         let (mut d1, mut d2) = (Net::new(), Net::new());
         let n = node(4);
-        d1.publish(&rosters, &[n], &[("app", n)]);
-        d2.publish(&rosters, &[n], &[("app", n)]);
+        d1.publish(&rosters, &[n], &[("myapp", n)]);
+        d2.publish(&rosters, &[n], &[("myapp", n)]);
         let book = TenantBook::default();
         let registry = LabelRegistry::new();
         let first = at(
@@ -2113,23 +2189,31 @@ mod tests {
             &book,
             &[d1.id, d2.id],
             &n,
-            &["app"],
+            &["myapp"],
             NOW,
         );
-        assert_eq!(first.names, ["app"]);
-        assert_eq!(registry.state().names["app"].network, d1.id);
+        assert_eq!(first.names, ["myapp"]);
+        assert_eq!(registry.state().names["myapp"].network, d1.id);
         assert!(rosters.remove(&d1.id));
         registry.network_removed(&rosters, &book, &d1.id, NOW + 10);
         let state = registry.state();
         assert_eq!(
-            state.names["app"].network, d2.id,
+            state.names["myapp"].network, d2.id,
             "moved to the network that grants it"
         );
         assert!(state.quarantine.is_empty());
         // The node comes back through the second network: nothing refuses it.
         registry.clear_for(&n, NOW + 15);
-        let back = at(&registry, &rosters, &book, &[d2.id], &n, &["app"], NOW + 20);
-        assert_eq!(back.names, ["app"]);
+        let back = at(
+            &registry,
+            &rosters,
+            &book,
+            &[d2.id],
+            &n,
+            &["myapp"],
+            NOW + 20,
+        );
+        assert_eq!(back.names, ["myapp"]);
     }
 
     /// Round T5, L4: a name a live session holds is not released at the removal (the sweep does
@@ -2140,25 +2224,25 @@ mod tests {
         let rosters = RosterStore::new();
         let mut d1 = Net::new();
         let n = node(5);
-        d1.publish(&rosters, &[n], &[("app", n)]);
+        d1.publish(&rosters, &[n], &[("myapp", n)]);
         let book = TenantBook::default();
         let registry = LabelRegistry::new();
-        at(&registry, &rosters, &book, &[d1.id], &n, &["app"], NOW);
+        at(&registry, &rosters, &book, &[d1.id], &n, &["myapp"], NOW);
         assert!(rosters.remove(&d1.id));
         registry.network_removed(&rosters, &book, &d1.id, NOW + 10);
         assert!(
-            registry.state().names.contains_key("app"),
+            registry.state().names.contains_key("myapp"),
             "a session still holds it"
         );
         registry.sweep(&rosters, &book, NOW + 11);
         assert!(
-            registry.state().names.contains_key("app"),
+            registry.state().names.contains_key("myapp"),
             "held: left alone"
         );
         registry.clear_for(&n, NOW + 12);
         registry.sweep(&rosters, &book, NOW + 13);
         let state = registry.state();
         assert!(state.names.is_empty());
-        assert_eq!(state.quarantine["app"].network, Some(d1.id));
+        assert_eq!(state.quarantine["myapp"].network, Some(d1.id));
     }
 }

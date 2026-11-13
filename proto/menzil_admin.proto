@@ -1,6 +1,6 @@
-// Sahip: menzil repo'su (proto/menzil_admin.proto). Sürüm 3.2; menzil-ui sürümlü kopya kullanır.
-// v3.2 (2026-11-07): GetUsage gerçek (status.json), Usage.generated_unix=6 eklendi.
-// TASLAK v3.1 (2026-11-07): v3 kabul edildi (tunnel_yanit_v3.md); D1: kota anahtarları sabit değil, GetFigures eklendi. v2'ye tunnel yanıtı (contract/tunnel_yanit_v2.md, koşullu kabul K1-K3) işlendi.
+// Tenant admin API of the menzil relay (mTLS gRPC). Version 3.2; a client keeps its own versioned copy of this file.
+// v3.2 (2026-11-07): GetUsage is real (read from the relay's status.json); Usage.generated_unix=6 added.
+// v3.1 (2026-11-07): quota keys are not fixed, GetFigures added. Earlier drafts were revised after review of a first client.
 // Sınır: menzil rölesi hesap bilmez; kiracı = slug + ağlar (relay/tenants/<slug>.toml). Ajan (tunnel
 // sahibi, mTLS, röle ile aynı makinede) yalnız bu dosyaları yazar; RPC yanıtı "dosya yazıldı"dır,
 // röle en geç 15 sn'de uygular. Düğüm kabulü (admit/revoke) her ağın KENDİ owner anahtarıyla yapılır.
@@ -42,7 +42,7 @@ message TenantRef { string slug = 1; }
 message CreateTenantRequest {
   string slug = 1;                 // Slug::parse: 3-32, küçük ASCII/rakam/tire
   // `menzil token --for-relay` çıktıları (`menzil1-roster:...`, sahip/steward imzalı Roster).
-  // menzil-ui ham NetworkId göndermez (TBD#13). İlk sürümde tek eleman.
+  // A client does not send a raw NetworkId. One element in the first version.
   repeated string tokens = 2;
   string class = 3;                // yalnız "personal" ya da "friend"; boş = "friend"
   string idempotency_key = 4;      // ajan SAKLAMAZ, yok sayılır

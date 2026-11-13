@@ -423,7 +423,7 @@ async fn a_terminated_share_is_served_through_a_certificate_the_relay_ordered_it
     let node = identity();
     let other = identity();
     let owner = SigningKey::generate(&mut rand::rng());
-    let (network_id, roster1) = roster(&owner, node.node_id, other.node_id, &["web", "app"]);
+    let (network_id, roster1) = roster(&owner, node.node_id, other.node_id, &["web", "myapp"]);
     let policy1 = policy_for(&owner, network_id, &node, &other);
     relay.relay.rosters().set(&roster1).unwrap();
     relay.relay.set_tenants(TenantBook::build(
@@ -460,7 +460,10 @@ async fn a_terminated_share_is_served_through_a_certificate_the_relay_ordered_it
             LocalTarget::new("127.0.0.1", http_port),
         )
         .unwrap()
-        .serve(service("tls:app"), LocalTarget::new("127.0.0.1", echo_port))
+        .serve(
+            service("tls:myapp"),
+            LocalTarget::new("127.0.0.1", echo_port),
+        )
         .unwrap();
     let started = Node::start(
         NodeConfig {
@@ -482,10 +485,10 @@ async fn a_terminated_share_is_served_through_a_certificate_the_relay_ordered_it
     })
     .await;
     let web = share("web", ShareMode::Terminated, "http:web");
-    let app = share("app", ShareMode::Blind, "tls:app");
-    book.set_shares(vec![web.clone(), app.clone()]).unwrap();
+    let myapp = share("myapp", ShareMode::Blind, "tls:myapp");
+    book.set_shares(vec![web.clone(), myapp.clone()]).unwrap();
     until("the shares to be accepted", || {
-        book.accepted_service(&web.service) && book.accepted_service(&app.service)
+        book.accepted_service(&web.service) && book.accepted_service(&myapp.service)
     })
     .await;
     until("the relay to hold the claims", || {
@@ -543,7 +546,7 @@ async fn a_terminated_share_is_served_through_a_certificate_the_relay_ordered_it
     );
 
     // --- 2. zone separation ----------------------------------------------------------------
-    echoes(tls_addr, "app.ali.share.test", b"blind bytes").await;
+    echoes(tls_addr, "myapp.ali.share.test", b"blind bytes").await;
     assert_refused(
         "a terminated share under the blind zone",
         tls_addr,
@@ -553,7 +556,7 @@ async fn a_terminated_share_is_served_through_a_certificate_the_relay_ordered_it
     assert_refused(
         "a blind share under the terminated zone",
         tls_addr,
-        "app.ali.t.share.test",
+        "myapp.ali.t.share.test",
     )
     .await;
     assert_eq!(target.count(), 0, "nothing reached the HTTP target yet");
@@ -618,7 +621,7 @@ async fn a_terminated_share_is_served_through_a_certificate_the_relay_ordered_it
     assert_eq!(target.count(), 2, "neither request reached the target");
 
     // --- 5. the share is withdrawn: the kept alive connection is closed, new ones refused ----
-    book.set_shares(vec![app.clone()]).unwrap();
+    book.set_shares(vec![myapp.clone()]).unwrap();
     until("the node to hold only the blind share", || {
         !book.accepted_service(&web.service)
     })
@@ -639,7 +642,7 @@ async fn a_terminated_share_is_served_through_a_certificate_the_relay_ordered_it
     );
     assert_refused("a withdrawn terminated share", tls_addr, T_HOST).await;
     // The blind share of the same tenant is not touched by it.
-    echoes(tls_addr, "app.ali.share.test", b"still blind").await;
+    echoes(tls_addr, "myapp.ali.share.test", b"still blind").await;
 
     acme_task.abort();
     started.shutdown().await;

@@ -1204,7 +1204,20 @@ mod tests {
 
     #[test]
     fn reserved_names_are_not_slugs_and_the_operator_can_reserve_more() {
-        for reserved in ["www", "mail", "admin", "api", "relay"] {
+        for reserved in [
+            "www",
+            "mail",
+            "admin",
+            "api",
+            "relay",
+            "app",
+            "dashboard",
+            "console",
+            "status",
+            "docs",
+            "login",
+            "static",
+        ] {
             assert_eq!(
                 Slug::parse(reserved),
                 Err(SlugError::Reserved(reserved.to_string()))

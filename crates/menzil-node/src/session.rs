@@ -988,6 +988,35 @@ struct Callers<'a> {
     stop: &'a mut watch::Receiver<bool>,
 }
 
+/// The longest one connection attempt (name lookup, TCP, proxy CONNECT, TLS, WebSocket upgrade,
+/// Noise handshake, ATTACH) may take. Nothing below `Session::connect` has a timeout of its own,
+/// so a lookup or a connection that never answers (seen after a resolver outage: the node sat
+/// `not attached` for an hour until a manual restart) would stop the retry loop for good.
+const CONNECT_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(45);
+
+/// [`Session::connect`] bounded by [`CONNECT_ATTEMPT_TIMEOUT`]; a hung attempt is an ordinary
+/// failed attempt, so the caller's backoff and retry go on.
+async fn connect_attempt(
+    config: &SessionConfig,
+    env: &HashMap<String, String>,
+    roster_store: Arc<RosterStore>,
+) -> Result<Session, NodeError> {
+    match tokio::time::timeout(
+        CONNECT_ATTEMPT_TIMEOUT,
+        Session::connect(config, env, roster_store),
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => Err(NodeError::Carrier(menzil_carrier::CarrierError::Connect(
+            format!(
+                "connection attempt timed out after {} s",
+                CONNECT_ATTEMPT_TIMEOUT.as_secs()
+            ),
+        ))),
+    }
+}
+
 /// Dials with [`Backoff`] retry, servicing `outbound` throughout —
 /// TODO.md L4h1's own review, finding 2: a send is tagged with an epoch
 /// the instant it is produced, so one tagged for the epoch *about to*
@@ -1022,7 +1051,7 @@ async fn connect_with_retry(
     let mut waiting: Vec<OutboundSend> = Vec::new();
     let mut waiting_bytes: usize = 0;
     loop {
-        let dial = Session::connect(config, env, Arc::clone(&roster_store));
+        let dial = connect_attempt(config, env, Arc::clone(&roster_store));
         tokio::pin!(dial);
         let result = loop {
             tokio::select! {
@@ -1667,6 +1696,50 @@ mod tests {
         };
         store.set(&Roster::sign(&owner, &body).unwrap()).unwrap();
         network_id
+    }
+
+    /// A connection attempt that never gets an answer (a silent server here; a hung name lookup
+    /// after a resolver outage in the field) is cut off and retried, not waited on forever.
+    #[tokio::test(start_paused = true)]
+    async fn connect_with_retry_gives_up_on_a_silent_attempt_and_dials_again() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let accepted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = Arc::clone(&accepted);
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((sock, _)) = listener.accept().await {
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                held.push(sock); // accept and say nothing
+            }
+        });
+        let mut config = config_claiming(vec![], node_cert(7));
+        config.dial.connection_info.port = port;
+        config.dial.connection_info.host = "127.0.0.1".to_string();
+        let store = Arc::new(RosterStore::new());
+        let (_out_tx, mut outbound) = mpsc::channel(4);
+        let (events, _events_rx) = mpsc::channel(4);
+        let (_stop_tx, mut stop) = watch::channel(false);
+        let mut backoff = Backoff::new();
+        let env = HashMap::new();
+        let task = connect_with_retry(
+            &config,
+            &env,
+            store,
+            Callers {
+                outbound: &mut outbound,
+                events: &events,
+                stop: &mut stop,
+            },
+            &mut backoff,
+            Epoch::first(),
+        );
+        // Several attempt lengths plus backoff; the future never finishes by itself.
+        let _ = tokio::time::timeout(Duration::from_secs(400), task).await;
+        assert!(
+            accepted.load(std::sync::atomic::Ordering::SeqCst) >= 3,
+            "a hung first attempt must not stop the retries"
+        );
     }
 
     #[test]

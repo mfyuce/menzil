@@ -40,7 +40,7 @@ fn err(result: Result<Plan>) -> String {
 
 #[test]
 fn a_request_line_round_trips_and_every_field_is_checked() {
-    let mut full = spec("app", 8443);
+    let mut full = spec("myapp", 8443);
     full.mode = ExposeMode::Tcp;
     full.host = "::1".to_string();
     full.alpn = vec!["h2".to_string(), "http/1.1".to_string()];
@@ -48,13 +48,16 @@ fn a_request_line_round_trips_and_every_field_is_checked() {
     let line = full.to_request_line();
     assert_eq!(
         line,
-        "expose name=app mode=tcp host=::1 port=8443 replace=1 alpn=h2,http/1.1"
+        "expose name=myapp mode=tcp host=::1 port=8443 replace=1 alpn=h2,http/1.1"
     );
     assert_eq!(ExposeSpec::parse_request_line(&line).unwrap(), full);
     assert_eq!(full.target(), "[::1]:8443");
-    assert_eq!(full.service().unwrap().to_string(), "tcp:app");
-    assert_eq!(spec("app", 80).target(), "127.0.0.1:80");
-    assert_eq!(spec("app", 80).service().unwrap().to_string(), "tls:app");
+    assert_eq!(full.service().unwrap().to_string(), "tcp:myapp");
+    assert_eq!(spec("myapp", 80).target(), "127.0.0.1:80");
+    assert_eq!(
+        spec("myapp", 80).service().unwrap().to_string(),
+        "tls:myapp"
+    );
 
     for (line, wanted) in [
         ("expose name=a mode=blind host=h port=1", "no replace"),
@@ -87,7 +90,7 @@ fn a_request_line_round_trips_and_every_field_is_checked() {
 #[test]
 fn what_cannot_be_exposed_is_refused_with_its_reason() {
     // A terminated share takes no ALPN list: the relay terminates its TLS.
-    let mut terminated = spec("app", 80);
+    let mut terminated = spec("myapp", 80);
     terminated.mode = ExposeMode::Terminated;
     assert!(terminated.validate().is_ok());
     terminated.alpn = vec!["h2".to_string()];
@@ -101,7 +104,7 @@ fn what_cannot_be_exposed_is_refused_with_its_reason() {
 
     for (change, wanted) in [
         (
-            (|s: &mut ExposeSpec| s.label = "App".into()) as fn(&mut ExposeSpec),
+            (|s: &mut ExposeSpec| s.label = "Myapp".into()) as fn(&mut ExposeSpec),
             "uppercase",
         ),
         (|s| s.label = "a.b".into(), "dot"),
@@ -117,7 +120,7 @@ fn what_cannot_be_exposed_is_refused_with_its_reason() {
         (|s| s.alpn = vec!["a\"b".into()], "alpn"),
         (|s| s.alpn = vec!["x".repeat(256)], "alpn"),
     ] {
-        let mut bad = spec("app", 80);
+        let mut bad = spec("myapp", 80);
         change(&mut bad);
         let error = format!("{:#}", bad.validate().unwrap_err());
         assert!(error.contains(wanted), "{bad:?}: {error}");
@@ -131,11 +134,11 @@ fn what_cannot_be_exposed_is_refused_with_its_reason() {
         "10.0.0.5",
         "my_host",
     ] {
-        let mut good = spec("app", 80);
+        let mut good = spec("myapp", 80);
         good.host = host.to_string();
         good.validate().unwrap();
     }
-    let mut alpn = spec("app", 80);
+    let mut alpn = spec("myapp", 80);
     alpn.alpn = vec!["h2".into(), "http/1.1".into(), "acme-tls/1".into()];
     alpn.validate().unwrap();
 }
@@ -154,7 +157,7 @@ fn only_the_machines_own_loopback_is_not_a_warning() {
 
 #[test]
 fn an_exposed_port_is_added_to_services_and_shares_and_everything_else_stays_as_written() {
-    let plan = plan_expose(BASE, &spec("app", 8443)).unwrap();
+    let plan = plan_expose(BASE, &spec("myapp", 8443)).unwrap();
     assert!(plan.changed);
     assert_eq!(
         plan.new_text,
@@ -164,16 +167,16 @@ relay = "menzil://relay.example.org:443/_menzil/v1?id=ababababababababababababab
 [services]
 # ssh for friends
 "tcp:ssh" = "127.0.0.1:22"   # keep me
-"tls:app" = "127.0.0.1:8443"  # menzil expose
+"tls:myapp" = "127.0.0.1:8443"  # menzil expose
 
 # tuning
 [serve]
 max_connections = 10
 
 [[share]]
-name = "app"
+name = "myapp"
 mode = "blind"
-service = "tls:app"
+service = "tls:myapp"
 "#
     );
     assert_eq!(plan.config.shares().unwrap().len(), 1);
@@ -185,7 +188,7 @@ service = "tls:app"
     second.alpn = vec!["h2".into(), "http/1.1".into()];
     let plan = plan_expose(&plan.new_text, &second).unwrap();
     assert!(plan.new_text.ends_with(
-        "[[share]]\nname = \"app\"\nmode = \"blind\"\nservice = \"tls:app\"\n\n[[share]]\nname = \"box\"\nmode = \"tcp\"\nservice = \"tcp:box\"\nalpn = [\"h2\", \"http/1.1\"]\n"
+        "[[share]]\nname = \"myapp\"\nmode = \"blind\"\nservice = \"tls:myapp\"\n\n[[share]]\nname = \"box\"\nmode = \"tcp\"\nservice = \"tcp:box\"\nalpn = [\"h2\", \"http/1.1\"]\n"
     ), "{}", plan.new_text);
     assert_eq!(plan.config.services["tcp:box"], "127.0.0.1:22");
     // Comments and the order of the rest are untouched.
@@ -207,15 +210,15 @@ fn a_file_with_no_services_table_or_no_final_newline_or_crlf_gets_a_well_formed_
         "relay = \"menzil://h:1/_menzil/v1?id=ab\"",
         "# only a comment\n",
     ] {
-        let plan = plan_expose(text, &spec("app", 8443)).unwrap();
+        let plan = plan_expose(text, &spec("myapp", 8443)).unwrap();
         assert!(
             plan.new_text
-                .contains("[services]\n\"tls:app\" = \"127.0.0.1:8443\"  # menzil expose\n"),
+                .contains("[services]\n\"tls:myapp\" = \"127.0.0.1:8443\"  # menzil expose\n"),
             "{}",
             plan.new_text
         );
         assert!(
-            plan.new_text.ends_with("service = \"tls:app\"\n"),
+            plan.new_text.ends_with("service = \"tls:myapp\"\n"),
             "{}",
             plan.new_text
         );
@@ -229,15 +232,15 @@ fn a_file_with_no_services_table_or_no_final_newline_or_crlf_gets_a_well_formed_
     // A last line that has no newline, inside the services table.
     let plan = plan_expose(
         "[services]\n\"tcp:ssh\" = \"127.0.0.1:22\"",
-        &spec("app", 1),
+        &spec("myapp", 1),
     )
     .unwrap();
     assert!(plan
         .new_text
-        .starts_with("[services]\n\"tcp:ssh\" = \"127.0.0.1:22\"\n\"tls:app\" = \"127.0.0.1:1\"  # menzil expose\n"));
+        .starts_with("[services]\n\"tcp:ssh\" = \"127.0.0.1:22\"\n\"tls:myapp\" = \"127.0.0.1:1\"  # menzil expose\n"));
     // Windows line endings are kept.
     let crlf = "[services]\r\n\"tcp:ssh\" = \"127.0.0.1:22\"\r\n";
-    let plan = plan_expose(crlf, &spec("app", 1)).unwrap();
+    let plan = plan_expose(crlf, &spec("myapp", 1)).unwrap();
     assert!(
         !plan.new_text.replace("\r\n", "").contains('\n'),
         "{:?}",
@@ -248,16 +251,16 @@ fn a_file_with_no_services_table_or_no_final_newline_or_crlf_gets_a_well_formed_
 
 #[test]
 fn exposing_the_same_thing_again_changes_nothing() {
-    let first = plan_expose(BASE, &spec("app", 8443)).unwrap();
-    let again = plan_expose(&first.new_text, &spec("app", 8443)).unwrap();
+    let first = plan_expose(BASE, &spec("myapp", 8443)).unwrap();
+    let again = plan_expose(&first.new_text, &spec("myapp", 8443)).unwrap();
     assert!(!again.changed);
     assert_eq!(again.new_text, first.new_text);
 }
 
 #[test]
 fn a_name_used_with_another_port_is_refused_unless_replace_is_given() {
-    let first = plan_expose(BASE, &spec("app", 8443)).unwrap();
-    let error = err(plan_expose(&first.new_text, &spec("app", 9000)));
+    let first = plan_expose(BASE, &spec("myapp", 8443)).unwrap();
+    let error = err(plan_expose(&first.new_text, &spec("myapp", 9000)));
     assert!(
         error.contains("exists already")
             && error.contains("--replace")
@@ -265,32 +268,32 @@ fn a_name_used_with_another_port_is_refused_unless_replace_is_given() {
         "{error}"
     );
     // A different ALPN list is a different share too.
-    let mut other = spec("app", 8443);
+    let mut other = spec("myapp", 8443);
     other.alpn = vec!["h2".into()];
     assert!(err(plan_expose(&first.new_text, &other)).contains("exists already"));
 
-    let mut replace = spec("app", 9000);
+    let mut replace = spec("myapp", 9000);
     replace.replace = true;
     let plan = plan_expose(&first.new_text, &replace).unwrap();
     assert!(plan.changed);
-    assert_eq!(plan.config.services["tls:app"], "127.0.0.1:9000");
+    assert_eq!(plan.config.services["tls:myapp"], "127.0.0.1:9000");
     assert_eq!(plan.config.share.len(), 1, "replaced, not added");
     // The marker stays on the line it was on: `expose remove` still takes the service out.
     assert!(
         plan.new_text
-            .contains("\"tls:app\" = \"127.0.0.1:9000\"  # menzil expose\n"),
+            .contains("\"tls:myapp\" = \"127.0.0.1:9000\"  # menzil expose\n"),
         "{}",
         plan.new_text
     );
     // Replacing in place keeps the share where it was in the file.
     let two = plan_expose(&first.new_text, &spec("web", 1)).unwrap();
-    let mut replace_first = spec("app", 7);
+    let mut replace_first = spec("myapp", 7);
     replace_first.replace = true;
     let plan = plan_expose(&two.new_text, &replace_first).unwrap();
     let names: Vec<&str> = plan.config.share.iter().map(|s| s.name.as_str()).collect();
-    assert_eq!(names, ["app", "web"]);
+    assert_eq!(names, ["myapp", "web"]);
     assert!(
-        plan.new_text.find("name = \"app\"").unwrap()
+        plan.new_text.find("name = \"myapp\"").unwrap()
             < plan.new_text.find("name = \"web\"").unwrap()
     );
 }
@@ -338,40 +341,40 @@ fn a_service_that_is_already_there_is_not_taken_over_quietly() {
 
 #[test]
 fn another_share_on_the_same_service_is_not_changed_behind_its_back() {
-    let text = "[services]\n\"tls:app\" = \"127.0.0.1:1\"\n\n[[share]]\nname = \"other\"\nmode = \"blind\"\nservice = \"tls:app\"\n";
-    let mut app = spec("app", 2);
-    app.replace = true;
-    let error = err(plan_expose(text, &app));
-    assert!(error.contains("another share uses tls:app"), "{error}");
+    let text = "[services]\n\"tls:myapp\" = \"127.0.0.1:1\"\n\n[[share]]\nname = \"other\"\nmode = \"blind\"\nservice = \"tls:myapp\"\n";
+    let mut myapp = spec("myapp", 2);
+    myapp.replace = true;
+    let error = err(plan_expose(text, &myapp));
+    assert!(error.contains("another share uses tls:myapp"), "{error}");
 }
 
 #[test]
 fn a_changed_mode_moves_the_share_and_takes_the_service_it_made_along() {
-    let first = plan_expose(BASE, &spec("app", 8443)).unwrap();
-    let mut tcp = spec("app", 8443);
+    let first = plan_expose(BASE, &spec("myapp", 8443)).unwrap();
+    let mut tcp = spec("myapp", 8443);
     tcp.mode = ExposeMode::Tcp;
     tcp.replace = true;
     let plan = plan_expose(&first.new_text, &tcp).unwrap();
     assert_eq!(
         plan.removed_service.as_ref().unwrap().to_string(),
-        "tls:app"
+        "tls:myapp"
     );
-    assert!(plan.config.services.contains_key("tcp:app"));
+    assert!(plan.config.services.contains_key("tcp:myapp"));
     assert!(
-        !plan.config.services.contains_key("tls:app"),
+        !plan.config.services.contains_key("tls:myapp"),
         "{}",
         plan.new_text
     );
-    assert_eq!(plan.config.share[0].service, "tcp:app");
+    assert_eq!(plan.config.share[0].service, "tcp:myapp");
     // A service the person wrote stays, with a note.
-    let text = "[services]\n\"tls:app\" = \"127.0.0.1:8443\"\n\n[[share]]\nname = \"app\"\nmode = \"blind\"\nservice = \"tls:app\"\n";
+    let text = "[services]\n\"tls:myapp\" = \"127.0.0.1:8443\"\n\n[[share]]\nname = \"myapp\"\nmode = \"blind\"\nservice = \"tls:myapp\"\n";
     let plan = plan_expose(text, &tcp).unwrap();
     assert!(plan.removed_service.is_none());
-    assert!(plan.config.services.contains_key("tls:app"));
+    assert!(plan.config.services.contains_key("tls:myapp"));
     assert!(
         plan.notes
             .iter()
-            .any(|n| n.contains("tls:app is still in [services]")),
+            .any(|n| n.contains("tls:myapp is still in [services]")),
         "{:?}",
         plan.notes
     );
@@ -379,32 +382,32 @@ fn a_changed_mode_moves_the_share_and_takes_the_service_it_made_along() {
 
 #[test]
 fn removing_a_share_takes_the_service_expose_made_and_nothing_else() {
-    let first = plan_expose(BASE, &spec("app", 8443)).unwrap();
-    let removed = plan_unexpose(&first.new_text, "app").unwrap();
+    let first = plan_expose(BASE, &spec("myapp", 8443)).unwrap();
+    let removed = plan_unexpose(&first.new_text, "myapp").unwrap();
     assert_eq!(
         removed.removed_service.as_ref().unwrap().to_string(),
-        "tls:app"
+        "tls:myapp"
     );
     assert_eq!(removed.new_text, BASE, "back to exactly what it was");
-    assert_eq!(removed.share.name, "app");
+    assert_eq!(removed.share.name, "myapp");
     // A file that had nothing is empty again, not left with an empty table.
-    let from_nothing = plan_expose("", &spec("app", 1)).unwrap();
+    let from_nothing = plan_expose("", &spec("myapp", 1)).unwrap();
     assert_eq!(
-        plan_unexpose(&from_nothing.new_text, "app")
+        plan_unexpose(&from_nothing.new_text, "myapp")
             .unwrap()
             .new_text,
         ""
     );
     // Two shares: only the named one goes.
     let two = plan_expose(&first.new_text, &spec("web", 1)).unwrap();
-    let removed = plan_unexpose(&two.new_text, "app").unwrap();
+    let removed = plan_unexpose(&two.new_text, "myapp").unwrap();
     assert_eq!(removed.config.share.len(), 1);
     assert_eq!(removed.config.share[0].name, "web");
     assert!(removed.config.services.contains_key("tls:web"));
     // A name nobody has.
     let error = err(plan_unexpose(&two.new_text, "nope"));
     assert!(
-        error.contains("no share named \"nope\"") && error.contains("app, web"),
+        error.contains("no share named \"nope\"") && error.contains("myapp, web"),
         "{error}"
     );
     assert!(err(plan_unexpose(BASE, "nope")).contains("there are none"));
@@ -511,13 +514,13 @@ fn config_text(home: &Home) -> String {
 async fn a_running_node_serves_and_advertises_a_new_share_at_once_and_a_restart_keeps_it() {
     let dir = tempfile::tempdir().unwrap();
     let (home, node) = running(dir.path(), "").await;
-    let app: ServiceId = "tls:app".parse().unwrap();
-    assert!(node.services.target(&app).is_none());
+    let myapp: ServiceId = "tls:myapp".parse().unwrap();
+    assert!(node.services.target(&myapp).is_none());
     assert!(node.node.shares().configured().is_empty());
 
-    let out = run_expose(&home, spec("app", 8443)).await.unwrap();
+    let out = run_expose(&home, spec("myapp", 8443)).await.unwrap();
     assert!(
-        out.contains("exposed app (blind): tls:app -> 127.0.0.1:8443"),
+        out.contains("exposed myapp (blind): tls:myapp -> 127.0.0.1:8443"),
         "{out}"
     );
     assert!(out.contains("the running node advertises it now"), "{out}");
@@ -529,14 +532,14 @@ async fn a_running_node_serves_and_advertises_a_new_share_at_once_and_a_restart_
         "{out}"
     );
     assert!(
-        out.contains("https://app.tunnel.example.org once the relay accepts it"),
+        out.contains("https://myapp.tunnel.example.org once the relay accepts it"),
         "{out}"
     );
     assert!(!out.contains("no node is running"), "{out}");
 
     // The node: the service is served from the new target, the share is configured.
     assert_eq!(
-        node.services.target(&app).unwrap().to_string(),
+        node.services.target(&myapp).unwrap().to_string(),
         "127.0.0.1:8443"
     );
     assert_eq!(node.node.shares().configured().len(), 1);
@@ -544,10 +547,10 @@ async fn a_running_node_serves_and_advertises_a_new_share_at_once_and_a_restart_
     let text = config_text(&home);
     assert!(text.starts_with("# written by hand\n"), "{text}");
     assert!(
-        text.contains("\"tls:app\" = \"127.0.0.1:8443\"  # menzil expose"),
+        text.contains("\"tls:myapp\" = \"127.0.0.1:8443\"  # menzil expose"),
         "{text}"
     );
-    assert!(text.contains("[[share]]\nname = \"app\""), "{text}");
+    assert!(text.contains("[[share]]\nname = \"myapp\""), "{text}");
     // A restart reads the same thing from the file.
     let reread = Config::load(&home).unwrap();
     assert_eq!(reread.shares().unwrap(), node.node.shares().configured());
@@ -556,36 +559,36 @@ async fn a_running_node_serves_and_advertises_a_new_share_at_once_and_a_restart_
     let list = run_list(&home).await.unwrap();
     assert!(list.contains("relay: not attached"), "{list}");
     assert!(
-        list.contains("app: blind tls:app -> 127.0.0.1:8443"),
+        list.contains("myapp: blind tls:myapp -> 127.0.0.1:8443"),
         "{list}"
     );
     let socket = crate::node_cmd::agent_socket_path(&home, &reread);
     let status = crate::agent::query_node_status(&socket).await.unwrap();
     assert_eq!(status.shares.len(), 1);
-    assert_eq!(status.shares[0].label, "app");
+    assert_eq!(status.shares[0].label, "myapp");
     assert_eq!(status.shares[0].state, ShareState::Offline);
     assert_eq!(status.shares[0].target.as_deref(), Some("127.0.0.1:8443"));
 
     // The same again changes nothing; another port is refused, then replaced.
-    let again = run_expose(&home, spec("app", 8443)).await.unwrap();
+    let again = run_expose(&home, spec("myapp", 8443)).await.unwrap();
     assert!(again.contains("is exposed as asked already"), "{again}");
     let error = format!(
         "{:#}",
-        run_expose(&home, spec("app", 9000)).await.unwrap_err()
+        run_expose(&home, spec("myapp", 9000)).await.unwrap_err()
     );
     assert!(
         error.contains("exists already") && error.contains("--replace"),
         "{error}"
     );
     assert_eq!(
-        node.services.target(&app).unwrap().to_string(),
+        node.services.target(&myapp).unwrap().to_string(),
         "127.0.0.1:8443"
     );
-    let mut replace = spec("app", 9000);
+    let mut replace = spec("myapp", 9000);
     replace.replace = true;
     run_expose(&home, replace).await.unwrap();
     assert_eq!(
-        node.services.target(&app).unwrap().to_string(),
+        node.services.target(&myapp).unwrap().to_string(),
         "127.0.0.1:9000"
     );
     assert_eq!(node.node.shares().configured().len(), 1);
@@ -599,21 +602,21 @@ async fn a_running_node_serves_and_advertises_a_new_share_at_once_and_a_restart_
     assert_eq!(config_text(&home), before);
 
     // Removing: the share and the service made for it go, the file is back to what it was.
-    let out = run_unexpose(&home, "app").await.unwrap();
+    let out = run_unexpose(&home, "myapp").await.unwrap();
     assert!(
-        out.contains("removed the share app") && out.contains("stopped advertising"),
+        out.contains("removed the share myapp") && out.contains("stopped advertising"),
         "{out}"
     );
-    assert!(node.services.target(&app).is_none());
+    assert!(node.services.target(&myapp).is_none());
     assert!(node.node.shares().configured().is_empty());
     let text = config_text(&home);
     assert!(
-        !text.contains("tls:app") && !text.contains("[[share]]"),
+        !text.contains("tls:myapp") && !text.contains("[[share]]"),
         "{text}"
     );
     assert!(text.contains("\"tcp:ssh\" = \"127.0.0.1:22\""), "{text}");
-    let error = format!("{:#}", run_unexpose(&home, "app").await.unwrap_err());
-    assert!(error.contains("no share named \"app\""), "{error}");
+    let error = format!("{:#}", run_unexpose(&home, "myapp").await.unwrap_err());
+    assert!(error.contains("no share named \"myapp\""), "{error}");
     // The config lock is not left behind by any of it.
     drop(home.lock_config().unwrap());
 }
@@ -623,29 +626,32 @@ async fn with_no_node_expose_edits_the_file_alone_and_says_so() {
     let dir = tempfile::tempdir().unwrap();
     let home = Home::new(dir.path().join("home"));
     plain_config(&home, dir.path(), "");
-    let out = run_expose(&home, spec("app", 8443)).await.unwrap();
+    let out = run_expose(&home, spec("myapp", 8443)).await.unwrap();
     assert!(
         out.contains("no node is running: only config.toml was changed"),
         "{out}"
     );
-    assert!(out.contains("exposed app (blind)"), "{out}");
+    assert!(out.contains("exposed myapp (blind)"), "{out}");
     assert!(
-        out.contains("https://app.tunnel.example.org once the relay accepts it"),
+        out.contains("https://myapp.tunnel.example.org once the relay accepts it"),
         "{out}"
     );
     let config = Config::load(&home).unwrap();
     assert_eq!(config.shares().unwrap().len(), 1);
     let list = run_list(&home).await.unwrap();
     assert!(
-        list.contains("app: blind tls:app -> 127.0.0.1:8443"),
+        list.contains("myapp: blind tls:myapp -> 127.0.0.1:8443"),
         "{list}"
     );
     assert!(list.contains("no node is running"), "{list}");
     assert!(!list.contains("relay:"), "{list}");
     // The same error texts as with a node.
-    let error = format!("{:#}", run_expose(&home, spec("app", 9)).await.unwrap_err());
+    let error = format!(
+        "{:#}",
+        run_expose(&home, spec("myapp", 9)).await.unwrap_err()
+    );
     assert!(error.contains("exists already"), "{error}");
-    let out = run_unexpose(&home, "app").await.unwrap();
+    let out = run_unexpose(&home, "myapp").await.unwrap();
     assert!(
         out.contains("no node is running: only config.toml was changed"),
         "{out}"
@@ -659,7 +665,7 @@ async fn with_no_node_expose_edits_the_file_alone_and_says_so() {
     );
     // A file that is not valid stops the command with the reason, whoever is asked.
     std::fs::write(home.config_path(), "raley = 1\n").unwrap();
-    assert!(run_expose(&home, spec("app", 1)).await.is_err());
+    assert!(run_expose(&home, spec("myapp", 1)).await.is_err());
     assert_eq!(config_text(&home), "raley = 1\n");
 }
 
@@ -774,7 +780,7 @@ fn the_file_is_written_atomically_readable_by_its_owner_only_and_a_link_stays_a_
     let dir = tempfile::tempdir().unwrap();
     let home = Home::new(dir.path().join("home"));
     plain_config(&home, dir.path(), "");
-    expose(&home, &spec("app", 1), None).unwrap();
+    expose(&home, &spec("myapp", 1), None).unwrap();
     let mode = std::fs::metadata(home.config_path()).unwrap().mode() & 0o777;
     assert_eq!(mode, 0o600);
     let leftovers: Vec<_> = std::fs::read_dir(home.root())
@@ -807,7 +813,7 @@ fn a_failed_edit_leaves_the_file_as_it_was() {
     let home = Home::new(dir.path().join("home"));
     plain_config(&home, dir.path(), "");
     let before = config_text(&home);
-    let mut refused = spec("app", 1);
+    let mut refused = spec("myapp", 1);
     refused.mode = ExposeMode::Terminated;
     refused.alpn = vec!["h2".to_string()];
     assert!(expose(&home, &refused, None).is_err());
@@ -831,37 +837,37 @@ fn each_share_shows_what_the_relay_answered_and_why() {
     let services = LocalServices::new();
     services
         .set_target(
-            "tls:app".parse().unwrap(),
+            "tls:myapp".parse().unwrap(),
             menzil_node::LocalTarget::new("127.0.0.1", 8443),
         )
         .unwrap();
-    let (app, web, db, ssh) = (
-        share_of("app", "tls:app"),
+    let (myapp, web, db, ssh) = (
+        share_of("myapp", "tls:myapp"),
         share_of("web", "tls:web"),
         share_of("db", "tls:db"),
         share_of("ssh", "tcp:ssh"),
     );
     let snapshot = ShareSnapshot {
-        sent: vec![app.clone(), web.clone(), ssh.clone()],
+        sent: vec![myapp.clone(), web.clone(), ssh.clone()],
         acked: true,
-        accepted: vec![app.clone()],
+        accepted: vec![myapp.clone()],
         rejected: vec![RejectedShare {
             name: "web".into(),
             reason: "label_taken".into(),
         }],
         names: vec![
-            "app".into(),
-            "app.ali".into(),
+            "myapp".into(),
+            "myapp.ali".into(),
             "apple".into(),
             "other.zed".into(),
         ],
         share_domain: None,
     };
-    let configured = [app.clone(), web, db, ssh];
+    let configured = [myapp.clone(), web, db, ssh];
     let views = views_from(&configured, &snapshot, &services, true);
     assert_eq!(views[0].state, ShareState::Accepted);
     // The names of this label only: not `apple`, not another share's.
-    assert_eq!(views[0].names, ["app", "app.ali"]);
+    assert_eq!(views[0].names, ["myapp", "myapp.ali"]);
     assert_eq!(views[0].target.as_deref(), Some("127.0.0.1:8443"));
     assert_eq!(views[1].state, ShareState::Rejected);
     assert_eq!(views[1].reason.as_deref(), Some("label_taken"));
@@ -886,7 +892,7 @@ fn each_share_shows_what_the_relay_answered_and_why() {
             .all(|v| v.state == ShareState::Offline && v.names.is_empty())
     );
     // A changed share (another ALPN) is not the one the relay accepted.
-    let mut changed = app;
+    let mut changed = myapp;
     changed.alpn = vec!["h2".into()];
     assert_eq!(
         views_from(&[changed], &snapshot, &services, true)[0].state,
@@ -921,11 +927,11 @@ fn cert(name: &str, state: CertViewState) -> CertView {
 #[test]
 fn the_certificates_of_a_share_ride_on_its_line_as_fixed_words() {
     use menzil_node::acme::FailureKind;
-    let mut full = view("app", ShareState::Accepted);
-    full.names = vec!["app".into(), "app.ali".into()];
+    let mut full = view("myapp", ShareState::Accepted);
+    full.names = vec!["myapp".into(), "myapp.ali".into()];
     full.certs = vec![
-        cert("app.share.test", CertViewState::Valid(1_800_000_000)),
-        cert("app.ali.share.test", CertViewState::Renewing),
+        cert("myapp.share.test", CertViewState::Valid(1_800_000_000)),
+        cert("myapp.ali.share.test", CertViewState::Renewing),
         cert("x.share.test", CertViewState::None),
         cert(
             "y.share.test",
@@ -939,7 +945,7 @@ fn the_certificates_of_a_share_ride_on_its_line_as_fixed_words() {
     let line = full.to_line();
     assert!(
         line.contains(
-            " certs=app.share.test=valid:1800000000,app.ali.share.test=renewing,x.share.test=none,y.share.test=failed:validation,z.share.test=failed:domain_mismatch"
+            " certs=myapp.share.test=valid:1800000000,myapp.ali.share.test=renewing,x.share.test=none,y.share.test=failed:validation,z.share.test=failed:domain_mismatch"
         ),
         "{line}"
     );
@@ -986,7 +992,7 @@ fn the_certificates_of_a_share_ride_on_its_line_as_fixed_words() {
 #[test]
 fn certificates_are_listed_under_the_share_in_words() {
     use menzil_node::acme::FailureKind;
-    let mut shown = view("app", ShareState::Accepted);
+    let mut shown = view("myapp", ShareState::Accepted);
     shown.certs = vec![
         cert("a.share.test", CertViewState::Valid(1_800_000_000)),
         cert("b.share.test", CertViewState::None),
@@ -1014,15 +1020,15 @@ fn certificates_are_listed_under_the_share_in_words() {
     );
     assert!(status.contains("; cert d.share.test: failed: the CA could not be reached"));
     // No certificates: nothing added.
-    let plain = render_list(&[view("app", ShareState::Accepted)], None);
+    let plain = render_list(&[view("myapp", ShareState::Accepted)], None);
     assert!(!plain.contains("cert "), "{plain}");
 }
 
 #[test]
 fn a_share_line_round_trips_and_text_from_the_relay_cannot_break_it() {
-    let mut full = view("app", ShareState::Accepted);
+    let mut full = view("myapp", ShareState::Accepted);
     full.alpn = vec!["h2".into(), "http/1.1".into()];
-    full.names = vec!["app".into(), "app.ali".into()];
+    full.names = vec!["myapp".into(), "myapp.ali".into()];
     assert_eq!(ShareView::from_line(&full.to_line()).unwrap(), full);
     let mut rejected = view("web", ShareState::Rejected);
     rejected.reason = Some("reserved name: it is the relay's".into());
@@ -1044,7 +1050,7 @@ fn a_share_line_round_trips_and_text_from_the_relay_cannot_break_it() {
     assert_eq!(back.label, "web");
     // A line from an agent that lies about its fields is not a share.
     for line in [
-        "share label=App mode=blind service=tls:a state=accepted",
+        "share label=Myapp mode=blind service=tls:a state=accepted",
         "share label=a mode=blind service=nonsense state=accepted",
         "share label=a mode=other service=tls:a state=accepted",
         "share label=a mode=blind service=tls:a state=maybe",
@@ -1063,7 +1069,7 @@ fn a_share_line_round_trips_and_text_from_the_relay_cannot_break_it() {
 fn the_reply_to_expose_and_unexpose_round_trips() {
     let reply = ExposeReply {
         changed: true,
-        share: view("app", ShareState::Pending),
+        share: view("myapp", ShareState::Pending),
         notes: vec!["tls:old is still in [services]".into()],
     };
     let lines: Vec<String> = reply.to_lines().lines().map(str::to_string).collect();
@@ -1081,30 +1087,30 @@ fn the_reply_to_expose_and_unexpose_round_trips() {
 
 #[test]
 fn the_public_address_is_built_from_what_the_relay_accepted_and_the_share_domain() {
-    let mut accepted = view("app", ShareState::Accepted);
-    accepted.names = vec!["app".into(), "app.ali".into()];
+    let mut accepted = view("myapp", ShareState::Accepted);
+    accepted.names = vec!["myapp".into(), "myapp.ali".into()];
     assert_eq!(
         public_address(&accepted, Some("tunnel.example.org")),
-        "https://app.tunnel.example.org, https://app.ali.tunnel.example.org"
+        "https://myapp.tunnel.example.org, https://myapp.ali.tunnel.example.org"
     );
     // Without the domain: the relay's names and a way to get whole addresses.
     let text = public_address(&accepted, None);
     assert!(
-        text.contains("app.<share domain>, app.ali.<share domain>")
+        text.contains("myapp.<share domain>, myapp.ali.<share domain>")
             && text.contains("share_domain"),
         "{text}"
     );
     // Not accepted yet: what it will be, and the tenant form.
-    let pending = view("app", ShareState::Pending);
+    let pending = view("myapp", ShareState::Pending);
     let text = public_address(&pending, Some("tunnel.example.org"));
     assert!(
-        text.contains("https://app.tunnel.example.org once the relay accepts it")
-            && text.contains("app.<tenant>.tunnel.example.org"),
+        text.contains("https://myapp.tunnel.example.org once the relay accepts it")
+            && text.contains("myapp.<tenant>.tunnel.example.org"),
         "{text}"
     );
     let text = public_address(&pending, None);
     assert!(
-        text.contains("app.<the relay's share domain>") && text.contains("share_domain"),
+        text.contains("myapp.<the relay's share domain>") && text.contains("share_domain"),
         "{text}"
     );
     // A tcp share is reached with TLS and a name, not as https.
@@ -1120,8 +1126,8 @@ fn the_public_address_is_built_from_what_the_relay_accepted_and_the_share_domain
 
 #[test]
 fn the_list_and_the_status_lines_say_accepted_or_rejected_with_the_relays_reason() {
-    let mut accepted = view("app", ShareState::Accepted);
-    accepted.names = vec!["app.ali".into()];
+    let mut accepted = view("myapp", ShareState::Accepted);
+    accepted.names = vec!["myapp.ali".into()];
     accepted.alpn = vec!["h2".into()];
     let mut rejected = view("web", ShareState::Rejected);
     rejected.reason = Some("label_taken".into());
@@ -1133,7 +1139,7 @@ fn the_list_and_the_status_lines_say_accepted_or_rejected_with_the_relays_reason
     ];
     let list = render_list(&views, Some("t.example.org"));
     assert!(
-        list.contains("app: blind tls:app -> 127.0.0.1:8443, alpn h2\n  accepted by the relay; https://app.ali.t.example.org\n"),
+        list.contains("myapp: blind tls:myapp -> 127.0.0.1:8443, alpn h2\n  accepted by the relay; https://myapp.ali.t.example.org\n"),
         "{list}"
     );
     assert!(
@@ -1148,7 +1154,7 @@ fn the_list_and_the_status_lines_say_accepted_or_rejected_with_the_relays_reason
         "{list}"
     );
     let status = render_status(&views, Some("t.example.org"));
-    assert!(status.contains("share app: blind tls:app -> 127.0.0.1:8443; accepted by the relay; https://app.ali.t.example.org\n"), "{status}");
+    assert!(status.contains("share myapp: blind tls:myapp -> 127.0.0.1:8443; accepted by the relay; https://myapp.ali.t.example.org\n"), "{status}");
     assert!(
         status.contains(
             "share web: blind tls:web -> 127.0.0.1:8443; REJECTED by the relay: label_taken;"
@@ -1169,12 +1175,12 @@ fn the_list_and_the_status_lines_say_accepted_or_rejected_with_the_relays_reason
 
 #[test]
 fn a_target_that_is_not_loopback_gets_a_warning() {
-    let mut open = spec("app", 80);
+    let mut open = spec("myapp", 80);
     open.host = "10.0.0.5".into();
     let out = render_exposed(
         &open,
         true,
-        &view("app", ShareState::Pending),
+        &view("myapp", ShareState::Pending),
         &[],
         true,
         None,
@@ -1184,9 +1190,9 @@ fn a_target_that_is_not_loopback_gets_a_warning() {
         "{out}"
     );
     let out = render_exposed(
-        &spec("app", 80),
+        &spec("myapp", 80),
         true,
-        &view("app", ShareState::Pending),
+        &view("myapp", ShareState::Pending),
         &[],
         true,
         None,
@@ -1229,9 +1235,9 @@ fn a_terminated_share_is_written_as_http_and_the_output_says_the_relay_reads_it(
     assert!(!out.contains("must speak TLS itself"), "{out}");
     // A blind share never gets that warning.
     let blind = render_exposed(
-        &spec("app", 80),
+        &spec("myapp", 80),
         true,
-        &view("app", ShareState::Pending),
+        &view("myapp", ShareState::Pending),
         &[],
         true,
         None,

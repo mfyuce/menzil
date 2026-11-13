@@ -57,9 +57,9 @@ fn a_label_is_given_listed_moved_and_taken_back_from_the_command_line() {
     );
 
     // Add: the words say what happened and what the relay and the members need.
-    let added = ok(menzil(&owner, &["label", "add", "app", "phone"])).stdout;
+    let added = ok(menzil(&owner, &["label", "add", "myapp", "phone"])).stdout;
     assert!(
-        added.contains("label app now belongs to phone")
+        added.contains("label myapp now belongs to phone")
             && added.contains("documents are now #3")
             && added.contains("menzil token --for-relay")
             && added.contains("within 15 seconds")
@@ -67,15 +67,15 @@ fn a_label_is_given_listed_moved_and_taken_back_from_the_command_line() {
         "{added}"
     );
     let listed = ok(menzil(&owner, &["label", "list"])).stdout;
-    assert_eq!(listed.trim(), "app  phone", "{listed}");
+    assert_eq!(listed.trim(), "myapp  phone", "{listed}");
 
     // Refusals are plain, exit non zero, and print no token.
     for (args, words) in [
-        (&["label", "add", "App", "phone"][..], "lowercase"),
+        (&["label", "add", "Myapp", "phone"][..], "lowercase"),
         (&["label", "add", "www", "phone"], "reserved"),
         (&["label", "add", "web", "tablet"], "no member called"),
         (
-            &["label", "add", "app", "laptop"],
+            &["label", "add", "myapp", "laptop"],
             "belongs to another member",
         ),
         (&["label", "remove", "nope"], "no label matches"),
@@ -91,20 +91,20 @@ fn a_label_is_given_listed_moved_and_taken_back_from_the_command_line() {
     // The explicit move, then the name goes back.
     let moved = ok(menzil(
         &owner,
-        &["label", "add", "app", "laptop", "--replace"],
+        &["label", "add", "myapp", "laptop", "--replace"],
     ))
     .stdout;
     assert!(
-        moved.contains("label app now belongs to laptop") && moved.contains("moved from phone"),
+        moved.contains("label myapp now belongs to laptop") && moved.contains("moved from phone"),
         "{moved}"
     );
     assert_eq!(
         ok(menzil(&owner, &["label", "list"])).stdout.trim(),
-        "app  laptop"
+        "myapp  laptop"
     );
-    let removed = ok(menzil(&owner, &["label", "remove", "app", "laptop"])).stdout;
+    let removed = ok(menzil(&owner, &["label", "remove", "myapp", "laptop"])).stdout;
     assert!(
-        removed.contains("took label app back") && removed.contains("documents are now #5"),
+        removed.contains("took label myapp back") && removed.contains("documents are now #5"),
         "{removed}"
     );
     assert!(

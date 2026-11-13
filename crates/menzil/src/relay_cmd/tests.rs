@@ -1705,8 +1705,8 @@ fn names_file(relay: &Home) -> String {
 /// name, the one that held it can (design 2.2, rules 8 and 9).
 #[tokio::test]
 async fn the_quarantine_of_a_released_name_survives_a_restart() {
-    let (net_a, token_a) = labeled_network(&[("app", 1)]);
-    let (net_b, token_b) = labeled_network(&[("app", 2)]);
+    let (net_a, token_a) = labeled_network(&[("myapp", 1)]);
+    let (net_b, token_b) = labeled_network(&[("myapp", 2)]);
     let (dir, relay) = relay_machine();
     add_network(&relay, &token_a, clock()).unwrap();
     add_network(&relay, &token_b, clock()).unwrap();
@@ -1717,13 +1717,13 @@ async fn the_quarantine_of_a_released_name_survives_a_restart() {
     );
 
     let t0 = clock();
-    let ack = advertise_now(&running, &net_a, 1, &["app"], t0);
-    assert_eq!(ack.names, vec!["app"]);
+    let ack = advertise_now(&running, &net_a, 1, &["myapp"], t0);
+    assert_eq!(ack.names, vec!["myapp"]);
     assert!(running.flush_rosters(FLUSH));
     let text = names_file(&relay);
     assert!(text.starts_with("menzil-names-state 1\n"), "{text}");
     assert!(
-        text.contains(&format!("name app - {} {t0} {t0}", net_a.to_hex())),
+        text.contains(&format!("name myapp - {} {t0} {t0}", net_a.to_hex())),
         "{text}"
     );
 
@@ -1739,10 +1739,10 @@ async fn the_quarantine_of_a_released_name_survives_a_restart() {
     );
     assert!(running.flush_rosters(FLUSH));
     let text = names_file(&relay);
-    assert!(!text.contains("\nname app"), "{text}");
+    assert!(!text.contains("\nname myapp"), "{text}");
     assert!(
         text.contains(&format!(
-            "quarantine flat app {} - {}",
+            "quarantine flat myapp {} - {}",
             t0 + 90 * DAY,
             net_a.to_hex()
         )),
@@ -1753,11 +1753,11 @@ async fn the_quarantine_of_a_released_name_survives_a_restart() {
     // Restart: the file is the relay's memory.
     let restarted = running_on(dir.path(), &relay).await;
     let later = t0 + 100 * DAY;
-    let theirs = advertise_now(&restarted, &net_b, 2, &["app"], later);
+    let theirs = advertise_now(&restarted, &net_b, 2, &["myapp"], later);
     assert!(theirs.names.is_empty());
     assert_eq!(theirs.rejected[0].reason, "quarantined");
-    let hers = advertise_now(&restarted, &net_a, 1, &["app"], later);
-    assert_eq!(hers.names, vec!["app"]);
+    let hers = advertise_now(&restarted, &net_a, 1, &["myapp"], later);
+    assert_eq!(hers.names, vec!["myapp"]);
     restarted.stop();
 }
 
@@ -1808,7 +1808,7 @@ async fn a_damaged_name_state_fails_closed_with_a_clear_error() {
     for bad in [
         "garbage\n".to_string(),
         String::new(),
-        "menzil-names-state 1\nname app - nothex 1 2\n".to_string(),
+        "menzil-names-state 1\nname myapp - nothex 1 2\n".to_string(),
     ] {
         fs::write(&path, &bad).unwrap();
         let error = match start(&relay, &run_options(dir.path())).await {
@@ -1892,7 +1892,7 @@ fn the_name_state_is_written_atomically() {
 /// writing its own part, keeps the operator's slug entries.
 #[tokio::test]
 async fn the_legacy_quarantine_moves_into_the_name_state_and_the_relay_keeps_the_slugs() {
-    let (net_a, token_a) = labeled_network(&[("app", 1)]);
+    let (net_a, token_a) = labeled_network(&[("myapp", 1)]);
     let (_b, _ob, _id_b, token_b) = another_network();
     let (dir, relay) = relay_machine();
     add_network(&relay, &token_a, clock()).unwrap();
@@ -1916,12 +1916,12 @@ async fn the_legacy_quarantine_moves_into_the_name_state_and_the_relay_keeps_the
     add_network_to(&relay, &token_b, clock(), Some("ali")).unwrap();
     remove_tenant(&relay, "ali", clock() + 5).unwrap();
     assert!(!legacy.exists());
-    advertise_now(&running, &net_a, 1, &["app"], clock());
+    advertise_now(&running, &net_a, 1, &["myapp"], clock());
     assert!(running.flush_rosters(FLUSH));
     let text = names_file(&relay);
     assert!(text.contains("quarantine slug oldone"), "{text}");
     assert!(text.contains("quarantine slug ali"), "{text}");
-    assert!(text.contains("name app - "), "{text}");
+    assert!(text.contains("name myapp - "), "{text}");
     let listing = render_tenants(&relay, clock() + DAY).unwrap();
     assert!(
         listing.contains("quarantine: ali") && listing.contains("quarantine: oldone"),
@@ -1934,19 +1934,19 @@ async fn the_legacy_quarantine_moves_into_the_name_state_and_the_relay_keeps_the
 /// flat one into quarantine bound to that network.
 #[tokio::test]
 async fn removing_a_network_releases_its_names_at_the_next_reload() {
-    let (net_a, token_a) = labeled_network(&[("app", 1)]);
+    let (net_a, token_a) = labeled_network(&[("myapp", 1)]);
     let (_b, token_b) = labeled_network(&[("other", 2)]);
     let (dir, relay) = relay_machine();
     add_network(&relay, &token_a, clock()).unwrap();
     add_network(&relay, &token_b, clock()).unwrap();
     let running = running_on(dir.path(), &relay).await;
-    advertise_now(&running, &net_a, 1, &["app"], clock());
+    advertise_now(&running, &net_a, 1, &["myapp"], clock());
     remove_network(&relay, &net_a.to_hex()).unwrap();
     reload_once(&running.relay, &relay, &mut Vec::new());
     // A session still holds the name when the network goes (it ends a moment later): the
     // reload leaves it, as the sweep leaves a held name (round T5, L4)...
     assert!(running.flush_rosters(FLUSH));
-    assert!(names_file(&relay).contains("\nname app "));
+    assert!(names_file(&relay).contains("\nname myapp "));
     // ...and releases it at the pass after the session has gone.
     running
         .relay
@@ -1955,8 +1955,8 @@ async fn removing_a_network_releases_its_names_at_the_next_reload() {
     reload_once(&running.relay, &relay, &mut Vec::new());
     assert!(running.flush_rosters(FLUSH));
     let text = names_file(&relay);
-    assert!(!text.contains("\nname app"), "{text}");
-    assert!(text.contains("quarantine flat app"), "{text}");
+    assert!(!text.contains("\nname myapp"), "{text}");
+    assert!(text.contains("quarantine flat myapp"), "{text}");
     running.stop();
 }
 
@@ -2195,24 +2195,24 @@ fn t5_slugs_and_grants_are_judged_against_quarantined_and_tenant_names() {
 /// set, so that in between they are not the default tenant's.
 #[tokio::test]
 async fn t5_a_reload_drops_a_removed_tenants_networks_before_it_swaps_the_book() {
-    let (net_a, token_a) = labeled_network(&[("app", 1)]);
-    let (net_d, token_d) = labeled_network(&[("app", 2)]);
+    let (net_a, token_a) = labeled_network(&[("myapp", 1)]);
+    let (net_d, token_d) = labeled_network(&[("myapp", 2)]);
     let (dir, relay) = relay_machine();
     add_network_to(&relay, &token_a, clock(), Some("ali")).unwrap();
     add_network(&relay, &token_d, clock()).unwrap();
     let running = running_on(dir.path(), &relay).await;
     // The default tenant's node holds `app`, and is offline for a moment.
     assert_eq!(
-        advertise_now(&running, &net_d, 2, &["app"], clock()).names,
-        ["app"]
+        advertise_now(&running, &net_d, 2, &["myapp"], clock()).names,
+        ["myapp"]
     );
     running
         .relay
         .labels()
         .clear_for(&NodeId::from([2u8; 32]), clock());
     assert_eq!(
-        advertise_now(&running, &net_a, 1, &["app"], clock()).names,
-        ["app.ali"]
+        advertise_now(&running, &net_a, 1, &["myapp"], clock()).names,
+        ["myapp.ali"]
     );
     running
         .relay
@@ -2232,17 +2232,17 @@ async fn t5_a_reload_drops_a_removed_tenants_networks_before_it_swaps_the_book()
             Some("ali"),
             "the old book still stands at this point"
         );
-        let ack = advertise_now(&running, &net_a, 1, &["app"], clock());
+        let ack = advertise_now(&running, &net_a, 1, &["myapp"], clock());
         assert!(ack.names.is_empty(), "{ack:?}");
     });
     assert!(looked);
     // The default tenant's name is where it was, and its node can take it again.
     let state = running.relay.labels().state();
-    assert_eq!(state.names["app"].network, net_d);
-    assert!(!state.quarantine.contains_key("app"));
+    assert_eq!(state.names["myapp"].network, net_d);
+    assert!(!state.quarantine.contains_key("myapp"));
     assert_eq!(
-        advertise_now(&running, &net_d, 2, &["app"], clock()).names,
-        ["app"]
+        advertise_now(&running, &net_d, 2, &["myapp"], clock()).names,
+        ["myapp"]
     );
     running.stop();
 }
@@ -2252,7 +2252,7 @@ async fn t5_a_reload_drops_a_removed_tenants_networks_before_it_swaps_the_book()
 /// ended are not carried on by a write.
 #[tokio::test]
 async fn t5_the_old_quarantine_file_is_validated_and_ended_slugs_are_pruned() {
-    let (net_a, token_a) = labeled_network(&[("app", 1)]);
+    let (net_a, token_a) = labeled_network(&[("myapp", 1)]);
     let (dir, relay) = relay_machine();
     add_network(&relay, &token_a, clock()).unwrap();
     fs::create_dir_all(tenants_dir(&relay)).unwrap();
@@ -2283,7 +2283,7 @@ async fn t5_the_old_quarantine_file_is_validated_and_ended_slugs_are_pruned() {
     );
     assert!(menzil_relay::NameState::parse(&text).is_ok());
     // The relay's own write drops the slug whose quarantine ended and keeps the others.
-    advertise_now(&running, &net_a, 1, &["app"], clock());
+    advertise_now(&running, &net_a, 1, &["myapp"], clock());
     assert!(running.flush_rosters(FLUSH));
     let text = names_file(&relay);
     assert!(!text.contains("quarantine slug expired "), "{text}");
@@ -2408,7 +2408,7 @@ async fn a_relay_with_a_share_domain_refuses_unknown_names_and_serves_port_80_on
         .unwrap();
     let http = running.http_addr.expect("asked for");
     let mut tcp = tokio::net::TcpStream::connect(http).await.unwrap();
-    tcp.write_all(b"GET /x HTTP/1.1\r\nHost: app.s.example\r\n\r\n")
+    tcp.write_all(b"GET /x HTTP/1.1\r\nHost: myapp.s.example\r\n\r\n")
         .await
         .unwrap();
     let mut got = Vec::new();
@@ -2418,7 +2418,7 @@ async fn a_relay_with_a_share_domain_refuses_unknown_names_and_serves_port_80_on
         .unwrap();
     assert_eq!(
         String::from_utf8(got).unwrap(),
-        "HTTP/1.1 301 Moved Permanently\r\nLocation: https://app.s.example/x\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        "HTTP/1.1 301 Moved Permanently\r\nLocation: https://myapp.s.example/x\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
     );
     running.stop();
 }

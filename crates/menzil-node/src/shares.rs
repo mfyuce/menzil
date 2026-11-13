@@ -589,15 +589,15 @@ mod tests {
 
     #[test]
     fn names_are_one_lowercase_ldh_label() {
-        for good in ["app", "a", "my-app-2", "0day", &"a".repeat(63)] {
+        for good in ["myapp", "a", "my-myapp-2", "0day", &"a".repeat(63)] {
             assert_eq!(check_name(good), Ok(()), "{good}");
         }
         for (bad, word) in [
             ("", "empty"),
-            ("App", "uppercase"),
+            ("Myapp", "uppercase"),
             ("my_app", "letters, digits and hyphens"),
-            ("-app", "hyphen"),
-            ("app-", "hyphen"),
+            ("-myapp", "hyphen"),
+            ("myapp-", "hyphen"),
             ("a.b", "dot"),
             ("caf\u{e9}", "letters, digits and hyphens"),
             (&"a".repeat(64), "63"),

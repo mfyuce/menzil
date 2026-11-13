@@ -54,7 +54,7 @@ fn domains(jobs: &BTreeSet<AcmeJob>) -> Vec<String> {
 #[test]
 fn only_a_wanted_share_and_only_a_name_of_the_ack_is_a_job_under_the_acks_domain() {
     let shares = [
-        blind("app", &["h2", "acme-tls/1"]),
+        blind("myapp", &["h2", "acme-tls/1"]),
         blind("plain", &["h2"]),
         blind("any", &[]),
         share("web", ShareMode::Terminated, "http:web", &[]),
@@ -62,8 +62,8 @@ fn only_a_wanted_share_and_only_a_name_of_the_ack_is_a_job_under_the_acks_domain
         blind("refused", &["acme-tls/1"]),
     ];
     let names = [
-        "app",
-        "app.ali",
+        "myapp",
+        "myapp.ali",
         "plain",
         "any",
         "web",
@@ -74,38 +74,42 @@ fn only_a_wanted_share_and_only_a_name_of_the_ack_is_a_job_under_the_acks_domain
     ];
     let book = answered(
         &shares,
-        &ack(&["app", "plain", "any", "web", "unlisted"], &names, Some(H)),
+        &ack(
+            &["myapp", "plain", "any", "web", "unlisted"],
+            &names,
+            Some(H),
+        ),
     );
     let jobs = candidate_jobs(&book.snapshot());
-    assert_eq!(domains(&jobs), ["app.ali.share.test", "app.share.test"]);
-    assert!(jobs.iter().all(|job| job.share == "app"));
+    assert_eq!(domains(&jobs), ["myapp.ali.share.test", "myapp.share.test"]);
+    assert!(jobs.iter().all(|job| job.share == "myapp"));
 }
 
 #[test]
 fn no_job_without_an_ack_without_a_domain_or_for_an_odd_name() {
-    let shares = [blind("app", &["acme-tls/1"])];
+    let shares = [blind("myapp", &["acme-tls/1"])];
     // Nothing answered yet.
     let book = ShareBook::new();
     book.note_sent(&shares);
     assert!(candidate_jobs(&book.snapshot()).is_empty());
     // An ACK without the share domain (an older relay): the node cannot name anything.
-    let book = answered(&shares, &ack(&["app"], &["app"], None));
+    let book = answered(&shares, &ack(&["myapp"], &["myapp"], None));
     assert!(candidate_jobs(&book.snapshot()).is_empty());
     // An ACK whose domain is not plausible is stored as none.
-    let book = answered(&shares, &ack(&["app"], &["app"], Some("Not A Domain")));
+    let book = answered(&shares, &ack(&["myapp"], &["myapp"], Some("Not A Domain")));
     assert!(candidate_jobs(&book.snapshot()).is_empty());
     // A name that is not `label` or `label.slug`, or that builds an unusable full name.
     let book = answered(
         &shares,
         &ack(
-            &["app"],
-            &["app.a.b", "app.", ".app", "app..x", "app.Ali", ""],
+            &["myapp"],
+            &["myapp.a.b", "myapp.", ".myapp", "myapp..x", "myapp.Ali", ""],
             Some(H),
         ),
     );
     assert!(candidate_jobs(&book.snapshot()).is_empty());
     // The end of the attachment ends every job.
-    let book = answered(&shares, &ack(&["app"], &["app"], Some(H)));
+    let book = answered(&shares, &ack(&["myapp"], &["myapp"], Some(H)));
     assert_eq!(candidate_jobs(&book.snapshot()).len(), 1);
     book.note_detached();
     assert!(candidate_jobs(&book.snapshot()).is_empty());
@@ -113,28 +117,32 @@ fn no_job_without_an_ack_without_a_domain_or_for_an_odd_name() {
 
 #[test]
 fn a_flood_of_names_is_cut_at_the_job_limit() {
-    let shares = [blind("app", &["acme-tls/1"])];
-    let many: Vec<String> = (0..200).map(|n| format!("app.t{n}")).collect();
+    let shares = [blind("myapp", &["acme-tls/1"])];
+    let many: Vec<String> = (0..200).map(|n| format!("myapp.t{n}")).collect();
     let names: Vec<&str> = many.iter().map(String::as_str).collect();
-    let book = answered(&shares, &ack(&["app"], &names, Some(H)));
+    let book = answered(&shares, &ack(&["myapp"], &names, Some(H)));
     assert_eq!(candidate_jobs(&book.snapshot()).len(), MAX_JOBS);
 }
 
 #[test]
 fn a_configured_share_domain_is_only_a_cross_check() {
-    let shares = [blind("app", &["acme-tls/1"])];
-    let book = answered(&shares, &ack(&["app"], &["app"], Some(H)));
+    let shares = [blind("myapp", &["acme-tls/1"])];
+    let book = answered(&shares, &ack(&["myapp"], &["myapp"], Some(H)));
     let snapshot = book.snapshot();
     // Not set, or the same (in any case): the jobs run.
     for configured in [None, Some("share.test"), Some("SHARE.test")] {
         let decided = plan(&snapshot, configured);
-        assert_eq!(domains(&decided.jobs), ["app.share.test"], "{configured:?}");
+        assert_eq!(
+            domains(&decided.jobs),
+            ["myapp.share.test"],
+            "{configured:?}"
+        );
         assert!(decided.blocked.is_empty() && decided.mismatch.is_none());
     }
     // Different: nothing runs, what would have is named, and the pair is reported.
     let decided = plan(&snapshot, Some("other.test"));
     assert!(decided.jobs.is_empty());
-    assert_eq!(domains(&decided.blocked), ["app.share.test"]);
+    assert_eq!(domains(&decided.blocked), ["myapp.share.test"]);
     assert_eq!(
         decided.mismatch,
         Some(DomainMismatch {
@@ -144,7 +152,7 @@ fn a_configured_share_domain_is_only_a_cross_check() {
     );
     // The configured domain is never used to build a name: with none from the relay there is
     // nothing, however it is set.
-    let book = answered(&shares, &ack(&["app"], &["app"], None));
+    let book = answered(&shares, &ack(&["myapp"], &["myapp"], None));
     let decided = plan(&book.snapshot(), Some("other.test"));
     assert!(decided.jobs.is_empty() && decided.blocked.is_empty() && decided.mismatch.is_none());
 }
@@ -268,14 +276,14 @@ async fn tasks_follow_the_relays_answer_start_stop_and_start_again() {
 
     // The ACK: only the wanted share and only the names it lists are ordered.
     let all = [
-        blind("app", &["acme-tls/1"]),
+        blind("myapp", &["acme-tls/1"]),
         blind("plain", &["h2"]),
         blind("unlisted", &["acme-tls/1"]),
         share("web", ShareMode::Terminated, "http:web", &[]),
     ];
     let first = ack(
-        &["app", "plain", "unlisted", "web"],
-        &["app", "app.ali", "plain", "web"],
+        &["myapp", "plain", "unlisted", "web"],
+        &["myapp", "myapp.ali", "plain", "web"],
         Some(H),
     );
     shares.note_sent(&all);
@@ -284,11 +292,11 @@ async fn tasks_follow_the_relays_answer_start_stop_and_start_again() {
     let counts = ca.counts();
     assert_eq!(
         counts.keys().cloned().collect::<Vec<_>>(),
-        ["app.ali.share.test", "app.share.test"],
+        ["myapp.ali.share.test", "myapp.share.test"],
         "{counts:?}"
     );
     assert_eq!(
-        state_of(&status, &scratch.0, "app.share.test"),
+        state_of(&status, &scratch.0, "myapp.share.test"),
         CertState::Failed(FailureKind::Validation)
     );
     #[cfg(unix)]
@@ -301,24 +309,24 @@ async fn tasks_follow_the_relays_answer_start_stop_and_start_again() {
     // A new ACK that no longer lists `app.ali`: its task stops, `app`'s goes on.
     shares.note_sent(&all);
     shares.note_ack(&ack(
-        &["app", "plain", "unlisted", "web"],
-        &["app", "plain", "web"],
+        &["myapp", "plain", "unlisted", "web"],
+        &["myapp", "plain", "web"],
         Some(H),
     ));
     minutes(2).await;
     assert_eq!(
-        state_of(&status, &scratch.0, "app.ali.share.test"),
+        state_of(&status, &scratch.0, "myapp.ali.share.test"),
         CertState::None
     );
     let before = ca.counts();
     minutes(180).await;
     let after = ca.counts();
     assert_eq!(
-        after["app.ali.share.test"], before["app.ali.share.test"],
+        after["myapp.ali.share.test"], before["myapp.ali.share.test"],
         "no order for a name the ACK dropped"
     );
     assert!(
-        after["app.share.test"] > before["app.share.test"],
+        after["myapp.share.test"] > before["myapp.share.test"],
         "the other name goes on: {before:?} then {after:?}"
     );
 
@@ -326,7 +334,7 @@ async fn tasks_follow_the_relays_answer_start_stop_and_start_again() {
     shares.note_detached();
     minutes(2).await;
     assert_eq!(
-        state_of(&status, &scratch.0, "app.share.test"),
+        state_of(&status, &scratch.0, "myapp.share.test"),
         CertState::None
     );
     let before = ca.counts();
@@ -339,8 +347,8 @@ async fn tasks_follow_the_relays_answer_start_stop_and_start_again() {
     minutes(10).await;
     let after = ca.counts();
     assert!(
-        after["app.share.test"] > before["app.share.test"]
-            && after["app.ali.share.test"] > before["app.ali.share.test"],
+        after["myapp.share.test"] > before["myapp.share.test"]
+            && after["myapp.ali.share.test"] > before["myapp.ali.share.test"],
         "{before:?} then {after:?}"
     );
 
@@ -356,7 +364,7 @@ async fn tasks_follow_the_relays_answer_start_stop_and_start_again() {
     shares.note_ack(&first);
     minutes(10).await;
     let running = ca.counts();
-    assert!(running["app.share.test"] > before["app.share.test"]);
+    assert!(running["myapp.share.test"] > before["myapp.share.test"]);
     supervisor.abort();
     let _ = supervisor.await;
     minutes(1).await;
@@ -386,8 +394,8 @@ async fn a_share_domain_that_differs_from_the_relays_orders_nothing_until_they_a
             move || configured.lock().unwrap().clone()
         },
     );
-    shares.note_sent(&[blind("app", &["acme-tls/1"])]);
-    shares.note_ack(&ack(&["app"], &["app"], Some(H)));
+    shares.note_sent(&[blind("myapp", &["acme-tls/1"])]);
+    shares.note_ack(&ack(&["myapp"], &["myapp"], Some(H)));
     minutes(10).await;
     assert!(ca.counts().is_empty(), "no order on a mismatch");
     assert!(
@@ -395,15 +403,15 @@ async fn a_share_domain_that_differs_from_the_relays_orders_nothing_until_they_a
         "not even an account key"
     );
     assert_eq!(
-        state_of(&status, &scratch.0, "app.share.test"),
+        state_of(&status, &scratch.0, "myapp.share.test"),
         CertState::Failed(FailureKind::DomainMismatch)
     );
     // The configuration is corrected (the 30 second look finds it): the order is made.
     *configured.lock().unwrap() = Some(H.to_string());
     minutes(10).await;
-    assert!(ca.counts().contains_key("app.share.test"));
+    assert!(ca.counts().contains_key("myapp.share.test"));
     assert_eq!(
-        state_of(&status, &scratch.0, "app.share.test"),
+        state_of(&status, &scratch.0, "myapp.share.test"),
         CertState::Failed(FailureKind::Validation)
     );
     // And an edit that makes them differ again stops it.
@@ -413,7 +421,7 @@ async fn a_share_domain_that_differs_from_the_relays_orders_nothing_until_they_a
     minutes(180).await;
     assert_eq!(ca.counts(), before);
     assert_eq!(
-        state_of(&status, &scratch.0, "app.share.test"),
+        state_of(&status, &scratch.0, "myapp.share.test"),
         CertState::Failed(FailureKind::DomainMismatch)
     );
     supervisor.abort();
@@ -439,12 +447,12 @@ async fn an_account_key_others_can_read_is_not_used_and_nothing_is_ordered() {
         status.clone(),
         || None,
     );
-    shares.note_sent(&[blind("app", &["acme-tls/1"])]);
-    shares.note_ack(&ack(&["app"], &["app"], Some(H)));
+    shares.note_sent(&[blind("myapp", &["acme-tls/1"])]);
+    shares.note_ack(&ack(&["myapp"], &["myapp"], Some(H)));
     minutes(5).await;
     assert!(ca.counts().is_empty());
     assert_eq!(
-        state_of(&status, &scratch.0, "app.share.test"),
+        state_of(&status, &scratch.0, "myapp.share.test"),
         CertState::Failed(FailureKind::Local)
     );
     assert_eq!(
@@ -455,7 +463,7 @@ async fn an_account_key_others_can_read_is_not_used_and_nothing_is_ordered() {
     // The owner fixes the mode: the next look orders.
     std::fs::set_permissions(&key_file, std::fs::Permissions::from_mode(0o600)).unwrap();
     minutes(2).await;
-    assert!(ca.counts().contains_key("app.share.test"));
+    assert!(ca.counts().contains_key("myapp.share.test"));
     supervisor.abort();
 }
 
@@ -476,24 +484,24 @@ async fn a_certificate_is_obtained_stored_and_reported_valid() {
         status.clone(),
         || Some(H.to_string()),
     );
-    shares.note_sent(&[blind("app", &["acme-tls/1"])]);
-    shares.note_ack(&ack(&["app"], &["app"], Some(H)));
+    shares.note_sent(&[blind("myapp", &["acme-tls/1"])]);
+    shares.note_ack(&ack(&["myapp"], &["myapp"], Some(H)));
     let store = CertStore::new(&scratch.0);
     for _ in 0..200 {
-        if store.validity("app.share.test").is_some() {
+        if store.validity("myapp.share.test").is_some() {
             break;
         }
         minutes(1).await;
     }
-    assert!(store.validity("app.share.test").is_some());
-    let (chain, key) = store.paths("app.share.test").unwrap();
+    assert!(store.validity("myapp.share.test").is_some());
+    let (chain, key) = store.paths("myapp.share.test").unwrap();
     assert!(chain.exists() && key.exists());
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_secs();
     assert!(matches!(
-        status.state(&store, "app.share.test", now),
+        status.state(&store, "myapp.share.test", now),
         CertState::Valid { not_after } if not_after > now
     ));
     // A name that was never ordered has nothing.
@@ -509,8 +517,8 @@ async fn a_certificate_is_obtained_stored_and_reported_valid() {
 /// How many orders `app.share.test` gets in three hours from a CA that never validates, with
 /// the attachment kept (`flapping` false) or dropped and made again every two minutes.
 async fn orders_in_three_hours(flapping: bool) -> usize {
-    let shares_list = [blind("app", &["acme-tls/1"])];
-    let one = ack(&["app"], &["app"], Some(H));
+    let shares_list = [blind("myapp", &["acme-tls/1"])];
+    let one = ack(&["myapp"], &["myapp"], Some(H));
     let scratch = Scratch::new();
     let ca = Recording::new(never_validates());
     let shares = ShareBook::new();
@@ -535,7 +543,7 @@ async fn orders_in_three_hours(flapping: bool) -> usize {
         minutes(180).await;
     }
     supervisor.abort();
-    ca.counts().get("app.share.test").copied().unwrap_or(0)
+    ca.counts().get("myapp.share.test").copied().unwrap_or(0)
 }
 
 #[tokio::test(start_paused = true)]
@@ -556,8 +564,8 @@ async fn an_attachment_that_flaps_every_two_minutes_does_not_order_faster_than_a
 
 #[tokio::test(start_paused = true)]
 async fn a_name_wanted_again_after_its_wait_orders_at_once_and_before_it_waits() {
-    let shares_list = [blind("app", &["acme-tls/1"])];
-    let one = ack(&["app"], &["app"], Some(H));
+    let shares_list = [blind("myapp", &["acme-tls/1"])];
+    let one = ack(&["myapp"], &["myapp"], Some(H));
     let scratch = Scratch::new();
     let ca = Recording::new(never_validates());
     let shares = ShareBook::new();
@@ -568,7 +576,7 @@ async fn a_name_wanted_again_after_its_wait_orders_at_once_and_before_it_waits()
         AcmeStatus::new(),
         || None,
     );
-    let orders = || ca.counts().get("app.share.test").copied().unwrap_or(0);
+    let orders = || ca.counts().get("myapp.share.test").copied().unwrap_or(0);
     shares.note_sent(&shares_list);
     shares.note_ack(&one);
     tokio::time::sleep(Duration::from_secs(5)).await;
@@ -593,7 +601,7 @@ async fn a_name_wanted_again_after_its_wait_orders_at_once_and_before_it_waits()
 #[tokio::test(start_paused = true)]
 async fn the_kept_order_timings_are_bounded_and_the_unplanned_ones_leave_first() {
     let job = |n: usize| AcmeJob {
-        share: "app".to_string(),
+        share: "myapp".to_string(),
         domain: format!("n{n}.share.test"),
     };
     let mut paces = Paces::default();

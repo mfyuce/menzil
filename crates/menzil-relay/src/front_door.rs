@@ -1474,11 +1474,15 @@ pub(crate) mod tests {
         let ali = tenant("ali");
         let veli = tenant("veli");
         let l = limits(2, 3, 100);
-        let a1 = counters.try_acquire("app.ali", &ali, client(1), l).unwrap();
-        let a2 = counters.try_acquire("app.ali", &ali, client(1), l).unwrap();
+        let a1 = counters
+            .try_acquire("myapp.ali", &ali, client(1), l)
+            .unwrap();
+        let a2 = counters
+            .try_acquire("myapp.ali", &ali, client(1), l)
+            .unwrap();
         assert!(
             counters
-                .try_acquire("app.ali", &ali, client(1), l)
+                .try_acquire("myapp.ali", &ali, client(1), l)
                 .is_none(),
             "the third connection to one name is over its figure"
         );
@@ -1492,9 +1496,9 @@ pub(crate) mod tests {
             "the fourth connection of one tenant is over its figure"
         );
         let other = counters
-            .try_acquire("app.veli", &veli, client(1), l)
+            .try_acquire("myapp.veli", &veli, client(1), l)
             .unwrap();
-        assert_eq!(counters.of_name("app.ali"), 2);
+        assert_eq!(counters.of_name("myapp.ali"), 2);
         assert_eq!(counters.of_tenant(&ali), 3);
         assert_eq!(counters.total(), 4);
         drop(a1);
@@ -1503,7 +1507,7 @@ pub(crate) mod tests {
             .expect("a released place is usable at once");
         drop((a2, b1, other, again));
         assert_eq!(counters.total(), 0);
-        assert_eq!(counters.of_name("app.ali"), 0);
+        assert_eq!(counters.of_name("myapp.ali"), 0);
         assert_eq!(counters.of_tenant(&ali), 0);
         assert!(
             counters.lock().per_name.is_empty(),
@@ -1561,12 +1565,12 @@ pub(crate) mod tests {
     #[test]
     fn a_request_head_is_read_strictly() {
         let ok = parse_head(
-            b"GET /.well-known/acme-challenge/tok?x=1 HTTP/1.1\r\nHost: App.Example.Test:80\r\nUser-Agent: t\r\n\r\n",
+            b"GET /.well-known/acme-challenge/tok?x=1 HTTP/1.1\r\nHost: Myapp.Example.Test:80\r\nUser-Agent: t\r\n\r\n",
         )
         .unwrap();
         assert_eq!(ok.method, "GET");
         assert_eq!(ok.target, "/.well-known/acme-challenge/tok?x=1");
-        assert_eq!(ok.host.as_deref(), Some("app.example.test"));
+        assert_eq!(ok.host.as_deref(), Some("myapp.example.test"));
         assert_eq!(
             parse_head(b"GET / HTTP/1.0\r\n\r\n").unwrap().host,
             None,
@@ -1596,17 +1600,17 @@ pub(crate) mod tests {
     #[test]
     fn the_redirect_keeps_a_visible_ascii_path_and_nothing_else() {
         assert_eq!(
-            redirect_to("app.s.test", "/a/b?c=d"),
-            "HTTP/1.1 301 Moved Permanently\r\nLocation: https://app.s.test/a/b?c=d\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            redirect_to("myapp.s.test", "/a/b?c=d"),
+            "HTTP/1.1 301 Moved Permanently\r\nLocation: https://myapp.s.test/a/b?c=d\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
         );
         for target in ["*", "http://evil.test/", "/a b", "/a\u{e9}", "/a\u{7f}"] {
             assert!(
-                redirect_to("app.s.test", target).contains("Location: https://app.s.test/\r\n"),
+                redirect_to("myapp.s.test", target).contains("Location: https://myapp.s.test/\r\n"),
                 "{target:?}"
             );
         }
         let long = format!("/{}", "a".repeat(3000));
-        assert!(redirect_to("app.s.test", &long).contains("https://app.s.test/\r\n"));
+        assert!(redirect_to("myapp.s.test", &long).contains("https://myapp.s.test/\r\n"));
     }
 
     // -----------------------------------------------------------------------------------------
@@ -1833,76 +1837,79 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn a_held_blind_name_resolves_to_its_node_network_and_service() {
-        let w = world(&["app", "raw"], None);
+        let w = world(&["myapp", "raw"], None);
         w.attach();
         w.advertise(vec![
-            share("app", ShareMode::Blind, "tls:app", &[]),
+            share("myapp", ShareMode::Blind, "tls:myapp", &[]),
             share("raw", ShareMode::Blind, "tcp:raw", &[]),
         ]);
-        let app = w.resolve("app.s.example.test", &[b"h2"]).expect("app");
-        assert_eq!(app.name, "app");
-        assert_eq!(app.tenant, TenantId::Default);
-        assert_eq!(app.held.node, w.node);
-        assert_eq!(app.held.network, w.network);
-        assert_eq!(app.service(), "tls:app".parse().unwrap());
-        assert_eq!(app.limits.per_name, FRONT_DOOR_PER_NAME);
-        assert_eq!(app.limits.per_tenant, FRONT_DOOR_PER_TENANT);
-        assert_eq!(app.limits.total, FRONT_DOOR_MAX_TOTAL);
+        let myapp = w.resolve("myapp.s.example.test", &[b"h2"]).expect("myapp");
+        assert_eq!(myapp.name, "myapp");
+        assert_eq!(myapp.tenant, TenantId::Default);
+        assert_eq!(myapp.held.node, w.node);
+        assert_eq!(myapp.held.network, w.network);
+        assert_eq!(myapp.service(), "tls:myapp".parse().unwrap());
+        assert_eq!(myapp.limits.per_name, FRONT_DOOR_PER_NAME);
+        assert_eq!(myapp.limits.per_tenant, FRONT_DOOR_PER_TENANT);
+        assert_eq!(myapp.limits.total, FRONT_DOOR_MAX_TOTAL);
         let raw = w.resolve("raw.s.example.test", &[]).expect("tcp: by SNI");
         assert_eq!(raw.service(), "tcp:raw".parse().unwrap());
     }
 
     #[tokio::test]
     async fn every_other_name_resolves_to_nothing() {
-        let w = world(&["app"], None);
+        let w = world(&["myapp"], None);
         w.attach();
-        w.advertise(vec![share("app", ShareMode::Blind, "tls:app", &[])]);
+        w.advertise(vec![share("myapp", ShareMode::Blind, "tls:myapp", &[])]);
         for host in [
             "nosuch.s.example.test",
             "s.example.test",
             ".s.example.test",
-            "app.example.test",
-            "app.s.example.test.evil.test",
-            "x.app.s.example.test",
-            "app.ali.s.example.test",
-            "app.t.example.test",
+            "myapp.example.test",
+            "myapp.s.example.test.evil.test",
+            "x.myapp.s.example.test",
+            "myapp.ali.s.example.test",
+            "myapp.t.example.test",
             "relay.example.test",
         ] {
             assert!(w.resolve(host, &[]).is_none(), "{host}");
         }
-        assert!(w.resolve("app.s.example.test", &[]).is_some());
+        assert!(w.resolve("myapp.s.example.test", &[]).is_some());
     }
 
     #[tokio::test]
     async fn a_name_is_served_only_while_its_node_is_attached_and_holds_the_claim() {
-        let w = world(&["app"], None);
+        let w = world(&["myapp"], None);
         w.attach();
-        w.advertise(vec![share("app", ShareMode::Blind, "tls:app", &[])]);
-        assert!(w.resolve("app.s.example.test", &[]).is_some());
+        w.advertise(vec![share("myapp", ShareMode::Blind, "tls:myapp", &[])]);
+        assert!(w.resolve("myapp.s.example.test", &[]).is_some());
         // The claim is gone (a new session before its ADVERTISE, or a withdrawal).
         w.relay.labels().clear_for(&w.node, unix_now());
-        assert!(w.resolve("app.s.example.test", &[]).is_none(), "unheld");
-        w.advertise(vec![share("app", ShareMode::Blind, "tls:app", &[])]);
-        assert!(w.resolve("app.s.example.test", &[]).is_some());
+        assert!(w.resolve("myapp.s.example.test", &[]).is_none(), "unheld");
+        w.advertise(vec![share("myapp", ShareMode::Blind, "tls:myapp", &[])]);
+        assert!(w.resolve("myapp.s.example.test", &[]).is_some());
         // The share withdrawn by a later ADVERTISE.
         w.advertise(vec![]);
-        assert!(w.resolve("app.s.example.test", &[]).is_none(), "withdrawn");
-        w.advertise(vec![share("app", ShareMode::Blind, "tls:app", &[])]);
+        assert!(
+            w.resolve("myapp.s.example.test", &[]).is_none(),
+            "withdrawn"
+        );
+        w.advertise(vec![share("myapp", ShareMode::Blind, "tls:myapp", &[])]);
         // The node detached while the claim is still on the books.
         assert!(w.relay.registry.detach(&w.node, 1));
-        assert!(w.resolve("app.s.example.test", &[]).is_none(), "detached");
+        assert!(w.resolve("myapp.s.example.test", &[]).is_none(), "detached");
     }
 
     #[tokio::test]
     async fn a_terminated_share_and_a_share_of_another_kind_are_not_routed() {
-        let w = world(&["web", "app"], None);
+        let w = world(&["web", "myapp"], None);
         w.attach();
         w.advertise(vec![
             share("web", ShareMode::Terminated, "http:web", &[]),
-            share("app", ShareMode::Blind, "tls:app", &[]),
+            share("myapp", ShareMode::Blind, "tls:myapp", &[]),
         ]);
         assert!(w.resolve("web.s.example.test", &[]).is_none());
-        assert!(w.resolve("app.s.example.test", &[]).is_some());
+        assert!(w.resolve("myapp.s.example.test", &[]).is_some());
     }
 
     #[tokio::test]
@@ -1934,13 +1941,13 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn a_name_in_quarantine_resolves_to_nothing() {
-        let w = world(&["app"], None);
+        let w = world(&["myapp"], None);
         w.attach();
-        w.advertise(vec![share("app", ShareMode::Blind, "tls:app", &[])]);
-        assert!(w.resolve("app.s.example.test", &[]).is_some());
+        w.advertise(vec![share("myapp", ShareMode::Blind, "tls:myapp", &[])]);
+        assert!(w.resolve("myapp.s.example.test", &[]).is_some());
         let mut state = w.relay.labels().state();
         state.quarantine.insert(
-            "app".to_string(),
+            "myapp".to_string(),
             Quarantine {
                 kind: QuarantineKind::Flat,
                 since: unix_now(),
@@ -1949,46 +1956,48 @@ pub(crate) mod tests {
             },
         );
         w.relay.labels().load_state(&state);
-        assert!(w.resolve("app.s.example.test", &[]).is_none());
+        assert!(w.resolve("myapp.s.example.test", &[]).is_none());
         // An ended quarantine is none.
-        state.quarantine.get_mut("app").unwrap().since = 1;
+        state.quarantine.get_mut("myapp").unwrap().since = 1;
         w.relay.labels().load_state(&state);
-        assert!(w.resolve("app.s.example.test", &[]).is_some());
+        assert!(w.resolve("myapp.s.example.test", &[]).is_some());
     }
 
     #[tokio::test]
     async fn a_tenants_names_live_in_its_zone_and_use_its_share_figures() {
         let w = world(
-            &["app"],
+            &["myapp"],
             Some(ali(&[
                 ("share_connections_per_name", 2),
                 ("share_connections", 5),
             ])),
         );
         w.attach();
-        let ack = w.advertise(vec![share("app", ShareMode::Blind, "tls:app", &[])]);
-        assert_eq!(ack.names, vec!["app.ali".to_string()]);
+        let ack = w.advertise(vec![share("myapp", ShareMode::Blind, "tls:myapp", &[])]);
+        assert_eq!(ack.names, vec!["myapp.ali".to_string()]);
         assert!(
-            w.resolve("app.s.example.test", &[]).is_none(),
+            w.resolve("myapp.s.example.test", &[]).is_none(),
             "the flat name is not this tenant's"
         );
-        let resolved = w.resolve("app.ali.s.example.test", &[]).expect("zone name");
-        assert_eq!(resolved.name, "app.ali");
+        let resolved = w
+            .resolve("myapp.ali.s.example.test", &[])
+            .expect("zone name");
+        assert_eq!(resolved.name, "myapp.ali");
         assert_eq!(resolved.tenant.slug(), Some("ali"));
         assert_eq!(resolved.limits.per_name, 2, "the tenant's figure");
         assert_eq!(resolved.limits.per_tenant, 5);
         assert!(
-            w.resolve("app.veli.s.example.test", &[]).is_none(),
+            w.resolve("myapp.veli.s.example.test", &[]).is_none(),
             "another tenant's zone"
         );
     }
 
     #[tokio::test]
     async fn a_name_whose_network_changed_tenant_since_it_was_accepted_is_refused() {
-        let w = world(&["app"], None);
+        let w = world(&["myapp"], None);
         w.attach();
-        w.advertise(vec![share("app", ShareMode::Blind, "tls:app", &[])]);
-        assert!(w.resolve("app.s.example.test", &[]).is_some());
+        w.advertise(vec![share("myapp", ShareMode::Blind, "tls:myapp", &[])]);
+        assert!(w.resolve("myapp.s.example.test", &[]).is_some());
         // The operator moved the network into a tenant: the accepted name (a flat one, the
         // default tenant's) is no longer the zone of the network's tenant.
         let mut spec = ali(&[]);
@@ -1999,7 +2008,7 @@ pub(crate) mod tests {
             &HashSet::new(),
             &HashSet::new(),
         ));
-        assert!(w.resolve("app.s.example.test", &[]).is_none());
+        assert!(w.resolve("myapp.s.example.test", &[]).is_none());
         // A network the tenant file of which was refused is held back and not served either.
         let book = TenantBook::build(
             vec![],
@@ -2012,26 +2021,26 @@ pub(crate) mod tests {
             &HashSet::new(),
         );
         w.relay.set_tenants(book);
-        assert!(w.resolve("app.s.example.test", &[]).is_none());
+        assert!(w.resolve("myapp.s.example.test", &[]).is_none());
     }
 
     #[tokio::test]
     async fn the_relays_own_host_name_is_routed_to_the_websocket_path_before_anything_else() {
-        let w = world(&["app"], None);
+        let w = world(&["myapp"], None);
         w.attach();
-        w.advertise(vec![share("app", ShareMode::Blind, "tls:app", &[])]);
+        w.advertise(vec![share("myapp", ShareMode::Blind, "tls:myapp", &[])]);
         let route = |sni: Option<&str>, alpn: &[&[u8]]| w.door.route(&w.relay, &hello(sni, alpn));
         assert!(matches!(route(Some(OWN), &[b"http/1.1"]), Route::Own));
         assert!(matches!(route(Some(OWN), &[b"acme-tls/1"]), Route::Own));
         assert!(matches!(
-            route(Some("app.s.example.test"), &[]),
+            route(Some("myapp.s.example.test"), &[]),
             Route::Share(_)
         ));
         assert!(is_refuse(&route(None, &[])));
         assert!(is_refuse(&route(Some("other.example.test"), &[])));
         assert!(is_refuse(&route(Some("nosuch.s.example.test"), &[])));
         assert!(is_refuse(&route(
-            Some("app.s.example.test"),
+            Some("myapp.s.example.test"),
             &[b"acme-tls/1"]
         )));
     }
@@ -2039,21 +2048,21 @@ pub(crate) mod tests {
     /// at once, and the new grantee's claim stops being refused once the stale holder is gone.
     #[tokio::test]
     async fn a_label_the_owner_moved_or_dropped_stops_routing_to_the_old_holder() {
-        let w = world(&["app"], None);
+        let w = world(&["myapp"], None);
         let x = w.node;
         let y = NodeId::from([8u8; 32]);
         w.attach();
         w.attach_node(y);
-        w.advertise(vec![share("app", ShareMode::Blind, "tls:app", &[])]);
-        assert_eq!(w.resolve("app.s.example.test", &[]).unwrap().held.node, x);
+        w.advertise(vec![share("myapp", ShareMode::Blind, "tls:myapp", &[])]);
+        assert_eq!(w.resolve("myapp.s.example.test", &[]).unwrap().held.node, x);
         // The owner moves the label to Y. X stays attached and never advertises again.
-        w.roster(2, &[x, y], &[("app", y)]);
+        w.roster(2, &[x, y], &[("myapp", y)]);
         assert!(
-            w.resolve("app.s.example.test", &[]).is_none(),
+            w.resolve("myapp.s.example.test", &[]).is_none(),
             "the old holder is not routed to once the Roster grants the label to another node"
         );
         // The stale holder entry still stands until the registry looks at the Rosters.
-        let stale = w.advertise_as(y, vec![share("app", ShareMode::Blind, "tls:app", &[])]);
+        let stale = w.advertise_as(y, vec![share("myapp", ShareMode::Blind, "tls:myapp", &[])]);
         assert_eq!(
             stale.rejected.len(),
             1,
@@ -2065,12 +2074,12 @@ pub(crate) mod tests {
                 .release_ungranted(w.relay.rosters(), unix_now()),
             1
         );
-        let ack = w.advertise_as(y, vec![share("app", ShareMode::Blind, "tls:app", &[])]);
-        assert_eq!(ack.accepted, vec!["app".to_string()], "{ack:?}");
-        assert_eq!(w.resolve("app.s.example.test", &[]).unwrap().held.node, y);
+        let ack = w.advertise_as(y, vec![share("myapp", ShareMode::Blind, "tls:myapp", &[])]);
+        assert_eq!(ack.accepted, vec!["myapp".to_string()], "{ack:?}");
+        assert_eq!(w.resolve("myapp.s.example.test", &[]).unwrap().held.node, y);
         // The owner drops the label: nobody is routed to, and the next pass releases Y's entry.
         w.roster(3, &[x, y], &[]);
-        assert!(w.resolve("app.s.example.test", &[]).is_none());
+        assert!(w.resolve("myapp.s.example.test", &[]).is_none());
         assert_eq!(
             w.relay
                 .labels()
@@ -2088,28 +2097,28 @@ pub(crate) mod tests {
     /// A holder the Roster no longer lists (or revokes) is not routed to either.
     #[tokio::test]
     async fn a_holder_the_roster_no_longer_lists_is_not_routed_to() {
-        let w = world(&["app"], None);
+        let w = world(&["myapp"], None);
         let other = NodeId::from([8u8; 32]);
         w.attach();
-        w.advertise(vec![share("app", ShareMode::Blind, "tls:app", &[])]);
-        w.roster(2, &[other], &[("app", w.node)]);
-        assert!(w.resolve("app.s.example.test", &[]).is_none());
-        w.roster(3, &[w.node, other], &[("app", w.node)]);
-        assert!(w.resolve("app.s.example.test", &[]).is_some());
+        w.advertise(vec![share("myapp", ShareMode::Blind, "tls:myapp", &[])]);
+        w.roster(2, &[other], &[("myapp", w.node)]);
+        assert!(w.resolve("myapp.s.example.test", &[]).is_none());
+        w.roster(3, &[w.node, other], &[("myapp", w.node)]);
+        assert!(w.resolve("myapp.s.example.test", &[]).is_some());
     }
 
     /// The relay's own watcher runs the pass on every Roster change.
     #[tokio::test]
     async fn the_relays_roster_watcher_drops_the_holders_of_a_moved_label() {
-        let w = world(&["app"], None);
+        let w = world(&["myapp"], None);
         let y = NodeId::from([8u8; 32]);
         w.attach();
-        w.advertise(vec![share("app", ShareMode::Blind, "tls:app", &[])]);
+        w.advertise(vec![share("myapp", ShareMode::Blind, "tls:myapp", &[])]);
         let watcher = w.relay.watch_grants();
-        w.roster(2, &[w.node, y], &[("app", y)]);
+        w.roster(2, &[w.node, y], &[("myapp", y)]);
         let mut freed = false;
         for _ in 0..200 {
-            if w.relay.labels().held_name("app", unix_now()).is_none() {
+            if w.relay.labels().held_name("myapp", unix_now()).is_none() {
                 freed = true;
                 break;
             }
@@ -2192,13 +2201,13 @@ pub(crate) mod tests {
             for _ in 0..FRONT_DOOR_PER_CLIENT_PER_NAME {
                 held.push(
                     counters
-                        .try_acquire("app.ali", &ali, client(who), l)
+                        .try_acquire("myapp.ali", &ali, client(who), l)
                         .unwrap(),
                 );
             }
             assert!(
                 counters
-                    .try_acquire("app.ali", &ali, client(who), l)
+                    .try_acquire("myapp.ali", &ali, client(who), l)
                     .is_none(),
                 "client {who} is at its figure for the name"
             );
@@ -2206,7 +2215,7 @@ pub(crate) mod tests {
         assert!(l.per_name > 2 * FRONT_DOOR_PER_CLIENT_PER_NAME);
         assert!(
             counters
-                .try_acquire("app.ali", &ali, client(3), l)
+                .try_acquire("myapp.ali", &ali, client(3), l)
                 .is_some(),
             "a third client still gets in"
         );
@@ -2399,9 +2408,9 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn a_challenge_for_the_relays_own_host_is_redirected_not_given_to_a_member() {
-        let w = world(&["app"], None);
+        let w = world(&["myapp"], None);
         w.attach();
-        w.advertise(vec![share("app", ShareMode::Blind, "tls:app", &[])]);
+        w.advertise(vec![share("myapp", ShareMode::Blind, "tls:myapp", &[])]);
         let own = http_exchange(
             &w,
             format!("GET /.well-known/acme-challenge/tok HTTP/1.1\r\nHost: {OWN}\r\n\r\n")
@@ -2522,13 +2531,13 @@ pub(crate) mod tests {
     /// Everything a terminated name needs: a flagged tenant, `web` advertised as `http:web`
     /// and accepted, the holder attached, the grant in the Roster, a certificate.
     fn terminated_world() -> (World, Relay) {
-        let w = world(&["web", "app"], Some(terminated_ali()));
+        let w = world(&["web", "myapp"], Some(terminated_ali()));
         w.attach();
         w.advertise(vec![
             share("web", ShareMode::Terminated, "http:web", &[]),
-            share("app", ShareMode::Blind, "tls:app", &[]),
+            share("myapp", ShareMode::Blind, "tls:myapp", &[]),
         ]);
-        let relay = with_certs(&w, &[T_HOST, "app.ali.t.s.example.test"]);
+        let relay = with_certs(&w, &[T_HOST, "myapp.ali.t.s.example.test"]);
         (w, relay)
     }
 
@@ -2615,11 +2624,11 @@ pub(crate) mod tests {
         let relay = with_certs(&w, &[T_HOST]);
         refused(&w, &relay, "blind share with an http service");
         // a certificate for another name serves nothing here
-        let w = world(&["web", "app"], Some(terminated_ali()));
+        let w = world(&["web", "myapp"], Some(terminated_ali()));
         w.attach();
         w.advertise(vec![
             share("web", ShareMode::Terminated, "http:web", &[]),
-            share("app", ShareMode::Terminated, "http:app", &[]),
+            share("myapp", ShareMode::Terminated, "http:myapp", &[]),
         ]);
         let relay = with_certs(&w, &[T_HOST]);
         assert!(matches!(
@@ -2627,7 +2636,7 @@ pub(crate) mod tests {
             Route::Terminated(..)
         ));
         assert!(matches!(
-            t_route(&w, &relay, "app.ali.t.s.example.test", &[]),
+            t_route(&w, &relay, "myapp.ali.t.s.example.test", &[]),
             Route::Refuse
         ));
         let w = world(&["web"], Some(terminated_ali()));
@@ -2669,16 +2678,16 @@ pub(crate) mod tests {
                 .is_none()
         );
         assert!(
-            t_resolve(&w, &relay, "app.ali.t.s.example.test").is_none(),
+            t_resolve(&w, &relay, "myapp.ali.t.s.example.test").is_none(),
             "a blind share under the terminated zone, with a certificate"
         );
         assert!(
             w.door
-                .resolve(&relay, "app.ali.s.example.test", &[])
+                .resolve(&relay, "myapp.ali.s.example.test", &[])
                 .is_some()
         );
         assert!(matches!(
-            t_route(&w, &relay, "app.ali.t.s.example.test", &[]),
+            t_route(&w, &relay, "myapp.ali.t.s.example.test", &[]),
             Route::Refuse
         ));
         assert!(matches!(
@@ -2688,8 +2697,8 @@ pub(crate) mod tests {
         // the zone label `t` is nobody's blind name
         for host in [
             "t.s.example.test",
-            "app.t.s.example.test",
-            "app.ali.t.s.example.test.evil",
+            "myapp.t.s.example.test",
+            "myapp.ali.t.s.example.test.evil",
             "ali.t.s.example.test",
             "x.web.ali.t.s.example.test",
             "web.t.ali.s.example.test",
@@ -2821,7 +2830,7 @@ pub(crate) mod tests {
             "the first response arrives"
         );
         // The owner moves `web` to Y; Y attaches and takes the name. X stays attached.
-        w.roster(2, &[x, y], &[("web", y), ("app", x)]);
+        w.roster(2, &[x, y], &[("web", y), ("myapp", x)]);
         w.relay
             .labels()
             .release_ungranted(w.relay.rosters(), unix_now());
@@ -2960,7 +2969,7 @@ pub(crate) mod tests {
         let mut buf = [0u8; 16];
         c.write_all(b"still").await.unwrap();
         assert_eq!(node_x.read(&mut buf).await.unwrap(), 5);
-        w.roster(2, &[x, y], &[("web", y), ("app", x)]);
+        w.roster(2, &[x, y], &[("web", y), ("myapp", x)]);
         w.relay
             .labels()
             .release_ungranted(w.relay.rosters(), unix_now());
@@ -3003,7 +3012,7 @@ pub(crate) mod tests {
     async fn an_open_websocket_is_cut_when_the_share_is_withdrawn() {
         let (w, relay) = terminated_world();
         let (mut c, _node_x, server) = open_websocket(&w, &relay).await;
-        w.advertise(vec![share("app", ShareMode::Blind, "tls:app", &[])]);
+        w.advertise(vec![share("myapp", ShareMode::Blind, "tls:myapp", &[])]);
         assert!(
             pipe_cut(&mut c, server, Duration::from_secs(5)).await,
             "the pipe must end"
@@ -3071,7 +3080,7 @@ pub(crate) mod tests {
     fn move_label_to_another_node(w: &World) {
         let x = w.node;
         let y = NodeId::from([8u8; 32]);
-        w.roster(2, &[x, y], &[("web", y), ("app", x)]);
+        w.roster(2, &[x, y], &[("web", y), ("myapp", x)]);
         w.relay
             .labels()
             .release_ungranted(w.relay.rosters(), unix_now());
@@ -3266,7 +3275,7 @@ pub(crate) mod tests {
         assert!(node_x.read(&mut buf).await.unwrap() > 0);
         node_x.write_all(SSE_HEAD).await.unwrap();
         assert!(c.read(&mut buf).await.unwrap() > 0);
-        w.advertise(vec![share("app", ShareMode::Blind, "tls:app", &[])]);
+        w.advertise(vec![share("myapp", ShareMode::Blind, "tls:myapp", &[])]);
         for _ in 0..20 {
             tokio::time::sleep(Duration::from_millis(100)).await;
             let _ = node_x.write_all(b"e\r\ndata: from-x\n\n\r\n").await;

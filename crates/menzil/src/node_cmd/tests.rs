@@ -1504,7 +1504,7 @@ mod acme_wiring {
     }
 
     // `plain` comes first: a status line must not be given the certificates of another share.
-    const SERVICES: &str = "[services]\n\"tls:app\" = \"127.0.0.1:8443\"\n\"tls:plain\" = \"127.0.0.1:8444\"\n[[share]]\nname = \"plain\"\nmode = \"blind\"\nservice = \"tls:plain\"\nalpn = [\"h2\"]\n[[share]]\nname = \"app\"\nmode = \"blind\"\nservice = \"tls:app\"\nalpn = [\"acme-tls/1\"]\n";
+    const SERVICES: &str = "[services]\n\"tls:myapp\" = \"127.0.0.1:8443\"\n\"tls:plain\" = \"127.0.0.1:8444\"\n[[share]]\nname = \"plain\"\nmode = \"blind\"\nservice = \"tls:plain\"\nalpn = [\"h2\"]\n[[share]]\nname = \"myapp\"\nmode = \"blind\"\nservice = \"tls:myapp\"\nalpn = [\"acme-tls/1\"]\n";
     const ACME: &str = "[acme]\ndirectory_url = \"https://ca.test/dir\"\n";
 
     fn home_with(dir: &Path, config: &str) -> (Home, Config) {
@@ -1540,7 +1540,7 @@ mod acme_wiring {
 
     fn answer(domain: &str, names: &[&str]) -> AdvertiseAckBody {
         AdvertiseAckBody {
-            accepted: vec!["app".to_string(), "plain".to_string()],
+            accepted: vec!["myapp".to_string(), "plain".to_string()],
             rejected: vec![],
             names: names.iter().map(|n| n.to_string()).collect(),
             share_domain: Some(domain.to_string()),
@@ -1612,22 +1612,22 @@ mod acme_wiring {
         // The answer names `H` and two zones of `app`: both are ordered, `plain` is not.
         node.node.shares().simulate_answer(
             &config.shares().unwrap(),
-            &answer("share.test", &["app", "app.ali", "plain"]),
+            &answer("share.test", &["myapp", "myapp.ali", "plain"]),
         );
         let failed = CertViewState::Failed(FailureKind::Validation);
-        until_status(&socket, "app", "both names fail validation", |certs| {
+        until_status(&socket, "myapp", "both names fail validation", |certs| {
             certs.len() == 2 && certs.iter().all(|c| c.state == failed)
         })
         .await;
         assert_eq!(
-            certs_of(&socket, "app").await,
+            certs_of(&socket, "myapp").await,
             vec![
                 CertView {
-                    name: "app.ali.share.test".into(),
+                    name: "myapp.ali.share.test".into(),
                     state: failed
                 },
                 CertView {
-                    name: "app.share.test".into(),
+                    name: "myapp.share.test".into(),
                     state: failed
                 },
             ]
@@ -1641,7 +1641,7 @@ mod acme_wiring {
         // The end of the attachment: the tasks stop and the status is forgotten.
         node.node.shares().simulate_detach();
         let stopped = {
-            until_status(&socket, "app", "the status is forgotten", |certs| {
+            until_status(&socket, "myapp", "the status is forgotten", |certs| {
                 certs.is_empty()
             })
             .await;
@@ -1665,8 +1665,8 @@ mod acme_wiring {
             .unwrap();
         node.node
             .shares()
-            .simulate_answer(&config.shares().unwrap(), &answer("share.test", &["app"]));
-        until_status(&socket, "app", "the mismatch is reported", |certs| {
+            .simulate_answer(&config.shares().unwrap(), &answer("share.test", &["myapp"]));
+        until_status(&socket, "myapp", "the mismatch is reported", |certs| {
             certs.len() == 1 && certs[0].state == CertViewState::Failed(FailureKind::DomainMismatch)
         })
         .await;
@@ -1681,8 +1681,8 @@ mod acme_wiring {
         std::fs::write(home.config_path(), text.replace("other.test", "share.test")).unwrap();
         node.node
             .shares()
-            .simulate_answer(&shares, &answer("share.test", &["app"]));
-        until_status(&socket, "app", "the order after the edit", |certs| {
+            .simulate_answer(&shares, &answer("share.test", &["myapp"]));
+        until_status(&socket, "myapp", "the order after the edit", |certs| {
             certs.len() == 1 && certs[0].state == CertViewState::Failed(FailureKind::Validation)
         })
         .await;
@@ -1691,10 +1691,10 @@ mod acme_wiring {
         std::fs::write(home.config_path(), "this is [not toml").unwrap();
         node.node
             .shares()
-            .simulate_answer(&shares, &answer("share.test", &["app"]));
+            .simulate_answer(&shares, &answer("share.test", &["myapp"]));
         tokio::time::sleep(Duration::from_millis(300)).await;
         assert_eq!(
-            certs_of(&socket, "app").await[0].state,
+            certs_of(&socket, "myapp").await[0].state,
             CertViewState::Failed(FailureKind::Validation),
             "an unreadable file does not bring the cross check back or take the names away"
         );
@@ -1716,7 +1716,7 @@ mod acme_wiring {
         assert!(node.acme.is_none());
         node.node
             .shares()
-            .simulate_answer(&config.shares().unwrap(), &answer("share.test", &["app"]));
+            .simulate_answer(&config.shares().unwrap(), &answer("share.test", &["myapp"]));
         tokio::time::sleep(Duration::from_millis(300)).await;
         assert!(status_of(&socket).await.iter().all(|v| v.certs.is_empty()));
         assert!(

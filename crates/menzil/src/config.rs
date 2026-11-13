@@ -38,7 +38,7 @@
 //! # (http:..., the relay terminates TLS) or "tcp" (tcp:..., reached by name like a blind share).
 //! # alpn is for blind and tcp shares only; leave it out for any.
 //! [[share]]
-//! name = "app"
+//! name = "myapp"
 //! mode = "blind"
 //! service = "tls:app"
 //! # alpn = ["h2", "http/1.1"]
@@ -485,7 +485,7 @@ mod tests {
 
             [services]
             "tcp:ssh" = "127.0.0.1:22"
-            "http:app" = "[::1]:8080"
+            "http:myapp" = "[::1]:8080"
             "#,
             relay_url()
         );
@@ -504,8 +504,8 @@ mod tests {
         assert_eq!(services.len(), 2);
         let ssh = services.target(&"tcp:ssh".parse().unwrap()).unwrap();
         assert_eq!((ssh.host(), ssh.port()), ("127.0.0.1", 22));
-        let app = services.target(&"http:app".parse().unwrap()).unwrap();
-        assert_eq!((app.host(), app.port()), ("::1", 8080));
+        let myapp = services.target(&"http:myapp".parse().unwrap()).unwrap();
+        assert_eq!((myapp.host(), myapp.port()), ("::1", 8080));
     }
 
     #[test]
@@ -664,7 +664,7 @@ mod tests {
 
     const SERVICES: &str = r#"
         [services]
-        "tls:app" = "127.0.0.1:8443"
+        "tls:myapp" = "127.0.0.1:8443"
         "http:web" = "127.0.0.1:8080"
         "tcp:ssh" = "127.0.0.1:22"
     "#;
@@ -678,9 +678,9 @@ mod tests {
         let shares = shares_of(
             r#"
             [[share]]
-            name = "app"
+            name = "myapp"
             mode = "blind"
-            service = "tls:app"
+            service = "tls:myapp"
             alpn = ["h2", "acme-tls/1"]
 
             [[share]]
@@ -698,7 +698,7 @@ mod tests {
         assert_eq!(shares.len(), 3);
         assert_eq!(shares[0].mode, ShareMode::Blind);
         assert_eq!(shares[0].alpn, vec!["h2", "acme-tls/1"]);
-        assert_eq!(shares[0].service.to_string(), "tls:app");
+        assert_eq!(shares[0].service.to_string(), "tls:myapp");
         assert_eq!(shares[1].mode, ShareMode::Terminated);
         assert!(shares[1].alpn.is_empty());
         // `tcp` is a blind share on the wire, with a tcp: service.
@@ -711,39 +711,39 @@ mod tests {
     fn a_bad_share_is_an_error_that_names_it_and_nothing_is_changed_quietly() {
         for (table, wanted) in [
             (
-                "name = \"app\"\nmode = \"public\"\nservice = \"tls:app\"",
+                "name = \"myapp\"\nmode = \"public\"\nservice = \"tls:myapp\"",
                 "mode \"public\"",
             ),
             (
-                "name = \"App\"\nmode = \"blind\"\nservice = \"tls:app\"",
+                "name = \"Myapp\"\nmode = \"blind\"\nservice = \"tls:myapp\"",
                 "uppercase",
             ),
             (
-                "name = \"a.b\"\nmode = \"blind\"\nservice = \"tls:app\"",
+                "name = \"a.b\"\nmode = \"blind\"\nservice = \"tls:myapp\"",
                 "dot",
             ),
             (
-                "name = \"-a\"\nmode = \"blind\"\nservice = \"tls:app\"",
+                "name = \"-a\"\nmode = \"blind\"\nservice = \"tls:myapp\"",
                 "hyphen",
             ),
             (
-                "name = \"app\"\nmode = \"blind\"\nservice = \"http:web\"",
+                "name = \"myapp\"\nmode = \"blind\"\nservice = \"http:web\"",
                 "goes with a tls:",
             ),
             (
-                "name = \"web\"\nmode = \"terminated\"\nservice = \"tls:app\"",
+                "name = \"web\"\nmode = \"terminated\"\nservice = \"tls:myapp\"",
                 "goes with a http:",
             ),
             (
-                "name = \"ssh\"\nmode = \"tcp\"\nservice = \"tls:app\"",
+                "name = \"ssh\"\nmode = \"tcp\"\nservice = \"tls:myapp\"",
                 "goes with a tcp:",
             ),
             (
-                "name = \"app\"\nmode = \"blind\"\nservice = \"nonsense\"",
+                "name = \"myapp\"\nmode = \"blind\"\nservice = \"nonsense\"",
                 "service \"nonsense\"",
             ),
             (
-                "name = \"app\"\nmode = \"blind\"\nservice = \"tls:other\"",
+                "name = \"myapp\"\nmode = \"blind\"\nservice = \"tls:other\"",
                 "not in [services]",
             ),
             (
@@ -751,10 +751,10 @@ mod tests {
                 "blind shares only",
             ),
             (
-                "name = \"app\"\nmode = \"blind\"\nservice = \"tls:app\"\nport = 1",
+                "name = \"myapp\"\nmode = \"blind\"\nservice = \"tls:myapp\"\nport = 1",
                 "unknown field",
             ),
-            ("name = \"app\"\nmode = \"blind\"", "missing field"),
+            ("name = \"myapp\"\nmode = \"blind\"", "missing field"),
         ] {
             let error = match shares_of(&format!("[[share]]\n{table}")) {
                 Ok(_) => panic!("{table:?} was accepted"),
@@ -764,7 +764,7 @@ mod tests {
         }
         // The same name twice is refused as a whole.
         let error = shares_of(
-            "[[share]]\nname = \"app\"\nmode = \"blind\"\nservice = \"tls:app\"\n[[share]]\nname = \"app\"\nmode = \"tcp\"\nservice = \"tcp:ssh\"",
+            "[[share]]\nname = \"myapp\"\nmode = \"blind\"\nservice = \"tls:myapp\"\n[[share]]\nname = \"myapp\"\nmode = \"tcp\"\nservice = \"tcp:ssh\"",
         )
         .unwrap_err();
         assert!(format!("{error:#}").contains("used twice"), "{error:#}");
@@ -779,7 +779,7 @@ mod tests {
     fn no_acme_table_changes_nothing() {
         assert_eq!(acme_of("").unwrap(), None);
         let text = format!(
-            "{SERVICES}\n[[share]]\nname = \"app\"\nmode = \"blind\"\nservice = \"tls:app\"\nalpn = [\"acme-tls/1\"]\n"
+            "{SERVICES}\n[[share]]\nname = \"myapp\"\nmode = \"blind\"\nservice = \"tls:myapp\"\nalpn = [\"acme-tls/1\"]\n"
         );
         let config = Config::parse(&text).unwrap();
         assert_eq!(config.acme, None);

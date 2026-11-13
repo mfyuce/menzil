@@ -46,7 +46,7 @@ impl Drop for Scratch {
 fn only_plain_lowercase_ldh_names_may_be_ordered() {
     for ok in [
         "a",
-        "app.relay.example",
+        "myapp.relay.example",
         "a-b.c1.d",
         "xn--bcher-kva.example",
     ] {
@@ -55,7 +55,7 @@ fn only_plain_lowercase_ldh_names_may_be_ordered() {
     for bad in [
         "",
         "*.example",
-        "App.example",
+        "Myapp.example",
         "a..b",
         ".a",
         "a.",
@@ -101,7 +101,7 @@ async fn a_name_is_pending_between_begin_and_the_drop_of_its_order() {
     assert!(book.is_pending(DOMAIN));
     assert!(!book.is_pending("other.relay.example"), "exact names only");
     assert!(
-        !book.is_pending("APP.relay.example"),
+        !book.is_pending("MYAPP.relay.example"),
         "lookups are lowercase"
     );
     assert_eq!(book.len(), 1);
@@ -1014,7 +1014,7 @@ async fn the_renewal_loop_orders_for_a_wanted_name_stores_the_result_and_stays_q
     let book = ChallengeBook::new();
     let allowed = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let job = AcmeJob {
-        share: "app".to_string(),
+        share: "myapp".to_string(),
         domain: DOMAIN.to_string(),
     };
     let ca = FakeCa::new(&book, Flags::default());
@@ -1110,7 +1110,7 @@ impl AcmeTransport for FailFirstOrders {
 
 fn pace_job() -> AcmeJob {
     AcmeJob {
-        share: "app".to_string(),
+        share: "myapp".to_string(),
         domain: DOMAIN.to_string(),
     }
 }

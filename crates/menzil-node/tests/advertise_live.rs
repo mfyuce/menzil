@@ -84,7 +84,7 @@ async fn a_node_advertises_after_every_attach_and_when_its_shares_change() {
     let node = identity();
     let owner = SigningKey::generate(&mut rand::rng());
     // The owner granted this node `app` and `web`, not `ghost` (yet).
-    let (network_id, roster1) = roster(&owner, 1, node.node_id, &["app", "web"]);
+    let (network_id, roster1) = roster(&owner, 1, node.node_id, &["myapp", "web"]);
     relay.relay.rosters().set(&roster1).unwrap();
     let own = Arc::new(RosterStore::new());
     own.set(&roster1).unwrap();
@@ -115,28 +115,36 @@ async fn a_node_advertises_after_every_attach_and_when_its_shares_change() {
             }
         }
     });
-    let app = share("app", ShareMode::Blind, "tls:app", &["h2"]);
+    let myapp = share("myapp", ShareMode::Blind, "tls:myapp", &["h2"]);
     let web = share("web", ShareMode::Terminated, "http:web", &[]);
     let ghost = share("ghost", ShareMode::Blind, "tls:ghost", &[]);
-    book.set_shares(vec![app.clone(), web.clone(), ghost.clone()])
+    book.set_shares(vec![myapp.clone(), web.clone(), ghost.clone()])
         .unwrap();
 
     // 1. The first attach: the relay accepts what the Roster grants and says why not the rest.
     until("the first ADVERTISE_ACK", || book.snapshot().acked).await;
     let snapshot = book.snapshot();
-    assert_eq!(names_of(&snapshot.accepted), ["app", "web"], "{snapshot:?}");
+    assert_eq!(
+        names_of(&snapshot.accepted),
+        ["myapp", "web"],
+        "{snapshot:?}"
+    );
     assert_eq!(snapshot.rejected.len(), 1, "{snapshot:?}");
     assert_eq!(snapshot.rejected[0].name, "ghost");
     assert_eq!(snapshot.rejected[0].reason, "label_unclaimed");
     let mut full = snapshot.names.clone();
     full.sort();
-    assert_eq!(full, ["app", "web"], "the full names of the default tenant");
-    assert!(book.accepted_service(&app.service));
+    assert_eq!(
+        full,
+        ["myapp", "web"],
+        "the full names of the default tenant"
+    );
+    assert!(book.accepted_service(&myapp.service));
     assert!(!book.accepted_service(&ghost.service));
     // The relay holds the claims: the same shares, by what it keeps for the node.
     assert_eq!(
         names_of(&relay.relay.labels().shares_for(&node.node_id)),
-        ["app", "web"]
+        ["myapp", "web"]
     );
     // What the node sent is what the relay kept (ALPN included).
     assert!(
@@ -144,12 +152,12 @@ async fn a_node_advertises_after_every_attach_and_when_its_shares_change() {
             .relay
             .labels()
             .shares_for(&node.node_id)
-            .contains(&app)
+            .contains(&myapp)
     );
 
     // 2. A newer Roster that grants `ghost`, which the node holds and pushes: the rejected name is
     // asked for again and accepted.
-    let (_, roster2) = roster(&owner, 2, node.node_id, &["app", "web", "ghost"]);
+    let (_, roster2) = roster(&owner, 2, node.node_id, &["myapp", "web", "ghost"]);
     own.set(&roster2).unwrap();
     until("ghost to be accepted after the Roster push", || {
         book.accepted_service(&ghost.service)
@@ -157,7 +165,7 @@ async fn a_node_advertises_after_every_attach_and_when_its_shares_change() {
     .await;
     assert_eq!(
         names_of(&relay.relay.labels().shares_for(&node.node_id)),
-        ["app", "ghost", "web"]
+        ["ghost", "myapp", "web"]
     );
     assert!(book.snapshot().rejected.is_empty());
 
@@ -195,24 +203,24 @@ async fn a_node_advertises_after_every_attach_and_when_its_shares_change() {
     until("the ACK of the new attachment", || book.snapshot().acked).await;
     assert_eq!(
         names_of(&book.snapshot().accepted),
-        ["app", "ghost", "web"],
+        ["ghost", "myapp", "web"],
         "advertised again after the reconnect"
     );
     assert_eq!(
         names_of(&relay.relay.labels().shares_for(&node.node_id)),
-        ["app", "ghost", "web"],
+        ["ghost", "myapp", "web"],
         "and the relay holds them again"
     );
 
     // 4. The owner changes the set while attached: the relay's claims follow, and an empty set
     // drops them all (the relay keeps the last complete set it was given).
-    book.set_shares(vec![app.clone()]).unwrap();
-    until("the relay to hold only app", || {
-        names_of(&relay.relay.labels().shares_for(&node.node_id)) == ["app"]
+    book.set_shares(vec![myapp.clone()]).unwrap();
+    until("the relay to hold only myapp", || {
+        names_of(&relay.relay.labels().shares_for(&node.node_id)) == ["myapp"]
     })
     .await;
     until("the ACK of the smaller set", || {
-        names_of(&book.snapshot().accepted) == ["app"]
+        names_of(&book.snapshot().accepted) == ["myapp"]
     })
     .await;
     book.set_shares(vec![]).unwrap();

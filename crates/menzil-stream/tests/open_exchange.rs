@@ -381,7 +381,7 @@ async fn a_handler_decline_after_authorization_is_acked_as_refused() {
     let mut stream_a = mux_a.open().await.unwrap();
     let open = OpenBody {
         v: menzil_proto::PROTOCOL_VERSION,
-        service: ServiceId::new(ServiceKind::Http, "app"),
+        service: ServiceId::new(ServiceKind::Http, "myapp"),
         target: None,
         meta: OpenMeta::default(),
     };

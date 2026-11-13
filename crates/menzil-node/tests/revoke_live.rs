@@ -52,7 +52,7 @@ async fn b_resets_the_stream_whose_grant_went_then_ends_the_session_of_a_revoked
             network_id,
             a.node_id,
             b.node_id,
-            &["tcp:app", "tcp:keep"],
+            &["tcp:myapp", "tcp:keep"],
             None,
         )],
     );
@@ -67,16 +67,19 @@ async fn b_resets_the_stream_whose_grant_went_then_ends_the_session_of_a_revoked
     let (b_policies, b_rosters) = stores();
 
     // B's two targets, each reporting how a connection to it ended.
-    let app = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let app_port = app.local_addr().unwrap().port();
+    let myapp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let app_port = myapp.local_addr().unwrap().port();
     let (app_ended_tx, mut app_ended) = mpsc::unbounded_channel();
-    tokio::spawn(echo_server(app, app_ended_tx));
+    tokio::spawn(echo_server(myapp, app_ended_tx));
     let keep = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let keep_port = keep.local_addr().unwrap().port();
     let (keep_ended_tx, mut keep_ended) = mpsc::unbounded_channel();
     tokio::spawn(echo_server(keep, keep_ended_tx));
     let services = LocalServices::new()
-        .serve(service("tcp:app"), LocalTarget::new("127.0.0.1", app_port))
+        .serve(
+            service("tcp:myapp"),
+            LocalTarget::new("127.0.0.1", app_port),
+        )
         .unwrap()
         .serve(
             service("tcp:keep"),
@@ -118,8 +121,8 @@ async fn b_resets_the_stream_whose_grant_went_then_ends_the_session_of_a_revoked
         }
     };
 
-    let mut app_stream = open("tcp:app").await.expect("granted");
-    echo_round_trip(&mut app_stream, b"app").await;
+    let mut app_stream = open("tcp:myapp").await.expect("granted");
+    echo_round_trip(&mut app_stream, b"myapp").await;
     let mut keep_stream = open("tcp:keep").await.expect("granted");
     echo_round_trip(&mut keep_stream, b"keep").await;
 
@@ -161,7 +164,7 @@ async fn b_resets_the_stream_whose_grant_went_then_ends_the_session_of_a_revoked
     );
     // The other service is untouched, and so is the session.
     echo_round_trip(&mut keep_stream, b"still granted").await;
-    let refused = open("tcp:app").await.expect_err("the grant is gone");
+    let refused = open("tcp:myapp").await.expect_err("the grant is gone");
     match refused {
         NodeOpenError::Open(OpenStreamError::Refused { code, .. }) => {
             assert_eq!(code, ErrorCode::NoGrant)

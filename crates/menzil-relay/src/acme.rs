@@ -945,11 +945,11 @@ mod tests {
 
     #[tokio::test]
     async fn the_hosts_and_the_accepted_terminated_shares_of_a_flagged_tenant_are_wanted() {
-        let w = world(&["web", "app", "plain"], Some(terminated_ali()));
+        let w = world(&["web", "myapp", "plain"], Some(terminated_ali()));
         w.attach();
         w.advertise(vec![
             share("web", ShareMode::Terminated, "http:web", &[]),
-            share("app", ShareMode::Blind, "tls:app", &["acme-tls/1"]),
+            share("myapp", ShareMode::Blind, "tls:myapp", &["acme-tls/1"]),
             share("plain", ShareMode::Blind, "tcp:plain", &[]),
         ]);
         assert_eq!(
@@ -1052,7 +1052,7 @@ mod tests {
     #[tokio::test]
     async fn the_relay_obtains_and_stores_a_certificate_for_its_own_host() {
         let scratch = Scratch::new();
-        let w = world(&["app"], None);
+        let w = world(&["myapp"], None);
         let acme = acme_for(&scratch.0, &[OWN]);
         let relay = relay_with(&w, &acme);
         let ca = FakeCa::new(acme.challenges(), Flags::default());
@@ -1076,11 +1076,11 @@ mod tests {
     #[tokio::test]
     async fn a_terminated_name_is_ordered_and_a_blind_share_is_never() {
         let scratch = Scratch::new();
-        let w = world(&["web", "app"], Some(terminated_ali()));
+        let w = world(&["web", "myapp"], Some(terminated_ali()));
         w.attach();
         w.advertise(vec![
             share("web", ShareMode::Terminated, "http:web", &[]),
-            share("app", ShareMode::Blind, "tls:app", &["acme-tls/1"]),
+            share("myapp", ShareMode::Blind, "tls:myapp", &["acme-tls/1"]),
         ]);
         let acme = acme_for(&scratch.0, &[]);
         let relay = relay_with(&w, &acme);
@@ -1114,12 +1114,12 @@ mod tests {
         let scratch = Scratch::new();
         // A blind share, an unflagged tenant's terminated share, an unattached holder: no host
         // configured, so no name is wanted and the CA is never spoken to.
-        let w = world(&["web", "app"], Some(ali(&[])));
+        let w = world(&["web", "myapp"], Some(ali(&[])));
         w.advertise(vec![]);
         w.attach();
         w.advertise(vec![
             share("web", ShareMode::Terminated, "http:web", &[]),
-            share("app", ShareMode::Blind, "tls:app", &["acme-tls/1"]),
+            share("myapp", ShareMode::Blind, "tls:myapp", &["acme-tls/1"]),
         ]);
         let acme = acme_for(&scratch.0, &[]);
         let relay = relay_with(&w, &acme);
@@ -1135,7 +1135,7 @@ mod tests {
     #[tokio::test]
     async fn a_failing_ca_is_asked_once_a_minute_at_most() {
         let scratch = Scratch::new();
-        let w = world(&["app"], None);
+        let w = world(&["myapp"], None);
         let acme = acme_for(&scratch.0, &[OWN]);
         let relay = relay_with(&w, &acme);
         let ca = FakeCa::new(
@@ -1173,7 +1173,7 @@ mod tests {
     }
 
     async fn door(with_acme: bool) -> Door {
-        let w = world(&["app"], None);
+        let w = world(&["myapp"], None);
         let acme = acme_for(std::path::Path::new("/nonexistent"), &[OWN]);
         let relay = if with_acme {
             relay_with(&w, &acme)

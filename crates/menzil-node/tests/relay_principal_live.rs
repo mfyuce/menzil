@@ -214,7 +214,7 @@ async fn the_relay_principal_opens_shared_services_of_a_live_node_and_only_those
     let node = identity();
     let other = identity();
     let owner = SigningKey::generate(&mut rand::rng());
-    let (network_id, roster1) = roster(&owner, node.node_id, other.node_id, &["app", "raw"]);
+    let (network_id, roster1) = roster(&owner, node.node_id, other.node_id, &["myapp", "raw"]);
     let policy1 = policy_for(&owner, network_id, &node, &other);
     relay.relay.rosters().set(&roster1).unwrap();
     let rosters = Arc::new(RosterStore::new());
@@ -223,10 +223,10 @@ async fn the_relay_principal_opens_shared_services_of_a_live_node_and_only_those
     policies.set(&policy1).unwrap();
 
     // The node's three local targets: two it shares, one it serves to members only.
-    let app = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let app_port = app.local_addr().unwrap().port();
+    let myapp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let app_port = myapp.local_addr().unwrap().port();
     let (app_ended_tx, mut app_ended) = mpsc::unbounded_channel();
-    tokio::spawn(echo_server(app, app_ended_tx));
+    tokio::spawn(echo_server(myapp, app_ended_tx));
     let raw = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let raw_port = raw.local_addr().unwrap().port();
     let (raw_ended_tx, mut raw_ended) = mpsc::unbounded_channel();
@@ -236,7 +236,10 @@ async fn the_relay_principal_opens_shared_services_of_a_live_node_and_only_those
     let secret_connections = Arc::new(AtomicUsize::new(0));
     tokio::spawn(counting_server(secret, secret_connections.clone()));
     let services = LocalServices::new()
-        .serve(service("tls:app"), LocalTarget::new("127.0.0.1", app_port))
+        .serve(
+            service("tls:myapp"),
+            LocalTarget::new("127.0.0.1", app_port),
+        )
         .unwrap()
         .serve(service("tcp:raw"), LocalTarget::new("127.0.0.1", raw_port))
         .unwrap()
@@ -278,7 +281,7 @@ async fn the_relay_principal_opens_shared_services_of_a_live_node_and_only_those
             .with_tick(Duration::from_millis(50))
             .with_handshake_timeout(HANDSHAKE),
     );
-    let app_share = share("app", "tls:app");
+    let app_share = share("myapp", "tls:myapp");
     let raw_share = share("raw", "tcp:raw");
 
     // --- 1. nothing shared yet: the node is silent ---------------------------------------
@@ -287,7 +290,7 @@ async fn the_relay_principal_opens_shared_services_of_a_live_node_and_only_those
         &principal,
         node.node_id,
         network_id,
-        "tls:app",
+        "tls:myapp",
         OpenMeta::default(),
     )
     .await
@@ -312,8 +315,8 @@ async fn the_relay_principal_opens_shared_services_of_a_live_node_and_only_those
         book.accepted_service(&app_share.service) && book.accepted_service(&raw_share.service)
     })
     .await;
-    let good = meta("203.0.113.9", "app.menzil.test");
-    let mut app_stream = open(&principal, node.node_id, network_id, "tls:app", good)
+    let good = meta("203.0.113.9", "myapp.menzil.test");
+    let mut app_stream = open(&principal, node.node_id, network_id, "tls:myapp", good)
         .await
         .expect("a shared service opens");
     echo_round_trip(&mut app_stream, b"hello through the relay principal").await;
@@ -345,9 +348,9 @@ async fn the_relay_principal_opens_shared_services_of_a_live_node_and_only_those
             assert_eq!(request.network_id, network_id);
             assert!(request.target.is_none());
         }
-        assert_eq!(seen[0].service, service("tls:app"));
+        assert_eq!(seen[0].service, service("tls:myapp"));
         assert_eq!(seen[0].meta.client_ip.as_deref(), Some("203.0.113.9"));
-        assert_eq!(seen[0].meta.sni.as_deref(), Some("app.menzil.test"));
+        assert_eq!(seen[0].meta.sni.as_deref(), Some("myapp.menzil.test"));
         assert_eq!(seen[1].service, service("tcp:raw"));
         assert_eq!(seen[1].meta, OpenMeta::default(), "bad fields are dropped");
     }
@@ -396,7 +399,7 @@ async fn the_relay_principal_opens_shared_services_of_a_live_node_and_only_those
         &principal,
         node.node_id,
         network_id,
-        "tls:app",
+        "tls:myapp",
         OpenMeta::default(),
     )
     .await
@@ -412,7 +415,7 @@ async fn the_relay_principal_opens_shared_services_of_a_live_node_and_only_those
     // Share it again for the rest.
     book.set_shares(vec![app_share.clone(), raw_share.clone()])
         .unwrap();
-    until("app to be accepted again", || {
+    until("myapp to be accepted again", || {
         book.accepted_service(&app_share.service)
     })
     .await;

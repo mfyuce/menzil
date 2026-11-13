@@ -51,7 +51,7 @@ use tokio::time::timeout;
 
 /// The share domain.
 const H: &str = "share.test";
-const NAME: &str = "app.share.test";
+const NAME: &str = "myapp.share.test";
 
 fn roster(owner: &SigningKey, node: NodeId, other: NodeId, labels: &[&str]) -> (NetworkId, Roster) {
     let network_id = NetworkId::from(owner.verifying_key().to_bytes());
@@ -211,7 +211,7 @@ async fn the_node_orders_for_the_name_of_the_relays_ack_and_stops_and_starts_wit
     let node_id = identity();
     let peer = identity();
     let owner = SigningKey::generate(&mut rand::rng());
-    let (network_id, roster1) = roster(&owner, node_id.node_id, peer.node_id, &["app"]);
+    let (network_id, roster1) = roster(&owner, node_id.node_id, peer.node_id, &["myapp"]);
     let policy1 = policy_for(&owner, network_id, &node_id, &peer);
     relay.rosters().set(&roster1).unwrap();
     let rosters = Arc::new(RosterStore::new());
@@ -226,7 +226,10 @@ async fn the_node_orders_for_the_name_of_the_relays_ack_and_stops_and_starts_wit
     tokio::spawn(echo_server(echo, ended));
     let challenges = ChallengeBook::new();
     let services = LocalServices::new()
-        .serve(service("tls:app"), LocalTarget::new("127.0.0.1", echo_port))
+        .serve(
+            service("tls:myapp"),
+            LocalTarget::new("127.0.0.1", echo_port),
+        )
         .unwrap()
         .serve(
             service("tls:other"),
@@ -278,13 +281,13 @@ async fn the_node_orders_for_the_name_of_the_relays_ack_and_stops_and_starts_wit
     );
 
     // --- 1. the ACK names the domain and the name; the order, the validation, the files -----
-    let app = blind("app", &["acme-tls/1"]);
+    let myapp = blind("myapp", &["acme-tls/1"]);
     let other = blind("other", &["acme-tls/1"]);
-    book.set_shares(vec![app.clone(), other.clone()]).unwrap();
+    book.set_shares(vec![myapp.clone(), other.clone()]).unwrap();
     until("the certificate", || store.validity(NAME).is_some()).await;
     assert_eq!(book.share_domain().as_deref(), Some(H), "the ACK's domain");
-    assert_eq!(book.names(), vec!["app".to_string()]);
-    assert!(book.accepted_service(&app.service));
+    assert_eq!(book.names(), vec!["myapp".to_string()]);
+    assert!(book.accepted_service(&myapp.service));
     assert!(
         !book.accepted_service(&other.service),
         "the relay holds no label `other` for this node"
@@ -299,7 +302,7 @@ async fn the_node_orders_for_the_name_of_the_relays_ack_and_stops_and_starts_wit
         );
         assert!(state.finalized);
     }
-    assert_eq!(orders(&ca), 1, "only `app` was ordered, `other` never");
+    assert_eq!(orders(&ca), 1, "only `myapp` was ordered, `other` never");
     let (chain, key) = store.paths(NAME).unwrap();
     assert!(chain.exists() && key.exists());
     {
@@ -325,7 +328,7 @@ async fn the_node_orders_for_the_name_of_the_relays_ack_and_stops_and_starts_wit
     // --- 2. withdrawn: the task stops; put back: it starts again ---------------------------
     book.set_shares(vec![other.clone()]).unwrap();
     until("the withdrawal to reach the relay", || {
-        !book.accepted_service(&app.service)
+        !book.accepted_service(&myapp.service)
     })
     .await;
     std::fs::remove_dir_all(chain.parent().unwrap()).unwrap();
@@ -333,7 +336,7 @@ async fn the_node_orders_for_the_name_of_the_relays_ack_and_stops_and_starts_wit
     tokio::time::sleep(Duration::from_millis(500)).await;
     assert_eq!(orders(&ca), before, "a withdrawn share is not ordered for");
     assert!(store.validity(NAME).is_none());
-    book.set_shares(vec![app.clone(), other.clone()]).unwrap();
+    book.set_shares(vec![myapp.clone(), other.clone()]).unwrap();
     until("the certificate again", || store.validity(NAME).is_some()).await;
     assert!(
         orders(&ca) > before,

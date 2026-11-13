@@ -321,7 +321,7 @@ fn assert_refused(ack: &OpenAckBody, code: ErrorCode, what: &str) {
 
 #[tokio::test(start_paused = true)]
 async fn the_relay_principal_comes_up_when_every_check_passes() {
-    let mut rp = rp(&[blind("app")], &["app"]).await;
+    let mut rp = rp(&[blind("myapp")], &["myapp"]).await;
     let up = rp.up().await;
     let ready = &up.node_ready;
     assert!(ready.relay_principal);
@@ -344,13 +344,18 @@ async fn the_relay_principal_comes_up_when_every_check_passes() {
 #[tokio::test(start_paused = true)]
 async fn an_init_from_another_static_key_than_the_relays_gets_silence() {
     // The L3 attachment negotiated another key for the relay than the one the initiator holds.
-    let mut rp = rp_with_static(X25519PublicKey::from([0x55; 32]), &[blind("app")], &["app"]).await;
+    let mut rp = rp_with_static(
+        X25519PublicKey::from([0x55; 32]),
+        &[blind("myapp")],
+        &["myapp"],
+    )
+    .await;
     rp.assert_silence().await;
 }
 
 #[tokio::test(start_paused = true)]
 async fn a_member_that_puts_the_relays_node_id_in_its_init_gets_silence() {
-    let mut rp = rp(&[blind("app")], &["app"]).await;
+    let mut rp = rp(&[blind("myapp")], &["myapp"]).await;
     let member = party();
     // The handshake is valid in itself: the prologue names the relay as the initiator. The key is
     // the member's, not the relay's.
@@ -378,7 +383,7 @@ async fn a_member_that_puts_the_relays_node_id_in_its_init_gets_silence() {
 
 #[tokio::test(start_paused = true)]
 async fn the_relays_key_is_the_one_of_the_current_attachment_only() {
-    let mut rp = rp(&[blind("app")], &["app"]).await;
+    let mut rp = rp(&[blind("myapp")], &["myapp"]).await;
     // The node reconnects and this attachment's L3 handshake negotiated another key.
     rp.nb.detach(Epoch::first()).await;
     let second = Epoch::first().next();
@@ -403,24 +408,24 @@ async fn the_relays_key_is_the_one_of_the_current_attachment_only() {
 #[tokio::test(start_paused = true)]
 async fn an_init_for_a_network_with_no_accepted_share_gets_silence() {
     // The Roster grants the label, but the relay accepted no share.
-    let mut rp = rp(&[], &["app"]).await;
+    let mut rp = rp(&[], &["myapp"]).await;
     rp.assert_silence().await;
 }
 
 #[tokio::test(start_paused = true)]
 async fn a_share_the_relay_accepted_for_another_network_does_not_open_this_one() {
     // The relay accepted `app`, but this network's Roster does not grant it to this node.
-    let mut rp = rp(&[blind("app")], &[]).await;
+    let mut rp = rp(&[blind("myapp")], &[]).await;
     rp.assert_silence().await;
 }
 
 #[tokio::test(start_paused = true)]
 async fn a_label_this_networks_roster_grants_to_another_node_is_not_ours() {
-    let mut rp = rp(&[blind("app")], &["app"]).await;
+    let mut rp = rp(&[blind("myapp")], &["myapp"]).await;
     let other = party().id;
     edit_roster_of(&rp.w, &rp.stores_b, |b| {
         b.labels = vec![Label {
-            name: "app".to_string(),
+            name: "myapp".to_string(),
             node_id: other,
         }]
     });
@@ -429,7 +434,7 @@ async fn a_label_this_networks_roster_grants_to_another_node_is_not_ours() {
 
 #[tokio::test(start_paused = true)]
 async fn a_label_of_another_name_does_not_make_the_share_ours() {
-    let mut rp = rp(&[blind("app")], &["app"]).await;
+    let mut rp = rp(&[blind("myapp")], &["myapp"]).await;
     let me = rp.b.id;
     edit_roster_of(&rp.w, &rp.stores_b, |b| {
         b.labels = vec![Label {
@@ -442,7 +447,7 @@ async fn a_label_of_another_name_does_not_make_the_share_ours() {
 
 #[tokio::test(start_paused = true)]
 async fn an_init_for_a_network_we_hold_no_documents_for_gets_silence() {
-    let rp = rp(&[blind("app")], &["app"]).await;
+    let rp = rp(&[blind("myapp")], &["myapp"]).await;
     let relay = Manual::new(&rp.net, rp.rel.clone_for_test());
     let (_hs, init) = relay.init(&rp.b, NetworkId::from([0x42; 32]), 1);
     rp.net.inject(rp.rel.id, rp.b.id, &init);
@@ -452,7 +457,7 @@ async fn an_init_for_a_network_we_hold_no_documents_for_gets_silence() {
 
 #[tokio::test(start_paused = true)]
 async fn an_init_while_our_documents_have_expired_gets_silence() {
-    let mut rp = rp(&[blind("app")], &["app"]).await;
+    let mut rp = rp(&[blind("myapp")], &["myapp"]).await;
     edit_roster_of(&rp.w, &rp.stores_b, |b| b.expires = 1);
     edit_policy(&rp.w, &rp.stores_b, |b| b.expires = 1);
     rp.assert_silence().await;
@@ -460,14 +465,14 @@ async fn an_init_while_our_documents_have_expired_gets_silence() {
 
 #[tokio::test(start_paused = true)]
 async fn an_init_while_this_node_is_revoked_gets_silence() {
-    let mut rp = rp(&[blind("app")], &["app"]).await;
+    let mut rp = rp(&[blind("myapp")], &["myapp"]).await;
     revoke(&rp.w, &rp.stores_b, rp.b.id);
     rp.assert_silence().await;
 }
 
 #[tokio::test(start_paused = true)]
 async fn an_init_while_our_own_certificate_is_not_in_the_policy_gets_silence() {
-    let mut rp = rp(&[blind("app")], &["app"]).await;
+    let mut rp = rp(&[blind("myapp")], &["myapp"]).await;
     let me = rp.b.id;
     edit_policy(&rp.w, &rp.stores_b, |b| {
         b.certs.retain(|c| c.decode().unwrap().node_id != me)
@@ -477,7 +482,7 @@ async fn an_init_while_our_own_certificate_is_not_in_the_policy_gets_silence() {
 
 #[tokio::test(start_paused = true)]
 async fn the_relays_inits_are_rate_limited_like_any_peers() {
-    let rp = rp(&[blind("app")], &["app"]).await;
+    let rp = rp(&[blind("myapp")], &["myapp"]).await;
     let relay = Manual::new(&rp.net, rp.rel.clone_for_test());
     for index in 1..=11 {
         let (_hs, init) = relay.init(&rp.b, rp.w.network, index);
@@ -493,7 +498,7 @@ async fn the_relays_inits_are_rate_limited_like_any_peers() {
 
 #[tokio::test(start_paused = true)]
 async fn an_l3_reconnect_ends_the_principal_session() {
-    let mut rp = rp(&[blind("app")], &["app"]).await;
+    let mut rp = rp(&[blind("myapp")], &["myapp"]).await;
     let mut up = rp.up().await;
     rp.nb.detach(Epoch::first()).await;
     let reason = ended(&mut up.node_ready.acceptor).await;
@@ -507,11 +512,11 @@ async fn an_l3_reconnect_ends_the_principal_session() {
 
 #[tokio::test(start_paused = true)]
 async fn the_relay_opens_a_shared_service_and_the_handler_serves_it() {
-    let mut rp = rp(&[blind("app")], &["app"]).await;
+    let mut rp = rp(&[blind("myapp")], &["myapp"]).await;
     let up = rp.up().await;
     let relay = rp.serving(None);
     rp.serve(up.node_ready, None, Some(&relay));
-    let (_stream, ack) = open_plain(&up.relay, "tls:app").await;
+    let (_stream, ack) = open_plain(&up.relay, "tls:myapp").await;
     assert!(ack.ok, "{ack:?}");
     assert_eq!(rp.rec.opens.load(Ordering::SeqCst), 1);
 }
@@ -520,16 +525,16 @@ async fn the_relay_opens_a_shared_service_and_the_handler_serves_it() {
 /// serves to its members.
 #[tokio::test(start_paused = true)]
 async fn the_relay_cannot_reach_a_service_that_is_not_shared() {
-    let mut rp = rp(&[blind("app")], &["app"]).await;
+    let mut rp = rp(&[blind("myapp")], &["myapp"]).await;
     let up = rp.up().await;
     let relay = rp.serving(None);
     rp.serve(up.node_ready, None, Some(&relay));
     for service in [
         "tcp:ssh",
         "tls:other",
-        "http:app",
-        "tcp:app",
-        "udp:app",
+        "http:myapp",
+        "tcp:myapp",
+        "udp:myapp",
         "egress:*",
     ] {
         let (_stream, ack) = open_plain(&up.relay, service).await;
@@ -544,7 +549,7 @@ async fn the_relay_cannot_reach_a_service_that_is_not_shared() {
 
 #[tokio::test(start_paused = true)]
 async fn the_relay_cannot_open_menzil_docs() {
-    let mut rp = rp(&[blind("app")], &["app"]).await;
+    let mut rp = rp(&[blind("myapp")], &["myapp"]).await;
     let up = rp.up().await;
     let relay = rp.serving(None);
     rp.serve(up.node_ready, None, Some(&relay));
@@ -555,7 +560,7 @@ async fn the_relay_cannot_open_menzil_docs() {
 
 #[tokio::test(start_paused = true)]
 async fn an_open_with_a_target_is_refused() {
-    let mut rp = rp(&[blind("app")], &["app"]).await;
+    let mut rp = rp(&[blind("myapp")], &["myapp"]).await;
     let up = rp.up().await;
     let relay = rp.serving(None);
     rp.serve(up.node_ready, None, Some(&relay));
@@ -563,7 +568,8 @@ async fn an_open_with_a_target_is_refused() {
         host: "127.0.0.1".to_string(),
         port: 22,
     };
-    let (_stream, ack) = relay_open(&up.relay, "tls:app", Some(target), OpenMeta::default()).await;
+    let (_stream, ack) =
+        relay_open(&up.relay, "tls:myapp", Some(target), OpenMeta::default()).await;
     assert!(!ack.ok);
     assert_eq!(rp.rec.opens.load(Ordering::SeqCst), 0);
 }
@@ -572,12 +578,12 @@ async fn an_open_with_a_target_is_refused() {
 /// it.
 #[tokio::test(start_paused = true)]
 async fn the_authorizer_itself_refuses_a_target() {
-    let rp = rp(&[blind("app")], &["app"]).await;
+    let rp = rp(&[blind("myapp")], &["myapp"]).await;
     let authorizer = rp.authorizer();
     let request = |target: Option<OpenTarget>, initiator: NodeId, network: NetworkId| OpenRequest {
         network_id: network,
         initiator,
-        service: "tls:app".parse().unwrap(),
+        service: "tls:myapp".parse().unwrap(),
         target,
         meta: OpenMeta::default(),
     };
@@ -612,12 +618,12 @@ async fn the_authorizer_itself_refuses_a_target() {
 #[tokio::test(start_paused = true)]
 async fn acme_http_is_for_blind_shares_only() {
     let terminated = share("site", ShareMode::Terminated, "http:site");
-    let mut rp = rp(&[blind("app"), terminated], &["app", "site"]).await;
+    let mut rp = rp(&[blind("myapp"), terminated], &["myapp", "site"]).await;
     let up = rp.up().await;
     let relay = rp.serving(None);
     rp.serve(up.node_ready, None, Some(&relay));
 
-    let (_stream, ack) = open_plain(&up.relay, "acme-http:app").await;
+    let (_stream, ack) = open_plain(&up.relay, "acme-http:myapp").await;
     assert!(ack.ok, "a blind share's challenge: {ack:?}");
     let (_stream, ack) = open_plain(&up.relay, "acme-http:site").await;
     assert_refused(&ack, ErrorCode::NoGrant, "a terminated share's challenge");
@@ -631,38 +637,38 @@ async fn acme_http_is_for_blind_shares_only() {
 
 #[tokio::test(start_paused = true)]
 async fn own_standing_is_checked_on_every_open() {
-    let mut rp = rp(&[blind("app")], &["app"]).await;
+    let mut rp = rp(&[blind("myapp")], &["myapp"]).await;
     let up = rp.up().await;
     let relay = rp.serving(None);
     // No revalidator: only the authorizer stands between the relay and the next stream.
     rp.serve(up.node_ready, None, Some(&relay));
-    let (_stream, ack) = open_plain(&up.relay, "tls:app").await;
+    let (_stream, ack) = open_plain(&up.relay, "tls:myapp").await;
     assert!(ack.ok, "{ack:?}");
 
     revoke(&rp.w, &rp.stores_b, rp.b.id);
-    let (_stream, ack) = open_plain(&up.relay, "tls:app").await;
+    let (_stream, ack) = open_plain(&up.relay, "tls:myapp").await;
     assert_refused(&ack, ErrorCode::NoGrant, "this node was revoked");
     assert_eq!(rp.rec.opens.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test(start_paused = true)]
 async fn nothing_is_served_on_expired_documents() {
-    let mut rp = rp(&[blind("app")], &["app"]).await;
+    let mut rp = rp(&[blind("myapp")], &["myapp"]).await;
     let up = rp.up().await;
     let relay = rp.serving(None);
     rp.serve(up.node_ready, None, Some(&relay));
     edit_roster_of(&rp.w, &rp.stores_b, |b| b.expires = 1);
     edit_policy(&rp.w, &rp.stores_b, |b| b.expires = 1);
-    let (_stream, ack) = open_plain(&up.relay, "tls:app").await;
+    let (_stream, ack) = open_plain(&up.relay, "tls:myapp").await;
     assert_refused(&ack, ErrorCode::NoGrant, "expired documents");
 }
 
 #[tokio::test(start_paused = true)]
 async fn a_session_with_no_relay_wiring_is_refused_every_stream() {
-    let mut rp = rp(&[blind("app")], &["app"]).await;
+    let mut rp = rp(&[blind("myapp")], &["myapp"]).await;
     let up = rp.up().await;
     rp.serve(up.node_ready, None, None);
-    let (_stream, ack) = open_plain(&up.relay, "tls:app").await;
+    let (_stream, ack) = open_plain(&up.relay, "tls:myapp").await;
     assert!(!ack.ok);
     assert_eq!(rp.rec.opens.load(Ordering::SeqCst), 0);
 }
@@ -671,18 +677,18 @@ async fn a_session_with_no_relay_wiring_is_refused_every_stream() {
 
 #[tokio::test(start_paused = true)]
 async fn a_withdrawn_share_resets_its_stream_and_the_session_keeps_the_others() {
-    let mut rp = rp(&[blind("app"), blind("other")], &["app", "other"]).await;
+    let mut rp = rp(&[blind("myapp"), blind("other")], &["myapp", "other"]).await;
     let mut up = rp.up().await;
     let reval = rp.revalidator();
     let relay = rp.serving(None);
     rp.serve(up.node_ready, Some(&reval), Some(&relay));
-    let (mut app, ack) = open_plain(&up.relay, "tls:app").await;
+    let (mut myapp, ack) = open_plain(&up.relay, "tls:myapp").await;
     assert!(ack.ok);
     let (mut other, ack) = open_plain(&up.relay, "tls:other").await;
     assert!(ack.ok);
 
     // The relay's answer to a new ADVERTISE no longer accepts `app`.
-    rp.book.note_sent(&[blind("app"), blind("other")]);
+    rp.book.note_sent(&[blind("myapp"), blind("other")]);
     rp.book.note_ack(&AdvertiseAckBody {
         accepted: vec!["other".to_string()],
         rejected: vec![],
@@ -691,7 +697,7 @@ async fn a_withdrawn_share_resets_its_stream_and_the_session_keeps_the_others() 
     });
 
     let mut byte = [0u8; 1];
-    let error = timeout(Duration::from_secs(2), app.read(&mut byte))
+    let error = timeout(Duration::from_secs(2), myapp.read(&mut byte))
         .await
         .expect("the stream of the withdrawn share is reset at once")
         .expect_err("a reset, not an end of file");
@@ -708,7 +714,7 @@ async fn a_withdrawn_share_resets_its_stream_and_the_session_keeps_the_others() 
             .is_err(),
         "the session stays"
     );
-    let (_stream, ack) = open_plain(&up.relay, "tls:app").await;
+    let (_stream, ack) = open_plain(&up.relay, "tls:myapp").await;
     assert_refused(&ack, ErrorCode::NoGrant, "the withdrawn share");
     let (_stream, ack) = open_plain(&up.relay, "tls:other").await;
     assert!(ack.ok, "{ack:?}");
@@ -719,12 +725,12 @@ async fn a_withdrawn_share_resets_its_stream_and_the_session_keeps_the_others() 
 /// has run, and `app` must stop being served at once, not stay until an ACK that does not come.
 #[tokio::test(start_paused = true)]
 async fn a_share_the_owner_withdrew_is_not_served_while_the_relay_has_not_answered() {
-    let mut rp = rp(&[blind("app"), blind("other")], &["app", "other"]).await;
+    let mut rp = rp(&[blind("myapp"), blind("other")], &["myapp", "other"]).await;
     let mut up = rp.up().await;
     let reval = rp.revalidator();
     let relay = rp.serving(None);
     rp.serve(up.node_ready, Some(&reval), Some(&relay));
-    let (mut app, ack) = open_plain(&up.relay, "tls:app").await;
+    let (mut myapp, ack) = open_plain(&up.relay, "tls:myapp").await;
     assert!(ack.ok);
     let (mut other, ack) = open_plain(&up.relay, "tls:other").await;
     assert!(ack.ok);
@@ -735,13 +741,13 @@ async fn a_share_the_owner_withdrew_is_not_served_while_the_relay_has_not_answer
     rp.book.note_sent(&[blind("other")]);
 
     let mut byte = [0u8; 1];
-    let error = timeout(Duration::from_secs(2), app.read(&mut byte))
+    let error = timeout(Duration::from_secs(2), myapp.read(&mut byte))
         .await
         .expect("the stream of the withdrawn share is reset at once")
         .expect_err("a reset, not an end of file");
     assert_eq!(error.kind(), std::io::ErrorKind::ConnectionReset);
     tokio::time::sleep(Duration::from_secs(120)).await;
-    let (_stream, ack) = open_plain(&up.relay, "tls:app").await;
+    let (_stream, ack) = open_plain(&up.relay, "tls:myapp").await;
     assert_refused(&ack, ErrorCode::NoGrant, "the withdrawn share, 120 s on");
     assert!(
         timeout(Duration::from_secs(1), other.read(&mut byte))
@@ -761,15 +767,15 @@ async fn a_share_the_owner_withdrew_is_not_served_while_the_relay_has_not_answer
 
 #[tokio::test(start_paused = true)]
 async fn losing_every_share_closes_the_session_with_grant_removed() {
-    let mut rp = rp(&[blind("app")], &["app"]).await;
+    let mut rp = rp(&[blind("myapp")], &["myapp"]).await;
     let mut up = rp.up().await;
     let reval = rp.revalidator();
     let relay = rp.serving(None);
     rp.serve(up.node_ready, Some(&reval), Some(&relay));
-    let (_stream, ack) = open_plain(&up.relay, "tls:app").await;
+    let (_stream, ack) = open_plain(&up.relay, "tls:myapp").await;
     assert!(ack.ok);
 
-    rp.book.note_sent(&[blind("app")]);
+    rp.book.note_sent(&[blind("myapp")]);
     rp.book.note_ack(&AdvertiseAckBody {
         accepted: vec![],
         rejected: vec![],
@@ -784,7 +790,7 @@ async fn losing_every_share_closes_the_session_with_grant_removed() {
 
 #[tokio::test(start_paused = true)]
 async fn a_roster_that_drops_the_label_closes_the_session() {
-    let mut rp = rp(&[blind("app")], &["app"]).await;
+    let mut rp = rp(&[blind("myapp")], &["myapp"]).await;
     let mut up = rp.up().await;
     let reval = rp.revalidator();
     let relay = rp.serving(None);
@@ -799,7 +805,7 @@ async fn a_roster_that_drops_the_label_closes_the_session() {
 
 #[tokio::test(start_paused = true)]
 async fn a_revoked_node_closes_the_principal_session() {
-    let mut rp = rp(&[blind("app")], &["app"]).await;
+    let mut rp = rp(&[blind("myapp")], &["myapp"]).await;
     let mut up = rp.up().await;
     let reval = rp.revalidator();
     let relay = rp.serving(None);
@@ -814,7 +820,7 @@ async fn a_revoked_node_closes_the_principal_session() {
 
 #[tokio::test(start_paused = true)]
 async fn the_revalidator_judges_the_principal_by_standing_and_shares() {
-    let mut rp = rp(&[blind("app")], &["app"]).await;
+    let mut rp = rp(&[blind("myapp")], &["myapp"]).await;
     let up = rp.up().await;
     let reval = Revalidator::new(
         rp.stores_b.policies.clone(),
@@ -845,17 +851,17 @@ async fn the_revalidator_judges_the_principal_by_standing_and_shares() {
 
 #[tokio::test(start_paused = true)]
 async fn the_relay_principal_has_its_own_limits_per_share_and_in_all() {
-    let mut rp = rp(&[blind("app"), blind("other")], &["app", "other"]).await;
+    let mut rp = rp(&[blind("myapp"), blind("other")], &["myapp", "other"]).await;
     let up = rp.up().await;
     let relay = rp.serving(Some(RelayLimits::with_figures(2, 3)));
     rp.serve(up.node_ready, None, Some(&relay));
     let mut held = Vec::new();
     for _ in 0..2 {
-        let (stream, ack) = open_plain(&up.relay, "tls:app").await;
+        let (stream, ack) = open_plain(&up.relay, "tls:myapp").await;
         assert!(ack.ok, "{ack:?}");
         held.push(stream);
     }
-    let (_stream, ack) = open_plain(&up.relay, "tls:app").await;
+    let (_stream, ack) = open_plain(&up.relay, "tls:myapp").await;
     assert_refused(
         &ack,
         ErrorCode::RateLimited,
@@ -882,7 +888,7 @@ async fn relay_streams_take_no_place_in_the_members_serve_limits() {
     use tokio::net::TcpListener;
     let w = world();
     let (b, m) = (party(), party());
-    let stores = labeled_stores(&w, &[&b, &m], &[("app", b.id)]);
+    let stores = labeled_stores(&w, &[&b, &m], &[("myapp", b.id)]);
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     tokio::spawn(async move {
@@ -895,7 +901,7 @@ async fn relay_streams_take_no_place_in_the_members_serve_limits() {
     let services = Arc::new(
         LocalServices::new()
             .serve(
-                "tls:app".parse().unwrap(),
+                "tls:myapp".parse().unwrap(),
                 LocalTarget::new("127.0.0.1", port),
             )
             .unwrap()
@@ -909,7 +915,7 @@ async fn relay_streams_take_no_place_in_the_members_serve_limits() {
         services.clone(),
         stores.rosters.clone(),
         RelayServing::with_limits(
-            book_accepting(&[blind("app")]),
+            book_accepting(&[blind("myapp")]),
             RelayLimits::with_figures(5, 5),
         ),
         w.network,
@@ -919,7 +925,7 @@ async fn relay_streams_take_no_place_in_the_members_serve_limits() {
     let request = |initiator: NodeId| OpenRequest {
         network_id: w.network,
         initiator,
-        service: "tls:app".parse().unwrap(),
+        service: "tls:myapp".parse().unwrap(),
         target: None,
         meta: OpenMeta::default(),
     };
@@ -976,7 +982,7 @@ async fn relay_streams_take_no_place_in_the_members_serve_limits() {
 
 #[tokio::test(start_paused = true)]
 async fn the_relays_meta_is_validated_not_scrubbed() {
-    let mut rp = rp(&[blind("app")], &["app"]).await;
+    let mut rp = rp(&[blind("myapp")], &["myapp"]).await;
     let up = rp.up().await;
     let relay = rp.serving(None);
     rp.serve(up.node_ready, None, Some(&relay));
@@ -987,15 +993,15 @@ async fn the_relays_meta_is_validated_not_scrubbed() {
     };
     let (_s1, ack) = relay_open(
         &up.relay,
-        "tls:app",
+        "tls:myapp",
         None,
-        meta("203.0.113.9", "App.relay.example"),
+        meta("203.0.113.9", "Myapp.relay.example"),
     )
     .await;
     assert!(ack.ok);
     let (_s2, ack) = relay_open(
         &up.relay,
-        "tls:app",
+        "tls:myapp",
         None,
         meta("not an address", "evil.example"),
     )
@@ -1003,9 +1009,9 @@ async fn the_relays_meta_is_validated_not_scrubbed() {
     assert!(ack.ok, "a bad field is dropped, the stream is served");
     let (_s3, ack) = relay_open(
         &up.relay,
-        "tls:app",
+        "tls:myapp",
         None,
-        meta("2001:db8::1", &format!("app.{}", "a".repeat(250))),
+        meta("2001:db8::1", &format!("myapp.{}", "a".repeat(250))),
     )
     .await;
     assert!(ack.ok);
@@ -1023,7 +1029,7 @@ async fn the_relays_meta_is_validated_not_scrubbed() {
         seen[0],
         OpenMeta {
             client_ip: Some("203.0.113.9".to_string()),
-            sni: Some("app.relay.example".to_string())
+            sni: Some("myapp.relay.example".to_string())
         }
     );
     assert_eq!(seen[1], OpenMeta::default());
@@ -1039,7 +1045,7 @@ async fn the_relays_meta_is_validated_not_scrubbed() {
 
 #[test]
 fn meta_validation_keeps_only_what_holds_up() {
-    let names = vec!["app".to_string(), "web.ali".to_string()];
+    let names = vec!["myapp".to_string(), "web.ali".to_string()];
     let meta = |ip: Option<&str>, sni: Option<&str>| OpenMeta {
         client_ip: ip.map(str::to_string),
         sni: sni.map(str::to_string),
@@ -1074,12 +1080,12 @@ fn meta_validation_keeps_only_what_holds_up() {
     }
     // Names: equal, below, or the name followed by the relay's domain.
     for good in [
-        "app",
-        "app.relay.example",
+        "myapp",
+        "myapp.relay.example",
         "x.web.ali",
         "web.ali",
         "web.ali.relay.example",
-        "APP.RELAY.EXAMPLE",
+        "MYAPP.RELAY.EXAMPLE",
     ] {
         assert!(
             validate_meta(&meta(None, Some(good)), &names).sni.is_some(),
@@ -1089,15 +1095,15 @@ fn meta_validation_keeps_only_what_holds_up() {
     for bad in [
         "",
         // A single label names a share relative to the relay's domain: `x.app` is not below it.
-        "x.app",
-        "x.y.app",
+        "x.myapp",
+        "x.y.myapp",
         "apple.relay.example",
         "xapp",
         "web.relay.example",
         "ali",
-        "app\0.example",
-        "app.exa mple",
-        "app.é.example",
+        "myapp\0.example",
+        "myapp.exa mple",
+        "myapp.é.example",
         "other.example",
     ] {
         assert_eq!(
@@ -1106,7 +1112,7 @@ fn meta_validation_keeps_only_what_holds_up() {
             "{bad:?}"
         );
     }
-    let long = format!("app.{}", "a".repeat(249));
+    let long = format!("myapp.{}", "a".repeat(247));
     assert_eq!(long.len(), 253);
     assert!(
         validate_meta(&meta(None, Some(&long)), &names)
@@ -1126,20 +1132,20 @@ fn meta_validation_keeps_only_what_holds_up() {
 async fn a_members_meta_is_still_scrubbed_beside_a_relay_session() {
     let w = world();
     let (a, b, rel) = (party(), party(), party());
-    let stores_b = labeled_stores(&w, &[&a, &b], &[("app", b.id)]);
+    let stores_b = labeled_stores(&w, &[&a, &b], &[("myapp", b.id)]);
     let grant = Grant {
         from: Principal {
             network_id: w.network,
             target: PrincipalTarget::Node(a.id),
         },
         to_node: NodeOrWildcard::Node(b.id),
-        services: vec!["tls:app".parse().unwrap()],
+        services: vec!["tls:myapp".parse().unwrap()],
         expires: None,
     };
     edit_policy(&w, &stores_b, |p| p.grants.push(grant.clone()));
     let stores_a = labeled_stores(&w, &[&a, &b], &[]);
     let net = Net::with_relay_party(&rel);
-    let book = book_accepting(&[blind("app")]);
+    let book = book_accepting(&[blind("myapp")]);
     let mut nb = node_full(&net, &b, &stores_b, TableConfig::default(), book.clone()).await;
     let na = node(&net, &a, &stores_a).await;
     let handle = ensure(&na, b.id, w.network).await.unwrap();
@@ -1161,11 +1167,11 @@ async fn a_members_meta_is_still_scrubbed_beside_a_relay_session() {
     );
     let (_stream, ack) = relay_open(
         &handle,
-        "tls:app",
+        "tls:myapp",
         None,
         OpenMeta {
             client_ip: Some("203.0.113.9".to_string()),
-            sni: Some("app.relay.example".to_string()),
+            sni: Some("myapp.relay.example".to_string()),
         },
     )
     .await;

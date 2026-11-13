@@ -35,7 +35,7 @@ fn provider() -> rustls::crypto::CryptoProvider {
 
 const PEEK_TIMEOUT: Duration = Duration::from_secs(5);
 const WAIT: Duration = Duration::from_secs(10);
-const DOMAIN: &str = "app.relay.example";
+const DOMAIN: &str = "myapp.relay.example";
 
 fn sha256(data: &[u8]) -> Vec<u8> {
     ring::digest::digest(&ring::digest::SHA256, data)
@@ -169,12 +169,12 @@ impl Fixture {
         let port = target.local_addr().unwrap().port();
         let services = LocalServices::new()
             .serve(
-                "tls:app".parse().unwrap(),
+                "tls:myapp".parse().unwrap(),
                 LocalTarget::new("127.0.0.1", port),
             )
             .unwrap()
             .serve(
-                "http:app".parse().unwrap(),
+                "http:myapp".parse().unwrap(),
                 LocalTarget::new("127.0.0.1", port),
             )
             .unwrap();
@@ -239,7 +239,7 @@ fn start_client(stream: Stream, sni: &str, alpn: &[&str]) -> tokio::task::JoinHa
 #[tokio::test]
 async fn a_stream_without_a_pending_order_is_piped_untouched_and_unread() {
     let fixture = Fixture::new().await;
-    let (mut client, mut target) = fixture.open("tls:app", Some(DOMAIN)).await;
+    let (mut client, mut target) = fixture.open("tls:myapp", Some(DOMAIN)).await;
     client
         .write_all(b"\x16\x03\x01 not looked at")
         .await
@@ -265,7 +265,7 @@ async fn a_stream_without_a_pending_order_is_piped_untouched_and_unread() {
 async fn through_the_handler_a_validation_is_answered_and_never_reaches_the_target() {
     let fixture = Fixture::new().await;
     let _order = fixture.book.begin(DOMAIN, "tok.thumb").unwrap();
-    let (client, mut target) = fixture.open("tls:app", Some(DOMAIN)).await;
+    let (client, mut target) = fixture.open("tls:myapp", Some(DOMAIN)).await;
     let connector = TlsConnector::from(client_config(&["acme-tls/1"]));
     let name = ServerName::try_from(DOMAIN.to_string()).unwrap();
     let tls = tokio::time::timeout(
@@ -291,7 +291,7 @@ async fn through_the_handler_a_validation_is_answered_and_never_reaches_the_targ
 async fn an_ordinary_hello_in_the_window_reaches_the_target_whole() {
     let fixture = Fixture::new().await;
     let _order = fixture.book.begin(DOMAIN, "tok.thumb").unwrap();
-    let (client, mut target) = fixture.open("tls:app", Some(DOMAIN)).await;
+    let (client, mut target) = fixture.open("tls:myapp", Some(DOMAIN)).await;
     let (hello, ()) = capture_hello(DOMAIN, &["h2"]).await;
     let client_task = start_client(client, DOMAIN, &["h2"]);
     let got = read_target(&mut target, hello.len()).await;
@@ -315,7 +315,7 @@ async fn a_validation_for_another_name_or_a_lapsed_order_reaches_the_target() {
     let fixture = Fixture::new().await;
     // The stream's name has an order, but the hello is for something else.
     let _order = fixture.book.begin(DOMAIN, "tok.thumb").unwrap();
-    let (client, mut target) = fixture.open("tls:app", Some(DOMAIN)).await;
+    let (client, mut target) = fixture.open("tls:myapp", Some(DOMAIN)).await;
     let client_task = start_client(client, "elsewhere.relay.example", &["acme-tls/1"]);
     let got = read_target(&mut target, 100).await;
     assert_eq!(got.first(), Some(&0x16), "the hello was passed on");
@@ -324,7 +324,7 @@ async fn a_validation_for_another_name_or_a_lapsed_order_reaches_the_target() {
     let book = fixture.book.clone();
     drop(_order);
     assert!(!book.is_pending(DOMAIN));
-    let (client, mut target) = fixture.open("tls:app", Some(DOMAIN)).await;
+    let (client, mut target) = fixture.open("tls:myapp", Some(DOMAIN)).await;
     let client_task = start_client(client, DOMAIN, &["acme-tls/1"]);
     let got = read_target(&mut target, 100).await;
     assert_eq!(got.first(), Some(&0x16));
@@ -335,7 +335,7 @@ async fn a_validation_for_another_name_or_a_lapsed_order_reaches_the_target() {
 async fn non_tls_bytes_in_the_window_reach_the_target_and_so_does_what_follows() {
     let fixture = Fixture::new().await;
     let _order = fixture.book.begin(DOMAIN, "tok.thumb").unwrap();
-    let (mut client, mut target) = fixture.open("tls:app", Some(DOMAIN)).await;
+    let (mut client, mut target) = fixture.open("tls:myapp", Some(DOMAIN)).await;
     client.write_all(b"GET / HTTP/1.1\r\n\r\n").await.unwrap();
     assert_eq!(
         read_target(&mut target, 18).await,
@@ -350,12 +350,12 @@ async fn only_the_relay_principals_sni_and_only_tls_and_tcp_services_are_looked_
     let fixture = Fixture::new().await;
     let _order = fixture.book.begin(DOMAIN, "tok.thumb").unwrap();
     // A member's stream has no sni (the node scrubs it): the pending name does not matter.
-    let (mut client, mut target) = fixture.open("tls:app", None).await;
+    let (mut client, mut target) = fixture.open("tls:myapp", None).await;
     let (hello, ()) = capture_hello(DOMAIN, &["acme-tls/1"]).await;
     client.write_all(&hello).await.unwrap();
     assert_eq!(read_target(&mut target, hello.len()).await, hello);
     // An http: service is not a blind share.
-    let (client, mut target) = fixture.open("http:app", Some(DOMAIN)).await;
+    let (client, mut target) = fixture.open("http:myapp", Some(DOMAIN)).await;
     let client_task = start_client(client, DOMAIN, &["acme-tls/1"]);
     let got = read_target(&mut target, 100).await;
     assert_eq!(got.first(), Some(&0x16));
@@ -366,7 +366,7 @@ async fn only_the_relay_principals_sni_and_only_tls_and_tcp_services_are_looked_
 async fn a_stream_that_never_sends_a_hello_is_reset_after_the_peek_timeout() {
     let fixture = Fixture::new().await;
     let _order = fixture.book.begin(DOMAIN, "tok.thumb").unwrap();
-    let (mut client, _target) = fixture.open("tls:app", Some(DOMAIN)).await;
+    let (mut client, _target) = fixture.open("tls:myapp", Some(DOMAIN)).await;
     let mut byte = [0u8; 1];
     let read = tokio::time::timeout(PEEK_TIMEOUT * 3, client.read(&mut byte))
         .await
@@ -396,7 +396,12 @@ fn ack(accepted: &[&str]) -> AdvertiseAckBody {
 
 #[test]
 fn a_share_is_wanted_only_when_accepted_blind_and_listing_acme_tls_1() {
-    let with = share("app", ShareMode::Blind, "tls:app", &["h2", "acme-tls/1"]);
+    let with = share(
+        "myapp",
+        ShareMode::Blind,
+        "tls:myapp",
+        &["h2", "acme-tls/1"],
+    );
     let without = share("plain", ShareMode::Blind, "tls:plain", &["h2"]);
     let any_alpn = share("any", ShareMode::Blind, "tls:any", &[]);
     assert!(lists_acme_alpn(&with));
@@ -414,22 +419,22 @@ fn a_share_is_wanted_only_when_accepted_blind_and_listing_acme_tls_1() {
 
     let book = ShareBook::new();
     let all = [with.clone(), without.clone(), any_alpn.clone()];
-    assert!(!wanted(&book, "app"), "nothing sent");
+    assert!(!wanted(&book, "myapp"), "nothing sent");
     book.note_sent(&all);
-    assert!(!wanted(&book, "app"), "sent, not answered yet");
-    book.note_ack(&ack(&["app", "plain", "any"]));
-    assert!(wanted(&book, "app"));
+    assert!(!wanted(&book, "myapp"), "sent, not answered yet");
+    book.note_ack(&ack(&["myapp", "plain", "any"]));
+    assert!(wanted(&book, "myapp"));
     assert!(!wanted(&book, "plain"));
     assert!(!wanted(&book, "any"));
     assert!(!wanted(&book, "unknown"));
     book.note_detached();
     assert!(
-        !wanted(&book, "app"),
+        !wanted(&book, "myapp"),
         "the claims ended with the attachment"
     );
     book.note_sent(&all);
     book.note_ack(&ack(&["plain"]));
-    assert!(!wanted(&book, "app"), "rejected by the relay");
+    assert!(!wanted(&book, "myapp"), "rejected by the relay");
 }
 
 // ---- the renewal wrapper ----
@@ -448,7 +453,7 @@ async fn the_renewal_loop_orders_only_while_the_share_is_wanted_and_stores_the_r
     let book = ChallengeBook::new();
     let shares = ShareBook::new();
     let job = AcmeJob {
-        share: "app".to_string(),
+        share: "myapp".to_string(),
         domain: DOMAIN.to_string(),
     };
     let ca = FakeCa::new(&book, Flags::default());
@@ -464,9 +469,9 @@ async fn the_renewal_loop_orders_only_while_the_share_is_wanted_and_stores_the_r
     assert!(ca.state().log.is_empty());
     assert!(store.validity(DOMAIN).is_none());
     // Accepted and listing acme-tls/1: an order is made and kept.
-    let share = share("app", ShareMode::Blind, "tls:app", &["acme-tls/1"]);
+    let share = share("myapp", ShareMode::Blind, "tls:myapp", &["acme-tls/1"]);
     shares.note_sent(std::slice::from_ref(&share));
-    shares.note_ack(&ack(&["app"]));
+    shares.note_ack(&ack(&["myapp"]));
     for _ in 0..200 {
         if store.validity(DOMAIN).is_some() {
             break;

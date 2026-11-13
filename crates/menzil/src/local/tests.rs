@@ -2264,18 +2264,18 @@ fn a_label_given_by_the_owner_is_what_a_relay_needs_to_accept_the_name() {
 
     // Before: the relay holds the Roster and turns the name away.
     let docs = load_documents(&two.owner, &two.network_id).unwrap();
-    let (accepted, rejected) = relay_accepts(&docs, &phone, &["app"]);
+    let (accepted, rejected) = relay_accepts(&docs, &phone, &["myapp"]);
     assert!(accepted.is_empty());
     assert_eq!(rejected.len(), 1);
 
-    let added = label_add(&two.owner, None, "app", "phone", false, NOW + 1).unwrap();
+    let added = label_add(&two.owner, None, "myapp", "phone", false, NOW + 1).unwrap();
     assert_eq!(added.issued.seq, seq_before + 1);
     assert_eq!(added.issued.member, Some(phone));
     assert_eq!(added.member_name, "phone");
     assert_eq!(added.moved_from, None);
     assert_eq!(
         labels(&two.owner, &two.network_id),
-        vec![("app".into(), phone)]
+        vec![("myapp".into(), phone)]
     );
 
     // The token is the pair the owner now holds; the Roster for a relay says the same.
@@ -2289,8 +2289,8 @@ fn a_label_given_by_the_owner_is_what_a_relay_needs_to_accept_the_name() {
     // After: the relay takes the name from the phone and not from the laptop, and still
     // turns away a name nobody was given.
     let docs = load_documents(&two.owner, &two.network_id).unwrap();
-    assert_eq!(relay_accepts(&docs, &phone, &["app"]).0, vec!["app"]);
-    let (accepted, rejected) = relay_accepts(&docs, &laptop, &["app"]);
+    assert_eq!(relay_accepts(&docs, &phone, &["myapp"]).0, vec!["myapp"]);
+    let (accepted, rejected) = relay_accepts(&docs, &laptop, &["myapp"]);
     assert!(accepted.is_empty() && rejected.len() == 1);
     assert!(relay_accepts(&docs, &phone, &["other"]).0.is_empty());
 
@@ -2304,7 +2304,7 @@ fn a_label_given_by_the_owner_is_what_a_relay_needs_to_accept_the_name() {
     assert_eq!(
         listed,
         vec![LabelEntry {
-            name: "app".into(),
+            name: "myapp".into(),
             node_id: phone,
             member: Some("phone".into())
         }]
@@ -2326,30 +2326,44 @@ fn a_label_given_by_the_owner_is_what_a_relay_needs_to_accept_the_name() {
 fn a_label_moves_only_with_replace_and_removing_it_closes_the_door_again() {
     let (two, phone) = with_phone();
     let laptop = load_identity(&two.owner).unwrap().0.node_id();
-    label_add(&two.owner, None, "app", "phone", false, NOW).unwrap();
+    label_add(&two.owner, None, "myapp", "phone", false, NOW).unwrap();
     let held = documents_bytes(&two.owner, &two.network_id);
 
     // Another member, the same member, each refused with the documents untouched.
     assert!(
-        err(label_add(&two.owner, None, "app", "laptop", false, NOW + 1))
-            .contains("belongs to another member")
+        err(label_add(
+            &two.owner,
+            None,
+            "myapp",
+            "laptop",
+            false,
+            NOW + 1
+        ))
+        .contains("belongs to another member")
     );
     assert!(
-        err(label_add(&two.owner, None, "app", "phone", false, NOW + 1))
-            .contains("this member's already")
+        err(label_add(
+            &two.owner,
+            None,
+            "myapp",
+            "phone",
+            false,
+            NOW + 1
+        ))
+        .contains("this member's already")
     );
     assert_eq!(documents_bytes(&two.owner, &two.network_id), held);
 
-    let moved = label_add(&two.owner, None, "app", "laptop", true, NOW + 2).unwrap();
+    let moved = label_add(&two.owner, None, "myapp", "laptop", true, NOW + 2).unwrap();
     assert_eq!(moved.moved_from.as_deref(), Some("phone"));
     assert_eq!(moved.member_name, "laptop");
     assert_eq!(
         labels(&two.owner, &two.network_id),
-        vec![("app".into(), laptop)]
+        vec![("myapp".into(), laptop)]
     );
     let docs = load_documents(&two.owner, &two.network_id).unwrap();
-    assert_eq!(relay_accepts(&docs, &laptop, &["app"]).0, vec!["app"]);
-    assert!(relay_accepts(&docs, &phone, &["app"]).0.is_empty());
+    assert_eq!(relay_accepts(&docs, &laptop, &["myapp"]).0, vec!["myapp"]);
+    assert!(relay_accepts(&docs, &phone, &["myapp"]).0.is_empty());
 
     // Remove: nothing to remove, then by the wrong member, then the right one.
     assert!(
@@ -2359,7 +2373,7 @@ fn a_label_moves_only_with_replace_and_removing_it_closes_the_door_again() {
         err(label_remove(
             &two.owner,
             None,
-            "app",
+            "myapp",
             Some("phone"),
             NOW + 3
         ))
@@ -2369,19 +2383,19 @@ fn a_label_moves_only_with_replace_and_removing_it_closes_the_door_again() {
         err(label_remove(
             &two.owner,
             None,
-            "app",
+            "myapp",
             Some("tablet"),
             NOW + 3
         ))
         .contains("no member called")
     );
     let seq = load_documents(&two.owner, &two.network_id).unwrap().seq();
-    let removed = label_remove(&two.owner, None, "app", Some("laptop"), NOW + 4).unwrap();
+    let removed = label_remove(&two.owner, None, "myapp", Some("laptop"), NOW + 4).unwrap();
     assert_eq!(removed.seq, seq + 1);
     assert_eq!(decode_documents(&removed.token).unwrap().seq(), seq + 1);
     assert!(labels(&two.owner, &two.network_id).is_empty());
     let docs = load_documents(&two.owner, &two.network_id).unwrap();
-    assert!(relay_accepts(&docs, &laptop, &["app"]).0.is_empty());
+    assert!(relay_accepts(&docs, &laptop, &["myapp"]).0.is_empty());
 
     // With no member named, whoever has it loses it.
     label_add(&two.owner, None, "web", "phone", false, NOW + 5).unwrap();
@@ -2400,7 +2414,7 @@ fn a_label_that_is_not_a_plain_unreserved_name_or_names_no_member_is_refused_unt
         "",
         "-a",
         "a-",
-        "App",
+        "Myapp",
         "a.b",
         "a b",
         "a_b",
@@ -2452,15 +2466,22 @@ fn a_label_that_is_not_a_plain_unreserved_name_or_names_no_member_is_refused_unt
         .node_id
         .to_hex();
     for who in ["tablet", "", "Phone", &hex[..7], "zzzzzzzz"] {
-        let error = err(label_add(&two.owner, None, "app", who, false, NOW + 1));
+        let error = err(label_add(&two.owner, None, "myapp", who, false, NOW + 1));
         assert!(error.contains("no member called"), "{who:?}: {error}");
     }
     assert_eq!(documents_bytes(&two.owner, &two.network_id), held);
     revoke(&two.owner, None, "phone", false, NOW + 2).unwrap();
     let after_revoke = documents_bytes(&two.owner, &two.network_id);
     assert!(
-        err(label_add(&two.owner, None, "app", "phone", false, NOW + 3))
-            .contains("no member called")
+        err(label_add(
+            &two.owner,
+            None,
+            "myapp",
+            "phone",
+            false,
+            NOW + 3
+        ))
+        .contains("no member called")
     );
     assert_eq!(documents_bytes(&two.owner, &two.network_id), after_revoke);
 }
@@ -2469,7 +2490,7 @@ fn a_label_that_is_not_a_plain_unreserved_name_or_names_no_member_is_refused_unt
 fn only_the_owner_changes_labels_and_a_steward_is_told_so_in_plain_words() {
     let s = stewarded();
     let (two, steward_device) = (&s.two, &s.two.member);
-    label_add(&two.owner, None, "app", "steward", false, NOW + 20).unwrap();
+    label_add(&two.owner, None, "myapp", "steward", false, NOW + 20).unwrap();
     // The steward device holds the documents of the owner's new pair.
     let token = token(&two.owner, None).unwrap();
     join(steward_device, &token, NOW + 21).unwrap();
@@ -2487,7 +2508,7 @@ fn only_the_owner_changes_labels_and_a_steward_is_told_so_in_plain_words() {
         error.contains("only the owner lists or takes back labels"),
         "{error}"
     );
-    let error = err(label_remove(steward_device, None, "app", None, NOW + 22));
+    let error = err(label_remove(steward_device, None, "myapp", None, NOW + 22));
     assert!(
         error.contains("only the owner lists or takes back labels"),
         "{error}"
@@ -2499,9 +2520,17 @@ fn only_the_owner_changes_labels_and_a_steward_is_told_so_in_plain_words() {
     // A plain member (no key at all) is refused as for a grant.
     let (plain, _) = with_phone();
     assert!(
-        err(label_add(&plain.member, None, "app", "laptop", false, NOW)).contains("does not own")
+        err(label_add(
+            &plain.member,
+            None,
+            "myapp",
+            "laptop",
+            false,
+            NOW
+        ))
+        .contains("does not own")
     );
-    assert!(err(label_remove(&plain.member, None, "app", None, NOW)).contains("does not own"));
+    assert!(err(label_remove(&plain.member, None, "myapp", None, NOW)).contains("does not own"));
 
     // The owner's pair after a steward's pair goes past what the steward can sign, and the
     // steward's later re-issue keeps the label.
@@ -2517,11 +2546,11 @@ fn only_the_owner_changes_labels_and_a_steward_is_told_so_in_plain_words() {
 #[test]
 fn revoking_a_member_takes_its_labels_and_the_relay_stops_taking_its_names() {
     let (two, phone) = with_phone();
-    label_add(&two.owner, None, "app", "phone", false, NOW).unwrap();
+    label_add(&two.owner, None, "myapp", "phone", false, NOW).unwrap();
     label_add(&two.owner, None, "blog", "phone", false, NOW).unwrap();
     assert_eq!(labels(&two.owner, &two.network_id).len(), 2);
     revoke(&two.owner, None, "phone", false, NOW + 1).unwrap();
     assert!(labels(&two.owner, &two.network_id).is_empty());
     let docs = load_documents(&two.owner, &two.network_id).unwrap();
-    assert!(relay_accepts(&docs, &phone, &["app"]).0.is_empty());
+    assert!(relay_accepts(&docs, &phone, &["myapp"]).0.is_empty());
 }

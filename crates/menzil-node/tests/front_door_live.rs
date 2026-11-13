@@ -366,7 +366,7 @@ async fn the_front_door_pipes_blind_shares_and_refuses_everything_else_the_same_
         &owner,
         node.node_id,
         other.node_id,
-        &["app", "raw", "acme", "web", "gone", "ghost"],
+        &["myapp", "raw", "acme", "web", "gone", "ghost"],
     );
     let policy1 = policy_for(&owner, network_id, &node, &other);
     relay.relay.rosters().set(&roster1).unwrap();
@@ -377,7 +377,7 @@ async fn the_front_door_pipes_blind_shares_and_refuses_everything_else_the_same_
 
     // The node's local targets: three echo servers (app, raw, web); `acme` shares app's.
     let mut ports = HashMap::new();
-    for name in ["app", "raw", "web"] {
+    for name in ["myapp", "raw", "web"] {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         ports.insert(name, listener.local_addr().unwrap().port());
         let (ended, _keep) = mpsc::unbounded_channel();
@@ -385,13 +385,13 @@ async fn the_front_door_pipes_blind_shares_and_refuses_everything_else_the_same_
     }
     let services = LocalServices::new()
         .serve(
-            service("tls:app"),
-            LocalTarget::new("127.0.0.1", ports["app"]),
+            service("tls:myapp"),
+            LocalTarget::new("127.0.0.1", ports["myapp"]),
         )
         .unwrap()
         .serve(
             service("tls:acme"),
-            LocalTarget::new("127.0.0.1", ports["app"]),
+            LocalTarget::new("127.0.0.1", ports["myapp"]),
         )
         .unwrap()
         .serve(
@@ -431,7 +431,7 @@ async fn the_front_door_pipes_blind_shares_and_refuses_everything_else_the_same_
     })
     .await;
     let shares = vec![
-        share("app", ShareMode::Blind, "tls:app", &["h2", "http/1.1"]),
+        share("myapp", ShareMode::Blind, "tls:myapp", &["h2", "http/1.1"]),
         share("raw", ShareMode::Blind, "tcp:raw", &[]),
         share("acme", ShareMode::Blind, "tls:acme", &["acme-tls/1"]),
         share("web", ShareMode::Terminated, "http:web", &[]),
@@ -449,7 +449,7 @@ async fn the_front_door_pipes_blind_shares_and_refuses_everything_else_the_same_
     let tls = relay.addr;
 
     // --- 2. blind shares: the bytes echo, the node sees the meta ------------------------------
-    let hello = client_hello(Some("App.Share.Test"), &["h2", "http/1.1"]);
+    let hello = client_hello(Some("Myapp.Share.Test"), &["h2", "http/1.1"]);
     let tail = b"application bytes after the hello".to_vec();
     drop(echoing(tls, &hello, &tail).await);
     let raw_hello = client_hello(Some("raw.share.test"), &[]);
@@ -457,7 +457,7 @@ async fn the_front_door_pipes_blind_shares_and_refuses_everything_else_the_same_
     let acme_hello = client_hello(Some("acme.share.test"), &["acme-tls/1"]);
     drop(echoing(tls, &acme_hello, b"challenge").await);
     // A ClientHello spread over two TLS records is routed the same.
-    let split_hello = fragmented(&client_hello(Some("app.share.test"), &["h2"]), 30);
+    let split_hello = fragmented(&client_hello(Some("myapp.share.test"), &["h2"]), 30);
     drop(echoing(tls, &split_hello, b"fragmented").await);
     {
         let seen = opens.lock().unwrap();
@@ -468,21 +468,21 @@ async fn the_front_door_pipes_blind_shares_and_refuses_everything_else_the_same_
             assert!(request.target.is_none());
             assert_eq!(request.meta.client_ip.as_deref(), Some("127.0.0.1"));
         }
-        assert_eq!(seen[0].service, service("tls:app"));
+        assert_eq!(seen[0].service, service("tls:myapp"));
         assert_eq!(
             seen[0].meta.sni.as_deref(),
-            Some("app.share.test"),
+            Some("myapp.share.test"),
             "lowercased"
         );
         assert_eq!(seen[1].service, service("tcp:raw"));
         assert_eq!(seen[1].meta.sni.as_deref(), Some("raw.share.test"));
         assert_eq!(seen[2].service, service("tls:acme"));
-        assert_eq!(seen[3].service, service("tls:app"));
-        assert_eq!(seen[3].meta.sni.as_deref(), Some("app.share.test"));
+        assert_eq!(seen[3].service, service("tls:myapp"));
+        assert_eq!(seen[3].meta.sni.as_deref(), Some("myapp.share.test"));
     }
 
     // --- 3. one refusal for every cause ---------------------------------------------------
-    let ok_hello = client_hello(Some("app.share.test"), &["h2"]);
+    let ok_hello = client_hello(Some("myapp.share.test"), &["h2"]);
     let cases: Vec<(&str, Vec<u8>, bool)> = vec![
         (
             "an unknown name",
@@ -492,12 +492,12 @@ async fn the_front_door_pipes_blind_shares_and_refuses_everything_else_the_same_
         ("the apex", client_hello(Some("share.test"), &[]), true),
         (
             "a name outside the share domain",
-            client_hello(Some("app.other.test"), &[]),
+            client_hello(Some("myapp.other.test"), &[]),
             true,
         ),
         (
             "a name too deep",
-            client_hello(Some("x.app.share.test"), &[]),
+            client_hello(Some("x.myapp.share.test"), &[]),
             true,
         ),
         (
@@ -512,7 +512,7 @@ async fn the_front_door_pipes_blind_shares_and_refuses_everything_else_the_same_
         ("no SNI", client_hello(None, &[]), true),
         (
             "bytes that are not TLS",
-            b"GET / HTTP/1.1\r\nHost: app.share.test\r\n\r\n".to_vec(),
+            b"GET / HTTP/1.1\r\nHost: myapp.share.test\r\n\r\n".to_vec(),
             true,
         ),
         (
@@ -532,7 +532,7 @@ async fn the_front_door_pipes_blind_shares_and_refuses_everything_else_the_same_
         ),
         (
             "acme-tls/1 for a share that did not list it",
-            client_hello(Some("app.share.test"), &["acme-tls/1"]),
+            client_hello(Some("myapp.share.test"), &["acme-tls/1"]),
             true,
         ),
         (
@@ -664,8 +664,8 @@ async fn the_front_door_pipes_blind_shares_and_refuses_everything_else_the_same_
     );
 
     // --- 7. port 80 --------------------------------------------------------------------------
-    let (got, _) = answer_to(http, &http_get("/a/b?c=d", Some("app.share.test"))).await;
-    assert_eq!(got, redirect("app.share.test", "/a/b?c=d"));
+    let (got, _) = answer_to(http, &http_get("/a/b?c=d", Some("myapp.share.test"))).await;
+    assert_eq!(got, redirect("myapp.share.test", "/a/b?c=d"));
     let (got, _) = answer_to(http, &http_get("/", Some("Nosuch.Share.Test:80"))).await;
     assert_eq!(
         got,
@@ -676,7 +676,7 @@ async fn the_front_door_pipes_blind_shares_and_refuses_everything_else_the_same_
     assert_eq!(got, redirect("localhost", "/"));
     let before = opens.lock().unwrap().len();
     let challenge = "/.well-known/acme-challenge/token123";
-    let (got, took) = answer_to(http, &http_get(challenge, Some("app.share.test"))).await;
+    let (got, took) = answer_to(http, &http_get(challenge, Some("myapp.share.test"))).await;
     assert_eq!(got, HTTP_REFUSAL, "a challenge the node cannot serve yet");
     assert!(
         took >= FAILURE_DELAY - Duration::from_millis(30),
@@ -686,8 +686,8 @@ async fn the_front_door_pipes_blind_shares_and_refuses_everything_else_the_same_
         let seen = opens.lock().unwrap();
         assert_eq!(seen.len(), before + 1, "the challenge reached the node");
         let last = seen.last().unwrap();
-        assert_eq!(last.service, service("acme-http:app"));
-        assert_eq!(last.meta.sni.as_deref(), Some("app.share.test"));
+        assert_eq!(last.service, service("acme-http:myapp"));
+        assert_eq!(last.meta.sni.as_deref(), Some("myapp.share.test"));
         assert_eq!(last.meta.client_ip.as_deref(), Some("127.0.0.1"));
     }
     for (what, request) in [
@@ -697,7 +697,7 @@ async fn the_front_door_pipes_blind_shares_and_refuses_everything_else_the_same_
         ),
         (
             "a name outside the domain",
-            http_get(challenge, Some("app.other.test")),
+            http_get(challenge, Some("myapp.other.test")),
         ),
         ("no Host", http_get(challenge, None)),
         (
@@ -706,7 +706,7 @@ async fn the_front_door_pipes_blind_shares_and_refuses_everything_else_the_same_
         ),
         (
             "a host outside the share domain, not a challenge",
-            http_get("/", Some("app.other.test")),
+            http_get("/", Some("myapp.other.test")),
         ),
     ] {
         let (got, took) = answer_to(http, &request).await;

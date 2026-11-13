@@ -178,7 +178,7 @@ enum Command {
     #[command(
         args_conflicts_with_subcommands = true,
         subcommand_negates_reqs = true,
-        after_help = "Examples:\n  menzil expose 8443 --name app          expose a local HTTPS server\n  menzil expose 22 --name box --mode tcp  reach sshd by name (TLS in front of it)\n  menzil expose list                      what is exposed and what the relay says\n  menzil expose remove app                take it away"
+        after_help = "Examples:\n  menzil expose 8443 --name myapp          expose a local HTTPS server\n  menzil expose 22 --name box --mode tcp  reach sshd by name (TLS in front of it)\n  menzil expose list                      what is exposed and what the relay says\n  menzil expose remove myapp                take it away"
     )]
     Expose(ExposeArgs),
     /// Listen on a local port (or a Unix socket) and carry each connection to a service of
@@ -273,7 +273,7 @@ enum LabelCommand {
     Add {
         /// The name: one lowercase label of letters, digits and hyphens (1 to 63, not starting
         /// or ending with a hyphen), not one a relay reserves (`www`, `mail`, `admin`, `api`,
-        /// `relay`, `t`).
+        /// `relay`, `t`, `app`, `dashboard`, `console`, `status`, `docs`, `login`, `static`).
         name: String,
         /// The member: its name, the start of its node id (8 or more hex digits), or a whole
         /// node id.
@@ -1148,18 +1148,18 @@ mod tests {
             member,
             replace,
             network,
-        }) = label_command(&["label", "add", "app", "phone"])
+        }) = label_command(&["label", "add", "myapp", "phone"])
         else {
             panic!("add");
         };
-        assert_eq!((name.as_str(), member.as_str()), ("app", "phone"));
+        assert_eq!((name.as_str(), member.as_str()), ("myapp", "phone"));
         assert!(!replace && network.is_none());
         let Ok(LabelCommand::Add {
             replace, network, ..
         }) = label_command(&[
             "label",
             "add",
-            "app",
+            "myapp",
             "phone",
             "--replace",
             "--network",
@@ -1173,13 +1173,13 @@ mod tests {
 
         // The member is optional for `remove`, and absent for `list`.
         let Ok(LabelCommand::Remove { name, member, .. }) =
-            label_command(&["label", "remove", "app"])
+            label_command(&["label", "remove", "myapp"])
         else {
             panic!("remove");
         };
-        assert_eq!((name.as_str(), member), ("app", None));
+        assert_eq!((name.as_str(), member), ("myapp", None));
         let Ok(LabelCommand::Remove { member, .. }) =
-            label_command(&["label", "remove", "app", "phone"])
+            label_command(&["label", "remove", "myapp", "phone"])
         else {
             panic!("remove");
         };
@@ -1194,11 +1194,11 @@ mod tests {
         for bad in [
             &["label"][..],
             &["label", "add"],
-            &["label", "add", "app"],
-            &["label", "add", "app", "phone", "extra"],
+            &["label", "add", "myapp"],
+            &["label", "add", "myapp", "phone", "extra"],
             &["label", "remove"],
-            &["label", "list", "app"],
-            &["label", "remove", "app", "phone", "--replace"],
+            &["label", "list", "myapp"],
+            &["label", "remove", "myapp", "phone", "--replace"],
             &["label", "list", "--replace"],
         ] {
             assert!(label_command(bad).is_err(), "{bad:?}");
@@ -1214,10 +1214,10 @@ mod tests {
 
     #[test]
     fn expose_takes_a_port_a_name_and_the_options_with_their_defaults() {
-        let args = expose_args(&["expose", "8443", "--name", "app"]).unwrap();
+        let args = expose_args(&["expose", "8443", "--name", "myapp"]).unwrap();
         assert!(args.command.is_none());
         assert_eq!(args.port, Some(8443));
-        assert_eq!(args.name.as_deref(), Some("app"));
+        assert_eq!(args.name.as_deref(), Some("myapp"));
         assert_eq!(args.mode, "blind");
         assert_eq!(args.host, "127.0.0.1");
         assert!(args.alpn.is_empty() && !args.replace);
@@ -1258,11 +1258,11 @@ mod tests {
         for bad in [
             &["expose"][..],
             &["expose", "8443"],
-            &["expose", "--name", "app"],
-            &["expose", "0", "--name", "app"],
-            &["expose", "65536", "--name", "app"],
-            &["expose", "http", "--name", "app"],
-            &["expose", "-1", "--name", "app"],
+            &["expose", "--name", "myapp"],
+            &["expose", "0", "--name", "myapp"],
+            &["expose", "65536", "--name", "myapp"],
+            &["expose", "http", "--name", "myapp"],
+            &["expose", "-1", "--name", "myapp"],
         ] {
             assert!(expose_args(bad).is_err(), "{bad:?}");
         }
@@ -1282,14 +1282,14 @@ mod tests {
     fn expose_list_and_remove_are_subcommands_that_take_no_port() {
         let args = expose_args(&["expose", "list"]).unwrap();
         assert!(matches!(args.command, Some(ExposeCommand::List)));
-        let args = expose_args(&["expose", "remove", "app"]).unwrap();
+        let args = expose_args(&["expose", "remove", "myapp"]).unwrap();
         assert!(
-            matches!(args.command, Some(ExposeCommand::Remove { ref label }) if label == "app")
+            matches!(args.command, Some(ExposeCommand::Remove { ref label }) if label == "myapp")
         );
         assert!(expose_args(&["expose", "remove"]).is_err());
         // A port together with a subcommand is a mistake, not a guess.
         assert!(expose_args(&["expose", "8443", "list"]).is_err());
-        assert!(expose_args(&["expose", "list", "--name", "app"]).is_err());
+        assert!(expose_args(&["expose", "list", "--name", "myapp"]).is_err());
     }
 
     #[test]

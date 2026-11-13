@@ -1469,7 +1469,7 @@ impl Opener for Sharer {
 #[tokio::test]
 async fn an_expose_request_reaches_the_node_whole_and_its_answer_comes_back() {
     let opener = sharer(vec![], None);
-    let spec = a_spec("app");
+    let spec = a_spec("myapp");
     let reply = with_agent(opener.clone(), async |socket, uid| {
         request_expose_as(socket, &spec, uid).await
     })
@@ -1477,15 +1477,15 @@ async fn an_expose_request_reaches_the_node_whole_and_its_answer_comes_back() {
     .unwrap();
     assert_eq!(opener.exposed.lock().unwrap().as_slice(), [spec]);
     assert!(reply.changed);
-    assert_eq!(reply.share, a_view("app"));
+    assert_eq!(reply.share, a_view("myapp"));
     assert_eq!(reply.notes, ["one note"]);
 
     let gone = with_agent(opener.clone(), async |socket, uid| {
-        request_unexpose_as(socket, "app", uid).await
+        request_unexpose_as(socket, "myapp", uid).await
     })
     .await
     .unwrap();
-    assert_eq!(opener.removed.lock().unwrap().as_slice(), ["app"]);
+    assert_eq!(opener.removed.lock().unwrap().as_slice(), ["myapp"]);
     assert!(gone.service_removed);
     assert_eq!(gone.notes, ["kept tcp:ssh"]);
 }
@@ -1494,7 +1494,7 @@ async fn an_expose_request_reaches_the_node_whole_and_its_answer_comes_back() {
 async fn a_refusal_of_the_node_comes_back_as_one_line_and_a_bad_request_never_reaches_it() {
     let opener = sharer(vec![], Some("it said no\nsecond line"));
     let error = with_agent(opener.clone(), async |socket, uid| {
-        request_expose_as(socket, &a_spec("app"), uid).await
+        request_expose_as(socket, &a_spec("myapp"), uid).await
     })
     .await
     .unwrap_err();
@@ -1509,7 +1509,7 @@ async fn a_refusal_of_the_node_comes_back_as_one_line_and_a_bad_request_never_re
         AskError::NoAgent => panic!("an agent answered"),
     }
     let error = with_agent(opener.clone(), async |socket, uid| {
-        request_unexpose_as(socket, "app", uid).await
+        request_unexpose_as(socket, "myapp", uid).await
     })
     .await
     .unwrap_err();
@@ -1554,14 +1554,14 @@ async fn a_refusal_of_the_node_comes_back_as_one_line_and_a_bad_request_never_re
         }
     }
     let error = with_agent(Arc::new(Plain), async |socket, uid| {
-        request_expose_as(socket, &a_spec("app"), uid).await
+        request_expose_as(socket, &a_spec("myapp"), uid).await
     })
     .await
     .unwrap_err();
     assert!(
         matches!(error, AskError::Failed(ref e) if format!("{e:#}").contains("does not manage shares"))
     );
-    let mut long = a_spec("app");
+    let mut long = a_spec("myapp");
     long.alpn = (0..60).map(|n| format!("protocol-{n:04}")).collect();
     let dir = tempfile::tempdir().unwrap();
     let uid = current_uid().await.unwrap();

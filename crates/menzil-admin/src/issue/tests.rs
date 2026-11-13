@@ -1567,7 +1567,7 @@ fn busy() -> Busy {
     ];
     policy.grants = vec![
         node_grant(network_id, phone, laptop, &["tcp:ssh"]),
-        node_grant(network_id, laptop, phone, &["http:app"]),
+        node_grant(network_id, laptop, phone, &["http:myapp"]),
         Grant {
             to_node: NodeOrWildcard::Any,
             ..node_grant(network_id, phone, laptop, &["tcp:web"])
@@ -1908,7 +1908,7 @@ fn removing_some_services_leaves_the_rest_and_a_grant_left_empty_goes() {
     let docs = grant(
         &owner,
         &docs,
-        node_grant(network_id, from, to, &["tcp:ssh", "http:app"]),
+        node_grant(network_id, from, to, &["tcp:ssh", "http:myapp"]),
         NOW,
     )
     .unwrap();
@@ -1934,7 +1934,7 @@ fn removing_some_services_leaves_the_rest_and_a_grant_left_empty_goes() {
     assert_eq!(
         partial.policy_body().grants,
         vec![
-            node_grant(network_id, from, to, &["http:app"]),
+            node_grant(network_id, from, to, &["http:myapp"]),
             node_grant(network_id, from, to, &["tcp:db"]),
         ]
     );
@@ -1949,7 +1949,7 @@ fn removing_some_services_leaves_the_rest_and_a_grant_left_empty_goes() {
         &partial,
         &target,
         &to_node,
-        Some(&[service("http:app"), service("tcp:db")]),
+        Some(&[service("http:myapp"), service("tcp:db")]),
         NOW + 2,
     )
     .unwrap();
@@ -2762,7 +2762,7 @@ fn replacing_moves_the_place_of_a_member_to_a_new_device_and_revokes_the_old_one
             },
             node_grant(network_id, b.tablet, b.laptop, &["tcp:ssh"]),
             node_grant(network_id, new, b.laptop, &["tcp:ssh"]),
-            node_grant(network_id, b.laptop, new, &["http:app"]),
+            node_grant(network_id, b.laptop, new, &["http:myapp"]),
             Grant {
                 to_node: NodeOrWildcard::Any,
                 ..node_grant(network_id, new, b.laptop, &["tcp:web"])
@@ -2963,9 +2963,12 @@ fn labels_of(docs: &Documents) -> Vec<(String, NodeId)> {
 fn a_label_is_listed_in_the_roster_by_the_owner_and_every_verifier_accepts_it() {
     let (owner, phone, _, docs) = with_phone();
     let laptop = docs.roster_body().members[0].node_id;
-    let next = add_label(&owner, &docs, "app", phone.node_id(), false, NOW + 60).unwrap();
+    let next = add_label(&owner, &docs, "myapp", phone.node_id(), false, NOW + 60).unwrap();
     assert_eq!(next.seq(), docs.seq() + 1);
-    assert_eq!(labels_of(&next), vec![("app".to_string(), phone.node_id())]);
+    assert_eq!(
+        labels_of(&next),
+        vec![("myapp".to_string(), phone.node_id())]
+    );
     let (rb, pb) = (next.roster_body(), next.policy_body());
     assert_eq!((rb.issued, rb.expires), (NOW + 60, NOW + 60 + 14 * DAY));
     assert_eq!(pb.seq, rb.seq);
@@ -2991,7 +2994,7 @@ fn a_label_is_listed_in_the_roster_by_the_owner_and_every_verifier_accepts_it() 
     assert_eq!(
         labels_of(&more),
         vec![
-            ("app".to_string(), phone.node_id()),
+            ("myapp".to_string(), phone.node_id()),
             ("blog".to_string(), phone.node_id()),
             ("home".to_string(), laptop),
         ]
@@ -3003,31 +3006,31 @@ fn a_label_is_listed_in_the_roster_by_the_owner_and_every_verifier_accepts_it() 
 fn a_label_belongs_to_one_member_unless_the_owner_moves_it() {
     let (owner, phone, _, docs) = with_phone();
     let laptop = docs.roster_body().members[0].node_id;
-    let one = add_label(&owner, &docs, "app", phone.node_id(), false, NOW).unwrap();
+    let one = add_label(&owner, &docs, "myapp", phone.node_id(), false, NOW).unwrap();
 
     // The same member again: nothing to issue, whatever `replace` says.
     for replace in [false, true] {
         assert!(matches!(
-            add_label(&owner, &one, "app", phone.node_id(), replace, NOW + 1),
-            Err(AdminError::LabelAlready(name)) if name == "app"
+            add_label(&owner, &one, "myapp", phone.node_id(), replace, NOW + 1),
+            Err(AdminError::LabelAlready(name)) if name == "myapp"
         ));
     }
     // Another member: refused, naming the holder.
     assert!(matches!(
-        add_label(&owner, &one, "app", laptop, false, NOW + 1),
-        Err(AdminError::LabelTaken { name, holder }) if name == "app" && holder == phone.node_id()
+        add_label(&owner, &one, "myapp", laptop, false, NOW + 1),
+        Err(AdminError::LabelTaken { name, holder }) if name == "myapp" && holder == phone.node_id()
     ));
     // A label of the other member is not in the way of a different name.
     add_label(&owner, &one, "web", laptop, false, NOW + 1).unwrap();
 
     // The explicit move: one entry, the new member's, and the other labels stay.
     let two = add_label(&owner, &one, "keep", phone.node_id(), false, NOW + 1).unwrap();
-    let moved = add_label(&owner, &two, "app", laptop, true, NOW + 2).unwrap();
+    let moved = add_label(&owner, &two, "myapp", laptop, true, NOW + 2).unwrap();
     assert_eq!(
         labels_of(&moved),
         vec![
             ("keep".to_string(), phone.node_id()),
-            ("app".to_string(), laptop)
+            ("myapp".to_string(), laptop)
         ]
     );
     assert_eq!(moved.seq(), two.seq() + 1);
@@ -3040,14 +3043,14 @@ fn a_label_belongs_to_one_member_unless_the_owner_moves_it() {
     assert_eq!(labels_of(&fresh), vec![("fresh".to_string(), laptop)]);
     // Capital letters in a stored name are the same name: one holder, however it was written.
     let mut roster = one.roster_body().clone();
-    roster.labels[0].name = "App".into();
+    roster.labels[0].name = "Myapp".into();
     let shouting = Documents::signed(&owner, roster, one.policy_body().clone()).unwrap();
     assert!(matches!(
-        add_label(&owner, &shouting, "app", laptop, false, NOW + 3),
+        add_label(&owner, &shouting, "myapp", laptop, false, NOW + 3),
         Err(AdminError::LabelTaken { .. })
     ));
-    let moved = add_label(&owner, &shouting, "app", laptop, true, NOW + 3).unwrap();
-    assert_eq!(labels_of(&moved), vec![("app".to_string(), laptop)]);
+    let moved = add_label(&owner, &shouting, "myapp", laptop, true, NOW + 3).unwrap();
+    assert_eq!(labels_of(&moved), vec![("myapp".to_string(), laptop)]);
 }
 
 #[test]
@@ -3055,18 +3058,18 @@ fn a_label_goes_only_to_a_member_in_good_standing() {
     let (owner, phone, _, docs) = with_phone();
     let stranger = NodeKeys::generate().node_id();
     assert!(matches!(
-        add_label(&owner, &docs, "app", stranger, false, NOW),
+        add_label(&owner, &docs, "myapp", stranger, false, NOW),
         Err(AdminError::NotAMember(id)) if id == stranger
     ));
     let revoked = revoke(&owner, &docs, phone.node_id(), NOW + 1).unwrap();
     assert!(matches!(
-        add_label(&owner, &revoked, "app", phone.node_id(), false, NOW + 2),
+        add_label(&owner, &revoked, "myapp", phone.node_id(), false, NOW + 2),
         Err(AdminError::Revoked(id)) if id == phone.node_id()
     ));
     // A node revoked ahead of time (not a member) is a revoked one, not an unknown one.
     let ahead = revoke(&owner, &docs, stranger, NOW + 1).unwrap();
     assert!(matches!(
-        add_label(&owner, &ahead, "app", stranger, false, NOW + 2),
+        add_label(&owner, &ahead, "myapp", stranger, false, NOW + 2),
         Err(AdminError::Revoked(_))
     ));
     // The key must be this network's owner.
@@ -3074,7 +3077,7 @@ fn a_label_goes_only_to_a_member_in_good_standing() {
         add_label(
             &OwnerKey::generate(),
             &docs,
-            "app",
+            "myapp",
             phone.node_id(),
             false,
             NOW
@@ -3087,19 +3090,19 @@ fn a_label_goes_only_to_a_member_in_good_standing() {
 fn revoking_a_member_takes_its_labels_with_it_and_the_names_are_free_again() {
     let (owner, phone, _, docs) = with_phone();
     let laptop = docs.roster_body().members[0].node_id;
-    let a = add_label(&owner, &docs, "app", phone.node_id(), false, NOW).unwrap();
+    let a = add_label(&owner, &docs, "myapp", phone.node_id(), false, NOW).unwrap();
     let b = add_label(&owner, &a, "home", laptop, false, NOW).unwrap();
     let revoked = revoke(&owner, &b, phone.node_id(), NOW + 1).unwrap();
     assert_eq!(labels_of(&revoked), vec![("home".to_string(), laptop)]);
     // The name can be given to another member at once.
-    let again = add_label(&owner, &revoked, "app", laptop, false, NOW + 2).unwrap();
-    assert!(labels_of(&again).contains(&("app".to_string(), laptop)));
+    let again = add_label(&owner, &revoked, "myapp", laptop, false, NOW + 2).unwrap();
+    assert!(labels_of(&again).contains(&("myapp".to_string(), laptop)));
 }
 
 #[test]
 fn a_label_is_one_lowercase_ldh_label() {
     let long = "a".repeat(63);
-    for good in ["a", "app", "my-app", "a1", "1", "x--y", long.as_str()] {
+    for good in ["a", "myapp", "my-myapp", "a1", "1", "x--y", long.as_str()] {
         check_label(good).unwrap_or_else(|e| panic!("{good:?}: {e}"));
     }
     let too_long = "a".repeat(64);
@@ -3108,7 +3111,7 @@ fn a_label_is_one_lowercase_ldh_label() {
         "-a",
         "a-",
         "-",
-        "App",
+        "Myapp",
         "a.b",
         "a b",
         "a_b",
@@ -3142,11 +3145,11 @@ fn a_label_is_one_lowercase_ldh_label() {
 fn removing_a_label_takes_exactly_the_matching_entries() {
     let (owner, phone, _, docs) = with_phone();
     let laptop = docs.roster_body().members[0].node_id;
-    let docs = add_label(&owner, &docs, "app", phone.node_id(), false, NOW).unwrap();
+    let docs = add_label(&owner, &docs, "myapp", phone.node_id(), false, NOW).unwrap();
     let docs = add_label(&owner, &docs, "blog", phone.node_id(), false, NOW).unwrap();
     let docs = add_label(&owner, &docs, "home", laptop, false, NOW).unwrap();
 
-    let next = remove_label(&owner, &docs, "app", None, NOW + 1).unwrap();
+    let next = remove_label(&owner, &docs, "myapp", None, NOW + 1).unwrap();
     assert_eq!(next.seq(), docs.seq() + 1);
     assert_eq!(
         labels_of(&next),
@@ -3170,7 +3173,7 @@ fn removing_a_label_takes_exactly_the_matching_entries() {
     // Nothing matched: an error, and no number spent.
     for (name, node) in [
         ("nope", None),
-        ("app", Some(laptop)),
+        ("myapp", Some(laptop)),
         ("home", Some(phone.node_id())),
     ] {
         assert!(
@@ -3191,7 +3194,7 @@ fn removing_a_label_takes_exactly_the_matching_entries() {
 fn labels_survive_a_steward_reissue_and_a_steward_cannot_change_them() {
     let s = stewarded();
     let me = s.base.roster_body().members[0].node_id;
-    let labelled = add_label(&s.owner, &s.base, "app", me, false, NOW + 1).unwrap();
+    let labelled = add_label(&s.owner, &s.base, "myapp", me, false, NOW + 1).unwrap();
     // The owner's pair jumps past the steward's span, steward listed or not.
     assert_eq!(labelled.seq(), s.base.seq() + STEWARD_SEQ_SPAN + 1);
     assert_eq!(labelled.roster_body().stewards.len(), 1);

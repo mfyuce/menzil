@@ -229,7 +229,7 @@ async fn a_relay_that_does_not_answer_or_refuses_an_advertise_does_not_keep_a_no
         let relay = start_relay(&trust, 1 << 20).await;
         let node = identity();
         let owner = SigningKey::generate(&mut rand::rng());
-        let (network_id, roster1) = roster(&owner, node.node_id, &["app"]);
+        let (network_id, roster1) = roster(&owner, node.node_id, &["myapp"]);
         relay.relay.rosters().set(&roster1).unwrap();
         let own = Arc::new(RosterStore::new());
         own.set(&roster1).unwrap();
@@ -243,9 +243,9 @@ async fn a_relay_that_does_not_answer_or_refuses_an_advertise_does_not_keep_a_no
         })
         .await;
         proxy.silence_existing();
-        running.book.set_shares(vec![blind("app")]).unwrap();
+        running.book.set_shares(vec![blind("myapp")]).unwrap();
         // The relay holds the claim (it received the ADVERTISE), the node never saw the ACK.
-        until("the relay to hold app", || {
+        until("the relay to hold myapp", || {
             !relay.relay.labels().shares_for(&node.node_id).is_empty()
         })
         .await;
@@ -261,7 +261,7 @@ async fn a_relay_that_does_not_answer_or_refuses_an_advertise_does_not_keep_a_no
         .await
         .expect("the node must end the attachment whose ADVERTISE got no answer");
         until("the ACK of the new attachment", || {
-            running.book.accepted_service(&blind("app").service)
+            running.book.accepted_service(&blind("myapp").service)
         })
         .await;
         let _ = running.stop.send(true);
@@ -281,15 +281,15 @@ async fn a_relay_that_does_not_answer_or_refuses_an_advertise_does_not_keep_a_no
         .await;
         let node = identity();
         let owner = SigningKey::generate(&mut rand::rng());
-        let (network_id, roster1) = roster(&owner, node.node_id, &["app"]);
+        let (network_id, roster1) = roster(&owner, node.node_id, &["myapp"]);
         relay.relay.rosters().set(&roster1).unwrap();
         let own = Arc::new(RosterStore::new());
         own.set(&roster1).unwrap();
         let running = run_node(session_config(&relay, &node, network_id), own);
 
-        running.book.set_shares(vec![blind("app")]).unwrap();
-        until("app to be accepted", || {
-            running.book.accepted_service(&blind("app").service)
+        running.book.set_shares(vec![blind("myapp")]).unwrap();
+        until("myapp to be accepted", || {
+            running.book.accepted_service(&blind("myapp").service)
         })
         .await;
         assert_eq!(relay.relay.labels().shares_for(&node.node_id).len(), 1);

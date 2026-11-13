@@ -622,14 +622,14 @@ mod tests {
     #[test]
     fn the_text_form_round_trips() {
         let mut state = NameState::default();
-        assert!(state.accept(&claim("app", None, 1), None, NOW).0.is_ok());
+        assert!(state.accept(&claim("myapp", None, 1), None, NOW).0.is_ok());
         assert!(
             state
                 .accept(&claim("blog.ali", Some("ali"), 2), Some(FIG), NOW + 5)
                 .0
                 .is_ok()
         );
-        assert!(state.release("app", NOW + 9));
+        assert!(state.release("myapp", NOW + 9));
         state.quarantine_slug("gone", NOW + 11);
         let text = state.render();
         assert!(text.starts_with("menzil-names-state 1\n"));
@@ -642,27 +642,33 @@ mod tests {
 
     #[test]
     fn a_damaged_text_is_an_error_naming_the_line() {
-        let ok = format!("{HEADER}\nname app - {} 1 2\n", net(1).to_hex());
+        let ok = format!("{HEADER}\nname myapp - {} 1 2\n", net(1).to_hex());
         assert!(NameState::parse(&ok).is_ok());
         for (text, line) in [
             (String::new(), 1),
             ("garbage\n".to_string(), 1),
-            (format!("{HEADER}\nname app - nothex 1 2\n"), 2),
-            (format!("{HEADER}\nname app - {} x 2\n", net(1).to_hex()), 2),
+            (format!("{HEADER}\nname myapp - nothex 1 2\n"), 2),
             (
-                format!("{HEADER}\nname app.ali bob {} 1 2\n", net(1).to_hex()),
+                format!("{HEADER}\nname myapp - {} x 2\n", net(1).to_hex()),
                 2,
             ),
-            (format!("{HEADER}\nname App - {} 1 2\n", net(1).to_hex()), 2),
+            (
+                format!("{HEADER}\nname myapp.ali bob {} 1 2\n", net(1).to_hex()),
+                2,
+            ),
+            (
+                format!("{HEADER}\nname Myapp - {} 1 2\n", net(1).to_hex()),
+                2,
+            ),
             (format!("{HEADER}\nsomething else\n"), 2),
             (
                 format!(
-                    "{HEADER}\nname app - {n} 1 2\nname app - {n} 1 2\n",
+                    "{HEADER}\nname myapp - {n} 1 2\nname myapp - {n} 1 2\n",
                     n = net(1).to_hex()
                 ),
                 3,
             ),
-            (format!("{HEADER}\nquarantine odd app 1 - -\n"), 2),
+            (format!("{HEADER}\nquarantine odd myapp 1 - -\n"), 2),
         ] {
             let error = NameState::parse(&text).unwrap_err();
             assert_eq!(error.line, line, "{text:?}: {error}");
@@ -770,18 +776,18 @@ mod tests {
     #[test]
     fn a_name_not_advertised_for_ninety_days_is_released_and_a_flat_one_is_quarantined() {
         let mut state = NameState::default();
-        let _ = state.accept(&claim("app", None, 1), None, NOW);
-        let _ = state.accept(&claim("app.ali", Some("ali"), 2), Some(FIG), NOW);
+        let _ = state.accept(&claim("myapp", None, 1), None, NOW);
+        let _ = state.accept(&claim("myapp.ali", Some("ali"), 2), Some(FIG), NOW);
         assert!(!state.sweep(NOW + 90 * DAY - 1, |_| false));
         assert!(state.sweep(NOW + 90 * DAY, |_| false));
         assert!(state.names.is_empty());
-        let q = &state.quarantine["app"];
+        let q = &state.quarantine["myapp"];
         assert_eq!(
             (q.kind, q.network, q.since),
             (QuarantineKind::Flat, Some(net(1)), NOW + 90 * DAY)
         );
         assert!(
-            !state.quarantine.contains_key("app.ali"),
+            !state.quarantine.contains_key("myapp.ali"),
             "a zone name is free at once, not quarantined"
         );
         // Quarantine ends after 180 days.
@@ -793,31 +799,33 @@ mod tests {
     #[test]
     fn a_name_held_by_a_session_is_stamped_not_released() {
         let mut state = NameState::default();
-        let _ = state.accept(&claim("app", None, 1), None, NOW);
+        let _ = state.accept(&claim("myapp", None, 1), None, NOW);
         let later = NOW + 200 * DAY;
-        assert!(state.sweep(later, |name| name == "app"));
-        assert_eq!(state.names["app"].last, later);
+        assert!(state.sweep(later, |name| name == "myapp"));
+        assert_eq!(state.names["myapp"].last, later);
         // Stamped at most once a day.
-        assert!(!state.sweep(later + 60, |name| name == "app"));
+        assert!(!state.sweep(later + 60, |name| name == "myapp"));
     }
 
     #[test]
     fn a_quarantined_flat_name_goes_back_only_to_the_network_that_held_it() {
         let mut state = NameState::default();
-        let _ = state.accept(&claim("app", None, 1), None, NOW);
-        state.release("app", NOW + DAY);
+        let _ = state.accept(&claim("myapp", None, 1), None, NOW);
+        state.release("myapp", NOW + DAY);
         assert_eq!(
-            state.accept(&claim("app", None, 2), None, NOW + 2 * DAY).0,
+            state
+                .accept(&claim("myapp", None, 2), None, NOW + 2 * DAY)
+                .0,
             Err(NameRefusal::Quarantined)
         );
-        let (back, changed) = state.accept(&claim("app", None, 1), None, NOW + 2 * DAY);
+        let (back, changed) = state.accept(&claim("myapp", None, 1), None, NOW + 2 * DAY);
         assert!(back.is_ok() && changed);
         assert!(state.quarantine.is_empty());
         // After the quarantine, anybody.
-        state.release("app", NOW + 3 * DAY);
+        state.release("myapp", NOW + 3 * DAY);
         assert!(
             state
-                .accept(&claim("app", None, 2), None, NOW + 3 * DAY + 180 * DAY)
+                .accept(&claim("myapp", None, 2), None, NOW + 3 * DAY + 180 * DAY)
                 .0
                 .is_ok()
         );
@@ -845,18 +853,18 @@ mod tests {
     #[test]
     fn the_relay_part_keeps_no_slug_and_the_default_names_are_the_default_tenants() {
         let mut state = NameState::default();
-        let _ = state.accept(&claim("app", None, 1), None, NOW);
+        let _ = state.accept(&claim("myapp", None, 1), None, NOW);
         let _ = state.accept(&claim("blog", Some("ali"), 1), None, NOW);
         let _ = state.accept(&claim("x.ali", Some("ali"), 1), None, NOW);
         state.quarantine_slug("gone", NOW);
         assert_eq!(
             state.default_flat_names(),
-            ["app".to_string()].into_iter().collect()
+            ["myapp".to_string()].into_iter().collect()
         );
         assert!(state.relay_part().quarantine.is_empty());
-        state.release("app", NOW);
+        state.release("myapp", NOW);
         assert!(
-            state.default_flat_names().contains("app"),
+            state.default_flat_names().contains("myapp"),
             "quarantined still counts"
         );
     }
@@ -1014,13 +1022,13 @@ mod tests {
     #[test]
     fn stamps_in_the_future_are_brought_back_to_now() {
         let mut state = NameState::default();
-        let _ = state.accept(&claim("app", None, 1), None, NOW + 400 * DAY);
+        let _ = state.accept(&claim("myapp", None, 1), None, NOW + 400 * DAY);
         let _ = state.accept(&claim("a.ali", Some("ali"), 1), Some(FIG), NOW + 400 * DAY);
         let _ = state.accept(&claim("gone", None, 1), None, NOW + 400 * DAY);
         state.release("gone", NOW + 400 * DAY);
         assert!(state.sweep(NOW, |_| false));
-        assert_eq!(state.names["app"].first, NOW);
-        assert_eq!(state.names["app"].last, NOW);
+        assert_eq!(state.names["myapp"].first, NOW);
+        assert_eq!(state.names["myapp"].last, NOW);
         assert_eq!(state.quarantine["gone"].since, NOW);
         assert_eq!(state.accepted["ali"], vec![NOW]);
         assert!(!state.sweep(NOW, |_| false), "nothing left to clamp");
@@ -1035,7 +1043,7 @@ mod tests {
         let _ = state.accept(&claim("blog", Some("ali"), 1), None, NOW);
         let _ = state.accept(&claim("shop", Some("veli"), 2), None, NOW);
         let _ = state.accept(&claim("x.ali", Some("ali"), 1), None, NOW);
-        let _ = state.accept(&claim("app", None, 3), None, NOW);
+        let _ = state.accept(&claim("myapp", None, 3), None, NOW);
         state.release("shop", NOW + 1);
         let flat = state.tenant_flat_names();
         assert_eq!(

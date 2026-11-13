@@ -855,9 +855,9 @@ mod tests {
     #[test]
     fn an_older_node_ignores_the_names_of_an_advertise_ack_and_a_new_one_reads_an_old_ack() {
         let new = AdvertiseAckBody {
-            accepted: vec!["app".to_string()],
+            accepted: vec!["myapp".to_string()],
             rejected: vec![],
-            names: vec!["app.ali".to_string(), "app.bob".to_string()],
+            names: vec!["myapp.ali".to_string(), "myapp.bob".to_string()],
             share_domain: None,
         };
         let wire = Record::AdvertiseAck(new.clone()).encode();
@@ -871,12 +871,12 @@ mod tests {
 
         let mut old_wire = vec![RecordType::AdvertiseAck as u8];
         old_wire.extend(encode_cbor_body_bytes(&OldAdvertiseAck {
-            accepted: vec!["app".to_string()],
+            accepted: vec!["myapp".to_string()],
             rejected: vec![],
         }));
         match Record::decode(&old_wire).unwrap() {
             Record::AdvertiseAck(ack) => {
-                assert_eq!(ack.accepted, vec!["app"]);
+                assert_eq!(ack.accepted, vec!["myapp"]);
                 assert!(ack.names.is_empty());
             }
             other => panic!("not an ADVERTISE_ACK: {other:?}"),
@@ -906,9 +906,9 @@ mod tests {
     #[test]
     fn the_share_domain_of_an_advertise_ack_round_trips_and_is_optional() {
         let some = AdvertiseAckBody {
-            accepted: vec!["app".to_string()],
+            accepted: vec!["myapp".to_string()],
             rejected: vec![],
-            names: vec!["app".to_string()],
+            names: vec!["myapp".to_string()],
             share_domain: Some("share.example.org".to_string()),
         };
         let wire = Record::AdvertiseAck(some.clone()).encode();
