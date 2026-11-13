@@ -788,6 +788,7 @@ impl Opener for NodeOpener {
     async fn status(&self) -> agent::RelayStatus {
         agent::RelayStatus {
             attached: Some(self.node.is_attached()),
+            since: Some(self.node.attach_state_since()),
             rejected: self.node.last_relay_error().map(rejected_of),
         }
     }

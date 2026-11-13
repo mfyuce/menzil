@@ -22,6 +22,7 @@
 //! client -> agent   status\n
 //! agent  -> client  lines "<key> <text>\n", then the connection ends. Keys:
 //!                     attached yes|no
+//!                     attached_since <Unix seconds>   when that last changed (optional)
 //!                     rejected_at <Unix seconds>      the relay's last rejection (below)
 //!                     rejected_code <name>            the ERROR code, e.g. revoked
 //!                     rejected_message <text>         the ERROR text
@@ -304,6 +305,9 @@ pub struct NodeStatus {
 pub struct RelayStatus {
     /// Whether the node is attached to its relay right now.
     pub attached: Option<bool>,
+    /// Unix seconds when `attached` last changed; with it `status` says for how long the node
+    /// has been attached or detached.
+    pub since: Option<u64>,
     /// The last time the relay turned the node away, if it has not been cleared by a good
     /// attachment since.
     pub rejected: Option<Rejected>,
@@ -337,6 +341,9 @@ impl RelayStatus {
                 "attached no\n"
             });
         }
+        if let Some(since) = self.since {
+            out.push_str(&format!("attached_since {since}\n"));
+        }
         if let Some(rejected) = &self.rejected {
             out.push_str(&format!("rejected_at {}\n", rejected.at));
             if let Some(code) = &rejected.code {
@@ -369,6 +376,7 @@ impl RelayStatus {
             let value = one_line(value);
             match key {
                 "attached" => status.attached = Some(value == "yes"),
+                "attached_since" => status.since = value.trim().parse().ok(),
                 "rejected_at" => {
                     rejected.at = value.trim().parse().unwrap_or(0);
                 }
@@ -391,16 +399,26 @@ impl RelayStatus {
         status
     }
 
+    /// The `relay: ...` line (with a newline; empty when the agent did not say), with how long
+    /// the state has lasted when the agent said when it began.
+    pub fn attach_line(&self, now: u64) -> String {
+        let lasted = match self.since {
+            Some(since) if since > 0 => format!(" (for {})", text::age(now.saturating_sub(since))),
+            _ => String::new(),
+        };
+        match (self.attached, &self.rejected) {
+            (Some(true), None) => format!("relay: attached{lasted}\n"),
+            (Some(true), Some(_)) => format!("relay: attached{lasted}, but see below\n"),
+            (Some(false), _) => format!("relay: not attached{lasted}\n"),
+            (None, _) => String::new(),
+        }
+    }
+
     /// What `menzil status` adds about the relay, as text (empty when the agent said nothing),
     /// with times relative to `now`.
     pub fn render(&self, now: u64) -> String {
         let mut out = String::new();
-        match (self.attached, &self.rejected) {
-            (Some(true), None) => out.push_str("relay: attached\n"),
-            (Some(true), Some(_)) => out.push_str("relay: attached, but see below\n"),
-            (Some(false), _) => out.push_str("relay: not attached\n"),
-            (None, _) => {}
-        }
+        out.push_str(&self.attach_line(now));
         if let Some(rejected) = &self.rejected {
             out.push_str(&format!("  {}\n", text::turned_away(rejected, now)));
         }

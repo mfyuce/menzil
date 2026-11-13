@@ -73,6 +73,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use menzil_e2e::Role;
@@ -183,6 +184,8 @@ pub struct Node {
     identity: IdentityCell,
     router: RouterHandle,
     attachment: watch::Receiver<Option<Epoch>>,
+    /// Unix seconds of the last change of [`Self::is_attached`] (the start of the node counts).
+    attach_since: Arc<AtomicU64>,
     events: Option<mpsc::Receiver<SessionEvent>>,
     policies: Arc<PolicyStore>,
     rosters: Arc<RosterStore>,
@@ -276,6 +279,7 @@ impl Node {
         let (stop_session, stop_rx) = watch::channel(false);
         let (ended_tx, session_ended) = watch::channel(false);
         let relay_notes = RelayNotes::new();
+        let attach_since = Arc::new(AtomicU64::new(unix_seconds()));
         let mut tasks = vec![
             tokio::spawn({
                 let rosters = rosters.clone();
@@ -315,6 +319,11 @@ impl Node {
             tokio::spawn(revalidator.run()),
             // A Roster newer than the Policy: fetch the Policy (protocol.md 5.5).
             tokio::spawn(sync.clone().run_roster_watch(networks.clone())),
+            // When the node last attached or detached (`menzil status` says for how long).
+            tokio::spawn(track_attach_changes(
+                attachment.clone(),
+                Arc::clone(&attach_since),
+            )),
         ];
         // Documents about to expire: ask for new ones (protocol.md 7.3).
         for network_id in networks {
@@ -325,6 +334,7 @@ impl Node {
             identity,
             router: handle,
             attachment,
+            attach_since,
             events: Some(passthrough),
             policies,
             rosters,
@@ -359,6 +369,12 @@ impl Node {
     /// [`Self::last_relay_error`] for that.
     pub fn is_attached(&self) -> bool {
         self.attachment.borrow().is_some()
+    }
+
+    /// Unix seconds when [`Self::is_attached`] last changed (when the node started, if it
+    /// never has): with the answer, how long the node has been attached or detached.
+    pub fn attach_state_since(&self) -> u64 {
+        self.attach_since.load(Ordering::Relaxed)
     }
 
     /// This node's own NodeId.
@@ -890,4 +906,57 @@ fn serve_relay_principal<H>(
         }
         drop(forget);
     });
+}
+
+fn unix_seconds() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
+/// Records the time of every change of the attachment (attach, detach, a new epoch on a
+/// reconnect that was seen); ends when the router's sender is dropped.
+async fn track_attach_changes(
+    mut attachment: watch::Receiver<Option<Epoch>>,
+    since: Arc<AtomicU64>,
+) {
+    let mut attached = attachment.borrow().is_some();
+    while attachment.changed().await.is_ok() {
+        let now_attached = attachment.borrow_and_update().is_some();
+        if now_attached != attached {
+            attached = now_attached;
+            since.store(unix_seconds(), Ordering::Relaxed);
+        }
+    }
+}
+
+#[cfg(test)]
+mod attach_since_tests {
+    use super::*;
+
+    /// `attach_state_since` moves when the node attaches or detaches and stays put when only the
+    /// epoch changes (a reconnect that was never seen as detached).
+    #[tokio::test]
+    async fn the_attach_time_changes_with_attach_and_detach_only() {
+        let (tx, rx) = watch::channel(None::<Epoch>);
+        let since = Arc::new(AtomicU64::new(1));
+        let task = tokio::spawn(track_attach_changes(rx, Arc::clone(&since)));
+        let settle = || tokio::time::sleep(Duration::from_millis(50));
+
+        settle().await;
+        assert_eq!(since.load(Ordering::Relaxed), 1, "no change, no write");
+        tx.send(Some(Epoch::first())).unwrap();
+        settle().await;
+        let attached_at = since.load(Ordering::Relaxed);
+        assert!(attached_at > 1, "attaching is recorded");
+        since.store(7, Ordering::Relaxed);
+        tx.send(Some(Epoch::first())).unwrap();
+        settle().await;
+        assert_eq!(since.load(Ordering::Relaxed), 7, "same state, same time");
+        tx.send(None).unwrap();
+        settle().await;
+        assert!(since.load(Ordering::Relaxed) > 7, "detaching is recorded");
+        drop(tx);
+        task.await.unwrap();
+    }
 }

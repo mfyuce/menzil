@@ -789,6 +789,7 @@ async fn ask(status: RelayStatus) -> Result<RelayStatus> {
 async fn the_status_request_carries_the_rejection_and_whether_the_node_is_attached() {
     let sent = RelayStatus {
         attached: Some(false),
+        since: None,
         rejected: Some(rejected("revoked")),
     };
     assert_eq!(ask(sent.clone()).await.unwrap(), sent);
@@ -796,11 +797,13 @@ async fn the_status_request_carries_the_rejection_and_whether_the_node_is_attach
     // GOAWAY alone.
     let attached = RelayStatus {
         attached: Some(true),
+        since: None,
         rejected: None,
     };
     assert_eq!(ask(attached.clone()).await.unwrap(), attached);
     let bare = RelayStatus {
         attached: None,
+        since: None,
         rejected: Some(Rejected {
             at: 5,
             code: Some("not_member".to_string()),
@@ -813,6 +816,7 @@ async fn the_status_request_carries_the_rejection_and_whether_the_node_is_attach
     // A not_member that the node's own Roster contradicts keeps that on the way.
     let listed = RelayStatus {
         attached: None,
+        since: None,
         rejected: Some(Rejected {
             at: 5,
             code: Some("not_member".to_string()),
@@ -824,6 +828,7 @@ async fn the_status_request_carries_the_rejection_and_whether_the_node_is_attach
     assert_eq!(ask(listed.clone()).await.unwrap(), listed);
     let goaway_only = RelayStatus {
         attached: Some(true),
+        since: None,
         rejected: Some(Rejected {
             at: 6,
             code: None,
@@ -833,6 +838,13 @@ async fn the_status_request_carries_the_rejection_and_whether_the_node_is_attach
         }),
     };
     assert_eq!(ask(goaway_only.clone()).await.unwrap(), goaway_only);
+    // How long the state has lasted travels too.
+    let timed = RelayStatus {
+        attached: Some(false),
+        since: Some(1_700_000_000),
+        rejected: None,
+    };
+    assert_eq!(ask(timed.clone()).await.unwrap(), timed);
     // An opener that knows nothing says nothing.
     assert_eq!(
         ask(RelayStatus::default()).await.unwrap(),
@@ -855,6 +867,7 @@ async fn the_default_opener_answers_status_with_nothing() {
 async fn what_the_agent_says_in_a_status_reply_never_reaches_the_terminal_unescaped() {
     let sent = RelayStatus {
         attached: Some(false),
+        since: None,
         rejected: Some(Rejected {
             at: 1,
             code: Some("revoked\u{1b}[2J".to_string()),
@@ -968,6 +981,7 @@ fn status_is_rendered_with_the_reason_in_words() {
     let now = 1_700_000_000 + 7 * 60;
     let text = RelayStatus {
         attached: Some(false),
+        since: None,
         rejected: Some(rejected("revoked")),
     }
     .render(now);
@@ -983,6 +997,7 @@ fn status_is_rendered_with_the_reason_in_words() {
     assert_eq!(text.lines().count(), 2, "{text}");
     let text = RelayStatus {
         attached: Some(true),
+        since: None,
         rejected: None,
     }
     .render(now);
@@ -996,6 +1011,7 @@ fn status_is_rendered_with_the_reason_in_words() {
 fn the_agent_and_the_client_each_make_the_status_text_printable() {
     let dirty = RelayStatus {
         attached: Some(false),
+        since: None,
         rejected: Some(Rejected {
             at: 1,
             code: Some("re\u{1b}[2Jvoked\nattached yes".to_string()),
@@ -1065,6 +1081,7 @@ async fn four_byte_relay_text_does_not_hide_the_status() {
     let kept = notes.last_error().unwrap();
     let sent = RelayStatus {
         attached: Some(false),
+        since: None,
         rejected: Some(Rejected {
             at: kept.at,
             code: Some("revoked".to_string()),
@@ -1654,4 +1671,34 @@ async fn a_status_with_hostile_share_lines_yields_only_the_well_formed_ones() {
         "{reason:?}"
     );
     assert_eq!(got.shares[1].names, ["a.b"]);
+}
+
+#[test]
+fn the_relay_line_says_for_how_long_the_node_has_been_detached_or_attached() {
+    let detached = RelayStatus {
+        attached: Some(false),
+        since: Some(1_000),
+        rejected: None,
+    };
+    assert_eq!(
+        detached.attach_line(1_000 + 2 * 3600 + 5 * 60),
+        "relay: not attached (for 2 h 5 min)\n"
+    );
+    let attached = RelayStatus {
+        attached: Some(true),
+        since: Some(1_000),
+        rejected: None,
+    };
+    assert_eq!(attached.attach_line(1_045), "relay: attached (for 45 s)\n");
+    // An agent that does not say since gives the old line; a clock behind `since` is 0 s.
+    let old = RelayStatus {
+        attached: Some(false),
+        since: None,
+        rejected: None,
+    };
+    assert_eq!(old.attach_line(5), "relay: not attached\n");
+    assert_eq!(attached.attach_line(10), "relay: attached (for 0 s)\n");
+    assert_eq!(RelayStatus::default().attach_line(5), "");
+    assert_eq!(crate::text::age(90_000), "1 d 1 h");
+    assert_eq!(crate::text::age(300), "5 min");
 }

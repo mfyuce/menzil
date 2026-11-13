@@ -164,6 +164,25 @@ pub fn one_line(message: &str, limit: usize) -> String {
         .collect()
 }
 
+/// A span of seconds in the two biggest units that apply: `45 s`, `5 min`, `2 h 5 min`,
+/// `1 d 3 h`.
+pub fn age(seconds: u64) -> String {
+    let (d, h, m) = (
+        seconds / 86_400,
+        seconds % 86_400 / 3_600,
+        seconds % 3_600 / 60,
+    );
+    if d > 0 {
+        format!("{d} d {h} h")
+    } else if h > 0 {
+        format!("{h} h {m} min")
+    } else if m > 0 {
+        format!("{m} min")
+    } else {
+        format!("{seconds} s")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -1559,11 +1559,10 @@ pub async fn run_list(home: &Home) -> Result<String> {
     match crate::agent::query_node_status(&socket).await {
         Ok(status) => {
             let mut out = String::new();
-            match status.relay.attached {
-                Some(true) => out.push_str("relay: attached\n"),
-                Some(false) => out.push_str("relay: not attached\n"),
-                None => {}
-            }
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_secs());
+            out.push_str(&status.relay.attach_line(now));
             out.push_str(&render_list(&status.shares, domain.as_deref()));
             Ok(out)
         }
