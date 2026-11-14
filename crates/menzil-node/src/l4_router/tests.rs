@@ -3707,3 +3707,361 @@ async fn a_stale_epoch_datagram_is_dropped() {
         Some(&b"from the current one"[..])
     );
 }
+
+// ----------------------------------------------------------------------
+// Round C1 follow up: every path that removes a session from the table gives its charge back
+// to the node wide counter at once (one test per `release_inbound` call site)
+// ----------------------------------------------------------------------
+
+/// One engine with local party `b`, fed by hand. Every assertion is made before the first
+/// `await`, so no actor has read (and released) any of the junk the tests feed.
+struct Rel {
+    w: World,
+    b: Party,
+    d: Driven,
+    net: Net,
+}
+
+fn rel_rig(
+    w: World,
+    b: Party,
+    stores: &Stores,
+    relay: NodeId,
+    relay_static: X25519PublicKey,
+) -> Rel {
+    let mut next = 6u32;
+    let mut d = driven_full(
+        &b,
+        stores,
+        relay,
+        1024,
+        move || {
+            next += 1;
+            next
+        },
+        None,
+        None,
+    );
+    d.engine.on_attached(Epoch::first(), LIMITS, relay_static);
+    Rel {
+        w,
+        b,
+        d,
+        net: Net::new(),
+    }
+}
+
+impl Rel {
+    fn recv(&mut self, src: NodeId, frame: &E2eFrame) {
+        let record = Record::Recv {
+            src,
+            e2e_proto: E2E_PROTO_TAG,
+            flags: 0,
+            payload: frame.encode(),
+        };
+        assert!(
+            self.d
+                .engine
+                .on_record(Epoch::first(), record, Now::capture())
+                .is_none()
+        );
+    }
+
+    /// An `init` from `from` (wire index `wire`) to the engine.
+    fn init(&mut self, from: &Party, wire: u32) {
+        let manual = Manual::new(&self.net, from.clone_for_test());
+        let (_hs, init) = manual.init(&self.b, self.w.network, wire);
+        self.recv(from.id, &init);
+    }
+
+    /// `count` junk records for the session at `index`, from `src`, counters from `from`.
+    fn feed(&mut self, src: NodeId, index: u32, from: u64, count: u64) {
+        for counter in from..from + count {
+            self.recv(src, &junk_data(index, counter, CEIL_RECORD));
+        }
+    }
+
+    fn used(&self) -> usize {
+        self.d.engine.node_inbound.in_use()
+    }
+
+    fn present(&self, index: u32) -> bool {
+        self.d.engine.table.get(index).is_some()
+    }
+
+    fn generation(&self, index: u32) -> u32 {
+        self.d.engine.table.get(index).unwrap().generation
+    }
+
+    fn notice(&mut self, index: u32, notice: SessionNotice) {
+        let tag = tag_of(self.generation(index), index);
+        self.d.engine.on_notice(tag, notice);
+    }
+}
+
+/// `on_detached`: the attachment ends, every session of its epoch leaves the table.
+#[tokio::test]
+async fn a_detach_leaves_the_node_counter_at_once() {
+    let mut t = three_sessions_at(CEIL_CEILING).await;
+    t.feed(7, 0, 5);
+    t.feed(8, 0, 3);
+    t.feed(9, 0, 2);
+    assert_eq!(t.node_in_use(), 10 * CEIL_CHARGE);
+    t.d.engine.on_detached(Epoch::first());
+    assert!(t.d.engine.table.is_empty());
+    assert_eq!(t.node_in_use(), 0, "the removed sessions still count");
+}
+
+/// `on_stop`: the router stops, every session leaves the table.
+#[tokio::test]
+async fn a_stop_leaves_the_node_counter_at_once() {
+    let mut t = three_sessions_at(CEIL_CEILING).await;
+    t.feed(7, 0, 5);
+    t.feed(8, 0, 3);
+    assert_eq!(t.node_in_use(), 8 * CEIL_CHARGE);
+    t.d.engine.on_stop(&grant_removed_close());
+    assert!(t.d.engine.table.is_empty());
+    assert_eq!(t.node_in_use(), 0, "the removed sessions still count");
+}
+
+/// `on_notice(Ended)` of a member session: only that session's charge goes.
+#[tokio::test]
+async fn an_ended_notice_leaves_the_node_counter_at_once() {
+    let mut t = three_sessions_at(CEIL_CEILING).await;
+    t.feed(7, 0, 5);
+    t.feed(8, 0, 3);
+    t.feed(9, 0, 2);
+    let generation = t.d.engine.table.get(7).unwrap().generation;
+    t.d.engine
+        .on_notice(tag_of(generation, 7), SessionNotice::Ended);
+    assert!(t.d.engine.table.get(7).is_none());
+    assert_eq!(t.node_in_use(), t.held(8) + t.held(9));
+    assert_eq!(t.node_in_use(), 5 * CEIL_CHARGE);
+}
+
+/// `ensure` finds the current session out of good standing and closes it.
+#[tokio::test]
+async fn a_session_closed_for_its_standing_leaves_the_node_counter_at_once() {
+    let w = world();
+    let (b, m, n) = (party(), party(), party());
+    let stores = w.stores(&[&b, &m, &n], vec![w.grant(&m, &b), w.grant(&n, &b)]);
+    let mut t = rel_rig(w, b, &stores, NodeId::from([0xAA; 32]), relay_static());
+    t.init(&m, 1);
+    t.init(&n, 1);
+    for index in [7, 8] {
+        t.notice(index, SessionNotice::FirstRecord);
+    }
+    t.feed(m.id, 7, 0, 4);
+    t.feed(n.id, 8, 0, 3);
+    assert_eq!(t.used(), 7 * CEIL_CHARGE);
+    edit_roster_of(&t.w, &stores, |body| {
+        body.revoked.push(menzil_proto::RevokedMember {
+            node_id: m.id,
+            since: 0,
+        });
+    });
+    let (reply, mut answer) = oneshot::channel();
+    t.d.engine
+        .ensure(m.id, t.w.network, false, reply, Now::capture());
+    assert!(!t.present(7), "m's session was closed");
+    assert!(t.present(8));
+    assert_eq!(t.used(), 3 * CEIL_CHARGE, "m's charge left the counter");
+    assert_eq!(
+        answer.try_recv().unwrap().err(),
+        Some(EnsureError::UnknownPeer)
+    );
+}
+
+/// `install_session` as responder: a newer `init` from the same peer supersedes the candidate.
+#[tokio::test]
+async fn a_superseded_candidate_leaves_the_node_counter_at_once() {
+    let w = world();
+    let (b, m, n) = (party(), party(), party());
+    let stores = w.stores(&[&b, &m, &n], vec![w.grant(&m, &b), w.grant(&n, &b)]);
+    let mut t = rel_rig(w, b, &stores, NodeId::from([0xAA; 32]), relay_static());
+    t.init(&m, 1);
+    t.init(&n, 1);
+    t.feed(m.id, 7, 0, 4);
+    t.feed(n.id, 8, 0, 3);
+    assert_eq!(t.used(), 7 * CEIL_CHARGE);
+    t.init(&m, 2);
+    assert!(!t.present(7), "m's first candidate was superseded");
+    assert!(t.present(8) && t.present(9));
+    assert_eq!(t.used(), 3 * CEIL_CHARGE);
+}
+
+/// `promote`: the first record of a replacement session retires the old current one.
+#[tokio::test]
+async fn a_retired_current_session_leaves_the_node_counter_at_once() {
+    let w = world();
+    let (b, m, n) = (party(), party(), party());
+    let stores = w.stores(&[&b, &m, &n], vec![w.grant(&m, &b), w.grant(&n, &b)]);
+    let mut t = rel_rig(w, b, &stores, NodeId::from([0xAA; 32]), relay_static());
+    t.init(&m, 1);
+    t.init(&n, 1);
+    t.notice(7, SessionNotice::FirstRecord);
+    t.init(&m, 2);
+    assert!(t.present(7) && t.present(9));
+    t.feed(m.id, 7, 0, 4);
+    t.feed(m.id, 9, 0, 2);
+    t.feed(n.id, 8, 0, 3);
+    assert_eq!(t.used(), 9 * CEIL_CHARGE);
+    t.notice(9, SessionNotice::FirstRecord);
+    assert!(!t.present(7), "the old current session was retired");
+    assert_eq!(t.used(), 5 * CEIL_CHARGE);
+}
+
+/// A docs only session: `install_session` as responder supersedes the peer's older one.
+#[tokio::test]
+async fn a_superseded_docs_only_session_leaves_the_node_counter_at_once() {
+    let w = world();
+    let (r, m, n) = (party(), party(), party());
+    let stores = w.split_stores(&[&r, &m, &n], &[&r, &m, &n], &[&r]);
+    let mut t = rel_rig(w, r, &stores, NodeId::from([0xAA; 32]), relay_static());
+    t.init(&m, 1);
+    t.init(&n, 1);
+    assert_eq!(t.d.engine.docs_only.len(), 2);
+    t.feed(m.id, 7, 0, 4);
+    t.feed(n.id, 8, 0, 3);
+    assert_eq!(t.used(), 7 * CEIL_CHARGE);
+    t.init(&m, 2);
+    assert!(!t.present(7));
+    assert_eq!(t.d.engine.docs_only.len(), 2);
+    assert_eq!(t.used(), 3 * CEIL_CHARGE);
+}
+
+/// A docs only session's own `Ended` notice.
+#[tokio::test]
+async fn an_ended_docs_only_session_leaves_the_node_counter_at_once() {
+    let w = world();
+    let (r, m, n) = (party(), party(), party());
+    let stores = w.split_stores(&[&r, &m, &n], &[&r, &m, &n], &[&r]);
+    let mut t = rel_rig(w, r, &stores, NodeId::from([0xAA; 32]), relay_static());
+    t.init(&m, 1);
+    t.init(&n, 1);
+    t.feed(m.id, 7, 0, 4);
+    t.feed(n.id, 8, 0, 3);
+    t.notice(7, SessionNotice::Ended);
+    assert!(!t.present(7));
+    assert_eq!(t.used(), 3 * CEIL_CHARGE);
+}
+
+/// A docs only session whose thirty seconds are up (`end_docs_only_sessions`).
+#[tokio::test]
+async fn a_docs_only_session_ended_by_its_deadline_leaves_the_node_counter_at_once() {
+    let w = world();
+    let (r, m) = (party(), party());
+    let stores = w.split_stores(&[&r, &m], &[&r, &m], &[&r]);
+    let mut t = rel_rig(w, r, &stores, NodeId::from([0xAA; 32]), relay_static());
+    t.init(&m, 1);
+    t.feed(m.id, 7, 0, 4);
+    assert_eq!(t.used(), 4 * CEIL_CHARGE);
+    let late = Now {
+        instant: Now::capture().instant + DOCS_ONLY_LIFETIME + Duration::from_secs(1),
+        unix: Now::capture().unix,
+    };
+    t.d.engine.on_tick(late);
+    assert!(!t.present(7));
+    assert_eq!(t.used(), 0);
+}
+
+/// `install_session` as the relay principal: a newer `init` from the relay supersedes its
+/// candidate.
+#[tokio::test]
+async fn a_superseded_relay_principal_candidate_leaves_the_node_counter_at_once() {
+    let w = world();
+    let (b, m, rel) = (party(), party(), party());
+    let roster = w.roster_edit(&[&b, &m], |body| {
+        body.labels.push(menzil_proto::Label {
+            name: "myapp".to_string(),
+            node_id: b.id,
+        });
+    });
+    let rosters = RosterStore::new();
+    rosters.set(&roster).unwrap();
+    let policies = PolicyStore::new();
+    policies
+        .set(&w.policy(&[&b, &m], &[&b, &m], vec![]))
+        .unwrap();
+    let stores = Stores {
+        policies: Arc::new(policies),
+        rosters: Arc::new(rosters),
+    };
+    let book = ShareBook::new();
+    let share = menzil_proto::Share {
+        name: "myapp".to_string(),
+        mode: menzil_proto::ShareMode::Blind,
+        service: "tls:myapp".parse().unwrap(),
+        alpn: vec![],
+    };
+    book.note_sent(std::slice::from_ref(&share));
+    book.note_ack(&menzil_proto::AdvertiseAckBody {
+        accepted: vec!["myapp".to_string()],
+        rejected: vec![],
+        names: vec![],
+        share_domain: None,
+    });
+    let mut t = rel_rig(w, b, &stores, rel.id, rel.x25519_public);
+    t.d.engine.shares = book;
+    t.init(&m, 1);
+    t.init(&rel, 1);
+    assert!(t.present(7) && t.present(8), "m and the relay came up");
+    t.feed(m.id, 7, 0, 3);
+    t.feed(rel.id, 8, 0, 4);
+    assert_eq!(t.used(), 7 * CEIL_CHARGE);
+    t.init(&rel, 2);
+    assert!(!t.present(8), "the relay's first candidate was superseded");
+    assert!(t.present(9));
+    assert_eq!(t.used(), 3 * CEIL_CHARGE);
+}
+
+/// `on_resp` as initiator, docs only answer: a second docs only session to the same peer
+/// replaces the first (they live under their own slot, so `ensure` dials again).
+#[tokio::test]
+async fn a_replaced_docs_only_initiator_session_leaves_the_node_counter_at_once() {
+    let w = world();
+    let (r, m) = (party(), party());
+    // M knows R completely; R's older Policy has no cert for M, so R answers docs only.
+    let stores = w.stores(&[&r, &m], vec![]);
+    let mut t = rel_rig(w, m, &stores, NodeId::from([0xAA; 32]), relay_static());
+    for round in 0..2u32 {
+        let (reply, _answer) = oneshot::channel();
+        t.d.engine
+            .ensure(r.id, t.w.network, false, reply, Now::capture());
+        let mut init = None;
+        while let Ok(request) = t.d.outbound.try_recv() {
+            if request.dst == r.id
+                && let Ok(frame @ E2eFrame::Init { .. }) = E2eFrame::decode(&request.payload)
+            {
+                init = Some(frame);
+            }
+        }
+        let hs = E2eResponderHandshake::start(
+            &r.x25519_private,
+            t.b.id,
+            r.id,
+            &init.expect("an init went to R"),
+        )
+        .unwrap();
+        let (_transport, resp) = hs
+            .finish_docs_only(
+                r.cert.clone(),
+                1,
+                1,
+                vec![E2E_PROTO_TAG],
+                4242 + round,
+                65_535,
+            )
+            .unwrap();
+        t.recv(r.id, &resp);
+        if round == 0 {
+            assert!(t.present(7), "the first docs only session is index 7");
+            assert_eq!(t.d.engine.docs_only.len(), 1);
+            t.feed(r.id, 7, 0, 4);
+            assert_eq!(t.used(), 4 * CEIL_CHARGE);
+        }
+    }
+    assert!(!t.present(7), "the first docs only session was replaced");
+    assert_eq!(t.d.engine.docs_only.len(), 1);
+    assert_eq!(t.used(), 0);
+}
