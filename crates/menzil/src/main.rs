@@ -1157,7 +1157,7 @@ async fn run(cli: Cli) -> Result<()> {
                 }
             };
             eprintln!(
-                "SOCKS5 proxy on {} through {exit}; use socks5h:// so that names are resolved at the exit; ctrl-c stops and resets what is open",
+                "SOCKS5 and HTTP CONNECT proxy on {} through {exit}; use socks5h:// or HTTPS_PROXY=http://ADDR so that names are resolved at the exit; ctrl-c stops and resets what is open",
                 listener.local_addr()?
             );
             proxy::run(&socket, &exit, listener, stop).await?;

@@ -436,6 +436,17 @@ enum Done {
     Dropped,
 }
 
+/// `host:port` as the log shows it: an IPv6 literal in brackets, so that the port is not part of
+/// the address.
+fn log_target(host: &str, port: u16) -> String {
+    let shown = log_host(host);
+    if shown.contains(':') {
+        format!("[{shown}]:{port}")
+    } else {
+        format!("{shown}:{port}")
+    }
+}
+
 /// `host` as the log shows it: unsafe characters written out and at most 255 bytes.
 fn log_host(host: &str) -> String {
     let mut shown = text::escaped(host);
@@ -605,8 +616,8 @@ where
         Ok(open) => open,
         Err(message) => {
             eprintln!(
-                "menzil proxy: {peer} to {}:{port} failed: {}",
-                log_host(&host),
+                "menzil proxy: {peer} to {} failed: {}",
+                log_target(&host, port),
                 text::one_line(&message, 300)
             );
             let code = exit_code(&message);
@@ -653,16 +664,16 @@ where
         Ok(End::Clean) => Done::Clean,
         Ok(End::Reset(why)) => {
             eprintln!(
-                "menzil proxy: {peer} to {}:{port} was reset: {}",
-                log_host(&host),
+                "menzil proxy: {peer} to {} was reset: {}",
+                log_target(&host, port),
                 text::one_line(&why, 300)
             );
             Done::Dropped
         }
         Err(error) => {
             eprintln!(
-                "menzil proxy: {peer} to {}:{port} failed: {}",
-                log_host(&host),
+                "menzil proxy: {peer} to {} failed: {}",
+                log_target(&host, port),
                 text::one_line(&format!("{error:#}"), 300)
             );
             Done::Dropped
@@ -1795,21 +1806,31 @@ mod tests {
     fn nothing_in_this_file_looks_a_name_up() {
         // Structural: the production half of this file (before its tests) names no call that
         // resolves a name. The needles are built so that this test does not match itself.
-        let source = include_str!("proxy.rs");
-        let production = &source[..source.find("#[cfg(test)]").unwrap()];
-        for needle in [
-            ["lookup", "_host"].concat(),
-            ["to_socket", "_addrs"].concat(),
-            ["get", "addrinfo"].concat(),
-            ["Resolver", "::"].concat(),
-            ["resolve", "("].concat(),
-            ["Tcp", "Stream::connect"].concat(),
+        for (file, source) in [
+            ("proxy.rs", include_str!("proxy.rs")),
+            ("proxy/http.rs", include_str!("proxy/http.rs")),
         ] {
-            assert!(
-                !production.contains(&needle),
-                "proxy.rs must resolve nothing and dial nothing itself: found `{needle}`"
-            );
+            let production = &source[..source.find("#[cfg(test)]").unwrap()];
+            for needle in [
+                ["lookup", "_host"].concat(),
+                ["to_socket", "_addrs"].concat(),
+                ["get", "addrinfo"].concat(),
+                ["Resolver", "::"].concat(),
+                ["resolve", "("].concat(),
+                ["Tcp", "Stream::connect"].concat(),
+            ] {
+                assert!(
+                    !production.contains(&needle),
+                    "{file} must resolve nothing and dial nothing itself: found `{needle}`"
+                );
+            }
         }
+    }
+
+    #[test]
+    fn the_log_brackets_an_ipv6_target_and_not_a_name() {
+        assert_eq!(log_target("2001:db8::1", 443), "[2001:db8::1]:443");
+        assert_eq!(log_target("example.org", 443), "example.org:443");
     }
 
     // ---- --listen ----------------------------------------------------------------------------
