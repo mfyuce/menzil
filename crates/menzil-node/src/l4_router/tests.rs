@@ -1347,7 +1347,7 @@ fn driven_with(
     capacity: usize,
     index_source: impl FnMut() -> u32 + Send + 'static,
 ) -> Driven {
-    driven_full(party, stores, relay, capacity, index_source, None)
+    driven_full(party, stores, relay, capacity, index_source, None, None)
 }
 
 /// [`driven_with`], optionally with another inbound budget per session
@@ -1359,6 +1359,7 @@ fn driven_full(
     capacity: usize,
     index_source: impl FnMut() -> u32 + Send + 'static,
     inbound_budget: Option<usize>,
+    inbound_ceiling: Option<usize>,
 ) -> Driven {
     let (outbound_tx, outbound) = mpsc::channel(capacity);
     let (ready_tx, ready) = mpsc::unbounded_channel();
@@ -1373,6 +1374,9 @@ fn driven_full(
     .unwrap();
     if let Some(bytes) = inbound_budget {
         config = config.with_inbound_budget(bytes);
+    }
+    if let Some(bytes) = inbound_ceiling {
+        config = config.with_inbound_ceiling(bytes);
     }
     let (attachment_tx, _) = tokio::sync::watch::channel(None);
     let engine = Engine::new(
@@ -2089,6 +2093,7 @@ async fn two_sessions_at(
             next
         },
         Some(budget),
+        None,
     );
     d.engine.on_attached(Epoch::first(), LIMITS, relay_static());
     let net = Net::new();
@@ -2185,6 +2190,201 @@ async fn a_session_that_passes_its_inbound_budget_is_closed_and_forgotten_and_a_
         }
         other => panic!("ended as {other:?}"),
     }
+}
+
+// ----------------------------------------------------------------------
+// TBD 75: the node wide ceiling, the session holding the most gives way
+// ----------------------------------------------------------------------
+
+const CEIL_BUDGET: usize = 768 * 1024;
+const CEIL_CEILING: usize = 1024 * 1024;
+const CEIL_RECORD: usize = 16 * 1024;
+/// What one `CEIL_RECORD` byte record is charged.
+const CEIL_CHARGE: usize = CEIL_RECORD + 128;
+
+/// Three sessions up at indices 7 (`m`), 8 (`n`) and 9 (`p`) on an engine with `ceiling`.
+struct Three {
+    d: Driven,
+    peers: [NodeId; 3],
+    ready: Vec<SessionReady>,
+}
+
+async fn three_sessions_at(ceiling: usize) -> Three {
+    let w = world();
+    let (b, m, n, p) = (party(), party(), party(), party());
+    let stores = w.stores(
+        &[&b, &m, &n, &p],
+        vec![w.grant(&m, &b), w.grant(&n, &b), w.grant(&p, &b)],
+    );
+    let mut next = 6u32;
+    let mut d = driven_full(
+        &b,
+        &stores,
+        NodeId::from([0xAA; 32]),
+        1024,
+        move || {
+            next += 1;
+            next
+        },
+        Some(CEIL_BUDGET),
+        Some(ceiling),
+    );
+    d.engine.on_attached(Epoch::first(), LIMITS, relay_static());
+    let net = Net::new();
+    for peer in [&m, &n, &p] {
+        let manual = Manual::new(&net, peer.clone_for_test());
+        let (_hs, init) = manual.init(&b, w.network, 1);
+        let record = Record::Recv {
+            src: peer.id,
+            e2e_proto: E2E_PROTO_TAG,
+            flags: 0,
+            payload: init.encode(),
+        };
+        assert!(
+            d.engine
+                .on_record(Epoch::first(), record, Now::capture())
+                .is_none()
+        );
+    }
+    let ready = (0..3)
+        .map(|_| d._ready.try_recv().expect("a session came up"))
+        .collect();
+    Three {
+        d,
+        peers: [m.id, n.id, p.id],
+        ready,
+    }
+}
+
+impl Three {
+    /// `count` junk records for the session at `index` (7, 8 or 9), counters from `from`.
+    fn feed(&mut self, index: u32, from: u64, count: u64) {
+        let src = self.peers[(index - 7) as usize];
+        for counter in from..from + count {
+            let record = Record::Recv {
+                src,
+                e2e_proto: E2E_PROTO_TAG,
+                flags: 0,
+                payload: junk_data(index, counter, CEIL_RECORD).encode(),
+            };
+            assert!(
+                self.d
+                    .engine
+                    .on_record(Epoch::first(), record, Now::capture())
+                    .is_none()
+            );
+        }
+    }
+
+    fn node_in_use(&self) -> usize {
+        self.d.engine.node_inbound.in_use()
+    }
+
+    fn held(&self, index: u32) -> usize {
+        self.d
+            .engine
+            .table
+            .get(index)
+            .unwrap()
+            .handle
+            .inbound_in_use()
+    }
+}
+
+async fn closed_rate_limited(ready: &mut SessionReady) {
+    let reason = timeout(Duration::from_secs(5), ready.acceptor.closed())
+        .await
+        .expect("the ended session's actor must end");
+    match reason.as_ref() {
+        EndReason::ClosedLocally(Some(close)) => {
+            assert_eq!(close.code, ErrorCode::RateLimited, "{close:?}");
+        }
+        other => panic!("ended as {other:?}"),
+    }
+}
+
+/// T1 (and the detach hooks): A holds most, B less; C's record crosses the node ceiling.
+#[tokio::test]
+async fn the_session_holding_the_most_gives_way_when_the_node_ceiling_is_crossed() {
+    let mut t = three_sessions_at(CEIL_CEILING).await;
+    t.feed(7, 0, 37);
+    t.feed(8, 0, 18);
+    let (a, b) = (37 * CEIL_CHARGE, 18 * CEIL_CHARGE);
+    assert_eq!((t.held(7), t.held(8), t.node_in_use()), (a, b, a + b));
+    // 8 more fit under the ceiling, the 9th does not.
+    t.feed(9, 0, 8);
+    assert!(t.d.engine.table.get(7).is_some(), "nothing crossed yet");
+    t.feed(9, 8, 1);
+
+    assert!(t.d.engine.table.get(7).is_none(), "A gave way");
+    assert_eq!(t.held(8), b, "B is untouched");
+    assert_eq!(
+        t.held(9),
+        9 * CEIL_CHARGE,
+        "C's arriving record was accepted"
+    );
+    // The detach hook fired: A still holds its queue, but the node no longer counts it.
+    let a_handle = t.ready[0].handle.clone();
+    assert_eq!(a_handle.inbound_in_use(), a, "A's own queue is still there");
+    assert_eq!(t.node_in_use(), b + 9 * CEIL_CHARGE);
+    closed_rate_limited(&mut t.ready[0]).await;
+}
+
+/// T2: the arriving session holds the most, so it is the one that ends.
+#[tokio::test]
+async fn the_arriving_session_ends_when_it_holds_the_most() {
+    let mut t = three_sessions_at(CEIL_CEILING).await;
+    t.feed(7, 0, 18);
+    t.feed(8, 0, 18);
+    t.feed(9, 0, 27);
+    assert!(t.d.engine.table.get(9).is_some());
+    t.feed(9, 27, 1);
+    assert!(t.d.engine.table.get(9).is_none(), "C ended");
+    assert_eq!(t.held(7), 18 * CEIL_CHARGE);
+    assert_eq!(t.held(8), 18 * CEIL_CHARGE);
+    assert_eq!(t.node_in_use(), 36 * CEIL_CHARGE, "C left the node counter");
+    closed_rate_limited(&mut t.ready[2]).await;
+}
+
+/// T3 and T4: after the eviction nothing else ends, and once the victim's actor has ended and
+/// dropped its queue the node counter is exactly what the survivors hold.
+#[tokio::test]
+async fn an_eviction_does_not_cascade_and_the_victims_queue_is_not_subtracted_twice() {
+    let mut t = three_sessions_at(CEIL_CEILING).await;
+    t.feed(7, 0, 37);
+    t.feed(8, 0, 18);
+    t.feed(9, 0, 9);
+    assert!(t.d.engine.table.get(7).is_none());
+    t.feed(9, 9, 10);
+    assert!(t.d.engine.table.get(8).is_some() && t.d.engine.table.get(9).is_some());
+    assert_eq!(t.node_in_use(), 18 * CEIL_CHARGE + 19 * CEIL_CHARGE);
+
+    // The victim's actor ends and its queue is released: its own count reaches zero (the
+    // permits are dropped) and the node counter does not move (they were detached).
+    closed_rate_limited(&mut t.ready[0]).await;
+    let a_handle = t.ready[0].handle.clone();
+    timeout(Duration::from_secs(5), async {
+        while a_handle.inbound_in_use() != 0 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the ended session's actor releases its queue");
+    // The survivors' actors ran meanwhile and may have read some of theirs: the node counter
+    // is exactly what they hold now, never less (victim subtracted twice) or more.
+    assert_eq!(t.node_in_use(), t.held(8) + t.held(9));
+}
+
+/// T5: the per session budget is clamped to the node ceiling.
+#[tokio::test]
+async fn the_per_session_budget_is_clamped_to_the_node_ceiling() {
+    let t = three_sessions_at(512 * 1024).await;
+    assert_eq!(t.held(7), 0);
+    for ready in &t.ready {
+        assert_eq!(ready.handle.inbound_budget(), 512 * 1024);
+    }
+    let t = three_sessions_at(CEIL_CEILING).await;
+    assert_eq!(t.ready[0].handle.inbound_budget(), CEIL_BUDGET);
 }
 
 #[tokio::test]

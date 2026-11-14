@@ -767,6 +767,18 @@ impl<H, P> SessionTable<H, P> {
         }
     }
 
+    /// Every session (candidate or current, not pending initiations or reserved indices) with
+    /// its handle, in no particular order. Read only: for a caller that has to pick one by a
+    /// property of its handle.
+    pub fn sessions(&self) -> impl Iterator<Item = (SessionIndex, &H)> {
+        self.entries
+            .iter()
+            .filter_map(|(&index, entry)| match entry {
+                Entry::Session { handle, .. } => Some((index, handle)),
+                _ => None,
+            })
+    }
+
     /// Removes every pending initiation whose state `pred` accepts and
     /// returns them (e.g. everything sent under an L3 attachment that just
     /// ended: its `resp` can no longer arrive). The counterpart of
@@ -1596,6 +1608,23 @@ mod tests {
         assert_eq!(t.slot(&id(5), &net(9)).pending, Some(pending_index));
         check_invariants(&t);
         assert_eq!(t.len(), 2);
+    }
+
+    #[test]
+    fn sessions_lists_every_session_and_neither_pending_nor_reserved_entries() {
+        let mut t = table();
+        let now = Instant::now();
+        let (a, _) = session(&mut t, id(2), net(9), Role::Initiator, 10, now);
+        let (b, _) = session(&mut t, id(3), net(9), Role::Responder, 11, now);
+        let _pending = pending(&mut t, id(5), net(9), now);
+        let _reserved = t.reserve_index(now).unwrap();
+        let mut listed: Vec<(SessionIndex, u32)> = t.sessions().map(|(i, h)| (i, *h)).collect();
+        listed.sort();
+        let mut expected = vec![(a, 10), (b, 11)];
+        expected.sort();
+        assert_eq!(listed, expected);
+        t.remove(a);
+        assert_eq!(t.sessions().count(), 1);
     }
 
     #[test]

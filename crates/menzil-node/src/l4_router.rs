@@ -140,9 +140,10 @@ use crate::admission::{
 };
 use crate::identity::IdentityCell;
 use crate::l4_session::{
-    CloseReason, E2E_PROTO_TAG, L4_INBOUND_BUDGET_PER_SESSION, L4_INBOUND_CEILING_PER_NODE,
-    L4SessionAcceptor, L4SessionConfig, L4SessionHandle, NodeInbound, SessionNotice,
-    SessionObserver, new as new_l4_session, new_with_datagrams as new_l4_session_with_datagrams,
+    CloseReason, E2E_PROTO_TAG, FeedRefused, L4_INBOUND_BUDGET_PER_SESSION,
+    L4_INBOUND_CEILING_PER_NODE, L4SessionAcceptor, L4SessionConfig, L4SessionHandle, NodeInbound,
+    SessionNotice, SessionObserver, new as new_l4_session,
+    new_with_datagrams as new_l4_session_with_datagrams,
 };
 use crate::outbound::{Epoch, OutboundSend, SendBudgets};
 use crate::policy_store::PolicyStore;
@@ -354,6 +355,7 @@ pub struct RouterConfig {
     budgets: SendBudgets,
     table: TableConfig,
     inbound_budget: usize,
+    inbound_ceiling: usize,
     shares: ShareBook,
 }
 
@@ -386,6 +388,7 @@ impl RouterConfig {
             budgets,
             table: TableConfig::default(),
             inbound_budget: L4_INBOUND_BUDGET_PER_SESSION,
+            inbound_ceiling: L4_INBOUND_CEILING_PER_NODE,
             shares: ShareBook::new(),
         })
     }
@@ -409,6 +412,15 @@ impl RouterConfig {
     /// past it is ended, see [`L4SessionHandle::feed_inbound`].
     pub fn with_inbound_budget(mut self, bytes: usize) -> Self {
         self.inbound_budget = bytes;
+        self
+    }
+
+    /// Replaces how many bytes of unread inbound records all sessions may hold together (the
+    /// default is [`L4_INBOUND_CEILING_PER_NODE`], TBD 75): past it the session holding the
+    /// most gives way. The per session budget is clamped to it, so one honest session never
+    /// meets the node ceiling before its own.
+    pub fn with_inbound_ceiling(mut self, bytes: usize) -> Self {
+        self.inbound_ceiling = bytes;
         self
     }
 }
@@ -777,8 +789,8 @@ impl Engine {
             rosters: config.rosters,
             shares: config.shares,
             budgets: config.budgets,
-            inbound_budget: config.inbound_budget,
-            node_inbound: Arc::new(NodeInbound::new(L4_INBOUND_CEILING_PER_NODE)),
+            inbound_budget: config.inbound_budget.min(config.inbound_ceiling),
+            node_inbound: Arc::new(NodeInbound::new(config.inbound_ceiling)),
             table: SessionTable::new(config.local_node_id, config.table, index_source),
             waiters: HashMap::new(),
             waiter_timeout,
@@ -896,16 +908,18 @@ impl Engine {
                 ciphertext,
             } => {
                 let refused = match self.table.route(receiver_index, &src) {
-                    // A refusal by the node ceiling ends the arriving session like an overflow of
-                    // its own budget; step 2 replaces this (the session holding the most
-                    // gives way, `FeedRefused::Node` hands the record back for that).
                     Route::Session { handle, .. } => {
-                        handle.handle.feed_inbound(counter, ciphertext).is_err()
+                        handle.handle.feed_inbound(counter, ciphertext).err()
                     }
-                    Route::Unknown | Route::WrongSource => false,
+                    Route::Unknown | Route::WrongSource => None,
                 };
-                if refused {
-                    self.end_overflowed(receiver_index, now);
+                match refused {
+                    None => {}
+                    Some(FeedRefused::Session(_)) => self.end_overflowed(receiver_index, now),
+                    Some(FeedRefused::Node {
+                        counter,
+                        ciphertext,
+                    }) => self.make_room(receiver_index, counter, ciphertext, now),
                 }
             }
         }
@@ -921,6 +935,46 @@ impl Engine {
     /// notice), a request for that peer dials afresh, and the actor's own
     /// `Ended` later finds nothing to remove.
     fn end_overflowed(&mut self, index: SessionIndex, now: Now) {
+        self.end_session_for(index, now, false);
+    }
+
+    /// The node wide ceiling refused the record `(counter, ciphertext)` that arrived for
+    /// session `arriving` (TBD 75): the session holding the most unread inbound data gives way,
+    /// the arriving one included (ties go to the lower index; when nothing holds anything the
+    /// arriving one, since ending another frees nothing). If the victim is another session it
+    /// is ended first, which takes its charges out of the node counter
+    /// ([`L4SessionHandle::detach_inbound`]), and then the record is charged without the
+    /// ceiling check, which may leave the node one record over it; the next refusal evicts
+    /// again, so it never grows. If the victim is the arriving session the record is dropped
+    /// with it (its counter has a gap anyway).
+    fn make_room(&mut self, arriving: SessionIndex, counter: u64, ciphertext: Vec<u8>, now: Now) {
+        let victim = self
+            .table
+            .sessions()
+            .map(|(index, entry)| (entry.handle.inbound_in_use(), index))
+            .filter(|&(held, _)| held > 0)
+            .max_by_key(|&(held, index)| (held, std::cmp::Reverse(index)))
+            .map_or(arriving, |(_, index)| index);
+        self.end_session_for(victim, now, true);
+        if victim == arriving {
+            return;
+        }
+        let refused = match self.table.get(arriving) {
+            Some(entry) => entry
+                .handle
+                .feed_inbound_over_ceiling(counter, ciphertext)
+                .is_err(),
+            None => false,
+        };
+        if refused {
+            self.end_overflowed(arriving, now);
+        }
+    }
+
+    /// Removes the session at `index` from the table, detaches its charges, closes it
+    /// `rate_limited` and fails whoever waited for it. `node_wide` says which limit it passed
+    /// (it only changes the log line and the close message).
+    fn end_session_for(&mut self, index: SessionIndex, now: Now, node_wide: bool) {
         let Some(Removed::Session { handle, .. }) = self.table.remove(index) else {
             return;
         };
@@ -931,17 +985,33 @@ impl Engine {
             // The records are charged before they are decrypted, so what
             // piled up may be junk a relay forwarded under this peer's name:
             // the line does not say the peer did it.
-            tracing::warn!(
-                %peer,
-                budget = self.inbound_budget,
-                held_back,
-                "ended an L4 session whose unread inbound data passed its budget \
-                 (the peer, or a relay forwarding records in its name)"
-            );
+            if node_wide {
+                tracing::warn!(
+                    %peer,
+                    ceiling = self.node_inbound.ceiling(),
+                    held_back,
+                    "ended the L4 session holding the most unread inbound data: this node's \
+                     total passed its ceiling (the peer, or a relay forwarding records in \
+                     its name)"
+                );
+            } else {
+                tracing::warn!(
+                    %peer,
+                    budget = self.inbound_budget,
+                    held_back,
+                    "ended an L4 session whose unread inbound data passed its budget \
+                     (the peer, or a relay forwarding records in its name)"
+                );
+            }
         }
         handle.handle.close(Some(CloseReason {
             code: ErrorCode::RateLimited,
-            msg: "unread inbound data passed the session budget".to_string(),
+            msg: if node_wide {
+                "this node's unread inbound data passed its ceiling"
+            } else {
+                "unread inbound data passed the session budget"
+            }
+            .to_string(),
         }));
         if !was_docs_only {
             self.fail_orphans(&(peer, network));
