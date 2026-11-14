@@ -1,6 +1,22 @@
-//! `menzil proxy <exit>`: a local SOCKS5 proxy whose every `CONNECT` leaves through the egress
-//! exit of another member (protocol.md 8), by way of the agent's `connect` request
-//! ([`crate::agent`]).
+//! `menzil proxy <exit>`: a local SOCKS5 and HTTP `CONNECT` proxy whose every `CONNECT` leaves
+//! through the egress exit of another member (protocol.md 8), by way of the agent's `connect`
+//! request ([`crate::agent`]).
+//!
+//! # One port, two protocols
+//!
+//! The first byte the client sends picks the parser: `0x05` is SOCKS5, `C` is HTTP `CONNECT`
+//! (the strict parser in `http.rs`: authority-form only, CRLF only, no body, `Host` optional and
+//! equal to the authority, the destination through the exit's own `Target::canonicalize`, no
+//! name resolved here), any other ASCII letter is another HTTP method and is answered with a
+//! fixed `405` and closed, anything else (SOCKS4 included) is closed without a word. One
+//! deadline covers the sniff and the head. The HTTP success line `200 Connection established`
+//! is sent only after the agent has said `ok`, like the SOCKS success reply; the bytes a client
+//! sends behind its head are kept and are the first bytes of the tunnel. A refusal is
+//! `403` (`no_grant`, `forbidden`), `400` (`invalid_target`), `503` (`rate_limited`) and `502` for
+//! everything else, `target_unreachable` included, with a fixed body: the exit's words never
+//! reach the client. The SOCKS path does not call `Target::canonicalize` (it sends an address
+//! as the client wrote it and the exit canonicalizes), so an existing SOCKS behaviour is
+//! unchanged.
 //!
 //! # What it is and is not
 //!
@@ -78,6 +94,8 @@ use tokio::time::timeout;
 use crate::agent::{self, End};
 use crate::text;
 
+mod http;
+
 /// How many connections are carried at once.
 pub const MAX_CONNECTIONS: usize = 128;
 /// How long the greeting and the request have, together, from the connection being accepted.
@@ -118,21 +136,63 @@ fn reply_bytes(code: u8) -> [u8; 10] {
     [SOCKS_VERSION, code, 0, ATYP_IPV4, 0, 0, 0, 0, 0, 0]
 }
 
-/// The SOCKS reply code for a refusal the agent reported, by the exit's code name. The agent's
-/// text for a refusal by the exit is `refused by the other end: <code> (<the exit's words>)`; the
-/// code is read only from there, never from the words after it (the exit's text is not ours), and
-/// anything that does not have that shape is a general failure. See the module documentation for
-/// the table.
-pub fn reply_code(message: &str) -> u8 {
+/// What the exit said, parsed once from the agent's error text and mapped by [`socks_code`] and
+/// [`http_status`]. The agent's text for a refusal by the exit is
+/// `refused by the other end: <code> (<the exit's words>)`; the code is read only from there,
+/// never from the words after it (the exit's text is not ours), and anything that does not have
+/// that shape is [`ExitCode::Other`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExitCode {
+    /// `no_grant`, `forbidden`.
+    NotAllowed,
+    /// `target_unreachable`.
+    Unreachable,
+    /// `invalid_target`.
+    InvalidTarget,
+    /// `rate_limited`.
+    RateLimited,
+    /// `unknown_service`, no agent, no such member, a lost session, anything else.
+    Other,
+}
+
+fn exit_code(message: &str) -> ExitCode {
     let Some(rest) = message.strip_prefix("refused by the other end: ") else {
-        return code::GENERAL_FAILURE;
+        return ExitCode::Other;
     };
     match rest.split(' ').next().unwrap_or("") {
-        "no_grant" | "forbidden" => code::NOT_ALLOWED,
-        "target_unreachable" => code::HOST_UNREACHABLE,
-        "invalid_target" => code::ADDRESS_TYPE_NOT_SUPPORTED,
-        _ => code::GENERAL_FAILURE,
+        "no_grant" | "forbidden" => ExitCode::NotAllowed,
+        "target_unreachable" => ExitCode::Unreachable,
+        "invalid_target" => ExitCode::InvalidTarget,
+        "rate_limited" => ExitCode::RateLimited,
+        _ => ExitCode::Other,
     }
+}
+
+fn socks_code(exit: ExitCode) -> u8 {
+    match exit {
+        ExitCode::NotAllowed => code::NOT_ALLOWED,
+        ExitCode::Unreachable => code::HOST_UNREACHABLE,
+        ExitCode::InvalidTarget => code::ADDRESS_TYPE_NOT_SUPPORTED,
+        ExitCode::RateLimited | ExitCode::Other => code::GENERAL_FAILURE,
+    }
+}
+
+/// The HTTP status of a refusal by the exit (HTTP `CONNECT`). `target_unreachable` and the
+/// general failure share 502 and its body, so a name that does not exist and a name that resolved
+/// only to refused addresses cannot be told apart.
+fn http_status(exit: ExitCode) -> u16 {
+    match exit {
+        ExitCode::NotAllowed => 403,
+        ExitCode::InvalidTarget => 400,
+        ExitCode::RateLimited => 503,
+        ExitCode::Unreachable | ExitCode::Other => 502,
+    }
+}
+
+/// The SOCKS reply code for a refusal the agent reported, by the exit's code name. See the module
+/// documentation for the table.
+pub fn reply_code(message: &str) -> u8 {
+    socks_code(exit_code(message))
 }
 
 /// Where a destination is opened: the agent, or (in the tests) something that says what a real
@@ -248,16 +308,16 @@ async fn take<R: AsyncRead + Unpin>(read: &mut R, buffer: &mut [u8]) -> Result<(
         .map_err(|_| Fault::Gone)
 }
 
-/// The greeting and the request, by exact counts. Writes the replies (the method selection, and
-/// a failure reply for a request that is refused) itself.
-async fn handshake<R, W>(read: &mut R, write: &mut W) -> Result<Request, Fault>
+/// The greeting and the request, by exact counts, the first byte of the greeting (the version)
+/// having been read by the sniff. Writes the replies (the method selection, and a failure reply
+/// for a request that is refused) itself.
+async fn handshake<R, W>(read: &mut R, write: &mut W, version: u8) -> Result<Request, Fault>
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
     // Greeting: VER NMETHODS METHODS...
-    let mut head = [0u8; 2];
-    take(read, &mut head[..1]).await?;
+    let mut head = [version, 0u8];
     if head[0] != SOCKS_VERSION {
         // SOCKS4 (0x04) or anything that is not SOCKS5: not answered.
         return Err(Fault::Silent("the client did not speak SOCKS5"));
@@ -416,9 +476,90 @@ where
     Done::Replied
 }
 
-/// One connection, from the greeting to the end of the bridge. `deadline` bounds the greeting and
-/// the request together. Nothing of the payload is ever logged.
-async fn serve_socks<R, W, E>(
+/// Which protocol the first byte chose.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Proto {
+    Unknown,
+    Socks,
+    Http,
+}
+
+/// What the sniff and the head or handshake came to.
+enum Front {
+    Socks(Request),
+    Http(Request, Vec<u8>),
+}
+
+/// Writes a fixed HTTP refusal, then the fault.
+async fn refuse_http<W: AsyncWrite + Unpin>(
+    write: &mut W,
+    status: u16,
+    why: &'static str,
+) -> Result<Front, Fault> {
+    let sent = async {
+        write.write_all(&http::response(status)).await?;
+        write.flush().await
+    }
+    .await;
+    match sent {
+        Ok(()) => Err(Fault::Replied(why)),
+        Err(_) => Err(Fault::Gone),
+    }
+}
+
+/// Reads one byte and hands the connection to the parser it names: `0x05` SOCKS5, `C` HTTP
+/// `CONNECT`, any other ASCII letter an HTTP method that is answered `405` and closed, anything
+/// else (SOCKS4 included) closed without a word. Everything here, the sniff and the head or the
+/// greeting and request, is under one deadline set by the caller; `proto` says afterwards which
+/// protocol it had got to, for the timeout answer.
+async fn front<R, W>(read: &mut R, write: &mut W, proto: &mut Proto) -> Result<Front, Fault>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let mut first = [0u8; 1];
+    take(read, &mut first).await?;
+    let first = first[0];
+    match first {
+        SOCKS_VERSION => {
+            *proto = Proto::Socks;
+            handshake(read, write, first).await.map(Front::Socks)
+        }
+        b'C' => {
+            *proto = Proto::Http;
+            match http::read_head(read, first).await {
+                Ok((connect, rest)) => Ok(Front::Http(
+                    Request {
+                        host: connect.host,
+                        port: connect.port,
+                    },
+                    rest,
+                )),
+                Err(http::HeadError::Refused(refusal)) => {
+                    refuse_http(
+                        write,
+                        refusal.status(),
+                        "a request head that is not accepted",
+                    )
+                    .await
+                }
+                Err(http::HeadError::Gone) => Err(Fault::Gone),
+            }
+        }
+        letter if letter.is_ascii_alphabetic() => {
+            *proto = Proto::Http;
+            refuse_http(write, 405, "an HTTP method other than CONNECT").await
+        }
+        _ => Err(Fault::Silent(
+            "the client spoke neither SOCKS5 nor HTTP CONNECT",
+        )),
+    }
+}
+
+/// One connection, from the first byte to the end of the bridge. `deadline` bounds the sniff and
+/// the greeting and request (or the head) together. Nothing of the payload is ever logged, and
+/// no header of an HTTP request is.
+async fn serve<R, W, E>(
     read: &mut R,
     write: &mut W,
     exit: &E,
@@ -430,12 +571,25 @@ where
     W: AsyncWrite + Unpin + Send,
     E: Exit,
 {
-    let request = match timeout(deadline, handshake(read, write)).await {
+    let mut proto = Proto::Unknown;
+    let (request, leftover) = match timeout(deadline, front(read, write, &mut proto)).await {
         Err(_) => {
             eprintln!("menzil proxy: closed a connection from {peer}: no complete request in time");
+            if proto == Proto::Http {
+                return match timeout(DRAIN_TIME, async {
+                    write.write_all(&http::response(408)).await?;
+                    write.flush().await
+                })
+                .await
+                {
+                    Ok(Ok(())) => close_after_reply(read, write).await,
+                    _ => Done::Dropped,
+                };
+            }
             return Done::Dropped;
         }
-        Ok(Ok(request)) => request,
+        Ok(Ok(Front::Socks(request))) => (request, None),
+        Ok(Ok(Front::Http(request, rest))) => (request, Some(rest)),
         Ok(Err(Fault::Replied(why))) => {
             eprintln!("menzil proxy: refused a connection from {peer}: {why}");
             return close_after_reply(read, write).await;
@@ -455,18 +609,47 @@ where
                 log_host(&host),
                 text::one_line(&message, 300)
             );
-            return match send_reply(write, reply_code(&message)).await {
+            let code = exit_code(&message);
+            let sent = async {
+                match leftover {
+                    None => send_reply(write, socks_code(code)).await,
+                    Some(_) => {
+                        write.write_all(&http::response(http_status(code))).await?;
+                        write.flush().await
+                    }
+                }
+            }
+            .await;
+            return match sent {
                 Ok(()) => close_after_reply(read, write).await,
                 Err(_) => Done::Dropped,
             };
         }
     };
     // Only now, with the destination open, does the client hear that it is.
-    if send_reply(write, code::SUCCEEDED).await.is_err() {
+    let told = match &leftover {
+        None => send_reply(write, code::SUCCEEDED).await,
+        Some(_) => {
+            async {
+                write.write_all(http::ESTABLISHED).await?;
+                write.flush().await
+            }
+            .await
+        }
+    };
+    if told.is_err() {
         // Dropping `open` has the agent reset the stream.
         return Done::Dropped;
     }
-    match open.bridge(read, write).await {
+    let bridged = match leftover {
+        // The bytes behind the head are the first bytes of the tunnel.
+        Some(rest) => {
+            let mut input = http::Prefixed::new(rest, read);
+            open.bridge(&mut input, write).await
+        }
+        None => open.bridge(read, write).await,
+    };
+    match bridged {
         Ok(End::Clean) => Done::Clean,
         Ok(End::Reset(why)) => {
             eprintln!(
@@ -617,7 +800,7 @@ async fn carry<E: Exit>(
         // Borrowed halves: dropping an owned write half would shut it down (a FIN).
         let (mut read, mut write) = tokio::io::split(&mut connection);
         tokio::select! {
-            done = serve_socks(&mut read, &mut write, exit, &peer, HANDSHAKE_TIMEOUT) => Some(done),
+            done = serve(&mut read, &mut write, exit, &peer, HANDSHAKE_TIMEOUT) => Some(done),
             _ = stop.wait_for(|stopped| *stopped) => None,
         }
     };
@@ -741,7 +924,7 @@ mod tests {
         }
     }
 
-    // ---- driving serve_socks over memory -----------------------------------------------------
+    // ---- driving serve over memory -----------------------------------------------------
 
     /// Runs one connection over memory: `input` is what the client sends (then it closes its
     /// side), and what comes back is what the server wrote.
@@ -756,7 +939,7 @@ mod tests {
             let _ = client.read_to_end(&mut out).await;
             out
         });
-        let done = serve_socks(&mut read, &mut write, exit, "test", deadline).await;
+        let done = serve(&mut read, &mut write, exit, "test", deadline).await;
         drop((read, write));
         let out = timeout(WAIT, feeder).await.unwrap().unwrap();
         (done, out)
@@ -889,8 +1072,7 @@ mod tests {
             vec![0],
             vec![6, 1, 0],
             vec![0xFF, 1, 0],
-            b"GET / HTTP/1.1\r\n\r\n".to_vec(),
-            b"CONNECT example.org:443 HTTP/1.1\r\n\r\n".to_vec(),
+            // (HTTP is no longer silent: `the_first_byte_picks_the_protocol` has it.)
         ] {
             let exit = FakeExit::new(Say::Open);
             let (done, out) = drive(&exit, &first, WAIT).await;
@@ -1032,7 +1214,7 @@ mod tests {
             let (mut read, mut write) = tokio::io::split(server);
             let began = Instant::now();
             // The client stays connected and silent: only the deadline ends it.
-            let done = serve_socks(&mut read, &mut write, &*exit, "test", SHORT).await;
+            let done = serve(&mut read, &mut write, &*exit, "test", SHORT).await;
             assert_eq!(done, Done::Dropped, "{sent:?}");
             assert!(began.elapsed() >= SHORT && began.elapsed() < WAIT);
             assert!(exit.asked().is_empty());
@@ -1051,7 +1233,7 @@ mod tests {
         let serving = {
             let exit = exit.clone();
             tokio::spawn(async move {
-                let done = serve_socks(&mut read, &mut write, &*exit, "test", SHORT).await;
+                let done = serve(&mut read, &mut write, &*exit, "test", SHORT).await;
                 (done, read, write)
             })
         };
@@ -1061,6 +1243,363 @@ mod tests {
         client.shutdown().await.unwrap();
         let (done, _, _) = timeout(WAIT, serving).await.unwrap().unwrap();
         assert_eq!(done, Done::Clean);
+    }
+
+    // ---- HTTP CONNECT on the same port ---------------------------------------------------------
+
+    fn connect_head(authority: &str, headers: &[&str]) -> Vec<u8> {
+        let mut out = format!("CONNECT {authority} HTTP/1.1\r\n");
+        for header in headers {
+            out.push_str(header);
+            out.push_str("\r\n");
+        }
+        out.push_str("\r\n");
+        out.into_bytes()
+    }
+
+    #[tokio::test]
+    async fn an_http_connect_reaches_the_exit_as_canonical_text_and_is_established_after_it_opened()
+    {
+        let cases: Vec<(&str, &str, u16)> = vec![
+            ("example.org:443", "example.org", 443),
+            ("EXAMPLE.org:443", "example.org", 443),
+            ("93.184.216.34:80", "93.184.216.34", 80),
+            ("[2001:db8::1]:443", "2001:db8::1", 443),
+            // The exit's own canonical form: an IPv4 mapped address goes out as the IPv4 one.
+            ("[::ffff:1.2.3.4]:80", "1.2.3.4", 80),
+        ];
+        for (authority, host, port) in cases {
+            let exit = FakeExit::new(Say::Open);
+            let input = connect_head(authority, &["Host: x"][..0]);
+            let (done, out) = drive(&exit, &input, WAIT).await;
+            assert_eq!(done, Done::Clean, "{authority}");
+            assert_eq!(exit.asked(), vec![(host.to_string(), port)], "{authority}");
+            assert_eq!(out, http::ESTABLISHED, "{authority}");
+        }
+    }
+
+    #[tokio::test]
+    async fn the_http_success_waits_for_the_exit_and_a_pipelined_hello_arrives_once_in_order() {
+        let (exit, gate) = FakeExit::gated(Say::Open);
+        let (mut client, server) = duplex(1 << 16);
+        let (mut read, mut write) = tokio::io::split(server);
+        // The head, and in the same write the first bytes of the application's protocol, which
+        // look like a second request on purpose: they are payload, never parsed.
+        let hello: &[u8] =
+            b"\x16\x03\x01CLIENT-HELLO\r\n\r\nCONNECT evil.example:25 HTTP/1.1\r\n\r\n";
+        let input = all(&[&connect_head("example.org:443", &[]), hello]);
+        client.write_all(&input).await.unwrap();
+        let serving = {
+            let exit = exit.clone();
+            tokio::spawn(async move { serve(&mut read, &mut write, &*exit, "test", WAIT).await })
+        };
+        while exit.asked().is_empty() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let mut early = [0u8; 1];
+        let early = timeout(Duration::from_millis(300), client.read(&mut early)).await;
+        assert!(
+            early.is_err(),
+            "a reply came before the exit answered: {early:?}"
+        );
+        assert!(!exit.bridge_started());
+        assert!(exit.bridged.lock().unwrap().is_empty());
+
+        gate.add_permits(1);
+        let mut established = vec![0u8; http::ESTABLISHED.len()];
+        timeout(WAIT, client.read_exact(&mut established))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(established, http::ESTABLISHED);
+        let mut echoed = vec![0u8; hello.len()];
+        timeout(WAIT, client.read_exact(&mut echoed))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(echoed, hello);
+        client.shutdown().await.unwrap();
+        assert_eq!(timeout(WAIT, serving).await.unwrap().unwrap(), Done::Clean);
+        assert_eq!(exit.bridged.lock().unwrap().as_slice(), hello);
+        // Only the one destination was ever asked for.
+        assert_eq!(exit.asked(), vec![("example.org".to_string(), 443)]);
+    }
+
+    #[tokio::test]
+    async fn a_refused_http_head_gets_its_status_and_nothing_reaches_the_exit() {
+        let long = "a".repeat(http::MAX_HEAD);
+        let many: Vec<String> = (0..=http::MAX_HEADERS)
+            .map(|i| format!("X-{i}: b"))
+            .collect();
+        let many: Vec<&str> = many.iter().map(String::as_str).collect();
+        let cases: Vec<(&str, Vec<u8>, u16)> = vec![
+            (
+                "two hosts",
+                connect_head(
+                    "example.org:443",
+                    &["Host: example.org:443", "Host: example.org:443"],
+                ),
+                400,
+            ),
+            (
+                "host mismatch",
+                connect_head("example.org:443", &["Host: evil.example:443"]),
+                400,
+            ),
+            (
+                "folded",
+                connect_head("example.org:443", &["X-A: b", " folded: x"]),
+                400,
+            ),
+            (
+                "space before colon",
+                connect_head("example.org:443", &["X-A : b"]),
+                400,
+            ),
+            (
+                "transfer-encoding",
+                connect_head("example.org:443", &["Transfer-Encoding: chunked"]),
+                400,
+            ),
+            (
+                "content-length",
+                connect_head("example.org:443", &["Content-Length: 5"]),
+                400,
+            ),
+            (
+                "absolute form",
+                connect_head("http://example.org:443/", &[]),
+                400,
+            ),
+            ("no port", connect_head("example.org", &[]), 400),
+            ("port 0", connect_head("example.org:0", &[]), 400),
+            ("ipv6 without brackets", connect_head("::1:443", &[]), 400),
+            ("name the exit refuses", connect_head("127.1:80", &[]), 400),
+            (
+                "version",
+                b"CONNECT example.org:443 HTTP/2.0\r\n\r\n".to_vec(),
+                400,
+            ),
+            (
+                "extra spaces",
+                b"CONNECT  example.org:443 HTTP/1.1\r\n\r\n".to_vec(),
+                400,
+            ),
+            (
+                "bare lf",
+                b"CONNECT example.org:443 HTTP/1.1\n\n".to_vec(),
+                400,
+            ),
+            (
+                "lone cr",
+                b"CONNECT example.org:443 HTTP/1.1\r\nX: a\rb\r\n\r\n".to_vec(),
+                400,
+            ),
+            (
+                "lowercase method",
+                b"connect example.org:443 HTTP/1.1\r\n\r\n".to_vec(),
+                405,
+            ),
+            ("65 headers", connect_head("example.org:443", &many), 431),
+            (
+                "huge head",
+                connect_head("example.org:443", &[&format!("X: {long}")]),
+                431,
+            ),
+        ];
+        for (what, input, status) in cases {
+            let exit = FakeExit::new(Say::Open);
+            let (done, out) = drive(&exit, &input, WAIT).await;
+            assert_eq!(done, Done::Replied, "{what}");
+            assert_eq!(out, http::response(status), "{what}");
+            assert!(exit.asked().is_empty(), "{what}: the exit was asked");
+            assert!(!exit.bridge_started(), "{what}");
+        }
+    }
+
+    #[tokio::test]
+    async fn the_first_byte_picks_the_protocol() {
+        for (what, input, answer) in [
+            ("GET", b"G".to_vec(), Some(405)),
+            ("POST", b"POST / HTTP/1.1\r\n\r\n".to_vec(), Some(405)),
+            ("lowercase", b"c".to_vec(), Some(405)),
+            ("OPTIONS", b"O".to_vec(), Some(405)),
+            ("socks4", vec![4, 1, 0, 80, 1, 2, 3, 4, 0], None),
+            ("tls hello", vec![0x16, 3, 1, 0, 5], None),
+            ("digit", b"1".to_vec(), None),
+            ("space", b" CONNECT a:1 HTTP/1.1\r\n\r\n".to_vec(), None),
+        ] {
+            let exit = FakeExit::new(Say::Open);
+            let (done, out) = drive(&exit, &input, WAIT).await;
+            match answer {
+                Some(status) => {
+                    assert_eq!(done, Done::Replied, "{what}");
+                    assert_eq!(out, http::response(status), "{what}");
+                }
+                None => {
+                    assert_eq!(done, Done::Dropped, "{what}");
+                    assert!(out.is_empty(), "{what}: {out:?}");
+                }
+            }
+            assert!(exit.asked().is_empty(), "{what}");
+        }
+        // SOCKS5 is still taken by its version byte.
+        let exit = FakeExit::new(Say::Open);
+        let input = all(&[&greeting(&[0]), &request(1, &domain(b"example.org"), 443)]);
+        let (done, out) = drive(&exit, &input, WAIT).await;
+        assert_eq!(done, Done::Clean);
+        assert_eq!(out, all(&[&METHOD_OK, &OK_REPLY]));
+    }
+
+    #[tokio::test]
+    async fn each_exit_code_gets_its_http_status_and_a_fixed_body() {
+        let cases: [(&str, u16); 9] = [
+            ("refused by the other end: no_grant (a)", 403),
+            ("refused by the other end: forbidden (b)", 403),
+            ("refused by the other end: target_unreachable (c)", 502),
+            ("refused by the other end: invalid_target (d)", 400),
+            ("refused by the other end: rate_limited (e)", 503),
+            ("refused by the other end: unknown_service (f)", 502),
+            ("refused by the other end: something_new (g)", 502),
+            ("no agent is running at /x", 502),
+            ("the session was lost", 502),
+        ];
+        for (text, status) in cases {
+            let exit = FakeExit::new(Say::Refuse(text));
+            let (done, out) = drive(&exit, &connect_head("example.org:443", &[]), WAIT).await;
+            assert_eq!(done, Done::Replied, "{text}");
+            assert_eq!(out, http::response(status), "{text}");
+            assert!(!String::from_utf8_lossy(&out).contains("200"), "{text}");
+        }
+        // A name that does not exist and a name that resolved only to refused addresses are the
+        // same bytes: the exit's words never reach the client.
+        let mut seen = Vec::new();
+        for words in [
+            "refused by the other end: target_unreachable (no such name)",
+            "refused by the other end: target_unreachable (only refused addresses: 10.0.0.1)",
+        ] {
+            let exit = FakeExit::new(Say::Refuse(words));
+            seen.push(
+                drive(&exit, &connect_head("db.internal.example:5432", &[]), WAIT)
+                    .await
+                    .1,
+            );
+        }
+        assert_eq!(seen[0], seen[1]);
+        assert!(!seen[0].is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_http_head_that_never_finishes_gets_408_at_the_deadline() {
+        let exit = FakeExit::new(Say::Open);
+        let (mut client, server) = duplex(1 << 16);
+        client.write_all(b"CONNECT exam").await.unwrap();
+        let (mut read, mut write) = tokio::io::split(server);
+        let began = Instant::now();
+        let serving = tokio::spawn({
+            let exit = exit.clone();
+            async move {
+                let done = serve(&mut read, &mut write, &*exit, "test", SHORT).await;
+                drop((read, write));
+                done
+            }
+        });
+        // The client stays connected and silent; the deadline ends it, with the 408 first.
+        let mut answer = vec![0u8; http::response(408).len()];
+        timeout(WAIT, client.read_exact(&mut answer))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(answer, http::response(408));
+        assert!(began.elapsed() >= SHORT && began.elapsed() < WAIT);
+        client.shutdown().await.unwrap();
+        assert_eq!(
+            timeout(WAIT, serving).await.unwrap().unwrap(),
+            Done::Replied
+        );
+        assert!(exit.asked().is_empty());
+    }
+
+    #[tokio::test]
+    async fn one_deadline_covers_the_sniff_and_the_head() {
+        // Nothing at all, a client that does not even send its first byte: dropped silently.
+        let exit = FakeExit::new(Say::Open);
+        let (client, server) = duplex(1 << 16);
+        let (mut read, mut write) = tokio::io::split(server);
+        let done = serve(&mut read, &mut write, &*exit, "test", SHORT).await;
+        assert_eq!(done, Done::Dropped);
+        drop(client);
+    }
+
+    #[tokio::test]
+    async fn http_and_socks_connections_share_the_slots() {
+        let exit = FakeExit::new(Say::Open);
+        let (address, stop, task) = start_proxy(exit.clone()).await;
+        let mut held = Vec::new();
+        for i in 0..MAX_CONNECTIONS {
+            let mut c = TcpStream::connect(address).await.unwrap();
+            // Half of them are in the middle of an HTTP head.
+            if i % 2 == 0 {
+                c.write_all(b"CONNECT exam").await.unwrap();
+            }
+            held.push(c);
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let mut extra = TcpStream::connect(address).await.unwrap();
+        let _ = extra.write_all(&connect_head("example.org:443", &[])).await;
+        let mut seen = [0u8; 12];
+        let got = timeout(WAIT, extra.read(&mut seen)).await.unwrap();
+        assert!(
+            !matches!(got, Ok(n) if n > 0),
+            "the 129th was served: {got:?}"
+        );
+        assert!(exit.asked().is_empty());
+        stop.send(true).unwrap();
+        timeout(WAIT, task).await.unwrap().unwrap().unwrap();
+        drop(held);
+    }
+
+    #[tokio::test]
+    async fn an_http_connect_over_tcp_is_carried_and_a_get_is_a_405() {
+        let exit = FakeExit::new(Say::Open);
+        let (address, stop, task) = start_proxy(exit.clone()).await;
+        let mut client = TcpStream::connect(address).await.unwrap();
+        client
+            .write_all(&connect_head("example.org:443", &["Host: example.org:443"]))
+            .await
+            .unwrap();
+        let mut established = vec![0u8; http::ESTABLISHED.len()];
+        timeout(WAIT, client.read_exact(&mut established))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(established, http::ESTABLISHED);
+        client.write_all(b"through http connect").await.unwrap();
+        let mut echoed = vec![0u8; 20];
+        timeout(WAIT, client.read_exact(&mut echoed))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(echoed, b"through http connect");
+        client.shutdown().await.unwrap();
+        let mut rest = Vec::new();
+        let ended = timeout(WAIT, client.read_to_end(&mut rest)).await.unwrap();
+        assert!(ended.is_ok() && rest.is_empty(), "{ended:?} {rest:?}");
+
+        // A plain GET (a DNS rebinding page can send one) gets the fixed 405 and nothing else.
+        let mut web = TcpStream::connect(address).await.unwrap();
+        web.write_all(b"GET http://example.org/ HTTP/1.1\r\nHost: example.org\r\n\r\n")
+            .await
+            .unwrap();
+        let mut answer = Vec::new();
+        timeout(WAIT, web.read_to_end(&mut answer))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(answer, http::response(405));
+        assert_eq!(exit.asked(), vec![("example.org".to_string(), 443)]);
+        stop.send(true).unwrap();
+        timeout(WAIT, task).await.unwrap().unwrap().unwrap();
     }
 
     // ---- ordering: success only after the exit, pipelined bytes ------------------------------
@@ -1079,9 +1618,7 @@ mod tests {
         client.write_all(&input).await.unwrap();
         let serving = {
             let exit = exit.clone();
-            tokio::spawn(
-                async move { serve_socks(&mut read, &mut write, &*exit, "test", WAIT).await },
-            )
+            tokio::spawn(async move { serve(&mut read, &mut write, &*exit, "test", WAIT).await })
         };
         // The method selection arrives; the success reply must not, while the exit is asked.
         let mut method = [0u8; 2];

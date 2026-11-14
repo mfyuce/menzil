@@ -114,6 +114,23 @@ async fn connect_code(proxy: SocketAddr, dest: Dest<'_>, port: u16) -> u8 {
     answer[3]
 }
 
+/// What an HTTP client gets for `request` sent to the proxy at `proxy`: everything up to the end
+/// (the proxy closes in order after a refusal).
+async fn http_answer(proxy: SocketAddr, request: &[u8]) -> String {
+    let mut client = TcpStream::connect(proxy).await.unwrap();
+    client.write_all(request).await.unwrap();
+    let mut answer = Vec::new();
+    timeout(WAIT, client.read_to_end(&mut answer))
+        .await
+        .expect("the proxy answers")
+        .unwrap();
+    String::from_utf8(answer).unwrap()
+}
+
+fn connect_request(authority: &str) -> Vec<u8> {
+    format!("CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\n\r\n").into_bytes()
+}
+
 #[tokio::test]
 async fn the_proxy_carries_a_connect_to_an_exit_and_the_exit_refuses_what_it_must() {
     let now = std::time::SystemTime::now()
@@ -397,6 +414,57 @@ async fn the_proxy_carries_a_connect_to_an_exit_and_the_exit_refuses_what_it_mus
         0x02
     );
     assert_eq!(accepts.load(Ordering::SeqCst), 0);
+
+    // (e) HTTP CONNECT on the same port: the same refusals as HTTP statuses, and nothing the
+    // floor refuses reaches the listener. The status line is all a client reads; the body is
+    // fixed text.
+    let echo_authority = format!("127.0.0.1:{echo_port}");
+    let answer = http_answer(through_laptop, &connect_request(&echo_authority)).await;
+    assert!(answer.starts_with("HTTP/1.1 403 "), "{answer}");
+    assert!(answer.contains("Connection: close"), "{answer}");
+    let mapped = format!("[::ffff:127.0.0.1]:{echo_port}");
+    let answer = http_answer(through_laptop, &connect_request(&mapped)).await;
+    assert!(answer.starts_with("HTTP/1.1 403 "), "{answer}");
+    let answer = http_answer(
+        through_laptop,
+        &connect_request(&format!("localhost:{echo_port}")),
+    )
+    .await;
+    assert!(answer.starts_with("HTTP/1.1 502 "), "{answer}");
+    // An upper case name is folded, so it gets the same answer byte for byte.
+    let folded = http_answer(
+        through_laptop,
+        &connect_request(&format!("LocalHost:{echo_port}")),
+    )
+    .await;
+    assert_eq!(folded.replace("LocalHost", "localhost"), answer);
+    // A name the exit cannot take as one is refused by the proxy itself, 400.
+    let answer = http_answer(through_laptop, &connect_request("127.1:80")).await;
+    assert!(answer.starts_with("HTTP/1.1 400 "), "{answer}");
+    // The exit that has egress off: 502 (`unknown_service`), whatever the target.
+    let answer = http_answer(through_tablet, &connect_request("example.org:443")).await;
+    assert!(answer.starts_with("HTTP/1.1 502 "), "{answer}");
+    // Another method is a fixed 405, on the same port as the SOCKS5 clients.
+    let answer = http_answer(
+        through_laptop,
+        b"GET http://example.org/ HTTP/1.1\r\nHost: example.org\r\n\r\n",
+    )
+    .await;
+    assert!(answer.starts_with("HTTP/1.1 405 "), "{answer}");
+    assert!(answer.contains("Allow: CONNECT"), "{answer}");
+    // A smuggling shaped head is a 400 and never gets as far as the exit.
+    let answer = http_answer(
+        through_laptop,
+        format!("CONNECT 127.0.0.1:{echo_port} HTTP/1.1\n\n").as_bytes(),
+    )
+    .await;
+    assert!(answer.starts_with("HTTP/1.1 400 "), "{answer}");
+    assert_eq!(accepts.load(Ordering::SeqCst), 0);
+    // SOCKS5 still works on that port after all of it.
+    assert_eq!(
+        connect_code(through_laptop, Dest::V4([127, 0, 0, 1]), echo_port).await,
+        0x02
+    );
 
     stop_tx.send(true).unwrap();
     for proxy in proxies {

@@ -206,13 +206,18 @@ enum Command {
         #[arg(long, value_name = "PATH")]
         unix: Option<PathBuf>,
     },
-    /// Run a local SOCKS5 proxy whose connections leave through another member's node.
+    /// Run a local SOCKS5 and HTTP CONNECT proxy whose connections leave through another member's node.
     ///
     /// Point the application at it with a `socks5h://` URL, for example
     /// `curl --proxy socks5h://127.0.0.1:1080 https://example.org/`. The `h` matters: the proxy
     /// resolves no name, it sends the name to the exit, which resolves it. With `socks5://` the
     /// application looks the name up itself, first, on this machine: that leaks the lookup and
     /// takes from the exit the choice of what the name means.
+    ///
+    /// The same port also takes HTTP CONNECT, told apart by the first byte: use
+    /// `http://127.0.0.1:1080` for `HTTPS_PROXY` (the proxy resolves no name there either).
+    /// HTTP here is CONNECT only: `HTTP_PROXY` (plain `http://` URLs) must not point at it, and
+    /// any other method is answered 405.
     ///
     /// Only CONNECT, without authentication, is supported. The proxy listens on loopback only
     /// (127.0.0.1 or ::1; `0.0.0.0`, `::` and any other address are refused before it binds)
@@ -226,7 +231,7 @@ enum Command {
     /// the cloud metadata and transition ranges (100.64/10, 198.18/15, fc00::/7 and others);
     /// only 10/8, 172.16/12 and 192.168/16 can be lifted by the owner, with a more specific
     /// allow. Port 25 is denied unless an allow names it. A refusal reaches the application
-    /// as a SOCKS error.
+    /// as a SOCKS error or an HTTP status.
     Proxy {
         /// The node to use as the exit: a member's name, or the start of its node id.
         exit: String,
@@ -1195,6 +1200,8 @@ mod tests {
             .render_long_help()
             .to_string();
         assert!(help.contains("socks5h://"), "{help}");
+        assert!(help.contains("http://127.0.0.1:1080"), "{help}");
+        assert!(help.contains("HTTP_PROXY"), "{help}");
         assert!(help.contains("[egress] enabled = true"), "{help}");
         assert!(help.contains("egress:*"), "{help}");
         assert!(help.contains("loopback"), "{help}");
