@@ -288,10 +288,15 @@ async fn run_handshake_and_validate(
         Err(rejection) => {
             // A node refused for its standing (revoked, or `min_serial` above its serial) is
             // first sent the Roster of the network concerned, as `send_eviction` does, so that it
-            // leaves that network out of its next HELLO. Never for `not_member`: that answer
-            // must not tell a served network from an unserved one (isolation rule I2).
+            // leaves that network out of its next HELLO; but only when that Roster is newer than
+            // the `roster_seq` the HELLO claimed for that network (absent counts as 0): a node
+            // that already holds it learns nothing from a repeat. Never for `not_member`: that
+            // answer must not tell a served network from an unserved one (isolation rule I2).
             if matches!(rejection.code, ErrorCode::Revoked | ErrorCode::StaleSerial)
                 && let Some(network_id) = rejection.network
+                && relay.rosters.seq_of(&network_id).is_some_and(|held| {
+                    held > hello.roster_seq.get(&network_id).copied().unwrap_or(0)
+                })
                 && let Some(records) = doc::roster_doc_records(&relay.rosters, &network_id)
             {
                 send_all(&mut conn, &mut transport, records).await;

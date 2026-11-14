@@ -17,9 +17,10 @@ mod common;
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-use common::{identity, session_config, start_relay, trust_test_certificate, unix_now};
+use common::{TestRelay, identity, session_config, start_relay, trust_test_certificate, unix_now};
 use ed25519_dalek::SigningKey;
 use menzil_node::{NodeError, RosterStore, Session};
 use menzil_proto::trust::Signer;
@@ -27,6 +28,8 @@ use menzil_proto::{
     ErrorCode, NetworkId, NodeId, PROTOCOL_VERSION, Record, RevokedMember, Roster, RosterBody,
     RosterMember, Steward, StewardBody, StewardKey,
 };
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
 use tokio::time::timeout;
 
 fn roster(
@@ -139,6 +142,58 @@ fn assert_steward_held(held: &RosterStore, network: &NetworkId, seq: u64, what: 
         matches!(held.signer(network), Some(Signer::Steward { .. })),
         "{what}: held signer is the steward"
     );
+}
+
+/// One refused HELLO through a proxy that counts the bytes the relay sends the node: returns that
+/// count once the ERROR `expected` has arrived. A DOC sent before the ERROR adds its bytes, and a
+/// node whose claimed `roster_seq` equals the relay's cannot adopt anything (not newer), so the
+/// count is the only way to see whether the relay sent the Roster.
+async fn refused_wire_bytes(
+    relay: &TestRelay,
+    node: &common::Identity,
+    network: NetworkId,
+    held: Arc<RosterStore>,
+    expected: ErrorCode,
+    what: &str,
+) -> usize {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let counted = Arc::new(AtomicUsize::new(0));
+    let relay_addr = relay.addr;
+    let from_relay = Arc::clone(&counted);
+    tokio::spawn(async move {
+        let (down, _) = listener.accept().await.unwrap();
+        let up = TcpStream::connect(relay_addr).await.unwrap();
+        let (mut down_read, mut down_write) = down.into_split();
+        let (mut up_read, mut up_write) = up.into_split();
+        tokio::spawn(async move {
+            let _ = tokio::io::copy(&mut down_read, &mut up_write).await;
+        });
+        let mut buf = vec![0u8; 4096];
+        loop {
+            let n = match up_read.read(&mut buf).await {
+                Ok(0) | Err(_) => return,
+                Ok(n) => n,
+            };
+            from_relay.fetch_add(n, Ordering::SeqCst);
+            if down_write.write_all(&buf[..n]).await.is_err() {
+                return;
+            }
+        }
+    });
+    let mut config = session_config(relay, node, network);
+    config.dial.connection_info.port = port;
+    let mut session = Session::connect(&config, &HashMap::new(), held)
+        .await
+        .unwrap();
+    let told = timeout(Duration::from_secs(10), session.recv())
+        .await
+        .expect("the relay refuses the HELLO");
+    assert!(
+        matches!(&told, Ok(Record::Error(body)) if body.code == expected),
+        "{what}: got {told:?}"
+    );
+    counted.load(Ordering::SeqCst)
 }
 
 #[tokio::test]
@@ -410,5 +465,137 @@ async fn an_evicted_node_adopts_the_roster_it_is_sent_and_keeps_its_other_networ
                 "{what}"
             );
         }
+    }
+
+    // A node that already holds the relay's Roster (its HELLO claims the current `roster_seq`)
+    // and is still refused for standing is sent no Roster: it could learn nothing from it. The
+    // node here holds an owner signed Roster at the relay's `seq` that lists it (the owner signed
+    // two Rosters of one seq), so it still claims the network. The refusal that follows a stale
+    // claim (seq 1) carries the Roster, so its wire byte count is larger by at least the
+    // Roster's size.
+    let owner_cases: [(ErrorCode, Next); 2] = [
+        (ErrorCode::Revoked, |node, other| {
+            (vec![(other, 1)], vec![node])
+        }),
+        (ErrorCode::StaleSerial, |node, other| {
+            (vec![(node, 2), (other, 1)], vec![])
+        }),
+    ];
+    for (expected, next) in owner_cases {
+        let what = format!("current claim {expected:?}");
+        let node = identity();
+        let owner_a = SigningKey::generate(&mut rand::rng());
+        let (network_a, a1) = roster(&owner_a, 1, &[(node.node_id, 1), (other, 1)], &[]);
+        let (members, revoked) = next(node.node_id, other);
+        let (_, a2) = roster(&owner_a, 2, &members, &revoked);
+        let (_, a2_listing) = roster(&owner_a, 2, &[(node.node_id, 1), (other, 1)], &[]);
+        relay.relay.rosters().set(&a1).unwrap();
+        relay.relay.rosters().set(&a2).unwrap();
+
+        let stale_held = Arc::new(RosterStore::new());
+        stale_held.set(&a1).unwrap();
+        let with_doc = refused_wire_bytes(
+            &relay,
+            &node,
+            network_a,
+            Arc::clone(&stale_held),
+            expected,
+            &what,
+        )
+        .await;
+        assert_eq!(
+            stale_held.body(&network_a).unwrap().seq,
+            2,
+            "{what}: stale learns"
+        );
+
+        let current = Arc::new(RosterStore::new());
+        current.set(&a2_listing).unwrap();
+        let without_doc = refused_wire_bytes(
+            &relay,
+            &node,
+            network_a,
+            Arc::clone(&current),
+            expected,
+            &what,
+        )
+        .await;
+        assert_eq!(
+            current.body(&network_a).unwrap().seq,
+            2,
+            "{what}: held unchanged"
+        );
+        assert!(
+            with_doc >= without_doc + a2.encode().len(),
+            "{what}: no Roster before the ERROR for a current claim ({with_doc} vs {without_doc})"
+        );
+    }
+
+    // The same against a steward pair (relay holds base 10 and renewal 11; the node holds an
+    // owner signed Roster of seq 11 that lists it).
+    let steward_current: [(&str, ErrorCode, Steward); 2] = [
+        (
+            "current claim steward revoked",
+            ErrorCode::Revoked,
+            |node, other| (vec![(other, 1)], vec![node]),
+        ),
+        (
+            "current claim steward min_serial",
+            ErrorCode::StaleSerial,
+            |node, other| (vec![(node, 2), (other, 1)], vec![]),
+        ),
+    ];
+    for (what, expected, next) in steward_current {
+        let node = identity();
+        let net = StewardNet::new();
+        let network_a = net.network_id;
+        let (_, a1) = roster(&net.owner, 1, &[(node.node_id, 1), (other, 1)], &[]);
+        let (_, a11) = roster(&net.owner, 11, &[(node.node_id, 1), (other, 1)], &[]);
+        let (members, revoked) = next(node.node_id, other);
+        let (base, renewal) = net.pair(10, false, &members, &revoked);
+        relay.relay.rosters().set(&a1).unwrap();
+        relay
+            .relay
+            .rosters()
+            .adopt(&renewal, Some(&base), now)
+            .unwrap();
+
+        let stale_held = Arc::new(RosterStore::new());
+        stale_held.set(&a1).unwrap();
+        let with_doc = refused_wire_bytes(
+            &relay,
+            &node,
+            network_a,
+            Arc::clone(&stale_held),
+            expected,
+            what,
+        )
+        .await;
+        assert_steward_held(&stale_held, &network_a, 11, what);
+
+        let current = Arc::new(RosterStore::new());
+        current.set(&a11).unwrap();
+        let without_doc = refused_wire_bytes(
+            &relay,
+            &node,
+            network_a,
+            Arc::clone(&current),
+            expected,
+            what,
+        )
+        .await;
+        assert_eq!(
+            current.body(&network_a).unwrap().seq,
+            11,
+            "{what}: held unchanged"
+        );
+        assert!(
+            matches!(current.signer(&network_a), Some(Signer::Owner)),
+            "{what}: held unchanged"
+        );
+        assert!(
+            with_doc >= without_doc + renewal.encode().len(),
+            "{what}: no Roster before the ERROR for a current claim ({with_doc} vs {without_doc})"
+        );
     }
 }
