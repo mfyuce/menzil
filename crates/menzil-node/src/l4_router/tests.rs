@@ -2452,6 +2452,59 @@ async fn datagrams_past_the_node_cap_are_dropped_and_never_end_a_session() {
     assert_eq!(per(&t, 7) + per(&t, 8) + per(&t, 9), 0);
 }
 
+/// L1 (round C1): a session removed from the table through any path other than `make_room`
+/// leaves the node counter at once, so a later node refusal evicts the true largest holder.
+/// Here the removal is an expired candidate in `on_tick`.
+#[tokio::test]
+async fn a_session_removed_by_the_clock_leaves_the_node_counter_and_an_innocent_one_survives() {
+    let mut t = three_sessions_at(CEIL_CEILING).await;
+    // n and p are established; m stays a candidate and will expire.
+    for index in [8u32, 9] {
+        let generation = t.d.engine.table.get(index).unwrap().generation;
+        t.d.engine
+            .on_notice(tag_of(generation, index), SessionNotice::FirstRecord);
+    }
+    t.feed(7, 0, 30);
+    t.feed(8, 0, 18);
+    assert_eq!(t.node_in_use(), 48 * CEIL_CHARGE);
+    let late = Now {
+        instant: Now::capture().instant + Duration::from_secs(120),
+        unix: Now::capture().unix,
+    };
+    t.d.engine.on_tick(late);
+    assert!(t.d.engine.table.get(7).is_none(), "m expired");
+    assert!(t.d.engine.table.get(8).is_some());
+    assert_eq!(
+        t.node_in_use(),
+        18 * CEIL_CHARGE,
+        "m's charge left the node counter when it was removed"
+    );
+    // p alone brings the node over the ceiling: p holds the most, so p gives way, not n.
+    t.feed(9, 0, 46);
+    assert!(
+        t.d.engine.table.get(8).is_some(),
+        "n, the innocent one, was evicted"
+    );
+    assert!(
+        t.d.engine.table.get(9).is_none(),
+        "p, the largest holder, gave way"
+    );
+}
+
+/// N1 (round C1): a ceiling below the per session floor is raised to it, so a lone session is
+/// not ended on its third 16 KiB record.
+#[tokio::test]
+async fn a_node_ceiling_below_the_per_session_floor_is_raised_to_it() {
+    let mut t = three_sessions_at(40_960).await;
+    assert!(t.d.engine.node_inbound.ceiling() >= 2 * (65_535 + 128));
+    t.feed(7, 0, 7);
+    assert!(
+        t.d.engine.table.get(7).is_some(),
+        "a lone session ended early"
+    );
+    assert_eq!(t.held(7), 7 * CEIL_CHARGE);
+}
+
 /// T5: the per session budget is clamped to the node ceiling.
 #[tokio::test]
 async fn the_per_session_budget_is_clamped_to_the_node_ceiling() {

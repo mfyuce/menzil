@@ -616,6 +616,12 @@ const NOISE_MESSAGE_LIMIT: usize = 65_535;
 /// bytes (TBD 75): 1 GiB, six sessions stalled with their whole window. The per session budget
 /// ([`L4_INBOUND_BUDGET_PER_SESSION`]) times the 4,096 sessions a table allows would be 650 GiB.
 /// Past it the session holding the most gives way (the victim choice is the router's).
+///
+/// **Scope.** This ceiling covers only the records yamux has not read yet. Bytes yamux has
+/// already read but the application has not consumed are limited per session by the receive
+/// window alone (about 144 MiB per session, [`RECEIVE_WINDOW_GRANT`]) and are not counted
+/// here, so the node wide worst case is not 1 GiB: it grows with the number of stalled
+/// sessions.
 pub const L4_INBOUND_CEILING_PER_NODE: usize = 1 << 30;
 
 /// The top bit of a session's counter: the session has been detached ([`InboundBudget::detach`]),

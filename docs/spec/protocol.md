@@ -603,6 +603,8 @@ Unread inbound reliable data of a node's L4 sessions (nodes; bytes held between 
 | Per session budget | 162.7 MiB (above the whole receive window granted to a peer; at most the node ceiling) | the record is not queued and that session ends: CLOSE `rate_limited` |
 | Per node, all sessions together (`RouterConfig::with_inbound_ceiling`, default 1 GiB; no `config.toml` key yet) | 1 GiB | the session holding the most unread data ends: CLOSE `rate_limited`; it is the session whose record just arrived only when that one holds the most; the arriving record is then queued |
 
+Scope of these limits: both cover only records the stream layer (yamux) has not read yet. Bytes yamux has already read but the application has not consumed are limited per session by the receive window alone (about 144 MiB per session) and are not counted against the node wide ceiling, so the node wide worst case of unread plus read-but-unconsumed data is not 1 GiB; it grows with the number of sessions that stall with a full window.
+
 Datagrams are counted apart (table below) and never end a session.
 
 Datagram class (nodes, 5.2 and 5.4), fixed in the node:

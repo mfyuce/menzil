@@ -121,10 +121,16 @@ pub(crate) const MAX_QUEUED_BYTES: usize = 4 * 1024 * 1024;
 /// own `outcome` oneshot (TODO.md L4h1).
 const MAX_QUEUED_BYTES_PER_DST: usize = 3 * MAX_QUEUED_BYTES / 4;
 
-/// What permit-less sends may occupy for one destination: the per
-/// destination cap minus [`L4_SEND_BUDGET_PER_DST`], so everything a
-/// [`SendBudget`] can reserve for that destination always still fits.
-const UNRESERVED_PER_DST: usize = MAX_QUEUED_BYTES_PER_DST - L4_SEND_BUDGET_PER_DST;
+/// What permit-less sends may occupy for one destination: three quarters of
+/// [`UNRESERVED_TOTAL`], so one destination can never take the whole
+/// unreserved pool (a second destination keeps a quarter of it, and the
+/// control room is not shared down to nothing). It is also at most the per
+/// destination cap minus [`L4_SEND_BUDGET_PER_DST`] (asserted below), so
+/// everything a [`SendBudget`] can reserve for that destination always
+/// still fits: reserved (at most the budget) plus unreserved (at most this)
+/// stays under [`MAX_QUEUED_BYTES_PER_DST`], and the totals likewise
+/// (unreserved total plus reserved total is at most [`MAX_QUEUED_BYTES`]).
+const UNRESERVED_PER_DST: usize = 3 * UNRESERVED_TOTAL / 4;
 
 /// What permit-less sends may occupy in total: [`MAX_QUEUED_BYTES`] minus
 /// [`L4_SEND_BUDGET_TOTAL`].
@@ -301,6 +307,11 @@ const _: () = {
     assert!(L4_SEND_BUDGET_PER_DST < MAX_QUEUED_BYTES_PER_DST);
     assert!(L4_SEND_BUDGET_TOTAL < MAX_QUEUED_BYTES);
     assert!(L4_SEND_BUDGET_PER_DST <= L4_SEND_BUDGET_TOTAL);
+    // A send holding a permit is never refused for room.
+    assert!(UNRESERVED_PER_DST < UNRESERVED_TOTAL);
+    assert!(UNRESERVED_PER_DST + L4_SEND_BUDGET_PER_DST <= MAX_QUEUED_BYTES_PER_DST);
+    assert!(UNRESERVED_TOTAL + L4_SEND_BUDGET_TOTAL <= MAX_QUEUED_BYTES);
+    assert!(UNRESERVED_CONTROL_ROOM < UNRESERVED_PER_DST);
 };
 
 /// A node's send budgets, one per destination peer plus a shared total
@@ -942,6 +953,22 @@ mod tests {
             q.enqueue_with_permit(peer(2), 0x01, RELIABLE, vec![0; 100], Some(permit)),
             EnqueueOutcome::Accepted,
             "peer(1)'s full backlog must not block admission for peer(2)"
+        );
+    }
+
+    #[test]
+    fn one_destination_cannot_take_the_whole_unreserved_pool() {
+        // Round C1 N2: with the per destination cap equal to the total, one
+        // destination filled the pool and every other destination's
+        // permit-less sends (KEEP, REKEY, CLOSE included) were refused.
+        let mut q = q(u32::MAX);
+        let (used, outcome) = fill_permitless(&mut q, peer(1), RELIABLE);
+        assert_eq!(outcome, EnqueueOutcome::QueueFull);
+        assert!(used < UNRESERVED_TOTAL, "peer(1) took the whole pool");
+        assert_eq!(
+            q.enqueue(peer(2), 0x01, RELIABLE, vec![0; 1000]),
+            EnqueueOutcome::Accepted,
+            "a second destination must still enqueue permit-less sends"
         );
     }
 

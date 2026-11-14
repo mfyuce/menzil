@@ -425,7 +425,7 @@ impl RouterConfig {
     /// most gives way. The per session budget is clamped to it, so one honest session never
     /// meets the node ceiling before its own.
     pub fn with_inbound_ceiling(mut self, bytes: usize) -> Self {
-        self.inbound_ceiling = bytes;
+        self.inbound_ceiling = clamp_ceiling(bytes);
         self
     }
 }
@@ -668,6 +668,25 @@ enum Origin {
     },
 }
 
+/// The smallest node wide ceiling that is honoured: the per session floor `l4_session` raises
+/// every session's budget to, `2 x (max_record + 128)` with `max_record` at its largest
+/// (Noise's 65,535 byte message). A lower ceiling would be raised again per session, so a lone
+/// honest session would end on a few records and `make_room`'s all zero branch would be
+/// reachable.
+const MIN_INBOUND_CEILING: usize = 2 * (65_535 + 128);
+
+fn clamp_ceiling(bytes: usize) -> usize {
+    bytes.max(MIN_INBOUND_CEILING)
+}
+
+/// Takes a session's charges out of the node wide counter. EVERY path that removes a session
+/// from the table must call this on the removed entry (its actor ends on its own time, and
+/// what it still holds must not count against others, nor make `make_room` pick an innocent
+/// victim). Idempotent.
+fn release_inbound(entry: &Entry) {
+    entry.handle.detach_inbound();
+}
+
 /// What the table routes `data` to.
 struct Entry {
     handle: L4SessionHandle,
@@ -794,8 +813,10 @@ impl Engine {
             rosters: config.rosters,
             shares: config.shares,
             budgets: config.budgets,
-            inbound_budget: config.inbound_budget.min(config.inbound_ceiling),
-            node_inbound: Arc::new(NodeInbound::new(config.inbound_ceiling)),
+            inbound_budget: config
+                .inbound_budget
+                .min(clamp_ceiling(config.inbound_ceiling)),
+            node_inbound: Arc::new(NodeInbound::new(clamp_ceiling(config.inbound_ceiling))),
             table: SessionTable::new(config.local_node_id, config.table, index_source),
             waiters: HashMap::new(),
             waiter_timeout,
@@ -843,8 +864,7 @@ impl Engine {
         // the actor as `EpochEnded`; no CLOSE is worth trying over a dead
         // L3 session.
         for (index, entry) in self.table.remove_where(|entry| entry.epoch == epoch) {
-            // Its actor ends on its own time; what it holds must not count against others.
-            entry.handle.detach_inbound();
+            release_inbound(&entry);
             self.docs_only.remove(&index);
         }
         drop(
@@ -984,7 +1004,7 @@ impl Engine {
             return;
         };
         let (peer, network) = (handle.peer, handle.network);
-        handle.handle.detach_inbound();
+        release_inbound(&handle);
         let was_docs_only = self.docs_only.remove(&index).is_some();
         if let Some(held_back) = self.overflow_log.allow(now.instant) {
             // The records are charged before they are decrypted, so what
@@ -1180,6 +1200,7 @@ impl Engine {
                 // by the initiation).
                 drop(installed.abandoned);
                 if let Some((_, superseded)) = installed.superseded_candidate {
+                    release_inbound(&superseded);
                     superseded.handle.close(None);
                 }
             }
@@ -1354,6 +1375,7 @@ impl Engine {
             Ok(installed) => {
                 drop(installed.abandoned);
                 if let Some((_, superseded)) = installed.superseded_candidate {
+                    release_inbound(&superseded);
                     superseded.handle.close(None);
                 }
             }
@@ -1454,6 +1476,7 @@ impl Engine {
             Ok(installed) => {
                 if let Some((old, superseded)) = installed.superseded_candidate {
                     self.docs_only.remove(&old);
+                    release_inbound(&superseded);
                     superseded.handle.close(None);
                 }
             }
@@ -1609,6 +1632,7 @@ impl Engine {
                 Err(reason) => {
                     tracing::info!(%peer, ?reason, "closing a session that is no longer in good standing");
                     if let Some(Removed::Session { handle: entry, .. }) = self.table.remove(index) {
+                        release_inbound(&entry);
                         // The CLOSE goes before the entry is dropped: dropping it ends the
                         // actor as `EpochEnded`, which the CLOSE must outrank.
                         entry.handle.close(Some(grant_removed_close()));
@@ -1806,6 +1830,7 @@ impl Engine {
         {
             Ok(installed) => {
                 if let Some((_, replaced)) = installed.replaced {
+                    release_inbound(&replaced);
                     replaced.handle.close(None);
                 }
             }
@@ -1868,6 +1893,7 @@ impl Engine {
             Ok(installed) => {
                 if let Some((old, replaced)) = installed.replaced {
                     self.docs_only.remove(&old);
+                    release_inbound(&replaced);
                     replaced.handle.close(None);
                 }
             }
@@ -1920,6 +1946,7 @@ impl Engine {
         self.docs_only.clear();
         for (index, entry) in self.table.remove_where(|_| true) {
             self.closing.insert(tag_of(entry.generation, index));
+            release_inbound(&entry);
             entry.handle.close(Some(reason.clone()));
         }
     }
@@ -1946,7 +1973,9 @@ impl Engine {
             // Never promoted, and nobody waits on it: only its end matters.
             if matches!(notice, SessionNotice::Ended) {
                 self.docs_only.remove(&index);
-                self.table.remove(index);
+                if let Some(Removed::Session { handle, .. }) = self.table.remove(index) {
+                    release_inbound(&handle);
+                }
             }
             return;
         }
@@ -1955,13 +1984,15 @@ impl Engine {
                 let handle = entry.handle.clone();
                 if let Some(Promoted { retired }) = self.table.promote(index) {
                     if let Some((_, old)) = retired {
+                        release_inbound(&old);
                         old.handle.close(None);
                     }
                     self.resolve_waiters(&key, &handle);
                 }
             }
             SessionNotice::Ended => {
-                if let Some(Removed::Session { .. }) = self.table.remove(index) {
+                if let Some(Removed::Session { handle, .. }) = self.table.remove(index) {
+                    release_inbound(&handle);
                     self.fail_orphans(&key);
                 }
             }
@@ -2005,6 +2036,7 @@ impl Engine {
             self.fail_waiters(&key, EnsureError::Timeout);
         }
         for (index, candidate) in expired.candidates {
+            release_inbound(&candidate);
             let key = (candidate.peer, candidate.network);
             if self.docs_only.remove(&index).is_some() {
                 candidate.handle.close(Some(docs_only_close()));
@@ -2030,6 +2062,7 @@ impl Engine {
         for index in due {
             self.docs_only.remove(&index);
             if let Some(Removed::Session { handle, .. }) = self.table.remove(index) {
+                release_inbound(&handle);
                 handle.handle.close(Some(docs_only_close()));
             }
         }
