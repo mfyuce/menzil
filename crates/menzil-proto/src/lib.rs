@@ -40,7 +40,7 @@ pub use doc::{
 };
 pub use e2e::{
     E2eDataBody, E2eDataKind, E2eFrame, E2eFrameTag, E2eHandshakePayload, L4_AEAD_TAG_LEN,
-    RecordClass, e2e_data_frame_len, max_e2e_data_plaintext,
+    RecordClass, e2e_data_frame_len, max_dgram_payload, max_e2e_data_plaintext,
 };
 pub use error::{ErrorCode, ProtoError};
 pub use handshake::{Capability, HelloBody, Limits, WelcomeBody};
@@ -63,7 +63,7 @@ pub use service::{
     ServiceId, ServiceIdParseError, ServiceKind, ServicePattern, UnknownServiceKind,
 };
 pub use signed::{Signed, SignedBody};
-pub use stream::{OpenAckBody, OpenBody, OpenMeta, OpenTarget};
+pub use stream::{OpenAckBody, OpenBody, OpenMeta, OpenTarget, OpenTransport};
 
 /// Current wire protocol version, bumped whenever the framing format
 /// changes in a way that is not backward compatible.

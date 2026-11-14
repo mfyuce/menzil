@@ -71,10 +71,39 @@
 //! calling it. The reverse (a reliable-only kind under a datagram
 //! counter) cannot happen, since every datagram-class counter is
 //! already refused before decryption.
+//!
+//! **The datagram class** (protocol.md 5.2, egress slice 2b1) has its own
+//! pair, [`E2eTransport::encrypt_dgram`] and [`E2eTransport::decrypt_dgram`],
+//! so that [`E2eTransport::decrypt_data`] stays exactly as it is and every
+//! caller that does not opt in behaves as before. Datagram counters are
+//! `2^63 | sequence` in the same nonce space, disjoint from the reliable
+//! class by the top bit. The send sequence stops at `2^63 - 2`: sequence
+//! `2^63 - 1` would be the nonce `2^64 - 1`, which Noise reserves for
+//! `Rekey()` ([`E2eError::DatagramCounterExhausted`]). On receive the order
+//! is: class and reserved counter, then the replay window's non mutating
+//! `check` (duplicates and counters 2048 or more behind cost no AEAD work),
+//! then the AEAD, then decoding, and only then the window's `commit`. A
+//! forged frame never reaches `commit`, so it cannot slide the window.
+//! Every pre-authentication refusal is "drop it", never session-fatal; the
+//! two post-authentication ones (a body that does not decode, a kind that is
+//! not DGRAM) are fatal like their reliable-class counterparts.
+//! `StatelessTransportState` cannot be cloned, so no grace key survives a
+//! rekey: a datagram encrypted under the old key that arrives after the REKEY
+//! record fails the AEAD and is dropped (a bare `Noise` error, not fatal).
 
-use menzil_proto::{E2eDataBody, E2eFrame, L4_AEAD_TAG_LEN, RecordClass};
+use menzil_proto::{E2eDataBody, E2eDataKind, E2eFrame, L4_AEAD_TAG_LEN, RecordClass};
 
 use crate::error::E2eError;
+use crate::replay::ReplayWindow;
+
+/// `u8 kind | u16 channel`: what a DGRAM plaintext spends before the
+/// payload.
+const DGRAM_PREFIX_LEN: usize = 3;
+
+/// The highest datagram sequence this side will send or accept: `2^63 - 2`.
+/// One more would make the wire counter `u64::MAX`, the nonce Noise reserves
+/// for `Rekey()` (snow refuses it with `State(Exhausted)`).
+pub const MAX_DGRAM_SEQUENCE: u64 = (1 << 63) - 2;
 
 /// Matches the Noise Protocol's own hard limit on one transport message
 /// (protocol.md 5.1's cipher suite); see `menzil_session::transport`'s
@@ -119,6 +148,10 @@ pub struct E2eTransport {
     /// The next reliable-class counter this side will accept on
     /// receive; both directions count from zero (protocol.md 5.2).
     recv_reliable_next: u64,
+    /// The next datagram-class sequence this side will assign on send.
+    send_dgram_next: u64,
+    /// The datagram-class replay window for receive.
+    recv_dgram_window: ReplayWindow,
 }
 
 impl E2eTransport {
@@ -133,6 +166,8 @@ impl E2eTransport {
             max_plaintext: menzil_proto::max_e2e_data_plaintext(max_record),
             send_reliable_next: 0,
             recv_reliable_next: 0,
+            send_dgram_next: 0,
+            recv_dgram_window: ReplayWindow::new(),
         })
     }
 
@@ -279,6 +314,102 @@ impl E2eTransport {
             self.rekey_incoming();
         }
         Ok(body)
+    }
+
+    /// The largest datagram payload (`bytes` of a DGRAM body) this session
+    /// may send: [`Self::max_plaintext`] less the three byte DGRAM prefix.
+    /// Equals `menzil_proto::max_dgram_payload` of the `max_record` this
+    /// transport was built with (65,452 at 65,535).
+    pub fn max_dgram_payload(&self) -> usize {
+        self.max_plaintext.saturating_sub(DGRAM_PREFIX_LEN)
+    }
+
+    /// Encrypts `bytes` as the next datagram-class `data` frame on
+    /// `channel`, counter `2^63 | sequence`. Touches no reliable-class
+    /// state.
+    ///
+    /// Refuses, without consuming a sequence or encrypting anything:
+    /// - a payload over [`Self::max_dgram_payload`]
+    ///   (`E2eError::DatagramTooLarge`; datagrams are never split);
+    /// - a sequence past [`MAX_DGRAM_SEQUENCE`]
+    ///   (`E2eError::DatagramCounterExhausted`), which would use Noise's
+    ///   reserved rekey nonce.
+    pub fn encrypt_dgram(&mut self, channel: u16, bytes: &[u8]) -> Result<E2eFrame, E2eError> {
+        if self.send_dgram_next > MAX_DGRAM_SEQUENCE {
+            return Err(E2eError::DatagramCounterExhausted);
+        }
+        let max = self.max_dgram_payload();
+        if bytes.len() > max {
+            return Err(E2eError::DatagramTooLarge {
+                len: bytes.len(),
+                max,
+            });
+        }
+        let mut plaintext = Vec::with_capacity(DGRAM_PREFIX_LEN + bytes.len());
+        plaintext.push(E2eDataKind::Dgram as u8);
+        plaintext.extend_from_slice(&channel.to_be_bytes());
+        plaintext.extend_from_slice(bytes);
+        let needed = plaintext.len() + L4_AEAD_TAG_LEN;
+        if needed > MAX_NOISE_MESSAGE {
+            return Err(snow::Error::Input.into());
+        }
+        let counter = RecordClass::Datagram.wire_counter(self.send_dgram_next);
+        let mut out = vec![0u8; needed];
+        let n = self.inner.write_message(counter, &plaintext, &mut out)?;
+        out.truncate(n);
+        self.send_dgram_next += 1;
+        Ok(E2eFrame::Data {
+            receiver_index: self.peer_index,
+            counter,
+            ciphertext: out,
+        })
+    }
+
+    /// Decrypts an incoming datagram-class `data` frame, returning its
+    /// channel and payload. Strictly in this order:
+    /// 1. A reliable-class counter (`E2eError::NotADatagramCounter`) or the
+    ///    reserved counter `u64::MAX` (`E2eError::ReservedDatagramCounter`)
+    ///    is refused before any work.
+    /// 2. The replay window's non mutating check:
+    ///    `E2eError::DatagramReplayed` or `E2eError::DatagramTooOld`,
+    ///    still before any decryption.
+    /// 3. The AEAD (`E2eError::Noise` on failure).
+    /// 4. Decoding; the body must be DGRAM
+    ///    (`E2eError::RecordClassMismatch` otherwise).
+    /// 5. Only now the window records the sequence.
+    ///
+    /// Steps 1 to 3 failing means "drop the frame, the session lives": all
+    /// of them can be produced by someone who holds no key. A failure at
+    /// step 4 is authenticated misbehavior and the caller should end the
+    /// session. The window and every counter are untouched on any failure.
+    pub fn decrypt_dgram(
+        &mut self,
+        counter: u64,
+        ciphertext: &[u8],
+    ) -> Result<(u16, Vec<u8>), E2eError> {
+        if RecordClass::of_counter(counter) != RecordClass::Datagram {
+            return Err(E2eError::NotADatagramCounter);
+        }
+        let seq = RecordClass::sequence_of(counter);
+        if seq > MAX_DGRAM_SEQUENCE {
+            return Err(E2eError::ReservedDatagramCounter);
+        }
+        self.recv_dgram_window.check(seq)?;
+        if ciphertext.len() > MAX_NOISE_MESSAGE {
+            return Err(snow::Error::Input.into());
+        }
+        let mut out = vec![0u8; ciphertext.len()];
+        let n = self.inner.read_message(counter, ciphertext, &mut out)?;
+        out.truncate(n);
+        let body = E2eDataBody::decode(&out)?;
+        let E2eDataBody::Dgram { channel, bytes } = body else {
+            return Err(E2eError::RecordClassMismatch {
+                counter_class: RecordClass::Datagram,
+                kind_class: body.kind().class(),
+            });
+        };
+        self.recv_dgram_window.commit(seq);
+        Ok((channel, bytes))
     }
 
     /// Rekeys this side's own sending cipher (protocol.md 5.2: "a sender
@@ -848,5 +979,339 @@ pub(crate) mod tests {
             initiator.encrypt_data(&E2eDataBody::Mux(vec![0; largest_mux + 1])),
             Err(E2eError::BodyTooLarge { .. })
         ));
+    }
+
+    // --- the datagram class (egress slice 2b1) ----------------------------
+
+    fn dgram(t: &mut E2eTransport, channel: u16, bytes: &[u8]) -> (u64, Vec<u8>) {
+        let E2eFrame::Data {
+            counter,
+            ciphertext,
+            ..
+        } = t.encrypt_dgram(channel, bytes).unwrap()
+        else {
+            unreachable!()
+        };
+        (counter, ciphertext)
+    }
+
+    #[test]
+    fn a_datagram_round_trips_with_its_channel_and_uses_the_top_bit() {
+        let (mut initiator, mut responder) = run_live_handshake();
+        let (counter, ct) = dgram(&mut initiator, 0x1234, b"hello");
+        assert_eq!(counter, 1 << 63);
+        assert_eq!(
+            responder.decrypt_dgram(counter, &ct).unwrap(),
+            (0x1234, b"hello".to_vec())
+        );
+        assert_eq!(ct.len(), 3 + 5 + 16);
+        assert_eq!(initiator.send_reliable_next, 0, "reliable state untouched");
+        assert_eq!(responder.recv_reliable_next, 0);
+        // An empty payload is a datagram too.
+        let (counter, ct) = dgram(&mut initiator, 9, b"");
+        assert_eq!(counter, (1 << 63) | 1);
+        assert_eq!(
+            responder.decrypt_dgram(counter, &ct).unwrap(),
+            (9, Vec::new())
+        );
+    }
+
+    #[test]
+    fn a_duplicate_inside_the_window_is_dropped_before_decryption() {
+        let (mut initiator, mut responder) = run_live_handshake();
+        let (counter, ct) = dgram(&mut initiator, 1, b"x");
+        responder.decrypt_dgram(counter, &ct).unwrap();
+        // Forged ciphertext at the seen counter: were it decrypted, it would
+        // fail as `Noise`. `DatagramReplayed` proves the window ran first.
+        let err = responder.decrypt_dgram(counter, &[0xee; 40]).unwrap_err();
+        assert!(matches!(err, E2eError::DatagramReplayed), "{err:?}");
+        // The genuine duplicate is refused the same way.
+        let err = responder.decrypt_dgram(counter, &ct).unwrap_err();
+        assert!(matches!(err, E2eError::DatagramReplayed), "{err:?}");
+    }
+
+    #[test]
+    fn the_window_edge_is_2047_behind_top_and_2048_is_too_old() {
+        let (mut initiator, mut responder) = run_live_handshake();
+        let frames: Vec<(u64, Vec<u8>)> = (0..2049)
+            .map(|i| dgram(&mut initiator, 1, &(i as u16).to_be_bytes()))
+            .collect();
+        // Sequence 2048 first: top is 2048.
+        let (c, ct) = &frames[2048];
+        responder.decrypt_dgram(*c, ct).unwrap();
+        // Sequence 0 is exactly 2048 behind: too old, dropped with no AEAD
+        // work (forged bytes show the refusal is not a decrypt failure).
+        let (c0, ct0) = &frames[0];
+        assert!(matches!(
+            responder.decrypt_dgram(*c0, &[0u8; 20]),
+            Err(E2eError::DatagramTooOld)
+        ));
+        assert!(matches!(
+            responder.decrypt_dgram(*c0, ct0),
+            Err(E2eError::DatagramTooOld)
+        ));
+        // Sequence 1 is 2047 behind: the last position still accepted.
+        let (c1, ct1) = &frames[1];
+        responder.decrypt_dgram(*c1, ct1).unwrap();
+    }
+
+    #[test]
+    fn a_forged_far_future_counter_does_not_move_the_window() {
+        let (mut initiator, mut responder) = run_live_handshake();
+        let frames: Vec<(u64, Vec<u8>)> = (0..6).map(|_| dgram(&mut initiator, 1, b"d")).collect();
+        let (c, ct) = &frames[0];
+        responder.decrypt_dgram(*c, ct).unwrap();
+        // A forged frame with a far future (but legal) sequence.
+        let far = RecordClass::Datagram.wire_counter(1 << 40);
+        let err = responder.decrypt_dgram(far, &[0xab; 40]).unwrap_err();
+        assert!(matches!(err, E2eError::Noise(_)), "{err:?}");
+        assert_eq!(responder.recv_dgram_window.top(), Some(0));
+        // Had the window moved, every genuine datagram below would be too old.
+        for (c, ct) in &frames[1..] {
+            responder.decrypt_dgram(*c, ct).unwrap();
+        }
+    }
+
+    #[test]
+    fn reordering_within_the_window_delivers_each_once() {
+        let (mut initiator, mut responder) = run_live_handshake();
+        let frames: Vec<(u64, Vec<u8>)> =
+            (0u8..10).map(|i| dgram(&mut initiator, 3, &[i])).collect();
+        for &i in &[4usize, 0, 9, 2, 1, 8, 3, 7, 5, 6] {
+            let (c, ct) = &frames[i];
+            assert_eq!(responder.decrypt_dgram(*c, ct).unwrap(), (3, vec![i as u8]));
+        }
+        for (c, ct) in &frames {
+            assert!(matches!(
+                responder.decrypt_dgram(*c, ct),
+                Err(E2eError::DatagramReplayed)
+            ));
+        }
+    }
+
+    #[test]
+    fn a_jump_of_2048_clears_the_window() {
+        let (mut initiator, mut responder) = run_live_handshake();
+        let frames: Vec<(u64, Vec<u8>)> =
+            (0..2060).map(|_| dgram(&mut initiator, 1, b"j")).collect();
+        for i in [10usize, 11] {
+            responder.decrypt_dgram(frames[i].0, &frames[i].1).unwrap();
+        }
+        // Top 11 to 2059: a jump of exactly 2048.
+        responder
+            .decrypt_dgram(frames[2059].0, &frames[2059].1)
+            .unwrap();
+        // 2058 shares its ring position with the stale 10; a window that
+        // kept the stale bit would call it a replay.
+        responder
+            .decrypt_dgram(frames[2058].0, &frames[2058].1)
+            .unwrap();
+        assert!(matches!(
+            responder.decrypt_dgram(frames[10].0, &frames[10].1),
+            Err(E2eError::DatagramTooOld)
+        ));
+    }
+
+    #[test]
+    fn a_reliable_kind_under_a_datagram_counter_is_a_class_mismatch() {
+        let (initiator, mut responder) = run_live_handshake();
+        let counter = RecordClass::Datagram.wire_counter(0);
+        let plaintext = E2eDataBody::Keep.encode().unwrap();
+        let ct = probe_ciphertext(&initiator, counter, &plaintext);
+        let err = responder.decrypt_dgram(counter, &ct).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                E2eError::RecordClassMismatch {
+                    counter_class: RecordClass::Datagram,
+                    kind_class: RecordClass::Reliable,
+                }
+            ),
+            "{err:?}"
+        );
+        // Authenticated but rejected: the window did not record it.
+        assert_eq!(responder.recv_dgram_window.top(), None);
+        // A reliable counter on the datagram path is refused before decryption.
+        let err = responder.decrypt_dgram(0, &[0u8; 20]).unwrap_err();
+        assert!(matches!(err, E2eError::NotADatagramCounter), "{err:?}");
+    }
+
+    #[test]
+    fn decrypt_dgram_refuses_a_reliable_counter_even_with_a_valid_dgram_ciphertext() {
+        let (initiator, mut responder) = run_live_handshake();
+        let plaintext = E2eDataBody::Dgram {
+            channel: 1,
+            bytes: vec![1],
+        }
+        .encode()
+        .unwrap();
+        let ct = probe_ciphertext(&initiator, 0, &plaintext);
+        let err = responder.decrypt_dgram(0, &ct).unwrap_err();
+        assert!(matches!(err, E2eError::NotADatagramCounter), "{err:?}");
+    }
+
+    #[test]
+    fn datagram_and_reliable_nonces_never_collide() {
+        let (mut initiator, mut responder) = run_live_handshake();
+        // Same plaintext body at reliable counter 0 and datagram sequence 0.
+        let plaintext = E2eDataBody::Dgram {
+            channel: 1,
+            bytes: vec![7],
+        }
+        .encode()
+        .unwrap();
+        let reliable = probe_ciphertext(&initiator, 0, &plaintext);
+        let (dc, datagram) = dgram(&mut initiator, 1, &[7]);
+        assert_eq!(RecordClass::of_counter(dc), RecordClass::Datagram);
+        assert_eq!(RecordClass::sequence_of(dc), 0);
+        assert_ne!(dc, 0);
+        assert_ne!(reliable, datagram, "same key, different nonce");
+        // Interleaved use: each class advances only its own sequence.
+        for i in 0u64..5 {
+            let E2eFrame::Data {
+                counter: rc,
+                ciphertext: rct,
+                ..
+            } = initiator.encrypt_data(&E2eDataBody::Keep).unwrap()
+            else {
+                unreachable!()
+            };
+            assert_eq!(rc, i);
+            responder.decrypt_data(rc, &rct).unwrap();
+            let (dc, dct) = dgram(&mut initiator, 1, &[i as u8]);
+            assert_eq!(dc, (1 << 63) | (i + 1));
+            responder.decrypt_dgram(dc, &dct).unwrap();
+        }
+        // A datagram frame is not accepted on the reliable path.
+        let err = responder.decrypt_data(dc, &datagram).unwrap_err();
+        assert!(matches!(err, E2eError::UnauthenticatedDatagramCounter));
+    }
+
+    #[test]
+    fn datagrams_continue_across_a_rekey_and_an_old_key_datagram_after_it_is_dropped_not_fatal() {
+        let (mut initiator, mut responder) = run_live_handshake();
+        let (c0, ct0) = dgram(&mut initiator, 1, b"before");
+        responder.decrypt_dgram(c0, &ct0).unwrap();
+        // Encrypted under the old key, delivered after the rekey.
+        let (c1, ct1) = dgram(&mut initiator, 1, b"old key");
+        let E2eFrame::Data {
+            counter: rc,
+            ciphertext: rct,
+            ..
+        } = initiator.encrypt_data(&E2eDataBody::Rekey).unwrap()
+        else {
+            unreachable!()
+        };
+        assert_eq!(
+            responder.decrypt_data(rc, &rct).unwrap(),
+            E2eDataBody::Rekey
+        );
+        let err = responder.decrypt_dgram(c1, &ct1).unwrap_err();
+        assert!(matches!(err, E2eError::Noise(_)), "{err:?}");
+        assert_eq!(responder.recv_dgram_window.top(), Some(0), "window intact");
+        // Sequence keeps running and the new key works.
+        let (c2, ct2) = dgram(&mut initiator, 1, b"after");
+        assert_eq!(RecordClass::sequence_of(c2), 2);
+        assert_eq!(
+            responder.decrypt_dgram(c2, &ct2).unwrap(),
+            (1, b"after".to_vec())
+        );
+        // A pre-rekey datagram replayed now fails the window.
+        assert!(matches!(
+            responder.decrypt_dgram(c0, &ct0),
+            Err(E2eError::DatagramReplayed)
+        ));
+        // The reliable path is unaffected.
+        let E2eFrame::Data {
+            counter: kc,
+            ciphertext: kct,
+            ..
+        } = initiator.encrypt_data(&E2eDataBody::Keep).unwrap()
+        else {
+            unreachable!()
+        };
+        assert_eq!(responder.decrypt_data(kc, &kct).unwrap(), E2eDataBody::Keep);
+    }
+
+    #[test]
+    fn the_datagram_ceiling_never_uses_the_reserved_nonce() {
+        let (mut initiator, mut responder) = run_live_handshake();
+        initiator.send_dgram_next = MAX_DGRAM_SEQUENCE;
+        let (counter, ct) = dgram(&mut initiator, 1, b"last");
+        assert_eq!(counter, u64::MAX - 1);
+        assert_eq!(
+            responder.decrypt_dgram(counter, &ct).unwrap(),
+            (1, b"last".to_vec())
+        );
+        let err = initiator.encrypt_dgram(1, b"one too many").unwrap_err();
+        assert!(matches!(err, E2eError::DatagramCounterExhausted), "{err:?}");
+        assert_eq!(initiator.send_dgram_next, MAX_DGRAM_SEQUENCE + 1);
+        // The reserved counter is refused on receive before any work, and
+        // does not move the window.
+        let err = responder.decrypt_dgram(u64::MAX, &[0u8; 20]).unwrap_err();
+        assert!(matches!(err, E2eError::ReservedDatagramCounter), "{err:?}");
+        assert_eq!(responder.recv_dgram_window.top(), Some(MAX_DGRAM_SEQUENCE));
+    }
+
+    #[test]
+    fn a_payload_of_max_dgram_payload_round_trips_and_one_more_is_refused() {
+        let (mut initiator, mut responder) = run_live_handshake();
+        assert_eq!(initiator.max_dgram_payload(), 65_452);
+        assert_eq!(menzil_proto::max_dgram_payload(65_535), 65_452);
+        let payload = vec![0xA5u8; 65_452];
+        let (counter, ct) = dgram(&mut initiator, 7, &payload);
+        assert_eq!(
+            menzil_proto::e2e_data_frame_len(3 + payload.len()),
+            menzil_proto::max_send_payload(65_535)
+        );
+        assert_eq!(responder.decrypt_dgram(counter, &ct).unwrap(), (7, payload));
+        let err = initiator.encrypt_dgram(7, &vec![0u8; 65_453]).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                E2eError::DatagramTooLarge {
+                    len: 65_453,
+                    max: 65_452
+                }
+            ),
+            "{err:?}"
+        );
+        assert_eq!(initiator.send_dgram_next, 1, "nothing consumed");
+        // A smaller record size shrinks the budget with it.
+        let (small, _r) = run_live_handshake_with_max_record(1024);
+        assert_eq!(
+            small.max_dgram_payload(),
+            menzil_proto::max_dgram_payload(1024)
+        );
+    }
+
+    #[test]
+    fn decrypt_data_still_refuses_datagram_counters() {
+        let (mut initiator, mut responder) = run_live_handshake();
+        let (counter, ct) = dgram(&mut initiator, 1, b"d");
+        let err = responder.decrypt_data(counter, &ct).unwrap_err();
+        assert!(matches!(err, E2eError::UnauthenticatedDatagramCounter));
+        assert_eq!(responder.recv_reliable_next, 0);
+        assert_eq!(responder.recv_dgram_window.top(), None);
+        // `encrypt_data` still refuses a Dgram body.
+        assert!(matches!(
+            initiator.encrypt_data(&E2eDataBody::Dgram {
+                channel: 1,
+                bytes: vec![]
+            }),
+            Err(E2eError::DatagramUnsupported)
+        ));
+        // And the datagram still decrypts on its own path afterwards.
+        responder.decrypt_dgram(counter, &ct).unwrap();
+    }
+
+    #[test]
+    fn a_dgram_body_shorter_than_its_prefix_is_a_fatal_proto_error_and_leaves_the_window() {
+        let (initiator, mut responder) = run_live_handshake();
+        let counter = RecordClass::Datagram.wire_counter(0);
+        let ct = probe_ciphertext(&initiator, counter, &[E2eDataKind::Dgram as u8, 0x01]);
+        let err = responder.decrypt_dgram(counter, &ct).unwrap_err();
+        assert!(matches!(err, E2eError::Proto(_)), "{err:?}");
+        assert_eq!(responder.recv_dgram_window.top(), None);
     }
 }

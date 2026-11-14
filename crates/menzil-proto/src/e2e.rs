@@ -515,6 +515,21 @@ pub fn max_e2e_data_plaintext(max_record: u32) -> usize {
         .saturating_sub(E2E_DATA_FRAME_PREFIX_LEN + L4_AEAD_TAG_LEN)
 }
 
+/// `u8 kind | u16 channel`: the bytes a DGRAM plaintext spends before its
+/// payload.
+const DGRAM_PREFIX_LEN: usize = 1 + 2;
+
+/// The largest datagram payload (the `bytes` of an [`E2eDataBody::Dgram`])
+/// one L4 `data` frame can carry under `max_record`:
+/// [`max_e2e_data_plaintext`] (the whole plaintext, kind byte included) less
+/// the three byte DGRAM prefix. At the default `max_record` of 65,535 that
+/// is 65,455 - 3 = 65,452 bytes. A larger datagram is never split; the
+/// sender drops it. Saturates at 0 for a `max_record` too small for any
+/// DGRAM.
+pub fn max_dgram_payload(max_record: u32) -> usize {
+    max_e2e_data_plaintext(max_record).saturating_sub(DGRAM_PREFIX_LEN)
+}
+
 /// The exact encoded size of an [`E2eFrame::Data`] whose plaintext (an
 /// [`E2eDataBody::encode`] result, kind byte included) is `plaintext_len`
 /// bytes: the frame's own prefix plus that plaintext plus the L4 AEAD tag.
@@ -747,5 +762,23 @@ mod tests {
     fn max_plaintext_saturates_instead_of_underflowing() {
         assert_eq!(max_e2e_data_plaintext(0), 0);
         assert_eq!(max_e2e_data_plaintext(10), 0);
+    }
+
+    #[test]
+    fn max_dgram_payload_is_the_plaintext_budget_less_the_dgram_prefix() {
+        assert_eq!(max_dgram_payload(65_535), 65_452);
+        assert_eq!(
+            max_dgram_payload(65_535),
+            max_e2e_data_plaintext(65_535) - 3
+        );
+        // The largest datagram fills its L3 record exactly; one byte more
+        // would not fit.
+        let body = E2eDataBody::Dgram {
+            channel: 1,
+            bytes: vec![0; max_dgram_payload(65_535)],
+        };
+        assert_eq!(body.encode().unwrap().len(), max_e2e_data_plaintext(65_535));
+        assert_eq!(max_dgram_payload(0), 0);
+        assert_eq!(max_dgram_payload(10), 0);
     }
 }

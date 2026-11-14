@@ -1693,6 +1693,7 @@ mod tests {
             target: Some(OpenTarget {
                 host: host.to_owned(),
                 port,
+                transport: None,
             }),
             meta: OpenMeta::default(),
         }

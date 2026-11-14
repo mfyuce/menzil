@@ -567,6 +567,7 @@ async fn an_open_with_a_target_is_refused() {
     let target = OpenTarget {
         host: "127.0.0.1".to_string(),
         port: 22,
+        transport: None,
     };
     let (_stream, ack) =
         relay_open(&up.relay, "tls:myapp", Some(target), OpenMeta::default()).await;
@@ -596,6 +597,7 @@ async fn the_authorizer_itself_refuses_a_target() {
     let target = Some(OpenTarget {
         host: "h".to_string(),
         port: 1,
+        transport: None,
     });
     assert!(!allowed(authorizer.authorize(&request(
         target,

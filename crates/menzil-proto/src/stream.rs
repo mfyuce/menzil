@@ -52,15 +52,34 @@ fn decode_len_prefixed<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T
     ciborium::from_reader(body).map_err(|e| ProtoError::Decode(e.to_string()))
 }
 
-/// `target: { host: str, port: u16 }` (protocol.md 5.3), present only
-/// when `service` is `egress:*`.
+/// The optional `transport` of an OPEN `target` (egress slice 2b1): absent
+/// means TCP, `"udp"` asks for a datagram channel. Any other string is a
+/// decode error. Unsigned, like the rest of OPEN.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum OpenTransport {
+    /// A UDP target, carried on an L4 datagram channel.
+    #[serde(rename = "udp")]
+    Udp,
+}
+
+/// `target: { host: str, port: u16, transport?: "udp" }` (protocol.md 5.3),
+/// present only when `service` is `egress:*`. A TCP target omits
+/// `transport`, so its encoding is byte identical to the one before the key
+/// existed. Unlike [`OpenBody`], the target refuses unknown keys: a receiver
+/// that does not understand a key must not silently serve the OPEN as
+/// something else.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct OpenTarget {
     /// The requested host, sent as a name (resolved at the exit,
     /// protocol.md 8) — never pre-resolved here.
     pub host: String,
     /// The requested port.
     pub port: u16,
+    /// `None` for TCP (the key is then absent on the wire), `Some(Udp)`
+    /// for a datagram channel.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transport: Option<OpenTransport>,
 }
 
 /// `meta: { client_ip: str | null, sni: str | null }` (protocol.md 5.3):
@@ -172,6 +191,7 @@ mod tests {
             target: Some(OpenTarget {
                 host: "example.com".to_string(),
                 port: 443,
+                transport: None,
             }),
             meta: OpenMeta {
                 client_ip: Some("203.0.113.5".to_string()),
@@ -233,5 +253,151 @@ mod tests {
         };
         let encoded = ack.encode().unwrap();
         assert_eq!(OpenAckBody::decode(&encoded).unwrap(), ack);
+    }
+
+    /// The CBOR a TCP `target` encoded to before the `transport` key
+    /// existed (`{ "host": "example.com", "port": 443 }`), written out by
+    /// hand: a map of two, text keys in struct order.
+    fn v0_4_target_cbor() -> Vec<u8> {
+        let mut b = vec![0xa2, 0x64];
+        b.extend_from_slice(b"host");
+        b.push(0x6b);
+        b.extend_from_slice(b"example.com");
+        b.push(0x64);
+        b.extend_from_slice(b"port");
+        b.extend_from_slice(&[0x19, 0x01, 0xbb]);
+        b
+    }
+
+    #[test]
+    fn an_open_target_without_transport_is_byte_identical_to_v0_4() {
+        let target = OpenTarget {
+            host: "example.com".to_string(),
+            port: 443,
+            transport: None,
+        };
+        let mut cbor = Vec::new();
+        ciborium::into_writer(&target, &mut cbor).unwrap();
+        assert_eq!(cbor, v0_4_target_cbor());
+        // And the whole OPEN: the target value sits inside unchanged.
+        let open = OpenBody {
+            v: crate::PROTOCOL_VERSION,
+            service: ServiceId::new(ServiceKind::Egress, "*"),
+            target: Some(target),
+            meta: OpenMeta::default(),
+        };
+        let encoded = open.encode().unwrap();
+        assert!(
+            encoded
+                .windows(cbor.len())
+                .any(|w| w == v0_4_target_cbor().as_slice()),
+            "a TCP target must encode exactly as before"
+        );
+        assert!(!encoded.windows(9).any(|w| w == b"transport"));
+        // A v0.4 sender's bytes (no transport key) decode with None.
+        let decoded: OpenTarget = ciborium::from_reader(v0_4_target_cbor().as_slice()).unwrap();
+        assert_eq!(decoded.transport, None);
+        assert_eq!(OpenBody::decode(&encoded).unwrap(), open);
+    }
+
+    #[test]
+    fn an_open_target_with_udp_round_trips() {
+        let open = OpenBody {
+            v: crate::PROTOCOL_VERSION,
+            service: ServiceId::new(ServiceKind::Egress, "*"),
+            target: Some(OpenTarget {
+                host: "example.com".to_string(),
+                port: 53,
+                transport: Some(OpenTransport::Udp),
+            }),
+            meta: OpenMeta::default(),
+        };
+        let encoded = open.encode().unwrap();
+        assert!(encoded.windows(3).any(|w| w == b"udp"));
+        assert_eq!(OpenBody::decode(&encoded).unwrap(), open);
+    }
+
+    fn target_cbor(entries: &[(&str, ciborium::Value)]) -> Vec<u8> {
+        let map = ciborium::Value::Map(
+            entries
+                .iter()
+                .map(|(k, v)| (ciborium::Value::Text((*k).to_string()), v.clone()))
+                .collect(),
+        );
+        let mut out = Vec::new();
+        ciborium::into_writer(&map, &mut out).unwrap();
+        out
+    }
+
+    #[test]
+    fn open_target_refuses_unknown_transport_and_unknown_keys() {
+        use ciborium::Value;
+        let host = ("host", Value::Text("example.com".into()));
+        let port = ("port", Value::Integer(443.into()));
+        let decode = |entries: &[(&str, Value)]| {
+            ciborium::from_reader::<OpenTarget, _>(target_cbor(entries).as_slice())
+        };
+        // "udp" is accepted.
+        let ok = decode(&[
+            host.clone(),
+            port.clone(),
+            ("transport", Value::Text("udp".into())),
+        ]);
+        assert_eq!(ok.unwrap().transport, Some(OpenTransport::Udp));
+        // Any other transport value is refused, whatever its case or type.
+        for bad in [
+            Value::Text("tcp".into()),
+            Value::Text("UDP".into()),
+            Value::Text("quic".into()),
+            Value::Text(String::new()),
+            Value::Integer(17.into()),
+        ] {
+            assert!(
+                decode(&[host.clone(), port.clone(), ("transport", bad.clone())]).is_err(),
+                "{bad:?}"
+            );
+        }
+        // An explicit null reads as absent (TCP); no sender emits it.
+        let null = decode(&[host.clone(), port.clone(), ("transport", Value::Null)]);
+        assert_eq!(null.unwrap().transport, None);
+        // Any unknown key is refused.
+        assert!(decode(&[host.clone(), port.clone(), ("extra", Value::Bool(true))]).is_err());
+        assert!(
+            decode(&[
+                host.clone(),
+                port.clone(),
+                ("transport", Value::Text("udp".into())),
+                ("zone", Value::Text("x".into())),
+            ])
+            .is_err()
+        );
+        // The refusal reaches a whole OPEN.
+        let mut bytes = Vec::new();
+        let open = Value::Map(vec![
+            (Value::Text("v".into()), Value::Integer(1.into())),
+            (
+                Value::Text("service".into()),
+                Value::Text("egress:*".into()),
+            ),
+            (
+                Value::Text("target".into()),
+                Value::Map(vec![
+                    (Value::Text("host".into()), Value::Text("h".into())),
+                    (Value::Text("port".into()), Value::Integer(1.into())),
+                    (Value::Text("transport".into()), Value::Text("sctp".into())),
+                ]),
+            ),
+            (
+                Value::Text("meta".into()),
+                Value::Map(vec![
+                    (Value::Text("client_ip".into()), Value::Null),
+                    (Value::Text("sni".into()), Value::Null),
+                ]),
+            ),
+        ]);
+        ciborium::into_writer(&open, &mut bytes).unwrap();
+        let mut framed = (bytes.len() as u16).to_be_bytes().to_vec();
+        framed.extend_from_slice(&bytes);
+        assert!(OpenBody::decode(&framed).is_err());
     }
 }

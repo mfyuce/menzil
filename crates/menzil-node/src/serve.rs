@@ -2267,6 +2267,7 @@ mod tests {
                 target: Some(OpenTarget {
                     host: "127.0.0.1".to_owned(),
                     port,
+                    transport: None,
                 }),
                 ..request("egress:*", 1)
             }
@@ -2293,6 +2294,7 @@ mod tests {
                     target: Some(OpenTarget {
                         host: host.to_owned(),
                         port,
+                        transport: None,
                     }),
                     ..open_body(service)
                 };

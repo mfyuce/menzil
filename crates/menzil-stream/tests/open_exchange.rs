@@ -124,6 +124,7 @@ async fn an_allowed_open_is_acked_and_the_accepted_stream_still_works_as_a_byte_
         target: Some(OpenTarget {
             host: "example.com".to_string(),
             port: 443,
+            transport: None,
         }),
         meta: OpenMeta {
             client_ip: Some("203.0.113.5".to_string()),

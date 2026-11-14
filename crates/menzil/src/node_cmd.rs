@@ -812,6 +812,7 @@ impl Opener for NodeOpener {
         let target = OpenTarget {
             host: host.to_string(),
             port,
+            transport: None,
         };
         self.open_on(network_id, peer, service, Some(target)).await
     }

@@ -1025,6 +1025,7 @@ mod tests {
         let target = Some(OpenTarget {
             host: "example.com".to_string(),
             port: 443,
+            transport: None,
         });
         let result = open(&a, ssh(), target).await;
         assert!(

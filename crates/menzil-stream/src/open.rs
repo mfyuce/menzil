@@ -741,6 +741,7 @@ mod tests {
         open.target = Some(OpenTarget {
             host: "a".repeat(70_000),
             port: 443,
+            transport: None,
         });
         let mut stream = MockStream::preloaded(Vec::new());
 
@@ -840,6 +841,7 @@ mod tests {
         open.target = Some(OpenTarget {
             host: "example.com".to_string(),
             port: 443,
+            transport: None,
         });
         let stream = MockStream::preloaded(open.encode().unwrap());
 
@@ -880,6 +882,7 @@ mod tests {
         open.target = Some(OpenTarget {
             host: "example.com".to_string(),
             port: 443,
+            transport: None,
         });
         let stream = MockStream::preloaded(open.encode().unwrap());
 

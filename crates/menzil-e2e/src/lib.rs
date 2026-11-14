@@ -39,10 +39,12 @@
 //! successful decryption (see [`transport`]'s doc comment on why that
 //! order matters); and REKEY/KEEP scheduling ([`rekey`], [`liveness`]).
 //!
-//! What protocol.md 5.2/13 defer to phase 2, and this crate does not
-//! implement even though the wire-level class split ships now regardless
-//! (already built into `menzil_proto::RecordClass`): a working
-//! send/receive path for the datagram class. [`transport::E2eTransport`]
+//! The datagram class has its own path since egress slice 2b1:
+//! [`transport::E2eTransport::encrypt_dgram`] and `decrypt_dgram`, with a
+//! 2048 position [`replay::ReplayWindow`] checked before decryption and
+//! moved only after authentication (see [`transport`]'s doc comment).
+//! What follows describes the reliable path, which is unchanged:
+//! [`transport::E2eTransport::encrypt_data`]
 //! refuses to send one (`E2eError::DatagramUnsupported`) and refuses an
 //! *incoming* one before even attempting to decrypt it, not after
 //! (`E2eError::UnauthenticatedDatagramCounter` — deliberately a
@@ -103,6 +105,7 @@ mod handshake;
 mod limiter;
 mod liveness;
 mod rekey;
+mod replay;
 mod table;
 mod transport;
 
@@ -114,8 +117,9 @@ pub use limiter::{
 };
 pub use liveness::Liveness;
 pub use rekey::RekeySchedule;
+pub use replay::{REPLAY_WINDOW_SIZE, ReplayWindow};
 pub use table::{
     Expired, IgnoreReason, InitDecision, Installed, Promoted, RegisterError, Removed, RespLookup,
     Role, Route, SessionIndex, SessionStatus, SessionTable, SlotState, TableConfig, TableError,
 };
-pub use transport::E2eTransport;
+pub use transport::{E2eTransport, MAX_DGRAM_SEQUENCE};

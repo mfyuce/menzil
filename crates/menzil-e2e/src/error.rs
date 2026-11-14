@@ -149,4 +149,44 @@ pub enum E2eError {
         /// The counter value the frame actually carried.
         actual: u64,
     },
+    /// A datagram-class `data` frame's sequence was already received
+    /// (its bit in the 2048 position replay window is set). Checked
+    /// *before* any decryption. **Not session-fatal: drop it.** Free for
+    /// anyone to trigger by repeating a counter.
+    #[error("datagram replayed: its sequence was already received")]
+    DatagramReplayed,
+    /// A datagram-class `data` frame's sequence is 2048 or more behind
+    /// the highest authenticated one. Checked *before* any decryption.
+    /// **Not session-fatal: drop it.**
+    #[error("datagram too old: 2048 or more sequences behind the window top")]
+    DatagramTooOld,
+    /// [`crate::E2eTransport::encrypt_dgram`] refused to assign a datagram
+    /// sequence past `2^63 - 2`: sequence `2^63 - 1` would make the Noise
+    /// nonce `2^64 - 1`, which Noise reserves for `Rekey()`. Nothing was
+    /// sent and no counter was consumed. Unreachable in practice (REKEY
+    /// fires every 2^20 records), checked rather than assumed.
+    #[error("the datagram sequence has reached its 2^63 - 2 ceiling")]
+    DatagramCounterExhausted,
+    /// [`crate::E2eTransport::decrypt_dgram`] was given a counter of the
+    /// reliable class. A routing mistake of the caller, refused before any
+    /// decryption. **Not session-fatal: drop it.**
+    #[error("a reliable-class counter was passed to the datagram path")]
+    NotADatagramCounter,
+    /// A datagram-class counter whose sequence is `2^63 - 1` (the whole
+    /// counter is `u64::MAX`): the nonce Noise reserves for `Rekey()`, never
+    /// produced by a compliant sender. Refused before any decryption.
+    /// **Not session-fatal: drop it.**
+    #[error("the reserved datagram counter 2^64 - 1 was refused before decryption")]
+    ReservedDatagramCounter,
+    /// A datagram payload passed to [`crate::E2eTransport::encrypt_dgram`]
+    /// is larger than this session's budget
+    /// ([`crate::E2eTransport::max_dgram_payload`]). Datagrams are never
+    /// split; nothing was consumed.
+    #[error("datagram payload of {len} bytes exceeds this session's {max}-byte budget")]
+    DatagramTooLarge {
+        /// The payload's length.
+        len: usize,
+        /// The budget it was checked against.
+        max: usize,
+    },
 }

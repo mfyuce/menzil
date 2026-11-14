@@ -1788,6 +1788,7 @@ mod tests {
             target: Some(menzil_proto::OpenTarget {
                 host: "example.com".to_string(),
                 port: 443,
+                transport: None,
             }),
             ..open_request(ids)
         }
