@@ -17,6 +17,8 @@
 //! max_connections = 256           # served at once, all peers together, at most 1000000
 //! max_connections_per_peer = 64   # served at once for one peer, at most 1000000
 //! connect_timeout_secs = 5        # giving up on a service's local target, at most 9
+//! # idle_secs = 300               # off unless set: reset a served tcp:/http:/tls: stream with no
+//! #                               # byte in either direction this long (10 to 86400)
 //!
 //! # Optional: make this node an egress exit (protocol.md 8). Off by default; the Policy must also
 //! # give it an `egress` entry and a member an `egress:*` grant. Read at start: a change needs a
@@ -294,9 +296,27 @@ pub struct ServeSettings {
     pub max_connections_per_peer: Option<usize>,
     /// Seconds to wait for the connect to a service's local target.
     pub connect_timeout_secs: Option<u64>,
+    /// Opt in: seconds without a byte in either direction before a served `tcp:`, `http:` or
+    /// `tls:` stream is reset (10 to 86400). Absent is off, as before. Egress has its own
+    /// `idle_secs` in `[egress]`.
+    pub idle_secs: Option<u64>,
 }
 
 impl ServeSettings {
+    /// The idle timeout asked for, if any (same bounds as `[egress] idle_secs`).
+    fn idle(&self) -> Result<Option<Duration>> {
+        let Some(seconds) = self.idle_secs else {
+            return Ok(None);
+        };
+        let (least, most) = (MIN_EGRESS_IDLE.as_secs(), MAX_EGRESS_IDLE.as_secs());
+        if seconds < least || seconds > most {
+            bail!(
+                "idle_secs in [serve] of config.toml is {seconds}: it must be from {least} to {most} (leave the key out for no idle timeout)"
+            );
+        }
+        Ok(Some(Duration::from_secs(seconds)))
+    }
+
     /// The limits these settings ask for, on top of the defaults.
     fn limits(&self) -> Result<ServeLimits> {
         let in_range = |key: &str, value: usize| {
@@ -505,6 +525,7 @@ impl Config {
         }
         services = services.with_limits(self.serve.limits()?);
         services = services.with_egress_limits(self.egress.checked()?.limits);
+        services = services.with_idle_timeout(self.serve.idle()?);
         if let Some(timeout) = self.serve.connect_timeout()? {
             services = services.with_connect_timeout(timeout);
         }
@@ -925,6 +946,9 @@ mod tests {
                 "max_connections_per_peer",
             ),
             ("[serve]\nconnect_timeout_secs = 0", "connect_timeout_secs"),
+            ("[serve]\nidle_secs = 0", "idle_secs"),
+            ("[serve]\nidle_secs = 9", "from 10 to 86400"),
+            ("[serve]\nidle_secs = 86401", "from 10 to 86400"),
             (
                 &format!("[serve]\nconnect_timeout_secs = {too_long}"),
                 "from 1 to",
@@ -946,6 +970,30 @@ mod tests {
             let error = Config::parse(text).unwrap_err().to_string();
             assert!(error.contains(wanted), "{text:?}: {error}");
         }
+    }
+
+    #[test]
+    fn the_serve_idle_timeout_is_off_unless_set_and_is_not_the_egress_one() {
+        let services = |text: &str| Config::parse(text).unwrap().local_services().unwrap();
+        assert_eq!(services("").idle_timeout(), None);
+        assert_eq!(
+            services("[serve]\nmax_connections = 5\n").idle_timeout(),
+            None
+        );
+        assert_eq!(
+            services("[serve]\nidle_secs = 10\n").idle_timeout(),
+            Some(Duration::from_secs(10))
+        );
+        assert_eq!(
+            services("[serve]\nidle_secs = 86400\n").idle_timeout(),
+            Some(Duration::from_secs(86_400))
+        );
+        // `[egress] idle_secs` leaves it off, and `[serve] idle_secs` leaves egress alone.
+        assert_eq!(services("[egress]\nidle_secs = 20\n").idle_timeout(), None);
+        assert_eq!(
+            services("[serve]\nidle_secs = 20\n").egress_limits().idle,
+            menzil_node::DEFAULT_EGRESS_IDLE
+        );
     }
 
     const SERVICES: &str = r#"

@@ -51,7 +51,12 @@
 //!   time, and a lookup the OPEN timeout gave up on keeps its place until it returns. The
 //!   log lines a peer can repeat as fast as it can send OPENs are throttled to one per
 //!   interval with a count of the ones left out.
-//! * **Not bounded here.** A pipe has no idle timeout and a service no limit of its own (the
+//! * **Idle timeout, opt in** ([`LocalServices::with_idle_timeout`]). Off by default: a pipe of
+//!   a `tcp:`, `http:` or `tls:` service then has no idle timeout. When set, a pipe with no
+//!   byte in either direction for that long is reset (an RST to the target, a reset to the
+//!   peer) and one `info` line says so; a byte in either direction, half close included, is
+//!   activity. Egress streams have their own, always on, timeout ([`EgressLimits`]).
+//! * **Not bounded here.** A service has no limit of its own (the
 //!   TODO.md line); the streams a session may hold are bounded by `menzil-stream`'s live
 //!   stream limit and the OPEN admission control of [`crate::accept_loop`]. A target that
 //!   stalls forever holds its stream and its slot until the peer ends it.
@@ -245,6 +250,8 @@ pub struct LocalServices {
     egress_slots: Arc<Slots>,
     egress_limits: EgressLimits,
     egress_full_log: Arc<LogThrottle>,
+    /// The opt in idle timeout of the pipes of `tcp:`, `http:` and `tls:` services; none is off.
+    idle_timeout: Option<Duration>,
 }
 
 /// The egress limits as the [`ServeLimits`] a [`Slots`] pool is built from.
@@ -318,6 +325,7 @@ impl LocalServices {
             egress_slots: Slots::new(&egress_pool(&EgressLimits::default())),
             egress_limits: EgressLimits::default(),
             egress_full_log: Arc::new(LogThrottle::new(LOG_INTERVAL)),
+            idle_timeout: None,
         }
     }
 
@@ -414,6 +422,20 @@ impl LocalServices {
         self.egress_slots = Slots::new(&egress_pool(&limits));
         self.egress_limits = limits;
         self
+    }
+
+    /// Turns on the idle timeout of the pipes of `tcp:`, `http:` and `tls:` services (off by
+    /// default): a pipe with no byte in either direction for `idle` is reset. Kept between
+    /// [`MIN_EGRESS_IDLE`] and [`MAX_EGRESS_IDLE`]; `None` turns it off. Does not touch egress
+    /// streams, which have [`EgressLimits::idle`].
+    pub fn with_idle_timeout(mut self, idle: Option<Duration>) -> Self {
+        self.idle_timeout = idle.map(|idle| idle.clamp(MIN_EGRESS_IDLE, MAX_EGRESS_IDLE));
+        self
+    }
+
+    /// The idle timeout of served pipes of local services, if turned on.
+    pub fn idle_timeout(&self) -> Option<Duration> {
+        self.idle_timeout
     }
 
     /// The egress limits in force.
@@ -687,7 +709,12 @@ impl LocalServices {
         prefix: Vec<u8>,
     ) -> Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
         let connect_timeout = self.connect_timeout;
-        let idle = self.egress_limits.idle;
+        // Egress pipes always have a timeout; a local service's has one only when configured.
+        let idle = if opened.live.is_some() {
+            Some(self.egress_limits.idle)
+        } else {
+            self.idle_timeout
+        };
         // A future dropped before it ran drops `stream` and `opened`, which reset themselves.
         Box::pin(async move {
             let mut pipe = Pipe::new(stream, opened);
@@ -973,6 +1000,9 @@ struct Pipe {
     local: Option<TcpStream>,
     _slot: Option<Slot>,
     egress: Option<EgressClose>,
+    /// Activity of a pipe of a local service with an idle timeout; none otherwise (egress pipes
+    /// keep theirs in `egress`).
+    idle_activity: Option<Arc<Activity>>,
 }
 
 impl Pipe {
@@ -982,6 +1012,7 @@ impl Pipe {
             remote: Some(TokioStream(stream)),
             local: Some(socket),
             _slot: slot,
+            idle_activity: None,
             egress: live.map(|live| EgressClose {
                 live,
                 started: Clock::now(),
@@ -999,7 +1030,7 @@ impl Pipe {
         service: &ServiceId,
         prefix: &[u8],
         limit: Duration,
-        idle: Duration,
+        idle: Option<Duration>,
     ) {
         if !prefix.is_empty() {
             let Some(local) = self.local.as_mut() else {
@@ -1020,7 +1051,10 @@ impl Pipe {
         self.run(service, idle).await;
     }
 
-    async fn run(&mut self, service: &ServiceId, idle: Duration) {
+    async fn run(&mut self, service: &ServiceId, idle: Option<Duration>) {
+        if self.egress.is_none() && idle.is_some() {
+            self.idle_activity = Some(Activity::new());
+        }
         let (Some(remote), Some(local)) = (self.remote.as_mut(), self.local.as_mut()) else {
             return;
         };
@@ -1034,13 +1068,24 @@ impl Pipe {
         let watch = |egress: &EgressClose, read: &Arc<AtomicU64>| {
             Some((egress.activity.clone(), read.clone()))
         };
+        // A local service's pipe with an idle timeout only notes activity; nothing is counted.
+        let plain =
+            |activity: &Arc<Activity>| Some((activity.clone(), Arc::new(AtomicU64::new(0))));
         let mut remote = Counted {
             inner: remote,
-            watch: self.egress.as_ref().and_then(|e| watch(e, &e.up)),
+            watch: match (&self.egress, &self.idle_activity) {
+                (Some(e), _) => watch(e, &e.up),
+                (None, Some(activity)) => plain(activity),
+                (None, None) => None,
+            },
         };
         let mut local = Counted {
             inner: local,
-            watch: self.egress.as_ref().and_then(|e| watch(e, &e.down)),
+            watch: match (&self.egress, &self.idle_activity) {
+                (Some(e), _) => watch(e, &e.down),
+                (None, Some(activity)) => plain(activity),
+                (None, None) => None,
+            },
         };
         let poke = Arc::new(Notify::new());
         let attached = match &self.egress {
@@ -1048,9 +1093,10 @@ impl Pipe {
             None => false,
         };
         let idle_watch = async {
-            match &self.egress {
-                Some(egress) => egress.activity.idle_for(idle).await,
-                None => std::future::pending().await,
+            match (&self.egress, &self.idle_activity, idle) {
+                (Some(egress), _, Some(idle)) => egress.activity.idle_for(idle).await,
+                (None, Some(activity), Some(idle)) => activity.idle_for(idle).await,
+                _ => std::future::pending().await,
             }
         };
         // Attached first, vetted second: a recheck that ran before the attach changed the rule
@@ -1085,6 +1131,13 @@ impl Pipe {
                 format!("no longer allowed: {why}"),
             )),
         };
+        if self.egress.is_none()
+            && let Err(error) = &outcome
+            && error.kind() == io::ErrorKind::TimedOut
+            && error.to_string().starts_with("idle:")
+        {
+            tracing::info!(%service, "served stream reset: idle, no byte in either direction");
+        }
         if let Some(egress) = self.egress.as_mut() {
             egress.outcome = match &outcome {
                 Ok(_) => "clean".to_owned(),
@@ -1818,10 +1871,7 @@ mod tests {
         let _ = &mut client_inbound;
 
         let mut pipe = Pipe::new(remote, opened_target(local));
-        let task = tokio::spawn(async move {
-            pipe.run(&"tcp:app".parse().unwrap(), DEFAULT_EGRESS_IDLE)
-                .await
-        });
+        let task = tokio::spawn(async move { pipe.run(&"tcp:app".parse().unwrap(), None).await });
         let mut one = [0u8; 1];
         accepted.read_exact(&mut one).await.unwrap();
         // The node shuts down: the task is aborted mid-pipe.
@@ -2558,6 +2608,153 @@ mod tests {
 
     /// `egress:*` through [`LocalServices::with_egress`] (protocol.md 8, the dial itself is
     /// `crate::egress`'s): what reaches the executor, the slots and the pipe.
+    mod local_idle {
+        use super::*;
+
+        async fn spin<T>(fut: impl std::future::Future<Output = T>) -> T {
+            use futures_util::FutureExt as _;
+            tokio::pin!(fut);
+            for _ in 0..3000 {
+                if let Some(out) = fut.as_mut().now_or_never() {
+                    return out;
+                }
+                tokio::task::yield_now().await;
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            panic!("nothing happened");
+        }
+
+        async fn settle() {
+            for _ in 0..10 {
+                tokio::task::yield_now().await;
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+
+        struct Live {
+            client: Stream,
+            target: TcpStream,
+            task: JoinHandle<()>,
+        }
+
+        /// One served `tcp:app` stream with the given idle timeout, the first byte through.
+        async fn live(idle: Option<u64>) -> Live {
+            let listener = listener().await;
+            let services = services_for(&listener).with_idle_timeout(idle.map(Duration::from_secs));
+            let request = request("tcp:app", 7);
+            let opened = services.open(&request).await.unwrap();
+            let (mut target, _) = listener.accept().await.unwrap();
+            let (client, server) = stream_pair().await;
+            let task = tokio::spawn(services.handle(server, request, opened));
+            let mut first = [0u8; 1];
+            timeout(WAIT, target.read_exact(&mut first))
+                .await
+                .unwrap()
+                .unwrap();
+            Live {
+                client,
+                target,
+                task,
+            }
+        }
+
+        #[tokio::test]
+        async fn a_silent_local_pipe_is_reset_after_the_idle_time_and_not_before() {
+            let Live {
+                mut client,
+                mut target,
+                task,
+            } = live(Some(10)).await;
+            tokio::time::pause();
+            tokio::time::advance(Duration::from_secs(4)).await;
+            settle().await;
+            assert!(!task.is_finished(), "reset before the idle time");
+            tokio::time::advance(Duration::from_secs(7)).await;
+            settle().await;
+            assert!(task.is_finished(), "a silent pipe outlived the idle time");
+            let mut byte = [0u8; 1];
+            let error = spin(target.read(&mut byte))
+                .await
+                .expect_err("the target must see a reset, not a clean end");
+            assert!(is_reset(&error), "the target saw {error:?}");
+            let mut buf = [0u8; 1];
+            spin(client.read(&mut buf))
+                .await
+                .expect_err("the peer must see a reset, not a clean end");
+        }
+
+        async fn bytes_one_way_keep_it_alive(upstream: bool) {
+            let Live {
+                mut client,
+                mut target,
+                task,
+            } = live(Some(10)).await;
+            tokio::time::pause();
+            for round in 0..5 {
+                tokio::time::advance(Duration::from_secs(5)).await;
+                let mut byte = [0u8; 1];
+                if upstream {
+                    spin(async {
+                        client.write_all(b"u").await.unwrap();
+                        client.flush().await.unwrap();
+                    })
+                    .await;
+                    spin(target.read_exact(&mut byte)).await.unwrap();
+                } else {
+                    target.write_all(b"d").await.unwrap();
+                    spin(client.read_exact(&mut byte)).await.unwrap();
+                }
+                settle().await;
+                assert!(!task.is_finished(), "reset in round {round} despite bytes");
+            }
+            tokio::time::advance(Duration::from_secs(11)).await;
+            settle().await;
+            assert!(task.is_finished(), "silence after the bytes did not end it");
+        }
+
+        #[tokio::test]
+        async fn bytes_from_the_peer_keep_a_local_pipe_alive() {
+            bytes_one_way_keep_it_alive(true).await;
+        }
+
+        #[tokio::test]
+        async fn bytes_from_the_target_keep_a_local_pipe_alive() {
+            bytes_one_way_keep_it_alive(false).await;
+        }
+
+        #[tokio::test]
+        async fn without_the_setting_a_silent_local_pipe_is_never_reset() {
+            let live = live(None).await;
+            tokio::time::pause();
+            tokio::time::advance(Duration::from_secs(100_000)).await;
+            settle().await;
+            assert!(
+                !live.task.is_finished(),
+                "a pipe was reset with no idle timeout set"
+            );
+        }
+
+        #[test]
+        fn the_local_idle_timeout_is_off_by_default_and_kept_between_ten_seconds_and_a_day() {
+            let idle = |secs: u64| {
+                LocalServices::new()
+                    .with_idle_timeout(Some(Duration::from_secs(secs)))
+                    .idle_timeout()
+            };
+            assert_eq!(LocalServices::new().idle_timeout(), None);
+            assert_eq!(idle(0), Some(MIN_EGRESS_IDLE));
+            assert_eq!(idle(10), Some(Duration::from_secs(10)));
+            assert_eq!(idle(u64::MAX), Some(MAX_EGRESS_IDLE));
+            assert_eq!(
+                LocalServices::new()
+                    .with_idle_timeout(Some(MIN_EGRESS_IDLE))
+                    .with_idle_timeout(None)
+                    .idle_timeout(),
+                None
+            );
+        }
+    }
+
     mod egress {
         use menzil_proto::{EgressRule, HostPortPattern, OpenTarget};
         use tokio::sync::Notify;
