@@ -23,12 +23,13 @@ use menzil_node::acme::{
     AcmeError, AcmeHandler, AcmeSetup, AcmeStatus, AcmeTransport, CertState, CertStore,
     ChallengeBook, HttpsTransport, Timing, candidate_jobs, spawn_renewals,
 };
+use menzil_node::egress::{EgressExecutor, PolicyEgressRules};
 use menzil_node::{
     Adopted, AdoptedDocs, DocStore, EnsureError, LocalIdentity, LocalServices, Node, NodeConfig,
     NodeError, NodeOpenError, OpenStreamError, PolicyStore, RelayError, RosterStore, SessionConfig,
 };
 use menzil_proto::trust::{DOC_MAX_LIFETIME, Reason};
-use menzil_proto::{ErrorCode, NetworkId, NodeId, ServiceId, ServiceKind, Share};
+use menzil_proto::{ErrorCode, NetworkId, NodeId, OpenTarget, ServiceId, ServiceKind, Share};
 use menzil_stream::Stream;
 use tokio::net::{UnixListener, UnixStream};
 use tokio::task::JoinHandle;
@@ -765,24 +766,54 @@ fn explain_with(error: &NodeOpenError, rejected: Option<&agent::Rejected>, now: 
     }
 }
 
-impl Opener for NodeOpener {
-    async fn open(&self, target: &str) -> Result<Stream, String> {
-        let (who, service) = split_target(target)?;
-        let (network_id, peer) = {
-            let directory = self
-                .directory
-                .read()
-                .map_err(|_| "the directory is unavailable".to_string())?;
-            let entry = directory.resolve(who)?;
-            (entry.network_id, entry.node_id)
-        };
+impl NodeOpener {
+    /// The member `who` names, as `open` and `connect` both read it: one resolution, so that
+    /// neither can trust a name the other would not.
+    fn resolve_peer(&self, who: &str) -> Result<(NetworkId, NodeId), String> {
+        let directory = self
+            .directory
+            .read()
+            .map_err(|_| "the directory is unavailable".to_string())?;
+        let entry = directory.resolve(who)?;
+        Ok((entry.network_id, entry.node_id))
+    }
+
+    /// Opens `service` on `peer`, with the destination only an `egress:*` stream carries.
+    async fn open_on(
+        &self,
+        network_id: NetworkId,
+        peer: NodeId,
+        service: ServiceId,
+        target: Option<OpenTarget>,
+    ) -> Result<Stream, String> {
         self.node
-            .open_stream(peer, network_id, service, None)
+            .open_stream(peer, network_id, service, target)
             .await
             .map_err(|error| {
                 let rejected = self.node.last_relay_error().map(rejected_of);
                 explain_with(&error, rejected.as_ref(), unix_now())
             })
+    }
+}
+
+impl Opener for NodeOpener {
+    async fn open(&self, target: &str) -> Result<Stream, String> {
+        let (who, service) = split_target(target)?;
+        let (network_id, peer) = self.resolve_peer(who)?;
+        self.open_on(network_id, peer, service, None).await
+    }
+
+    /// The exit `who` is asked for `egress:*` with the destination as a name (protocol.md 8):
+    /// nothing is resolved here, and what the exit refuses comes back by its code name
+    /// ([`explain_with`]).
+    async fn open_egress(&self, who: &str, host: &str, port: u16) -> Result<Stream, String> {
+        let (network_id, peer) = self.resolve_peer(who)?;
+        let service = ServiceId::new(ServiceKind::Egress, "*");
+        let target = OpenTarget {
+            host: host.to_string(),
+            port,
+        };
+        self.open_on(network_id, peer, service, Some(target)).await
     }
 
     async fn status(&self) -> agent::RelayStatus {
@@ -960,7 +991,19 @@ where
         caps: vec![],
         e2e_protos: vec![0x01],
     };
+    // `[egress] enabled = true` makes this node an exit (protocol.md 8): the executor reads this
+    // node's own EgressRule from the same Policies the node adopts into. Without it nothing is
+    // installed and an egress OPEN is answered `unknown_service`.
+    // (`load_identity` checked that the certificate is the keys' own, so this is the node id.)
+    let own_node_id = keys.node_id();
     let services = config.local_services()?;
+    let services = match config.egress_enabled() {
+        true => services.with_egress(EgressExecutor::new(
+            true,
+            Arc::new(PolicyEgressRules::new(policies.clone(), own_node_id)),
+        )),
+        false => services,
+    };
     // The node serves from a clone; `expose` and the reload change the table through this one.
     let services_handle = services.clone();
     // Checked before anything starts: a bad `[[share]]` stops the node with its reason, as a bad

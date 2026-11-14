@@ -15,6 +15,25 @@
 //!                   kind 2 reset: the sender aborts, payload is a reason
 //! ```
 //!
+//! A second way to open a stream asks for the egress exit of another member (`menzil proxy`, see
+//! [`crate::proxy`]; protocol.md 8). The stream is the same, the reply is the same and so are the
+//! frames; only the request differs, and it names a destination for the exit to dial:
+//!
+//! ```text
+//! client -> agent   connect <who> <host> <port>\n   (one line, at most 512 bytes, the fields
+//!                                                    separated by one space each)
+//! agent  -> client  ok\n   or   error <message>\n
+//! ```
+//!
+//! `<who>` is a member as `open` takes it, `<host>` an address literal or a name (never resolved
+//! here: the exit resolves it) and `<port>` 1 to 65535. The agent checks all three before it
+//! asks the node ([`parse_connect_request`], [`validate_target`]): nothing the exit's own check
+//! ([`menzil_node::egress`]) decides is decided here, but a destination that cannot be one is
+//! not sent. An `error` line that comes from the exit carries the exit's refusal code by name
+//! (`forbidden`, `invalid_target`, `target_unreachable`, `no_grant`, `unknown_service`,
+//! `rate_limited`) right after `refused by the other end: `, which is how `menzil proxy` picks
+//! its SOCKS reply code.
+//!
 //! The other request asks how the node stands with its relay (`menzil status` uses it) and gets
 //! text lines, not frames:
 //!
@@ -135,6 +154,20 @@ const MAX_CONNECTIONS: usize = 256;
 pub trait Opener: Send + Sync + 'static {
     /// Opens a stream to `target`, which is `<who>/<service>` as the user typed it.
     fn open(&self, target: &str) -> impl Future<Output = Result<Stream, String>> + Send;
+
+    /// Opens a stream to the egress exit `who` for the destination `host`:`port`, for the
+    /// `connect` request. `host` and `port` have passed [`validate_target`]; the exit decides
+    /// what it dials. The default says egress is not available, so that an opener that knows
+    /// nothing of it need not.
+    fn open_egress(
+        &self,
+        who: &str,
+        host: &str,
+        port: u16,
+    ) -> impl Future<Output = Result<Stream, String>> + Send {
+        let _ = (who, host, port);
+        async { Err("egress is not available".to_string()) }
+    }
 
     /// How the node stands with its relay, for the `status` request. An opener that knows
     /// nothing says nothing.
@@ -480,6 +513,73 @@ pub fn parse_request(line: &str) -> Result<&str, String> {
     Ok(target)
 }
 
+/// The longest host a `connect` request carries: a DNS name is at most 253 bytes (protocol.md 8).
+pub const MAX_HOST_BYTES: usize = 253;
+
+/// A `connect` request that is allowed, borrowed from its line.
+#[derive(Debug, PartialEq, Eq)]
+pub struct ConnectRequest<'a> {
+    /// The exit, as `open` takes a member.
+    pub who: &'a str,
+    /// The destination, an address literal or a name, as the client wrote it.
+    pub host: &'a str,
+    /// The destination port, 1 to 65535.
+    pub port: u16,
+}
+
+/// Why a destination cannot be one, in words for the person; `None` when nothing is wrong with
+/// it. This is the whole of the local check and it does not canonicalize: the exit's
+/// `Target::canonicalize` decides what is a valid name or address. What is refused here could
+/// not be sent safely at all: nothing, more bytes than a name has, whitespace or a control
+/// character (the request is one line), a port that is not 1 to 65535.
+pub fn validate_target(host: &str, port: u16) -> Result<(), String> {
+    if host.is_empty() {
+        return Err("the destination host is empty".to_string());
+    }
+    if host.len() > MAX_HOST_BYTES {
+        return Err(format!(
+            "the destination host is longer than {MAX_HOST_BYTES} bytes"
+        ));
+    }
+    if host.chars().any(|c| c.is_control() || c.is_whitespace()) {
+        return Err("the destination host holds whitespace or a control character".to_string());
+    }
+    if port == 0 {
+        return Err("the destination port must be 1 to 65535".to_string());
+    }
+    Ok(())
+}
+
+/// A `connect` request line that is allowed: `connect <who> <host> <port>`, three fields of one
+/// space each, a printable `who` of at most 256 bytes, a destination that passes
+/// [`validate_target`] and a port written as plain decimal digits (no sign, no leading zero).
+pub fn parse_connect_request(line: &str) -> Result<ConnectRequest<'_>, String> {
+    const USAGE: &str = "the request must be `connect <who> <host> <port>`";
+    let line = line.strip_suffix('\n').unwrap_or(line);
+    let line = line.strip_suffix('\r').unwrap_or(line);
+    let rest = line
+        .strip_prefix("connect ")
+        .ok_or_else(|| USAGE.to_string())?;
+    let fields: Vec<&str> = rest.split(' ').collect();
+    let [who, host, port] = fields.as_slice() else {
+        return Err(USAGE.to_string());
+    };
+    if who.is_empty() || who.len() > 256 || who.chars().any(|c| c.is_control() || c.is_whitespace())
+    {
+        return Err("the exit must be 1 to 256 printable characters without spaces".to_string());
+    }
+    let digits = !port.is_empty()
+        && port.len() <= 5
+        && port.bytes().all(|b| b.is_ascii_digit())
+        && !port.starts_with('0');
+    let port: u16 = digits
+        .then(|| port.parse().ok())
+        .flatten()
+        .ok_or_else(|| "the destination port must be 1 to 65535".to_string())?;
+    validate_target(host, port)?;
+    Ok(ConnectRequest { who, host, port })
+}
+
 /// Single line, printable, short: a status value, and what a client shows of a reset's reason
 /// (see [`text::one_line`]).
 fn one_line(message: &str) -> String {
@@ -719,6 +819,24 @@ async fn handle<O: Opener>(connection: UnixStream, opener: &O) -> Result<()> {
         write.write_all(reply.as_bytes()).await?;
         return Ok(());
     }
+    if request == "connect" || request.starts_with("connect ") {
+        let opened = match parse_connect_request(request) {
+            Ok(connect) => {
+                timeout(
+                    OPEN_TIMEOUT,
+                    opener.open_egress(connect.who, connect.host, connect.port),
+                )
+                .await
+            }
+            Err(message) => {
+                write
+                    .write_all(format!("error {}\n", error_line(&message)).as_bytes())
+                    .await?;
+                return Ok(());
+            }
+        };
+        return answer_open(opened, read, write).await;
+    }
     let target = match parse_request(&line) {
         Ok(target) => target,
         Err(message) => {
@@ -728,7 +846,17 @@ async fn handle<O: Opener>(connection: UnixStream, opener: &O) -> Result<()> {
             return Ok(());
         }
     };
-    let opened = match timeout(OPEN_TIMEOUT, opener.open(target)).await {
+    let opened = timeout(OPEN_TIMEOUT, opener.open(target)).await;
+    answer_open(opened, read, write).await
+}
+
+/// What a stream that was asked for came to: an error line, or `ok` and the bridge.
+async fn answer_open(
+    opened: Result<Result<Stream, String>, tokio::time::error::Elapsed>,
+    read: BufReader<tokio::net::unix::OwnedReadHalf>,
+    mut write: tokio::net::unix::OwnedWriteHalf,
+) -> Result<()> {
+    let opened = match opened {
         Ok(Ok(stream)) => stream,
         Ok(Err(message)) => {
             write
@@ -855,6 +983,58 @@ where
     R: AsyncRead + Unpin + Send,
     W: AsyncWrite + Unpin + Send,
 {
+    request_as(socket, &request_line(target), uid)
+        .await?
+        .bridge(input, output)
+        .await
+}
+
+/// An agent connection that has said `ok` to a request: frames follow ([`Self::bridge`]). Until
+/// [`Self::bridge`] is called nothing is read from the program and nothing is sent to the agent
+/// besides the request, so a caller can answer its own client between the two (`menzil proxy`
+/// sends its success reply only now). Dropping it closes the connection and the agent resets the
+/// stream.
+pub struct Opened {
+    read: BufReader<tokio::net::unix::OwnedReadHalf>,
+    write: tokio::net::unix::OwnedWriteHalf,
+}
+
+/// The client side of `connect`: asks the agent at `socket` to open a stream to the destination
+/// `host`:`port` through the exit `who`, and returns once the agent has said `ok` (the stream is
+/// open and the exit has dialled) or failed with its words (the exit's refusal code by name among
+/// them, see the module documentation). `host` and `port` are checked by [`validate_target`]
+/// before anything is sent, and nothing is resolved here.
+///
+/// The wait for the agent is bounded: the agent gives up on the open after 60 seconds and says
+/// so, and this call gives up on the agent after 70.
+pub async fn open_connect(socket: &Path, who: &str, host: &str, port: u16) -> Result<Opened> {
+    let uid = current_uid()
+        .await
+        .context("finding out which user this is")?;
+    open_connect_as(socket, who, host, port, uid).await
+}
+
+/// [`open_connect`] for a client that expects the agent to run as `uid`.
+async fn open_connect_as(
+    socket: &Path,
+    who: &str,
+    host: &str,
+    port: u16,
+    uid: u32,
+) -> Result<Opened> {
+    validate_target(host, port).map_err(anyhow::Error::msg)?;
+    let line = format!("connect {who} {host} {port}\n");
+    // The agent's own parse is the authority; this is the same check, so that what it would
+    // refuse is not sent (and a request over the line limit is said in words).
+    if line.len() > MAX_REQUEST_BYTES {
+        bail!("the request is longer than the agent takes ({MAX_REQUEST_BYTES} bytes)");
+    }
+    parse_connect_request(&line).map_err(anyhow::Error::msg)?;
+    request_as(socket, &line, uid).await
+}
+
+/// Connects to the agent, checks who runs it, sends `line` and reads the answer.
+async fn request_as(socket: &Path, line: &str, uid: u32) -> Result<Opened> {
     crate::node_cmd::check_socket_path_length(socket)?;
     let connection = UnixStream::connect(socket).await.with_context(|| {
         format!(
@@ -874,7 +1054,7 @@ where
     }
     let (read, mut write) = connection.into_split();
     let mut read = BufReader::new(read);
-    write.write_all(request_line(target).as_bytes()).await?;
+    write.write_all(line.as_bytes()).await?;
     let reply = timeout(
         OPEN_TIMEOUT + Duration::from_secs(10),
         read_line(&mut read, MAX_REPLY_BYTES),
@@ -889,54 +1069,70 @@ where
             None => bail!("the agent answered something this client does not understand"),
         },
     }
+    Ok(Opened { read, write })
+}
 
-    // Both directions run as futures of this call, each from where it is: neither is ever
-    // dropped half way through a frame, which would leave the other end out of step.
-    let up = async {
-        let mut buffer = vec![0u8; COPY_BUFFER];
-        loop {
-            match input.read(&mut buffer).await {
-                Ok(0) => {
-                    return match write_frame(&mut write, FRAME_END, &[]).await {
-                        Ok(()) => Up::Finished,
-                        Err(_) => Up::AgentGone,
-                    };
-                }
-                Ok(n) => {
-                    if write_frame(&mut write, FRAME_DATA, &buffer[..n])
-                        .await
-                        .is_err()
-                    {
-                        return Up::AgentGone;
+impl Opened {
+    /// Carries `input` to the stream and its bytes to `output`, both directions to their end;
+    /// see [`connect_and_bridge`].
+    pub async fn bridge<R, W>(self, input: &mut R, output: &mut W) -> Result<End>
+    where
+        R: AsyncRead + Unpin + Send,
+        W: AsyncWrite + Unpin + Send,
+    {
+        let Self {
+            mut read,
+            mut write,
+        } = self;
+
+        // Both directions run as futures of this call, each from where it is: neither is ever
+        // dropped half way through a frame, which would leave the other end out of step.
+        let up = async {
+            let mut buffer = vec![0u8; COPY_BUFFER];
+            loop {
+                match input.read(&mut buffer).await {
+                    Ok(0) => {
+                        return match write_frame(&mut write, FRAME_END, &[]).await {
+                            Ok(()) => Up::Finished,
+                            Err(_) => Up::AgentGone,
+                        };
+                    }
+                    Ok(n) => {
+                        if write_frame(&mut write, FRAME_DATA, &buffer[..n])
+                            .await
+                            .is_err()
+                        {
+                            return Up::AgentGone;
+                        }
+                    }
+                    Err(error) => {
+                        let message = one_line(&error.to_string());
+                        let _ = write_frame(&mut write, FRAME_RESET, message.as_bytes()).await;
+                        return Up::InputFailed(message);
                     }
                 }
-                Err(error) => {
-                    let message = one_line(&error.to_string());
-                    let _ = write_frame(&mut write, FRAME_RESET, message.as_bytes()).await;
-                    return Up::InputFailed(message);
-                }
             }
-        }
-    };
-    let down = read_frames(&mut read, output);
-    tokio::pin!(up, down);
-    let (mut up_done, mut down_done) = (false, false);
-    loop {
-        tokio::select! {
-            outcome = &mut up, if !up_done => match outcome {
-                Up::Finished => up_done = true,
-                Up::AgentGone => return Ok(End::Reset("the agent went away".to_string())),
-                Up::InputFailed(why) => {
-                    return Ok(End::Reset(format!("reading the input failed: {why}")));
-                }
-            },
-            end = &mut down, if !down_done => match end? {
-                End::Clean => down_done = true,
-                reset => return Ok(reset),
-            },
-        }
-        if up_done && down_done {
-            return Ok(End::Clean);
+        };
+        let down = read_frames(&mut read, output);
+        tokio::pin!(up, down);
+        let (mut up_done, mut down_done) = (false, false);
+        loop {
+            tokio::select! {
+                outcome = &mut up, if !up_done => match outcome {
+                    Up::Finished => up_done = true,
+                    Up::AgentGone => return Ok(End::Reset("the agent went away".to_string())),
+                    Up::InputFailed(why) => {
+                        return Ok(End::Reset(format!("reading the input failed: {why}")));
+                    }
+                },
+                end = &mut down, if !down_done => match end? {
+                    End::Clean => down_done = true,
+                    reset => return Ok(reset),
+                },
+            }
+            if up_done && down_done {
+                return Ok(End::Clean);
+            }
         }
     }
 }

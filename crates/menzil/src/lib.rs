@@ -9,6 +9,8 @@
 //!   `join`, `renew`, `cert` and `status`. Every one takes the clock as a parameter.
 //! * [`expose`]: `menzil expose`, a local port under a public name: the edit of `config.toml`,
 //!   how a running node picks it up, and the text printed about it.
+//! * [`proxy`]: `menzil proxy`, a local SOCKS5 proxy (CONNECT only, loopback only) whose connections
+//!   leave through another member's egress exit by way of the agent's `connect` request.
 //! * [`cert_renew`] and [`cert_node`]: certificate rotation. The first is the pure rules (when a
 //!   node renews, when a network is warned about, which pushed renewals a steward lists); the
 //!   second renews a running node's certificate and reports it through the agent socket.
@@ -24,6 +26,7 @@ pub mod home;
 pub mod local;
 pub mod node_cmd;
 pub mod persist;
+pub mod proxy;
 pub mod reach;
 pub mod relay_cmd;
 pub mod signals;

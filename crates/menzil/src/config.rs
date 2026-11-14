@@ -18,6 +18,12 @@
 //! max_connections_per_peer = 64   # served at once for one peer, at most 1000000
 //! connect_timeout_secs = 5        # giving up on a service's local target, at most 9
 //!
+//! # Optional: make this node an egress exit (protocol.md 8). Off by default; the Policy must also
+//! # give it an `egress` entry and a member an `egress:*` grant. Read at start: a change needs a
+//! # restart.
+//! # [egress]
+//! # enabled = true
+//!
 //! # Optional: the relay's share domain H (public names are `<name>.H`, or `<name>.<tenant>.H`).
 //! # Only `menzil expose` and `menzil status` use it, to print `https://<name>.H`; the relay
 //! # operator tells it to you (relay run --share-domain).
@@ -83,9 +89,34 @@ pub struct Config {
     /// What this node holds for its peers at most: `[serve]`.
     #[serde(default)]
     pub serve: ServeSettings,
+    /// Whether this node is an egress exit: `[egress]` (protocol.md 8). Off without it.
+    #[serde(default)]
+    pub egress: EgressSettings,
     /// Public names to advertise to the relay: `[[share]]`.
     #[serde(default)]
     pub share: Vec<ShareSettings>,
+}
+
+/// The `[egress]` table (protocol.md 8, 11): whether this node dials destinations for members
+/// that hold an `egress:*` grant and that an `egress` entry of the Policy lets it serve.
+///
+/// ```toml
+/// [egress]
+/// enabled = true
+/// ```
+///
+/// `enabled` is the node's own consent and it is off by default: with the table absent, or
+/// `enabled = false`, an egress OPEN is answered `unknown_service` (after the grant check), no
+/// matter what the Policy says. It is the only key (no limits yet); an unknown key is an error
+/// that stops `menzil node` at start, like everywhere in this file. The table is read at start
+/// only: a change needs a restart of `menzil node` (the periodic reload applies `[[share]]`
+/// entries, not this).
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct EgressSettings {
+    /// Whether this node serves as an egress exit. Default false.
+    #[serde(default)]
+    pub enabled: bool,
 }
 
 /// The `[acme]` table as written; [`Config::acme`] checks it. There is no default CA.
@@ -234,6 +265,7 @@ impl std::fmt::Debug for Config {
             .field("share_domain", &self.share_domain)
             .field("acme", &self.acme)
             .field("serve", &self.serve)
+            .field("egress", &self.egress)
             .field("share", &self.share)
             .finish()
     }
@@ -362,6 +394,11 @@ impl Config {
             out.push((id, target));
         }
         Ok(out)
+    }
+
+    /// Whether `[egress] enabled = true` is set: this node is an egress exit ([`EgressSettings`]).
+    pub fn egress_enabled(&self) -> bool {
+        self.egress.enabled
     }
 
     /// The services to serve, validated.
@@ -506,6 +543,48 @@ mod tests {
         assert_eq!((ssh.host(), ssh.port()), ("127.0.0.1", 22));
         let myapp = services.target(&"http:myapp".parse().unwrap()).unwrap();
         assert_eq!((myapp.host(), myapp.port()), ("::1", 8080));
+    }
+
+    #[test]
+    fn egress_is_off_unless_the_table_turns_it_on() {
+        // Absent, empty, and `enabled = false` are all off.
+        assert!(!Config::parse("").unwrap().egress_enabled());
+        assert!(!Config::parse("[egress]").unwrap().egress_enabled());
+        assert!(
+            !Config::parse("[egress]\nenabled = false")
+                .unwrap()
+                .egress_enabled()
+        );
+        assert!(Config::default().egress == EgressSettings { enabled: false });
+        let on = Config::parse("[egress]\nenabled = true").unwrap();
+        assert!(on.egress_enabled());
+        assert_eq!(on.egress, EgressSettings { enabled: true });
+        // It sits next to the other tables without disturbing them.
+        let both =
+            Config::parse("[services]\n\"tcp:ssh\" = \"127.0.0.1:22\"\n[egress]\nenabled = true")
+                .unwrap();
+        assert!(both.egress_enabled());
+        assert_eq!(both.local_services().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_mistake_in_the_egress_table_is_an_error() {
+        for (text, wanted) in [
+            // A key that is not there (no limits yet), and a typo of the one that is.
+            ("[egress]\nenabled = true\nlimit = 5", "limit"),
+            ("[egress]\nenable = true", "enable"),
+            ("[egress]\nallow = [\"*\"]", "allow"),
+            // The wrong type.
+            ("[egress]\nenabled = \"yes\"", "boolean"),
+            ("[egress]\nenabled = 1", "boolean"),
+            ("egress = true", "struct"),
+        ] {
+            let error = Config::parse(text).unwrap_err();
+            assert!(
+                format!("{error:#}").contains(wanted),
+                "{text:?} gave {error:#}"
+            );
+        }
     }
 
     #[test]

@@ -15,7 +15,7 @@ use menzil_cli::expose::{self, ExposeMode, ExposeSpec};
 use menzil_cli::home::Home;
 use menzil_cli::local::{self, Joined};
 use menzil_cli::stdio::{ClosingStdout, reset_message};
-use menzil_cli::{node_cmd, reach, relay_cmd, signals, text, token};
+use menzil_cli::{node_cmd, proxy, reach, relay_cmd, signals, text, token};
 use menzil_proto::ServiceId;
 use tracing_subscriber::EnvFilter;
 
@@ -206,10 +206,30 @@ enum Command {
         #[arg(long, value_name = "PATH")]
         unix: Option<PathBuf>,
     },
-    /// Run a local SOCKS proxy that exits through a node.
+    /// Run a local SOCKS5 proxy whose connections leave through another member's node.
+    ///
+    /// Point the application at it with a `socks5h://` URL, for example
+    /// `curl --proxy socks5h://127.0.0.1:1080 https://example.org/`. The `h` matters: the proxy
+    /// resolves no name, it sends the name to the exit, which resolves it. With `socks5://` the
+    /// application looks the name up itself, first, on this machine: that leaks the lookup and
+    /// takes from the exit the choice of what the name means.
+    ///
+    /// Only CONNECT, without authentication, is supported. The proxy listens on loopback only
+    /// (127.0.0.1 or ::1; `0.0.0.0`, `::` and any other address are refused before it binds)
+    /// and, like `reach` on a TCP port, is open to every user of this machine, each of whom
+    /// gets this user's grants. At most 128 connections at once.
+    ///
+    /// The exit must be a member whose node runs with `[egress] enabled = true` in its
+    /// config.toml, to which this device holds an `egress:*` grant and for which the Policy has
+    /// an `egress` entry (an egress rule); the exit refuses loopback, link local, its own
+    /// addresses and other private ranges whatever the rules say. A refusal reaches the
+    /// application as a SOCKS error.
     Proxy {
-        /// Node to use as the SOCKS exit.
+        /// The node to use as the exit: a member's name, or the start of its node id.
         exit: String,
+        /// Where to listen, as a loopback TCP address (or `localhost:PORT`).
+        #[arg(long, default_value = "127.0.0.1:1080", value_name = "ADDR")]
+        listen: String,
     },
     /// Carry standard input and output to a service of another member: what an SSH
     /// `ProxyCommand` runs (`ssh -o ProxyCommand="menzil stdio %h/ssh" laptop`). Both directions
@@ -1117,17 +1137,26 @@ async fn run(cli: Cli) -> Result<()> {
             };
             print!("{out}");
         }
-        Command::Proxy { .. } => not_implemented("proxy"),
+        Command::Proxy { exit, listen } => {
+            let home = home()?;
+            let socket = node_cmd::agent_socket_path(&home, &Config::load(&home)?);
+            // Refused before anything is bound unless it is loopback.
+            let listener = proxy::bind(&listen).await?;
+            let stop = async {
+                match signals::shutdown().await {
+                    Ok(why) => eprintln!("stopping ({why})"),
+                    Err(error) => eprintln!("menzil: cannot wait for a signal: {error}"),
+                }
+            };
+            eprintln!(
+                "SOCKS5 proxy on {} through {exit}; use socks5h:// so that names are resolved at the exit; ctrl-c stops and resets what is open",
+                listener.local_addr()?
+            );
+            proxy::run(&socket, &exit, listener, stop).await?;
+        }
         Command::Version => println!("menzil {}", env!("CARGO_PKG_VERSION")),
     }
     Ok(())
-}
-
-/// Prints a one line "not implemented" message for `subcommand` to stderr,
-/// then exits the process with status 2.
-fn not_implemented(subcommand: &str) -> ! {
-    eprintln!("{subcommand}: not implemented yet");
-    std::process::exit(2);
 }
 
 #[cfg(test)]
@@ -1136,6 +1165,36 @@ mod tests {
 
     fn parse(args: &[&str]) -> Result<Cli, clap::Error> {
         Cli::try_parse_from(std::iter::once("menzil").chain(args.iter().copied()))
+    }
+
+    #[test]
+    fn proxy_takes_the_exit_and_listens_on_loopback_1080_by_default() {
+        let proxy = |args: &[&str]| match parse(args)?.command {
+            Command::Proxy { exit, listen } => Ok((exit, listen)),
+            _ => panic!("not proxy"),
+        };
+        let got: Result<(String, String), clap::Error> = proxy(&["proxy", "laptop"]);
+        assert_eq!(
+            got.unwrap(),
+            ("laptop".to_string(), "127.0.0.1:1080".to_string())
+        );
+        let got: Result<(String, String), clap::Error> =
+            proxy(&["proxy", "laptop", "--listen", "[::1]:9050"]);
+        assert_eq!(got.unwrap().1, "[::1]:9050");
+        // The exit is required; the address is checked (and refused unless loopback) when the
+        // command runs, before it binds.
+        assert!(parse(&["proxy"]).is_err());
+        assert!(menzil_cli::proxy::parse_listen("0.0.0.0:1080").is_err());
+        // The help says what an application must do.
+        let help = <Cli as clap::CommandFactory>::command()
+            .find_subcommand_mut("proxy")
+            .unwrap()
+            .render_long_help()
+            .to_string();
+        assert!(help.contains("socks5h://"), "{help}");
+        assert!(help.contains("[egress] enabled = true"), "{help}");
+        assert!(help.contains("egress:*"), "{help}");
+        assert!(help.contains("loopback"), "{help}");
     }
 
     fn label_command(args: &[&str]) -> Result<LabelCommand, clap::Error> {

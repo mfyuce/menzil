@@ -2,7 +2,7 @@ use std::io;
 use std::sync::Mutex;
 
 use menzil_stream::{Inbound, Mode, OutboundFrames, StreamMux};
-use tokio::io::{AsyncReadExt, AsyncWriteExt, duplex};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, duplex};
 use tokio::sync::mpsc;
 
 use super::*;
@@ -1764,4 +1764,336 @@ async fn the_status_request_carries_the_relays_share_domain_and_a_hostile_one_is
         crate::expose::domain_for(None, &RelayStatus::default()),
         None
     );
+}
+
+// ---- the `connect` request (egress, `menzil proxy`) ------------------------------------------
+
+#[test]
+fn a_connect_request_is_three_fields_of_one_space_and_a_destination_that_can_be_one() {
+    fn ok(line: &str) -> Result<(&str, &str, u16), String> {
+        parse_connect_request(line).map(|r| (r.who, r.host, r.port))
+    }
+    assert_eq!(
+        ok("connect exit example.org 443\n"),
+        Ok(("exit", "example.org", 443))
+    );
+    assert_eq!(
+        ok("connect exit 10.1.2.3 1\r\n"),
+        Ok(("exit", "10.1.2.3", 1))
+    );
+    assert_eq!(ok("connect exit ::1 65535"), Ok(("exit", "::1", 65535)));
+    assert_eq!(
+        ok("connect 0123456789abcdef x 80"),
+        Ok(("0123456789abcdef", "x", 80))
+    );
+    let longest = "a".repeat(MAX_HOST_BYTES);
+    assert!(ok(&format!("connect exit {longest} 80\n")).is_ok());
+    // Not canonicalized here: what the exit refuses as a name is the exit's to refuse.
+    assert_eq!(ok("connect exit 0x7f.1 80\n"), Ok(("exit", "0x7f.1", 80)));
+    assert_eq!(
+        ok("connect exit LOCALHOST. 80\n"),
+        Ok(("exit", "LOCALHOST.", 80))
+    );
+
+    let too_long_host = "a".repeat(MAX_HOST_BYTES + 1);
+    let too_long_who = "w".repeat(257);
+    for bad in [
+        // fields missing, extra, empty, or separated otherwise than by one space
+        "connect\n".to_string(),
+        "connect \n".to_string(),
+        "connect exit\n".to_string(),
+        "connect exit example.org\n".to_string(),
+        "connect exit example.org \n".to_string(),
+        "connect exit example.org 80 extra\n".to_string(),
+        "connect  example.org 80\n".to_string(),
+        "connect exit  example.org 80\n".to_string(),
+        "connect exit example.org  80\n".to_string(),
+        "connect exit example.org\t80\n".to_string(),
+        "connect exit\texample.org 80\n".to_string(),
+        " connect exit example.org 80\n".to_string(),
+        "CONNECT exit example.org 80\n".to_string(),
+        "connect-exit example.org 80\n".to_string(),
+        "open exit example.org 80\n".to_string(),
+        // the port
+        "connect exit example.org 0\n".to_string(),
+        "connect exit example.org 65536\n".to_string(),
+        "connect exit example.org 99999\n".to_string(),
+        "connect exit example.org 123456\n".to_string(),
+        "connect exit example.org -1\n".to_string(),
+        "connect exit example.org +80\n".to_string(),
+        "connect exit example.org 080\n".to_string(),
+        "connect exit example.org 00\n".to_string(),
+        "connect exit example.org 8o\n".to_string(),
+        "connect exit example.org http\n".to_string(),
+        "connect exit example.org 80.0\n".to_string(),
+        "connect exit example.org 0x50\n".to_string(),
+        "connect exit example.org \u{0661}\u{0662}\n".to_string(),
+        // the host
+        "connect exit  80\n".to_string(),
+        format!("connect exit {too_long_host} 80\n"),
+        "connect exit exa\0mple.org 80\n".to_string(),
+        "connect exit exa\u{1b}[31mmple.org 80\n".to_string(),
+        "connect exit exa\u{85}mple.org 80\n".to_string(),
+        "connect exit exa\u{a0}mple.org 80\n".to_string(),
+        "connect exit exa\u{2028}mple.org 80\n".to_string(),
+        "connect exit exa\rmple.org 80\n".to_string(),
+        // the exit
+        format!("connect {too_long_who} example.org 80\n"),
+        "connect ex\0it example.org 80\n".to_string(),
+        "connect ex\u{7f}it example.org 80\n".to_string(),
+    ] {
+        assert!(parse_connect_request(&bad).is_err(), "{bad:?}");
+    }
+    // The shared check, directly.
+    assert!(validate_target("example.org", 80).is_ok());
+    assert!(validate_target("", 80).is_err());
+    assert!(validate_target("a b", 80).is_err());
+    assert!(validate_target("a\0b", 80).is_err());
+    assert!(validate_target(&too_long_host, 80).is_err());
+    assert!(validate_target(&longest, 80).is_ok());
+    assert!(validate_target("example.org", 0).is_err());
+}
+
+/// Records what reaches `open_egress`, and either refuses or opens a stream to the remote's echo.
+struct EgressOpener {
+    mux: StreamMux,
+    refuse: Option<&'static str>,
+    calls: Mutex<Vec<(String, String, u16)>>,
+    opens: std::sync::atomic::AtomicUsize,
+}
+
+impl Opener for EgressOpener {
+    async fn open(&self, _target: &str) -> Result<Stream, String> {
+        self.opens.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Err("`open` was not asked".to_string())
+    }
+
+    async fn open_egress(&self, who: &str, host: &str, port: u16) -> Result<Stream, String> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push((who.to_string(), host.to_string(), port));
+        if let Some(text) = self.refuse {
+            return Err(text.to_string());
+        }
+        let mut stream = self.mux.open().await.map_err(|e| e.to_string())?;
+        stream.write_all(b"e").await.map_err(|e| e.to_string())?;
+        Ok(stream)
+    }
+}
+
+fn egress_opener(refuse: Option<&'static str>) -> Arc<EgressOpener> {
+    let (client_mux, _client_inbound, client_out, client_driver) =
+        menzil_stream::new(Mode::Client, 65_535);
+    let (server_mux, server_inbound, server_out, server_driver) =
+        menzil_stream::new(Mode::Server, 65_535);
+    tokio::spawn(client_driver);
+    tokio::spawn(server_driver);
+    tokio::spawn(pump(client_out, server_mux.clone()));
+    tokio::spawn(pump(server_out, client_mux.clone()));
+    let (seen_tx, _seen) = mpsc::unbounded_channel();
+    tokio::spawn(remote(server_inbound, seen_tx));
+    Arc::new(EgressOpener {
+        mux: client_mux,
+        refuse,
+        calls: Mutex::new(Vec::new()),
+        opens: std::sync::atomic::AtomicUsize::new(0),
+    })
+}
+
+/// One raw line to an agent; its one-line answer.
+async fn ask_line(socket: &Path, line: &[u8]) -> String {
+    let mut connection = UnixStream::connect(socket).await.unwrap();
+    connection.write_all(line).await.unwrap();
+    let mut answer = String::new();
+    let mut reader = BufReader::new(connection);
+    timeout(WAIT, reader.read_line(&mut answer))
+        .await
+        .unwrap()
+        .unwrap();
+    answer
+}
+
+#[tokio::test]
+async fn a_connect_request_reaches_open_egress_with_exactly_the_parsed_host_and_port() {
+    let opener = egress_opener(None);
+    let seen = opener.clone();
+    with_agent(opener, async |socket, uid| {
+        for (host, port) in [
+            ("example.org", 443u16),
+            ("10.0.0.7", 1),
+            ("2001:db8::7", 65535),
+            ("Mixed.Case.Example", 8080),
+        ] {
+            let opened = open_connect_as(socket, "exit", host, port, uid)
+                .await
+                .unwrap();
+            drop(opened);
+        }
+    })
+    .await;
+    assert_eq!(
+        *seen.calls.lock().unwrap(),
+        vec![
+            ("exit".to_string(), "example.org".to_string(), 443),
+            ("exit".to_string(), "10.0.0.7".to_string(), 1),
+            ("exit".to_string(), "2001:db8::7".to_string(), 65535),
+            ("exit".to_string(), "Mixed.Case.Example".to_string(), 8080),
+        ]
+    );
+    assert_eq!(seen.opens.load(std::sync::atomic::Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn bytes_flow_both_ways_through_a_connect_and_end_cleanly() {
+    let opener = egress_opener(None);
+    let data: Vec<u8> = (0..100_000u32).map(|i| (i % 251) as u8).collect();
+    let (output, end) = with_agent(opener, async |socket, uid| {
+        let opened = open_connect_as(socket, "exit", "echo.example", 7, uid)
+            .await
+            .unwrap();
+        let (mut feed, mut stdin) = duplex(64 * 1024);
+        let (mut stdout, mut collect) = duplex(1 << 20);
+        let input = data.clone();
+        tokio::spawn(async move {
+            let _ = feed.write_all(&input).await;
+            let _ = feed.shutdown().await;
+        });
+        let end = opened.bridge(&mut stdin, &mut stdout).await.unwrap();
+        drop(stdout);
+        let mut output = Vec::new();
+        collect.read_to_end(&mut output).await.unwrap();
+        (output, end)
+    })
+    .await;
+    assert_eq!(end, End::Clean);
+    assert_eq!(output, data);
+}
+
+#[tokio::test]
+async fn a_bad_connect_request_is_answered_and_never_reaches_the_opener() {
+    let opener = egress_opener(None);
+    let seen = opener.clone();
+    with_agent(opener, async |socket, _uid| {
+        let long_host = "a".repeat(MAX_HOST_BYTES + 1);
+        for line in [
+            "connect\n".to_string(),
+            "connect exit\n".to_string(),
+            "connect exit example.org\n".to_string(),
+            "connect exit example.org 80 extra\n".to_string(),
+            "connect exit example.org 0\n".to_string(),
+            "connect exit example.org 70000\n".to_string(),
+            "connect exit exa\0mple.org 80\n".to_string(),
+            format!("connect exit {long_host} 80\n"),
+            "connectx exit example.org 80\n".to_string(),
+        ] {
+            let answer = ask_line(socket, line.as_bytes()).await;
+            assert!(answer.starts_with("error "), "{line:?} gave {answer:?}");
+        }
+        // And what is well formed is answered by the opener.
+        let answer = ask_line(socket, b"connect exit example.org 80\n").await;
+        assert_eq!(answer, "ok\n");
+    })
+    .await;
+    assert_eq!(
+        *seen.calls.lock().unwrap(),
+        vec![("exit".to_string(), "example.org".to_string(), 80)]
+    );
+}
+
+#[tokio::test]
+async fn the_client_checks_the_destination_before_it_sends_anything() {
+    // No agent listens here: if the client got as far as connecting, the error would say so.
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("nobody.sock");
+    let uid = current_uid().await.unwrap();
+    let long_host = "a".repeat(MAX_HOST_BYTES + 1);
+    for (host, port) in [
+        ("", 80u16),
+        ("a b", 80),
+        ("a\0b", 80),
+        ("a\nb", 80),
+        (long_host.as_str(), 80),
+        ("example.org", 0),
+    ] {
+        let error = open_connect_as(&socket, "exit", host, port, uid)
+            .await
+            .err()
+            .expect("refused locally");
+        assert!(
+            !format!("{error:#}").contains("no agent is listening"),
+            "{host:?}:{port} went to the socket: {error:#}"
+        );
+    }
+    // A request that would pass the agent's line limit is refused in words, locally.
+    let who = "w".repeat(256);
+    let host = "h".repeat(MAX_HOST_BYTES);
+    let error = open_connect_as(&socket, &who, &host, 80, uid)
+        .await
+        .err()
+        .unwrap();
+    assert!(
+        format!("{error:#}").contains("longer than the agent takes"),
+        "{error:#}"
+    );
+    // A destination that is fine goes to the socket (and finds no agent).
+    let error = open_connect_as(&socket, "exit", "example.org", 80, uid)
+        .await
+        .err()
+        .unwrap();
+    assert!(
+        format!("{error:#}").contains("no agent is listening"),
+        "{error:#}"
+    );
+}
+
+#[tokio::test]
+async fn an_opener_without_egress_says_so_and_a_refusal_comes_back_in_the_exits_words() {
+    // The default `open_egress` of an opener that knows nothing of it.
+    let got = with_agent(
+        Arc::new(Reports(RelayStatus::default())),
+        async |socket, uid| {
+            open_connect_as(socket, "exit", "example.org", 80, uid)
+                .await
+                .err()
+                .map(|e| format!("{e:#}"))
+        },
+    )
+    .await;
+    assert_eq!(got.as_deref(), Some("egress is not available"));
+
+    for text in [
+        "refused by the other end: forbidden (target not allowed)",
+        "refused by the other end: no_grant (x): this device holds no grant",
+        "refused by the other end: target_unreachable (x)",
+        "refused by the other end: invalid_target (x)",
+        "refused by the other end: rate_limited (x)",
+        "refused by the other end: unknown_service (x)",
+    ] {
+        let opener = egress_opener(Some(text));
+        let got = with_agent(opener, async |socket, uid| {
+            open_connect_as(socket, "exit", "example.org", 80, uid)
+                .await
+                .err()
+                .map(|e| format!("{e:#}"))
+        })
+        .await;
+        // Word for word, so that `menzil proxy` can read the code.
+        assert_eq!(got.as_deref(), Some(text));
+        assert_ne!(crate::proxy::reply_code(text), 0);
+    }
+}
+
+#[tokio::test]
+async fn what_the_opener_says_about_a_connect_is_one_clean_line() {
+    let opener = egress_opener(Some("bad\nname \u{1b}[31mred"));
+    let got = with_agent(opener, async |socket, uid| {
+        open_connect_as(socket, "exit", "example.org", 80, uid)
+            .await
+            .err()
+            .map(|e| format!("{e:#}"))
+    })
+    .await
+    .unwrap();
+    assert!(!got.contains('\n') && !got.contains('\u{1b}'), "{got:?}");
 }
