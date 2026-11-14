@@ -427,6 +427,19 @@ async fn node_full(
     table: TableConfig,
     shares: ShareBook,
 ) -> TestNode {
+    node_limited(net, party, stores, table, shares, None, None).await
+}
+
+/// [`node_full`], optionally with another inbound budget per session and node wide ceiling.
+async fn node_limited(
+    net: &Net,
+    party: &Party,
+    stores: &Stores,
+    table: TableConfig,
+    shares: ShareBook,
+    inbound_budget: Option<usize>,
+    inbound_ceiling: Option<usize>,
+) -> TestNode {
     let (events_tx, events_rx) = mpsc::channel(1024);
     let (outbound_tx, mut outbound_rx) = mpsc::channel::<OutboundSend>(1024);
     net.inner.lock().unwrap().links.insert(
@@ -447,6 +460,13 @@ async fn node_full(
     .unwrap()
     .with_table_config(table)
     .with_shares(shares);
+    let mut config = config;
+    if let Some(bytes) = inbound_budget {
+        config = config.with_inbound_budget(bytes);
+    }
+    if let Some(bytes) = inbound_ceiling {
+        config = config.with_inbound_ceiling(bytes);
+    }
     let parts = new_router(config, outbound_tx, events_rx);
     let task = tokio::spawn(parts.task);
 
@@ -4064,4 +4084,219 @@ async fn a_replaced_docs_only_initiator_session_leaves_the_node_counter_at_once(
     assert!(!t.present(7), "the first docs only session was replaced");
     assert_eq!(t.d.engine.docs_only.len(), 1);
     assert_eq!(t.used(), 0);
+}
+
+// ----------------------------------------------------------------------
+// T1c: stream data received but not yet read is charged (yamux BufferMeter)
+// ----------------------------------------------------------------------
+
+/// What `streams` unread stream payloads of `each` bytes make.
+const KIB: usize = 1024;
+
+/// Opens `count` streams on `from`, writes `each` bytes on every one, and keeps the streams
+/// (the sender must not drop them: a drop ends the stream, which is not what is tested).
+async fn send_unread(
+    from: &L4SessionHandle,
+    count: usize,
+    each: usize,
+) -> Vec<menzil_stream::Stream> {
+    let mut opened = Vec::new();
+    for _ in 0..count {
+        let mut stream = from.open_stream().await.unwrap();
+        stream.write_all(&vec![7u8; each]).await.unwrap();
+        stream.flush().await.unwrap();
+        opened.push(stream);
+    }
+    opened
+}
+
+/// Waits until `handle`'s inbound counter is exactly `want` and stays there across a pause
+/// (records through the queue have all been read by yamux, only unread stream data is left).
+async fn settle_at(handle: &L4SessionHandle, want: usize) {
+    timeout(Duration::from_secs(30), async {
+        loop {
+            if handle.inbound_in_use() == want {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                if handle.inbound_in_use() == want {
+                    return;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "counter {} never settled at {want}",
+            handle.inbound_in_use()
+        )
+    });
+}
+
+/// R1: session A holds about 600 KiB of accepted but unread stream data after its record
+/// queue drained; C's records then cross the node ceiling (1 MiB) and A, holding the most, is
+/// closed `rate_limited`. Without the meter A would hold 0 and nobody would give way.
+#[tokio::test(start_paused = true)]
+async fn unread_stream_data_counts_toward_the_node_ceiling_and_its_holder_gives_way() {
+    let w = world();
+    let (a, b, c) = (party(), party(), party());
+    let stores = w.stores(&[&a, &b, &c], vec![w.grant(&a, &b), w.grant(&c, &b)]);
+    let net = Net::new();
+    let na = node(&net, &a, &stores).await;
+    let nc = node(&net, &c, &stores).await;
+    let mut nb = node_limited(
+        &net,
+        &b,
+        &stores,
+        TableConfig::default(),
+        ShareBook::new(),
+        None,
+        Some(1024 * KIB),
+    )
+    .await;
+
+    let from_a = ensure(&na, b.id, w.network).await.unwrap();
+    let mut b_of_a = nb.next_ready().await;
+    assert_eq!(b_of_a.peer, a.id);
+    let _a_ready = {
+        let mut na = na;
+        na.next_ready().await
+    };
+    let mut accepted = Vec::new();
+    let _held_a = send_unread(&from_a, 3, 200 * KIB).await;
+    for _ in 0..3 {
+        accepted.push(b_of_a.acceptor.accept().await.expect("A's stream"));
+    }
+    settle_at(&b_of_a.handle, 600 * KIB).await;
+
+    let from_c = ensure(&nc, b.id, w.network).await.unwrap();
+    let mut b_of_c = nb.next_ready().await;
+    assert_eq!(b_of_c.peer, c.id);
+    // C's records cross the ceiling while it holds less than A does.
+    let _held_c = send_unread(&from_c, 5, 100 * KIB).await;
+
+    closed_rate_limited(&mut b_of_a).await;
+    // The ended session's unread data leaves with its streams.
+    drop(accepted);
+    settle_at(&b_of_a.handle, 0).await;
+    assert!(
+        timeout(Duration::from_secs(1), b_of_c.acceptor.closed())
+            .await
+            .is_err(),
+        "C, holding less, stays"
+    );
+}
+
+/// R2: the per session budget (768 KiB) counts unread stream data: A buffers about 690 KiB,
+/// the next records pass the budget and the session ends `rate_limited`.
+#[tokio::test(start_paused = true)]
+async fn unread_stream_data_counts_toward_the_session_budget() {
+    let w = world();
+    let (a, b) = (party(), party());
+    let stores = w.stores(&[&a, &b], vec![w.grant(&a, &b)]);
+    let net = Net::new();
+    let na = node(&net, &a, &stores).await;
+    let mut nb = node_limited(
+        &net,
+        &b,
+        &stores,
+        TableConfig::default(),
+        ShareBook::new(),
+        Some(768 * KIB),
+        None,
+    )
+    .await;
+    let from_a = ensure(&na, b.id, w.network).await.unwrap();
+    let mut b_of_a = nb.next_ready().await;
+    let _held = send_unread(&from_a, 3, 230 * KIB).await;
+    let mut accepted = Vec::new();
+    for _ in 0..3 {
+        accepted.push(b_of_a.acceptor.accept().await.expect("A's stream"));
+    }
+    settle_at(&b_of_a.handle, 690 * KIB).await;
+    assert!(
+        timeout(Duration::from_millis(500), b_of_a.acceptor.closed())
+            .await
+            .is_err(),
+        "still under the budget"
+    );
+    // One more stream's data passes the budget.
+    let _more = send_unread(&from_a, 1, 100 * KIB).await;
+    closed_rate_limited(&mut b_of_a).await;
+}
+
+/// R3: a reader that keeps pace moves 16 MiB through a 1 MiB ceiling and is never ended; the
+/// counter is back at 0 afterwards (the node counter is the sum of the sessions' and is not
+/// observable through the router handle, so the session's counter stands for it).
+#[tokio::test(start_paused = true)]
+async fn a_reader_that_keeps_pace_is_not_evicted_and_the_counters_return_to_zero() {
+    const TOTAL: usize = 16 * 1024 * KIB;
+    let w = world();
+    let (a, b) = (party(), party());
+    let stores = w.stores(&[&a, &b], vec![w.grant(&a, &b)]);
+    let net = Net::new();
+    let na = node(&net, &a, &stores).await;
+    let mut nb = node_limited(
+        &net,
+        &b,
+        &stores,
+        TableConfig::default(),
+        ShareBook::new(),
+        None,
+        Some(1024 * KIB),
+    )
+    .await;
+    let from_a = ensure(&na, b.id, w.network).await.unwrap();
+    let mut b_of_a = nb.next_ready().await;
+    // Lock step: the writer sends 512 KiB, waits until the reader has taken all of it, sends
+    // the next. Unread data never passes 512 KiB, whatever window yamux has grown (a free
+    // running writer can outgrow a 1 MiB budget with a window that grows to 16 MiB, which is
+    // not what this test is about).
+    const ROUND: usize = 512 * KIB;
+    let (done_tx, mut done_rx) = mpsc::channel::<()>(1);
+    let mut out = from_a.open_stream().await.unwrap();
+    let writer = tokio::spawn(async move {
+        let chunk = vec![9u8; ROUND];
+        for _ in 0..TOTAL / ROUND {
+            out.write_all(&chunk).await.unwrap();
+            out.flush().await.unwrap();
+            done_rx.recv().await.expect("the reader takes every round");
+        }
+        out
+    });
+    let mut input = timeout(Duration::from_secs(30), b_of_a.acceptor.accept())
+        .await
+        .unwrap()
+        .expect("the stream");
+    let mut buf = vec![0u8; 64 * KIB];
+    let mut got = 0;
+    let mut peak = 0;
+    while got < TOTAL {
+        let n = timeout(Duration::from_secs(60), input.read(&mut buf))
+            .await
+            .expect("the reader keeps getting data (not evicted)");
+        let n = match n {
+            Ok(n) => n,
+            Err(e) => {
+                let r = timeout(Duration::from_secs(1), b_of_a.acceptor.closed()).await;
+                panic!("read failed after {got}: {e}; session end: {r:?}");
+            }
+        };
+        assert!(n > 0, "early EOF after {got}");
+        peak = peak.max(b_of_a.handle.inbound_in_use());
+        got += n;
+        if got % ROUND == 0 {
+            done_tx.send(()).await.unwrap();
+        }
+    }
+    assert!(peak > 0, "the meter saw the data in flight");
+    let _out = writer.await.unwrap();
+    assert_eq!(got, TOTAL);
+    settle_at(&b_of_a.handle, 0).await;
+    assert!(
+        timeout(Duration::from_secs(1), b_of_a.acceptor.closed())
+            .await
+            .is_err(),
+        "never ended"
+    );
 }

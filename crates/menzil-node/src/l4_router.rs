@@ -100,9 +100,10 @@
 //!
 //! **Inbound data is bounded, not paced** (TODO.md L4h6b). Each session holds
 //! at most [`L4_INBOUND_BUDGET_PER_SESSION`] bytes of `data` records that
-//! `yamux` has not read yet (counted from [`L4SessionHandle::feed_inbound`]
+//! `yamux` has not processed yet (counted from [`L4SessionHandle::feed_inbound`]
 //! to the moment `yamux` reads the record, through the actor and through
-//! `menzil-stream`'s queue). A record that does not fit ends that session
+//! `menzil-stream`'s queue) plus stream data `yamux` has received and the
+//! application has not read yet (the same counter, fed by a `BufferMeter`). A record that does not fit ends that session
 //! at once ([`Engine::end_overflowed`]): closed with `rate_limited`,
 //! removed, nothing else touched. All sessions together hold at most
 //! [`L4_INBOUND_CEILING_PER_NODE`] (`RouterConfig::with_inbound_ceiling`): a record that
@@ -412,15 +413,16 @@ impl RouterConfig {
         self
     }
 
-    /// Replaces how many bytes of unread inbound records each session may
-    /// hold (the default is [`L4_INBOUND_BUDGET_PER_SESSION`]); a session
+    /// Replaces how many bytes of unprocessed inbound records plus unread stream data each
+    /// session may hold (the default is [`L4_INBOUND_BUDGET_PER_SESSION`]); a session
     /// past it is ended, see [`L4SessionHandle::feed_inbound`].
     pub fn with_inbound_budget(mut self, bytes: usize) -> Self {
         self.inbound_budget = bytes;
         self
     }
 
-    /// Replaces how many bytes of unread inbound records all sessions may hold together (the
+    /// Replaces how many bytes of unprocessed inbound records plus unread stream data all
+    /// sessions may hold together (the
     /// default is [`L4_INBOUND_CEILING_PER_NODE`], TBD 75): past it the session holding the
     /// most gives way. The per session budget is clamped to it, so one honest session never
     /// meets the node ceiling before its own.
@@ -970,7 +972,7 @@ impl Engine {
     /// is ended first, which takes its charges out of the node counter
     /// ([`L4SessionHandle::detach_inbound`]), and then the record is charged without the
     /// ceiling check, which may leave the node one record over it; the next refusal evicts
-    /// again, so it never grows. If the victim is the arriving session the record is dropped
+    /// again; during the scan it can only grow back up to what was just released (one record per driver). If the victim is the arriving session the record is dropped
     /// with it (its counter has a gap anyway).
     fn make_room(&mut self, arriving: SessionIndex, counter: u64, ciphertext: Vec<u8>, now: Now) {
         let victim = self

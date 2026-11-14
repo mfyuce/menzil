@@ -281,8 +281,11 @@
 //! `yamux` from reading for up to 35 s; 200,000 Pings grew the process by
 //! 15 MiB with no plateau). Now every record is charged to the session's
 //! budget when it is fed and the charge is given back when `yamux` has read
-//! it, so one session never holds more than
-//! [`L4_INBOUND_BUDGET_PER_SESSION`] of unread inbound data, and a record
+//! it; the stream data `yamux` then holds until the application reads it is
+//! charged to the same counter (a `BufferMeter`, patch 5 of the vendored
+//! `yamux`), so one session never holds more than
+//! [`L4_INBOUND_BUDGET_PER_SESSION`] of records not yet processed by the
+//! stream layer plus stream data received but not yet read, and a record
 //! past that is refused with [`InboundOverflow`] and ends the session. That
 //! constant's docs say what is counted and why the caller is not made to
 //! wait instead.
@@ -541,7 +544,8 @@ impl Drop for EndGuard {
 }
 
 /// What one L4 session may hold of inbound `data` records that `yamux` has
-/// not read yet (TODO.md L4h6b), in bytes: the whole receive window we grant
+/// not processed yet, plus stream data `yamux` has received but the
+/// application has not read yet (TODO.md L4h6b, T1), in bytes: the whole receive window we grant
 /// a peer ([`RECEIVE_WINDOW_GRANT`], about 144 MiB) plus an eighth and 1 MiB
 /// for what rides on top of the payload, about 163 MiB.
 ///
@@ -558,6 +562,14 @@ impl Drop for EndGuard {
 /// `yamux` keeps within a small factor of memory: see `menzil-stream`'s
 /// `config_for`), and what we hold toward the peer is held
 /// by [`SendBudget`].
+///
+/// **Stream data not yet read (T1).** The stream layer is built with a `BufferMeter` (the
+/// `InboundBudget` itself): every byte `yamux` queues for a stream's reader is charged to this
+/// same counter (payload bytes, not heap) and given back when the reader takes it, the stream
+/// is dropped or reset, or the connection ends. The charge changes hands from record to
+/// stream data; it is never created twice. The meter never refuses (it cannot, `yamux` has
+/// the bytes already): only [`InboundBudget::reserve`] enforces, so the ending rule is
+/// unchanged. Heap for the stream data part can be about twice what is charged.
 ///
 /// **Why that size.** It is a ceiling for a peer that ignores flow control,
 /// so it must sit above everything a peer that respects it can have in
@@ -617,11 +629,12 @@ const NOISE_MESSAGE_LIMIT: usize = 65_535;
 /// ([`L4_INBOUND_BUDGET_PER_SESSION`]) times the 4,096 sessions a table allows would be 650 GiB.
 /// Past it the session holding the most gives way (the victim choice is the router's).
 ///
-/// **Scope.** This ceiling covers only the records yamux has not read yet. Bytes yamux has
-/// already read but the application has not consumed are limited per session by the receive
-/// window alone (about 144 MiB per session, [`RECEIVE_WINDOW_GRANT`]) and are not counted
-/// here, so the node wide worst case is not 1 GiB: it grows with the number of stalled
-/// sessions.
+/// **Scope.** This ceiling counts records not yet processed by the stream layer AND stream
+/// data `yamux` has received but the application has not read yet (the `BufferMeter` on the
+/// session's [`InboundBudget`]); both move one charge between them. Only a record's arrival
+/// enforces it (the session holding the most gives way); stream data that `yamux` already
+/// holds is charged without a check. Memory for the stream data part can be about twice the
+/// charge (heap, not payload).
 pub const L4_INBOUND_CEILING_PER_NODE: usize = 1 << 30;
 
 /// The top bit of a session's counter: the session has been detached ([`InboundBudget::detach`]),
@@ -714,7 +727,7 @@ pub(crate) enum Refused {
 
 /// The counter behind [`L4_INBOUND_BUDGET_PER_SESSION`], one per session,
 /// shared by every clone of its [`L4SessionHandle`].
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub(crate) struct InboundBudget {
     /// The charges, with [`DETACHED`] in the top bit.
     in_use: Arc<AtomicUsize>,
@@ -807,6 +820,36 @@ impl InboundBudget {
             node.in_use.fetch_sub(held, Ordering::AcqRel);
         }
         held
+    }
+}
+
+/// The stream layer's meter (T1): stream data `yamux` holds unread is charged to the session
+/// and node counters exactly like a record's permit, and given back the same way.
+///
+/// `buffered` charges the node first and the session second: if a concurrent
+/// [`InboundBudget::detach`] has already taken the session's charges out of the node counter,
+/// the node charge is taken back again. The other order lets `detach` subtract a `held` that
+/// includes a charge the node never received, which can wrap the node counter below zero.
+impl menzil_stream::BufferMeter for InboundBudget {
+    fn buffered(&self, n: usize) {
+        if let Some(node) = &self.node {
+            node.add(n, false);
+        }
+        let prev = self.in_use.fetch_add(n, Ordering::AcqRel);
+        if prev & DETACHED != 0
+            && let Some(node) = &self.node
+        {
+            node.in_use.fetch_sub(n, Ordering::AcqRel);
+        }
+    }
+
+    fn consumed(&self, n: usize) {
+        let prev = self.in_use.fetch_sub(n, Ordering::AcqRel);
+        if prev & DETACHED == 0
+            && let Some(node) = &self.node
+        {
+            node.in_use.fetch_sub(n, Ordering::AcqRel);
+        }
     }
 }
 
@@ -1212,8 +1255,6 @@ fn build(
     } else {
         (None, None)
     };
-    let (stream_mux, inbound, outbound_frames, driver) =
-        menzil_stream::new(config.mode, config.max_record);
     let (inbound_data_tx, inbound_data_rx) = mpsc::unbounded_channel();
     // At least two records of the largest size that can exist, so that one
     // the wire allows can always be queued; sized from the smaller of
@@ -1225,6 +1266,12 @@ fn build(
             .max(2 * (largest_record + INBOUND_RECORD_OVERHEAD)),
     )
     .with_node(config.node_inbound.clone());
+    let (stream_mux, inbound, outbound_frames, driver) = menzil_stream::new_metered(
+        config.mode,
+        config.max_record,
+        menzil_stream::MuxLimits::default(),
+        Arc::new(inbound_budget.clone()),
+    );
     let dgram_node = config
         .node_inbound
         .as_ref()
@@ -3833,6 +3880,93 @@ mod tests {
             for handle in handles {
                 handle.join().unwrap();
             }
+            assert_eq!(node.in_use(), 0, "round {round}");
+            assert_eq!(budget.used(), 0, "round {round}");
+        }
+    }
+
+    // --- T1c: the stream layer's meter on the same counters ------------------
+
+    /// U3: `buffered` and `consumed` interleaved with permits and a detach, in every order
+    /// that matters: the node ends at 0 and the session counter is exact at each step.
+    #[test]
+    fn the_buffer_meter_shares_the_counters_with_permits_across_a_detach() {
+        use menzil_stream::BufferMeter;
+        let (node, budgets) = node_and_budgets(10_000, 2);
+        let (a, b) = (&budgets[0], &budgets[1]);
+        let permit = a.reserve(100, true).unwrap();
+        a.buffered(40);
+        b.buffered(5);
+        assert_eq!((a.used(), node.in_use()), (140, 145));
+        // Charged without a check, past the node ceiling too.
+        a.buffered(20_000);
+        assert_eq!((a.used(), node.in_use()), (20_140, 20_145));
+        a.consumed(20_000);
+        assert_eq!((a.used(), node.in_use()), (140, 145));
+        // Detach takes out exactly what is held (permit and stream data alike).
+        assert_eq!(a.detach(), 140);
+        assert_eq!(node.in_use(), 5);
+        // After the detach: buffered charges the session only, consumed too.
+        a.buffered(60);
+        assert_eq!((a.used(), node.in_use()), (200, 5));
+        a.consumed(30);
+        assert_eq!((a.used(), node.in_use()), (170, 5));
+        drop(permit);
+        assert_eq!((a.used(), node.in_use()), (70, 5));
+        a.consumed(40);
+        a.consumed(30);
+        assert_eq!((a.used(), node.in_use()), (0, 5));
+        b.consumed(5);
+        assert_eq!((b.used(), node.in_use()), (0, 0));
+    }
+
+    /// U3 stress: four threads buffer and consume while this thread detaches; the node
+    /// counter never wraps (never seen above 1 << 62) and ends at 0, the session's too.
+    #[test]
+    fn the_buffer_meter_never_wraps_the_node_counter_against_a_detach() {
+        use menzil_stream::BufferMeter;
+        const THREADS: usize = 4;
+        const ROUNDS: usize = 20_000;
+        for round in 0..20 {
+            let (node, budgets) = node_and_budgets(usize::MAX >> 2, 1);
+            let budget = budgets[0].clone();
+            let barrier = Arc::new(std::sync::Barrier::new(THREADS + 2));
+            let handles: Vec<_> = (0..THREADS)
+                .map(|_| {
+                    let (budget, barrier) = (budget.clone(), Arc::clone(&barrier));
+                    std::thread::spawn(move || {
+                        barrier.wait();
+                        for _ in 0..ROUNDS {
+                            budget.buffered(7);
+                            budget.consumed(7);
+                        }
+                    })
+                })
+                .collect();
+            let sampler = {
+                let (node, barrier) = (Arc::clone(&node), Arc::clone(&barrier));
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    let mut worst = 0;
+                    for _ in 0..ROUNDS {
+                        worst = worst.max(node.in_use());
+                    }
+                    worst
+                })
+            };
+            barrier.wait();
+            for _ in 0..(round * 50) {
+                std::hint::spin_loop();
+            }
+            budget.detach();
+            for handle in handles {
+                handle.join().unwrap();
+            }
+            let worst = sampler.join().unwrap();
+            assert!(
+                worst < (1 << 62),
+                "round {round}: node counter wrapped ({worst})"
+            );
             assert_eq!(node.in_use(), 0, "round {round}");
             assert_eq!(budget.used(), 0, "round {round}");
         }

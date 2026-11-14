@@ -323,7 +323,7 @@ A node that stops on purpose sends CLOSE `shutting_down` on each of its sessions
 
 ### 5.3 Streams
 
-yamux (spec version 0) inside MUX records, initial receive window 256 KiB, receiver tuned upward to 16 MiB within a per session budget. The stream initiator writes an OPEN header first:
+yamux (spec version 0) inside MUX records, initial receive window 256 KiB, receiver tuned upward to 16 MiB within a per session budget (a receiver also caps a yamux data frame body at 65,535 bytes and counts unread stream data against the limits of section 10; the receive window is no longer the only bound). The stream initiator writes an OPEN header first:
 
 ```
 OPEN     = u16 len | CBOR{ v: 1, service: ServiceId, target: { host: str, port: u16, transport: "udp" } | null, meta: { client_ip: str | null, sni: str | null } }
@@ -596,14 +596,14 @@ Relay principal and public shares (6.1 to 6.3), global. Of these the operator ca
 
 A share connection holds its place from the decision to route it until both ends are gone; a connection whose open failed holds it until its refusal has been sent. Together with the principal's bounds they are the memory bound of share traffic: the principal measured about 290 KiB of buffers on each side for a stream whose peer reads nothing, so 4,096 share connections are about 1.2 GiB on the relay in the worst case; the relay has no further stream cap beyond these. The front door and the piped connections need file descriptors: up to 7,168 on top of the sessions (1,024 ClientHello reads, as many on port 80, 1,024 refusals, 4,096 piped connections), so `menzil relay run` raises its soft limit to the hard one at start and warns if that is too low.
 
-Unread inbound reliable data of a node's L4 sessions (nodes; bytes held between the arrival of a class 0 record and the moment the stream layer reads it, each record charged its ciphertext length plus 128 bytes):
+Unread inbound reliable data of a node's L4 sessions (nodes; two kinds of bytes are counted together: class 0 records not yet processed by the stream layer, each charged its ciphertext length plus 128 bytes, and stream data the stream layer has received but the application has not read yet, charged its payload length; one charge moves from the first kind to the second, it is never counted twice):
 
 | Item | Default | When over |
 |---|---|---|
-| Per session budget | 162.7 MiB (above the whole receive window granted to a peer; at most the node ceiling) | the record is not queued and that session ends: CLOSE `rate_limited` |
-| Per node, all sessions together (`RouterConfig::with_inbound_ceiling`, default 1 GiB; no `config.toml` key yet) | 1 GiB | the session holding the most unread data ends: CLOSE `rate_limited`; it is the session whose record just arrived only when that one holds the most; the arriving record is then queued |
+| Per session budget | 162.7 MiB (above the whole receive window granted to a peer; at most the node ceiling) | the arriving record is not queued and that session ends: CLOSE `rate_limited` |
+| Per node, all sessions together (`RouterConfig::with_inbound_ceiling`, default 1 GiB; no `config.toml` key yet) | 1 GiB | the session holding the most (records plus unread stream data) ends: CLOSE `rate_limited`; it is the session whose record just arrived only when that one holds the most; the arriving record is then queued |
 
-Scope of these limits: both cover only records the stream layer (yamux) has not read yet. Bytes yamux has already read but the application has not consumed are limited per session by the receive window alone (about 144 MiB per session) and are not counted against the node wide ceiling, so the node wide worst case of unread plus read-but-unconsumed data is not 1 GiB; it grows with the number of sessions that stall with a full window.
+Scope of these limits: both count records not yet processed by the stream layer AND stream data received but not yet read by the application (the stream layer reports every change of what its streams hold, and the node charges it to the same per session and per node counters). Only the arrival of a record enforces a limit; data the stream layer already holds is charged without a check, so a counter can stand above its limit until the next record ends a session. Memory for the stream data part can be about twice the charged payload (heap, not payload bytes). The ending rule is unchanged. Receiver limit, not a wire change: a yamux data frame body is at most 65,535 bytes (every conforming sender stays below it, as a MUX record is at most that size), and a frame header announcing a larger body ends the session. Streams held by a node that is not a router session (a relay principal's own sessions, local services built without the router) are outside this counter.
 
 Datagrams are counted apart (table below) and never end a session.
 
