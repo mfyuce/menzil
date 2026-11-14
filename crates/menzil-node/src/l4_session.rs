@@ -1253,7 +1253,6 @@ impl Drop for CloseChannelsOnDrop {
 #[allow(clippy::too_many_arguments)]
 fn send_dgram(
     transport: &mut E2eTransport,
-    liveness: &mut Liveness,
     rekey: &mut RekeySchedule,
     outbound: &mpsc::Sender<OutboundSend>,
     peer: NodeId,
@@ -1279,7 +1278,9 @@ fn send_dgram(
         permit: None,
     };
     if outbound.try_send(req).is_ok() {
-        liveness.note_sent(clock_now());
+        // `liveness.note_sent` is NOT called: a datagram is droppable and its outcome is not
+        // watched, so a relay that drops every one of them must not silence the KEEP that
+        // tells the peer this side is alive (red team round E3, M1).
         rekey.note_sent();
     } else {
         tracing::debug!(%peer, "a datagram was dropped: the send queue is full or gone");
@@ -1485,8 +1486,7 @@ async fn run(
                     continue;
                 };
                 send_dgram(
-                    &mut transport, &mut liveness, &mut rekey, &outbound, peer, epoch,
-                    channel, &bytes,
+                    &mut transport, &mut rekey, &outbound, peer, epoch, channel, &bytes,
                 );
             }
 
@@ -3269,7 +3269,6 @@ mod tests {
         let (mut a_side, _b_side) = two_sides(11, 65_535);
         let peer = a_side.peer;
         let now = clock_now();
-        let mut liveness = Liveness::new(now);
         let mut rekey = RekeySchedule::new(now);
         let (full_tx, _full_rx) = mpsc::channel(1);
         let filler = || {
@@ -3287,7 +3286,6 @@ mod tests {
         full_tx.try_send(filler()).unwrap();
         send_dgram(
             &mut a_side.transport,
-            &mut liveness,
             &mut rekey,
             &full_tx,
             peer,
@@ -3299,7 +3297,6 @@ mod tests {
         drop(closed_rx);
         send_dgram(
             &mut a_side.transport,
-            &mut liveness,
             &mut rekey,
             &closed_tx,
             peer,
@@ -3310,7 +3307,6 @@ mod tests {
         // A datagram the transport refuses (too large) is dropped too.
         send_dgram(
             &mut a_side.transport,
-            &mut liveness,
             &mut rekey,
             &closed_tx,
             peer,
@@ -3365,5 +3361,57 @@ mod tests {
         }
         to_a.abort();
         to_b.abort();
+    }
+
+    // Regression (red team round E3, M1): a side that sends only datagrams, all dropped on the way (a relay bucket
+    // or tenant droppable cap), must still keep its peer alive with KEEP.
+    #[tokio::test(start_paused = true)]
+    async fn a_datagram_only_sender_whose_datagrams_are_dropped_keeps_the_peer_alive() {
+        let pair = dgram_pair();
+        let DgramPair {
+            a,
+            a_acceptor: _aa,
+            mut a_out,
+            b,
+            b_acceptor: mut bacc,
+            mut b_out,
+            _keep,
+        } = pair;
+        let a_channel = a.channels().unwrap().allocate().unwrap();
+        let b2 = b.clone();
+        let reliable_from_a = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let r2 = reliable_from_a.clone();
+        let fwd_a = tokio::spawn(async move {
+            while let Some(req) = a_out.recv().await {
+                if req.flags & 0x01 != 0 {
+                    // The relay drops every droppable SEND of A.
+                    let _ = req.outcome.send(EnqueueOutcome::Accepted);
+                    continue;
+                }
+                r2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                deliver(&b2, req);
+            }
+        });
+        let a2 = a.clone();
+        let fwd_b = tokio::spawn(async move {
+            while let Some(req) = b_out.recv().await {
+                deliver(&a2, req);
+            }
+        });
+        let sender = async {
+            for _ in 0..24u32 {
+                let _ = a_channel.send(&[0u8; 100]);
+                tokio::time::sleep(Duration::from_secs(5)).await;
+            }
+        };
+        tokio::select! {
+            reason = bacc.closed() => {
+                panic!("B ended at a datagram-only sender: {reason:?}; reliable records A sent: {}",
+                    reliable_from_a.load(std::sync::atomic::Ordering::SeqCst));
+            }
+            () = sender => {}
+        }
+        fwd_a.abort();
+        fwd_b.abort();
     }
 }
