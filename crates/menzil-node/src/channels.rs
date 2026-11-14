@@ -59,6 +59,13 @@ pub const DGRAM_SEND_QUEUE: usize = 64;
 /// frame prefix, the 3 byte DGRAM header and the 16 byte tag.
 pub const DGRAM_WIRE_OVERHEAD: usize = 32;
 
+/// The charge of a datagram of `n` payload bytes against every bucket: its L3 SEND payload,
+/// floored at the relay's own minimum charge ([`MIN_SEND_CHARGE_BYTES`]) so an empty datagram
+/// costs here what it costs at the relay.
+pub fn dgram_cost(n: usize) -> usize {
+    (n + DGRAM_WIRE_OVERHEAD).max(menzil_proto::MIN_SEND_CHARGE_BYTES as usize)
+}
+
 /// A bucket's sustained rate, 20 Mbit/s (the relay's figure for one pair, protocol.md 5.4).
 pub const BUCKET_RATE_BYTES_PER_SEC: u64 = 2_500_000;
 
@@ -386,10 +393,7 @@ impl ChannelTable {
             inner.dropped.unknown_channel += 1;
             return Delivery::Unknown;
         };
-        if !sink
-            .recv_bucket
-            .try_take(bytes.len() + DGRAM_WIRE_OVERHEAD, now)
-        {
+        if !sink.recv_bucket.try_take(dgram_cost(bytes.len()), now) {
             inner.dropped.rate_limited += 1;
             return Delivery::RateLimited;
         }
@@ -459,7 +463,7 @@ impl Channel {
         if bytes.len() > self.table.max_payload {
             return Err(SendDrop::TooLarge);
         }
-        let cost = bytes.len() + DGRAM_WIRE_OVERHEAD;
+        let cost = dgram_cost(bytes.len());
         let now = self.table.now();
         {
             let mut inner = self.table.lock();
@@ -483,10 +487,18 @@ impl Channel {
             }
         }
         // A full queue or an actor that is gone drops the datagram: a gap is harmless here.
+        // The datagram then never left, so both buckets get its charge back.
         self.table
             .out
             .try_send((self.id, bytes.to_vec()))
-            .map_err(|_| SendDrop::QueueFull)
+            .map_err(|_| {
+                let mut inner = self.table.lock();
+                inner.send_aggregate.give_back(cost);
+                if let Some(sink) = inner.live.get_mut(&self.id) {
+                    sink.send_bucket.give_back(cost);
+                }
+                SendDrop::QueueFull
+            })
     }
 }
 
@@ -760,6 +772,60 @@ mod tests {
         assert_eq!(b.send(&payload), Err(SendDrop::PeerRate));
         // The refused datagram gave its channel tokens back: `b` can still send a small one.
         b.send(&[0; 100]).expect("b's own bucket is intact");
+    }
+
+    #[test]
+    fn a_datagram_refused_by_a_full_queue_gives_its_tokens_back() {
+        let clock = Manual::new();
+        let (responder, _rx) = table(false, &clock);
+        let channel = responder.allocate().unwrap();
+        for _ in 0..DGRAM_SEND_QUEUE {
+            channel.send(&[0; 10]).unwrap();
+        }
+        // Without the refund, 1000 refused datagrams would drain the 256 KiB bucket.
+        for _ in 0..1000 {
+            assert_eq!(channel.send(&[0; 10]), Err(SendDrop::QueueFull));
+        }
+        let (chan, agg) = {
+            let inner = responder.lock();
+            (
+                inner.live.get(&channel.id()).unwrap().send_bucket.tokens,
+                inner.send_aggregate.tokens,
+            )
+        };
+        let spent = (DGRAM_SEND_QUEUE * dgram_cost(10)) as f64;
+        let full = BUCKET_BURST_BYTES as f64;
+        assert_eq!(chan, full - spent);
+        assert_eq!(agg, full - spent);
+    }
+
+    #[test]
+    fn an_empty_datagram_costs_the_relays_minimum_charge() {
+        assert_eq!(dgram_cost(0), 64);
+        assert_eq!(dgram_cost(31), 64);
+        assert_eq!(dgram_cost(32), 64);
+        assert_eq!(dgram_cost(33), 65);
+        let clock = Manual::new();
+        let (responder, _rx) = table(false, &clock);
+        let a = responder.allocate().unwrap();
+        a.send(&[]).unwrap();
+        let tokens = responder
+            .lock()
+            .live
+            .get(&a.id())
+            .unwrap()
+            .send_bucket
+            .tokens;
+        assert_eq!(tokens, (BUCKET_BURST_BYTES - 64) as f64);
+        // The receiver's bucket charges the same floor.
+        let budget = InboundBudget::new(DGRAM_BUDGET_PER_SESSION);
+        let id = a.id();
+        assert_eq!(
+            responder.deliver(id, vec![], permit(&budget)),
+            Delivery::Delivered
+        );
+        let tokens = responder.lock().live.get(&id).unwrap().recv_bucket.tokens;
+        assert_eq!(tokens, (BUCKET_BURST_BYTES - 64) as f64);
     }
 
     #[test]

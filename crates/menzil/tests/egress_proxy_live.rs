@@ -245,7 +245,10 @@ async fn the_proxy_carries_a_connect_to_an_exit_and_the_exit_refuses_what_it_mus
         )
         .unwrap();
     };
-    write_config(&laptop_home, "[egress]\nenabled = true\n");
+    write_config(
+        &laptop_home,
+        "[egress]\nenabled = true\ndeny = [\"blocked.invalid\"]\n",
+    );
     write_config(&tablet_home, "");
     write_config(&phone_home, "");
     let start = |home: &Home, socket: &str| {
@@ -404,6 +407,21 @@ async fn the_proxy_carries_a_connect_to_an_exit_and_the_exit_refuses_what_it_mus
     let text = said("example.org", "tablet").await;
     assert!(
         text.starts_with("refused by the other end: unknown_service"),
+        "{text}"
+    );
+    // `node_cmd::start` installs the `[egress] deny` list of the configuration on the executor:
+    // the denied name is `forbidden` (refused before any lookup), while a neighbour that is not
+    // in the list gets as far as the lookup and fails there (`target_unreachable`). (A live
+    // "allowed" dial needs a target the floor lets through; loopback and the host's own
+    // addresses are never one, so the neighbour's answer is what shows the list is narrow.)
+    let text = said("blocked.invalid", "laptop").await;
+    assert!(
+        text.starts_with("refused by the other end: forbidden"),
+        "{text}"
+    );
+    let text = said("open.invalid", "laptop").await;
+    assert!(
+        text.starts_with("refused by the other end: target_unreachable"),
         "{text}"
     );
     assert_eq!(accepts.load(Ordering::SeqCst), 0);
