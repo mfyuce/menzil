@@ -873,6 +873,7 @@ mod tests {
             send_budget: crate::outbound::SendBudgets::new().for_peer(peer),
             observer: None,
             inbound_budget: crate::l4_session::L4_INBOUND_BUDGET_PER_SESSION,
+            node_inbound: None,
         };
         let (handle, acceptor, outbound_rx, epoch_ended_tx, task) = if datagrams {
             let (h, a, t) =

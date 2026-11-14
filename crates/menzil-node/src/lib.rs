@@ -105,8 +105,9 @@ pub use l4_router::{
 pub use l4_session::new as new_l4_session;
 pub use l4_session::new_with_datagrams as new_l4_session_with_datagrams;
 pub use l4_session::{
-    CloseReason, EndReason, InboundOverflow, L4_INBOUND_BUDGET_PER_SESSION, L4SessionAcceptor,
-    L4SessionConfig, L4SessionHandle, SessionNotice, SessionObserver,
+    CloseReason, EndReason, FeedRefused, InboundOverflow, L4_INBOUND_BUDGET_PER_SESSION,
+    L4_INBOUND_CEILING_PER_NODE, L4SessionAcceptor, L4SessionConfig, L4SessionHandle, NodeInbound,
+    SessionNotice, SessionObserver,
 };
 pub use l5_stream::{
     AcceptedStreams, OpenStreamError, accept_loop, accept_loop_relay_principal,

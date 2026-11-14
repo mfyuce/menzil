@@ -140,9 +140,9 @@ use crate::admission::{
 };
 use crate::identity::IdentityCell;
 use crate::l4_session::{
-    CloseReason, E2E_PROTO_TAG, L4_INBOUND_BUDGET_PER_SESSION, L4SessionAcceptor, L4SessionConfig,
-    L4SessionHandle, SessionNotice, SessionObserver, new as new_l4_session,
-    new_with_datagrams as new_l4_session_with_datagrams,
+    CloseReason, E2E_PROTO_TAG, L4_INBOUND_BUDGET_PER_SESSION, L4_INBOUND_CEILING_PER_NODE,
+    L4SessionAcceptor, L4SessionConfig, L4SessionHandle, NodeInbound, SessionNotice,
+    SessionObserver, new as new_l4_session, new_with_datagrams as new_l4_session_with_datagrams,
 };
 use crate::outbound::{Epoch, OutboundSend, SendBudgets};
 use crate::policy_store::PolicyStore;
@@ -708,6 +708,8 @@ struct Engine {
     shares: ShareBook,
     budgets: SendBudgets,
     inbound_budget: usize,
+    /// Unread inbound data of every session together ([`L4_INBOUND_CEILING_PER_NODE`]).
+    node_inbound: Arc<NodeInbound>,
     table: SessionTable<Entry, Pending>,
     waiters: HashMap<(NodeId, NetworkId), Vec<Waiting>>,
     /// How long a caller waits at most: the whole retry chain.
@@ -776,6 +778,7 @@ impl Engine {
             shares: config.shares,
             budgets: config.budgets,
             inbound_budget: config.inbound_budget,
+            node_inbound: Arc::new(NodeInbound::new(L4_INBOUND_CEILING_PER_NODE)),
             table: SessionTable::new(config.local_node_id, config.table, index_source),
             waiters: HashMap::new(),
             waiter_timeout,
@@ -822,7 +825,9 @@ impl Engine {
         // Dropping each entry drops its `epoch_ended` sender, which ends
         // the actor as `EpochEnded`; no CLOSE is worth trying over a dead
         // L3 session.
-        for (index, _) in self.table.remove_where(|entry| entry.epoch == epoch) {
+        for (index, entry) in self.table.remove_where(|entry| entry.epoch == epoch) {
+            // Its actor ends on its own time; what it holds must not count against others.
+            entry.handle.detach_inbound();
             self.docs_only.remove(&index);
         }
         drop(
@@ -891,6 +896,9 @@ impl Engine {
                 ciphertext,
             } => {
                 let refused = match self.table.route(receiver_index, &src) {
+                    // A refusal by the node ceiling ends the arriving session like an overflow of
+                    // its own budget; step 2 replaces this (the session holding the most
+                    // gives way, `FeedRefused::Node` hands the record back for that).
                     Route::Session { handle, .. } => {
                         handle.handle.feed_inbound(counter, ciphertext).is_err()
                     }
@@ -917,6 +925,7 @@ impl Engine {
             return;
         };
         let (peer, network) = (handle.peer, handle.network);
+        handle.handle.detach_inbound();
         let was_docs_only = self.docs_only.remove(&index).is_some();
         if let Some(held_back) = self.overflow_log.allow(now.instant) {
             // The records are charged before they are decrypted, so what
@@ -1990,6 +1999,7 @@ impl Engine {
             epoch: attached.epoch,
             send_budget: self.budgets.for_peer(peer),
             inbound_budget: self.inbound_budget,
+            node_inbound: Some(Arc::clone(&self.node_inbound)),
             observer: Some(SessionObserver::new(
                 self.notices.clone(),
                 tag_of(generation, index),

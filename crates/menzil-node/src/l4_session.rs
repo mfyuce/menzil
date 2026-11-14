@@ -588,9 +588,7 @@ impl Drop for EndGuard {
 /// either (the counter gap ends the session, protocol.md 5.2), so the
 /// session ends, now, and only that one.
 ///
-/// A node-wide total across sessions is not built: the worst case is this
-/// ceiling times the sessions the table allows, and every one of them is a
-/// member of a network the owner signed.
+/// The total across sessions is bounded by [`L4_INBOUND_CEILING_PER_NODE`].
 pub const L4_INBOUND_BUDGET_PER_SESSION: usize =
     RECEIVE_WINDOW_GRANT + RECEIVE_WINDOW_GRANT / 8 + 1024 * 1024;
 
@@ -612,35 +610,53 @@ const INBOUND_RECORD_OVERHEAD: usize = 128;
 /// validate it, so nothing sized from it may be trusted to be at most this.
 const NOISE_MESSAGE_LIMIT: usize = 65_535;
 
-/// The counter behind [`L4_INBOUND_BUDGET_PER_SESSION`], one per session,
-/// shared by every clone of its [`L4SessionHandle`].
-#[derive(Clone)]
-pub(crate) struct InboundBudget {
-    in_use: Arc<AtomicUsize>,
+/// What all of one node's L4 sessions may hold together of unread inbound `data` records, in
+/// bytes (TBD 75): 1 GiB, six sessions stalled with their whole window. The per session budget
+/// ([`L4_INBOUND_BUDGET_PER_SESSION`]) times the 4,096 sessions a table allows would be 650 GiB.
+/// Past it the session holding the most gives way (the victim choice is the router's).
+pub const L4_INBOUND_CEILING_PER_NODE: usize = 1 << 30;
+
+/// The top bit of a session's counter: the session has been detached ([`InboundBudget::detach`]),
+/// its charges already left the node counter, and its permits must not subtract again.
+const DETACHED: usize = 1 << (usize::BITS - 1);
+
+/// The node wide total of the unread inbound charges of every session built with it
+/// ([`L4SessionConfig::node_inbound`]), against a ceiling. Increments only happen on the
+/// router task (`feed_inbound`), decrements (a permit's drop) on any thread; atomics, no lock.
+#[derive(Debug)]
+pub struct NodeInbound {
+    in_use: AtomicUsize,
     ceiling: usize,
 }
 
-impl InboundBudget {
-    pub(crate) fn new(ceiling: usize) -> Self {
+impl NodeInbound {
+    /// A counter at zero with `ceiling` bytes.
+    pub fn new(ceiling: usize) -> Self {
         Self {
-            in_use: Arc::new(AtomicUsize::new(0)),
+            in_use: AtomicUsize::new(0),
             ceiling,
         }
     }
 
-    /// What is charged right now (tests).
-    #[cfg(test)]
-    pub(crate) fn in_use_for_tests(&self) -> usize {
+    /// What every session built with this counter holds right now.
+    pub fn in_use(&self) -> usize {
         self.in_use.load(Ordering::Relaxed)
     }
 
-    /// Charges `charge` bytes, or `None` if that would pass the ceiling.
-    pub(crate) fn try_reserve(&self, charge: usize) -> Option<InboundPermit> {
+    /// The ceiling in bytes.
+    pub fn ceiling(&self) -> usize {
+        self.ceiling
+    }
+
+    /// Adds `charge`; with `enforce`, refuses (and adds nothing) if that would pass the ceiling.
+    fn add(&self, charge: usize, enforce: bool) -> bool {
         let mut current = self.in_use.load(Ordering::Relaxed);
         loop {
-            let next = current.checked_add(charge)?;
-            if next > self.ceiling {
-                return None;
+            let Some(next) = current.checked_add(charge) else {
+                return false;
+            };
+            if enforce && next > self.ceiling {
+                return false;
             }
             match self.in_use.compare_exchange_weak(
                 current,
@@ -648,28 +664,160 @@ impl InboundBudget {
                 Ordering::AcqRel,
                 Ordering::Relaxed,
             ) {
-                Ok(_) => {
-                    return Some(InboundPermit {
-                        in_use: Arc::clone(&self.in_use),
-                        charge,
-                    });
-                }
+                Ok(_) => return true,
                 Err(actual) => current = actual,
             }
         }
     }
 }
 
+/// Why [`InboundBudget::try_reserve`] refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Refused {
+    /// The session's own budget.
+    Session,
+    /// The node wide ceiling.
+    Node,
+}
+
+/// The counter behind [`L4_INBOUND_BUDGET_PER_SESSION`], one per session,
+/// shared by every clone of its [`L4SessionHandle`].
+#[derive(Clone)]
+pub(crate) struct InboundBudget {
+    /// The charges, with [`DETACHED`] in the top bit.
+    in_use: Arc<AtomicUsize>,
+    ceiling: usize,
+    node: Option<Arc<NodeInbound>>,
+}
+
+impl InboundBudget {
+    pub(crate) fn new(ceiling: usize) -> Self {
+        Self {
+            in_use: Arc::new(AtomicUsize::new(0)),
+            ceiling,
+            node: None,
+        }
+    }
+
+    /// The same budget, also counted in `node`.
+    pub(crate) fn with_node(mut self, node: Option<Arc<NodeInbound>>) -> Self {
+        self.node = node;
+        self
+    }
+
+    /// What is charged right now (tests).
+    #[cfg(test)]
+    pub(crate) fn in_use_for_tests(&self) -> usize {
+        self.used()
+    }
+
+    /// What is charged right now, without the detach bit.
+    pub(crate) fn used(&self) -> usize {
+        self.in_use.load(Ordering::Relaxed) & !DETACHED
+    }
+
+    /// Charges `charge` bytes: refused with [`Refused::Session`] if that would pass this
+    /// session's ceiling, and, when `enforce_node`, with [`Refused::Node`] if it would pass the
+    /// node's. Without `enforce_node` the node counter is charged regardless.
+    ///
+    /// Must only be called from the one task that increments (the router): it is what makes
+    /// "reserve the session, then the node" and [`Self::detach`] not interleave.
+    pub(crate) fn reserve(
+        &self,
+        charge: usize,
+        enforce_node: bool,
+    ) -> Result<InboundPermit, Refused> {
+        let mut current = self.in_use.load(Ordering::Relaxed);
+        let detached = loop {
+            let detached = current & DETACHED;
+            let next_used = (current & !DETACHED)
+                .checked_add(charge)
+                .ok_or(Refused::Session)?;
+            if next_used > self.ceiling {
+                return Err(Refused::Session);
+            }
+            match self.in_use.compare_exchange_weak(
+                current,
+                next_used | detached,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break detached != 0,
+                Err(actual) => current = actual,
+            }
+        };
+        // A detached session's charges are not in the node counter, and its permits skip it.
+        if let Some(node) = self.node.as_ref().filter(|_| !detached)
+            && !node.add(charge, enforce_node)
+        {
+            self.in_use.fetch_sub(charge, Ordering::AcqRel);
+            return Err(Refused::Node);
+        }
+        Ok(InboundPermit {
+            in_use: Arc::clone(&self.in_use),
+            node: self.node.clone(),
+            charge,
+        })
+    }
+
+    /// [`Self::reserve`] with the node ceiling enforced, as an `Option` (tests of other modules).
+    #[cfg(test)]
+    pub(crate) fn try_reserve(&self, charge: usize) -> Option<InboundPermit> {
+        self.reserve(charge, true).ok()
+    }
+
+    /// Takes everything this session holds out of the node counter now, and keeps its permits
+    /// from doing so later (a session whose actor is slow to end must not make others give way).
+    /// Returns what was taken out; zero on a repeat or without a node counter. The drop of a
+    /// permit and this are ordered on the same atomic: a drop before the `fetch_or` took its
+    /// own charge out of the node counter, one after sees the bit and leaves it.
+    pub(crate) fn detach(&self) -> usize {
+        let prev = self.in_use.fetch_or(DETACHED, Ordering::AcqRel);
+        if prev & DETACHED != 0 {
+            return 0;
+        }
+        let held = prev & !DETACHED;
+        if let Some(node) = &self.node {
+            node.in_use.fetch_sub(held, Ordering::AcqRel);
+        }
+        held
+    }
+}
+
 /// A charge on an [`InboundBudget`], given back on drop.
 pub(crate) struct InboundPermit {
     in_use: Arc<AtomicUsize>,
+    node: Option<Arc<NodeInbound>>,
     charge: usize,
 }
 
 impl Drop for InboundPermit {
     fn drop(&mut self) {
-        self.in_use.fetch_sub(self.charge, Ordering::AcqRel);
+        let prev = self.in_use.fetch_sub(self.charge, Ordering::AcqRel);
+        if prev & DETACHED == 0
+            && let Some(node) = &self.node
+        {
+            node.in_use.fetch_sub(self.charge, Ordering::AcqRel);
+        }
     }
+}
+
+/// [`L4SessionHandle::feed_inbound`] refused a reliable record, which is handed back where
+/// that is useful. Either way the record is not queued, the peer's counter has a gap, and the
+/// session cannot go on.
+#[derive(Debug, PartialEq, Eq)]
+pub enum FeedRefused {
+    /// This session's own budget is spent.
+    Session(InboundOverflow),
+    /// The node wide ceiling ([`L4_INBOUND_CEILING_PER_NODE`]) would be passed. The record is
+    /// handed back so the router can retry it after making room
+    /// ([`L4SessionHandle::feed_inbound_over_ceiling`]).
+    Node {
+        /// The record's counter.
+        counter: u64,
+        /// The record's ciphertext.
+        ciphertext: Vec<u8>,
+    },
 }
 
 /// [`L4SessionHandle::feed_inbound`] was refused: this session already holds
@@ -735,6 +883,9 @@ pub struct L4SessionConfig {
     /// Noise's 65,535), so that a record the wire allows can always be
     /// queued.
     pub inbound_budget: usize,
+    /// The node wide counter this session's unread inbound data is also charged to; `None`
+    /// for a session built without a router.
+    pub node_inbound: Option<Arc<NodeInbound>>,
 }
 
 /// A cloneable handle to one running [`run`] actor's send side: open
@@ -814,22 +965,58 @@ impl L4SessionHandle {
     /// records, so the actor sees a datagram and a REKEY in the order they arrived. One past
     /// that budget is dropped and the session lives: a datagram that goes missing leaves no gap
     /// anyone depends on. The class is read from the counter, never from the L3 flag.
-    pub fn feed_inbound(&self, counter: u64, ciphertext: Vec<u8>) -> Result<(), InboundOverflow> {
+    pub fn feed_inbound(&self, counter: u64, ciphertext: Vec<u8>) -> Result<(), FeedRefused> {
+        self.feed(counter, ciphertext, true)
+    }
+
+    /// [`Self::feed_inbound`] without the node wide check: the node counter is charged even past
+    /// its ceiling (by at most this record), the session's own budget still applies. For the
+    /// router, after it made room by ending another session. A datagram is never refused.
+    pub fn feed_inbound_over_ceiling(
+        &self,
+        counter: u64,
+        ciphertext: Vec<u8>,
+    ) -> Result<(), FeedRefused> {
+        self.feed(counter, ciphertext, false)
+    }
+
+    /// Takes this session's charges out of the node counter at once, for a session the router
+    /// gave up on whose actor has not ended yet (see [`InboundBudget::detach`]). Router task
+    /// only. Idempotent.
+    pub fn detach_inbound(&self) {
+        self.inbound_budget.detach();
+    }
+
+    fn feed(
+        &self,
+        counter: u64,
+        ciphertext: Vec<u8>,
+        enforce_node: bool,
+    ) -> Result<(), FeedRefused> {
         if RecordClass::of_counter(counter) == RecordClass::Datagram {
             if self.channels.is_none() {
                 return Ok(());
             }
             let charge = ciphertext.len().saturating_add(INBOUND_RECORD_OVERHEAD);
-            if let Some(permit) = self.dgram_budget.try_reserve(charge) {
+            if let Ok(permit) = self.dgram_budget.reserve(charge, false) {
                 let _ = self.inbound_data_tx.send((counter, ciphertext, permit));
             }
             return Ok(());
         }
         let charge = ciphertext.len().saturating_add(INBOUND_RECORD_OVERHEAD);
-        let Some(permit) = self.inbound_budget.try_reserve(charge) else {
-            return Err(InboundOverflow {
-                budget: self.inbound_budget.ceiling,
-            });
+        let permit = match self.inbound_budget.reserve(charge, enforce_node) {
+            Ok(permit) => permit,
+            Err(Refused::Session) => {
+                return Err(FeedRefused::Session(InboundOverflow {
+                    budget: self.inbound_budget.ceiling,
+                }));
+            }
+            Err(Refused::Node) => {
+                return Err(FeedRefused::Node {
+                    counter,
+                    ciphertext,
+                });
+            }
         };
         // A send to an actor that is gone hands the message back inside the
         // error; dropping it gives the charge back.
@@ -846,13 +1033,13 @@ impl L4SessionHandle {
     /// How many bytes of inbound datagrams this session holds right now (the actor's queue and
     /// the channels' sinks), against [`DGRAM_BUDGET_PER_SESSION`].
     pub fn dgram_in_use(&self) -> usize {
-        self.dgram_budget.in_use.load(Ordering::Relaxed)
+        self.dgram_budget.used()
     }
 
     /// How many bytes of inbound records this session holds right now that
     /// `yamux` has not read yet (what [`Self::feed_inbound`] charges).
     pub fn inbound_in_use(&self) -> usize {
-        self.inbound_budget.in_use.load(Ordering::Relaxed)
+        self.inbound_budget.used()
     }
 
     /// The most [`Self::inbound_in_use`] can reach before
@@ -1008,7 +1195,8 @@ fn build(
         config
             .inbound_budget
             .max(2 * (largest_record + INBOUND_RECORD_OVERHEAD)),
-    );
+    )
+    .with_node(config.node_inbound);
     let (command_tx, command_rx) = mpsc::unbounded_channel();
     let (ended_tx, ended_rx) = oneshot::channel();
 
@@ -1691,6 +1879,7 @@ mod tests {
                 send_budget,
                 observer,
                 inbound_budget: L4_INBOUND_BUDGET_PER_SESSION,
+                node_inbound: None,
             },
             outbound_tx,
             epoch_ended_rx,
@@ -2617,6 +2806,20 @@ mod tests {
         mpsc::Receiver<OutboundSend>,
         oneshot::Sender<()>,
     ) {
+        sleeping_session_on(seed, inbound_budget, None)
+    }
+
+    /// [`sleeping_session`] counted in a node wide counter.
+    fn sleeping_session_on(
+        seed: u8,
+        inbound_budget: usize,
+        node_inbound: Option<Arc<NodeInbound>>,
+    ) -> (
+        L4SessionHandle,
+        impl Future<Output = ()> + Send + 'static,
+        mpsc::Receiver<OutboundSend>,
+        oneshot::Sender<()>,
+    ) {
         let (_a_side, b_side) = two_sides(seed, 65_535);
         let (outbound_tx, outbound_rx) = mpsc::channel(64);
         let (epoch_tx, epoch_rx) = oneshot::channel();
@@ -2631,6 +2834,7 @@ mod tests {
                 send_budget: crate::outbound::SendBudgets::new().for_peer(b_side.peer),
                 observer: None,
                 inbound_budget,
+                node_inbound,
             },
             outbound_tx,
             epoch_rx,
@@ -2664,7 +2868,10 @@ mod tests {
         }
 
         assert_eq!(accepted, fits, "exactly what fits in {BUDGET} bytes");
-        assert_eq!(refused, Some(InboundOverflow { budget: BUDGET }));
+        assert_eq!(
+            refused,
+            Some(FeedRefused::Session(InboundOverflow { budget: BUDGET }))
+        );
         assert_eq!(handle.inbound_in_use(), fits * charge);
         // Still refused while nothing is consumed, and nothing is added.
         assert!(handle.feed_inbound(fits as u64, vec![0u8; RECORD]).is_err());
@@ -2801,6 +3008,7 @@ mod tests {
                     send_budget: crate::outbound::SendBudgets::new().for_peer(b_side.peer),
                     observer: None,
                     inbound_budget: 1,
+                    node_inbound: None,
                 },
                 outbound_tx,
                 epoch_rx,
@@ -2900,6 +3108,7 @@ mod tests {
                 send_budget,
                 observer: None,
                 inbound_budget: BUDGET,
+                node_inbound: None,
             },
             outbound_tx,
             epoch_rx,
@@ -2931,7 +3140,10 @@ mod tests {
             assert!(fed < 50_000, "the flood was never cut off");
         };
 
-        assert_eq!(overflow, InboundOverflow { budget: BUDGET });
+        assert_eq!(
+            overflow,
+            FeedRefused::Session(InboundOverflow { budget: BUDGET })
+        );
         // What was accepted is what fits plus what `yamux` read before it
         // paused (a few dozen: the channel of replies it writes into holds
         // 64 frames plus the one the actor staged).
@@ -3008,6 +3220,7 @@ mod tests {
                 send_budget,
                 observer: None,
                 inbound_budget: L4_INBOUND_BUDGET_PER_SESSION,
+                node_inbound: None,
             },
             outbound_tx,
             epoch_ended_rx,
@@ -3413,5 +3626,174 @@ mod tests {
         }
         fwd_a.abort();
         fwd_b.abort();
+    }
+
+    // --- TBD 75 step 1: the node wide counter ------------------------------
+
+    fn node_and_budgets(ceiling: usize, n: usize) -> (Arc<NodeInbound>, Vec<InboundBudget>) {
+        let node = Arc::new(NodeInbound::new(ceiling));
+        let budgets = (0..n)
+            .map(|_| InboundBudget::new(usize::MAX >> 2).with_node(Some(Arc::clone(&node))))
+            .collect();
+        (node, budgets)
+    }
+
+    /// T7: a drop after `detach` leaves the node counter alone, a drop before it lowers it
+    /// once, and `detach` takes out exactly what was still held.
+    #[test]
+    fn a_permit_dropped_after_detach_does_not_lower_the_node_counter_again() {
+        let (node, budgets) = node_and_budgets(10_000, 2);
+        let (a, b) = (&budgets[0], &budgets[1]);
+        let early = a.reserve(100, true).unwrap();
+        let late = a.reserve(200, true).unwrap();
+        let other = b.reserve(50, true).unwrap();
+        assert_eq!(node.in_use(), 350);
+        // Dropped before the detach: lowers the node counter once.
+        drop(early);
+        assert_eq!(node.in_use(), 250);
+        assert_eq!(a.detach(), 200);
+        assert_eq!(node.in_use(), 50);
+        // Dropped after: the node counter is not touched, the session's is.
+        drop(late);
+        assert_eq!(node.in_use(), 50);
+        assert_eq!(a.used(), 0);
+        assert_eq!(a.detach(), 0, "a second detach takes nothing out");
+        assert_eq!(node.in_use(), 50);
+        drop(other);
+        assert_eq!(node.in_use(), 0);
+    }
+
+    /// A reservation made after the detach charges the session only.
+    #[test]
+    fn a_detached_session_is_not_charged_to_the_node() {
+        let (node, budgets) = node_and_budgets(10_000, 1);
+        let a = &budgets[0];
+        let held = a.reserve(100, true).unwrap();
+        a.detach();
+        let after = a.reserve(300, true).unwrap();
+        assert_eq!(a.used(), 400);
+        assert_eq!(node.in_use(), 0);
+        drop(held);
+        drop(after);
+        assert_eq!(a.used(), 0);
+        assert_eq!(node.in_use(), 0);
+    }
+
+    /// A refusal by the node adds nothing to the session or the node; `enforce_node = false`
+    /// charges past the ceiling; the session's own budget is checked first and wins.
+    #[test]
+    fn a_node_refusal_leaves_both_counters_as_they_were() {
+        let (node, _) = node_and_budgets(1000, 0);
+        let a = InboundBudget::new(5000).with_node(Some(Arc::clone(&node)));
+        let held = a.reserve(900, true).unwrap();
+        assert!(matches!(a.reserve(200, true), Err(Refused::Node)));
+        assert_eq!(a.used(), 900);
+        assert_eq!(node.in_use(), 900);
+        let forced = a.reserve(200, false).unwrap();
+        assert_eq!(node.in_use(), 1100);
+        assert_eq!(a.used(), 1100);
+        assert!(matches!(a.reserve(5000, true), Err(Refused::Session)));
+        assert_eq!(node.in_use(), 1100);
+        drop(held);
+        drop(forced);
+        assert_eq!(node.in_use(), 0);
+        assert_eq!(a.used(), 0);
+    }
+
+    /// `feed_inbound` through the handles: the node refusal hands the record back, the forced
+    /// feed takes it, and the detach and the drain leave the counters exact (T4).
+    #[tokio::test]
+    async fn feed_inbound_refuses_at_the_node_ceiling_and_the_accounting_stays_exact() {
+        const RECORD: usize = 1000;
+        let charge = RECORD + INBOUND_RECORD_OVERHEAD;
+        // Room for five charges in the node, plenty in each session.
+        let node = Arc::new(NodeInbound::new(5 * charge));
+        let (a, a_task, _a_out, _a_end) =
+            sleeping_session_on(1, 100 * charge, Some(Arc::clone(&node)));
+        let (b, b_task, _b_out, _b_end) =
+            sleeping_session_on(2, 100 * charge, Some(Arc::clone(&node)));
+        for counter in 0..3 {
+            a.feed_inbound(counter, vec![1; RECORD]).unwrap();
+        }
+        for counter in 0..2 {
+            b.feed_inbound(counter, vec![2; RECORD]).unwrap();
+        }
+        assert_eq!(node.in_use(), 5 * charge);
+        // The sixth does not fit: refused, handed back untouched, nothing charged.
+        let record = vec![3; RECORD];
+        match b.feed_inbound(2, record.clone()) {
+            Err(FeedRefused::Node {
+                counter,
+                ciphertext,
+            }) => {
+                assert_eq!(counter, 2);
+                assert_eq!(ciphertext, record);
+            }
+            other => panic!("expected a node refusal, got {other:?}"),
+        }
+        assert_eq!(node.in_use(), 5 * charge);
+        assert_eq!(b.inbound_in_use(), 2 * charge);
+        // The forced feed takes it past the ceiling, once.
+        b.feed_inbound_over_ceiling(2, record).unwrap();
+        assert_eq!(node.in_use(), 6 * charge);
+        assert_eq!(b.inbound_in_use(), 3 * charge);
+        // Detach A: its charges leave the node counter at once, its own stay until drained.
+        a.detach_inbound();
+        a.detach_inbound();
+        assert_eq!(node.in_use(), 3 * charge);
+        assert_eq!(a.inbound_in_use(), 3 * charge);
+        // A detached session no longer counts, so B can feed within the ceiling again.
+        b.feed_inbound(3, vec![4; RECORD]).unwrap();
+        assert_eq!(node.in_use(), 4 * charge);
+        // Drain: the actors are never polled, so dropping the tasks drops the queued permits.
+        drop(a_task);
+        drop(b_task);
+        assert_eq!(a.inbound_in_use(), 0);
+        assert_eq!(b.inbound_in_use(), 0);
+        assert_eq!(node.in_use(), 0);
+    }
+
+    /// T8: four threads drop 10,000 permits each while this thread detaches, over and over;
+    /// the node counter ends at 0 and is never seen above what was reserved.
+    #[test]
+    fn concurrent_drops_and_a_detach_leave_the_node_counter_at_zero() {
+        const THREADS: usize = 4;
+        const PERMITS: usize = 10_000;
+        for round in 0..20 {
+            let (node, budgets) = node_and_budgets(usize::MAX >> 2, 1);
+            let budget = budgets[0].clone();
+            let mut lots: Vec<Vec<InboundPermit>> = (0..THREADS)
+                .map(|_| {
+                    (0..PERMITS)
+                        .map(|_| budget.reserve(7, true).unwrap())
+                        .collect()
+                })
+                .collect();
+            assert_eq!(node.in_use(), THREADS * PERMITS * 7);
+            let barrier = Arc::new(std::sync::Barrier::new(THREADS + 1));
+            let handles: Vec<_> = lots
+                .drain(..)
+                .map(|lot| {
+                    let barrier = Arc::clone(&barrier);
+                    std::thread::spawn(move || {
+                        barrier.wait();
+                        for permit in lot {
+                            drop(permit);
+                        }
+                    })
+                })
+                .collect();
+            barrier.wait();
+            // Detach somewhere in the middle of the drops.
+            for _ in 0..(round * 50) {
+                std::hint::spin_loop();
+            }
+            budget.detach();
+            for handle in handles {
+                handle.join().unwrap();
+            }
+            assert_eq!(node.in_use(), 0, "round {round}");
+            assert_eq!(budget.used(), 0, "round {round}");
+        }
     }
 }
