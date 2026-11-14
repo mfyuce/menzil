@@ -39,8 +39,9 @@
 //! | `rate_limited`, `unknown_service`, anything else (no agent, no such member, a lost session) | 0x01 general failure |
 //!
 //! `unknown_service` is deliberately the general failure: it is what an exit that has egress
-//! turned off, or no egress entry, says, and the proxy has no reason to tell the application more
-//! than "failed". After a failure reply the connection is closed in an orderly way (a FIN after
+//! turned off says (a granted member whose node has no `egress` entry in the Policy gets
+//! `no_grant`, a refusal), and the proxy has no reason to tell the application more than
+//! "failed". After a failure reply the connection is closed in an orderly way (a FIN after
 //! the reply, so that it is read); a connection that goes wrong after the success reply is reset
 //! like `reach` does it, so the program cannot take a truncated answer for a whole one.
 //!
@@ -495,6 +496,9 @@ pub fn parse_listen(listen: &str) -> Result<SocketAddr> {
     let (host, port) = listen.rsplit_once(':').with_context(|| {
         format!("--listen {listen:?} is not ADDR:PORT, for example 127.0.0.1:1080")
     })?;
+    if !port.bytes().all(|b| b.is_ascii_digit()) {
+        bail!("--listen {listen:?}: {port:?} is not a port (0 to 65535, digits only)");
+    }
     let port: u16 = port
         .parse()
         .with_context(|| format!("--listen {listen:?}: {port:?} is not a port (0 to 65535)"))?;
@@ -1297,6 +1301,9 @@ mod tests {
             "127.0.0.1:",
             "127.0.0.1:99999",
             "127.0.0.1:-1",
+            "127.0.0.1:+0",
+            "127.0.0.1:+1080",
+            "[::1]:+80",
             ":1080",
             "",
             "::1:1080x",

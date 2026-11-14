@@ -221,9 +221,12 @@ enum Command {
     ///
     /// The exit must be a member whose node runs with `[egress] enabled = true` in its
     /// config.toml, to which this device holds an `egress:*` grant and for which the Policy has
-    /// an `egress` entry (an egress rule); the exit refuses loopback, link local, its own
-    /// addresses and other private ranges whatever the rules say. A refusal reaches the
-    /// application as a SOCKS error.
+    /// an `egress` entry (an egress rule). Whatever the rules say, the exit refuses loopback,
+    /// link local, multicast, its own addresses, the networks it is directly connected to and
+    /// the cloud metadata and transition ranges (100.64/10, 198.18/15, fc00::/7 and others);
+    /// only 10/8, 172.16/12 and 192.168/16 can be lifted by the owner, with a more specific
+    /// allow. Port 25 is denied unless an allow names it. A refusal reaches the application
+    /// as a SOCKS error.
     Proxy {
         /// The node to use as the exit: a member's name, or the start of its node id.
         exit: String,

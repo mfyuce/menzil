@@ -33,6 +33,10 @@
 //! 6. The connect goes to the vetted [`SocketAddr`]s only, one after the other, inside one
 //!    connect timeout for the whole of steps 5 and 6. Nothing is resolved again.
 //!
+//! The exit's own on-link prefixes ([`own_links`]: IPv6 from `/proc/net/if_inet6`, IPv4 from
+//! `/proc/net/fib_trie`) are read at each OPEN like `self` and are refused whatever the Policy
+//! says; an unreadable file refuses every dial.
+//!
 //! The floor ([`reserved_reason`]): the unspecified, loopback, link local, multicast and `self`
 //! addresses, and the ranges protocol.md 8 says no `allow` lifts (100.64/10, 198.18/15,
 //! 240/4, 192.0.0.0/24, 192.88.99.0/24, ::/96, fc00::/7, 64:ff9b::/96, 64:ff9b:1::/48,
@@ -44,7 +48,9 @@
 //!
 //! Choices where protocol.md 8 leaves room (all of them the stricter reading):
 //!
-//! * A pattern that does not parse matches nothing; two `egress` entries for one node are
+//! * An `allow` pattern that does not parse matches nothing; a `deny` pattern that does not
+//!   parse, or is an IPv4 mapped IPv6 address or prefix, makes the whole rule allow nothing
+//!   (`forbidden`). An `allow` that names no port never overrides a `deny` that names one. Two `egress` entries for one node are
 //!   ambiguous and the node has no rule ([`rule_of`]).
 //! * A name `allow` (an exact name or `*.name`) lets the name be resolved and its addresses
 //!   count as allowed when no address pattern matches them, but an address pattern that wins
@@ -58,6 +64,7 @@
 //!   not lift port 25. Only an `allow` with a longer prefix on that port does (for example
 //!   `203.0.113.0/24:25`).
 
+use std::collections::HashMap;
 use std::future::Future;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -73,7 +80,7 @@ use tokio::net::TcpStream;
 use tokio::sync::Semaphore;
 
 use crate::policy_store::PolicyStore;
-use crate::serve::{LOG_INTERVAL, LogThrottle, connect_addr, system_resolve};
+use crate::serve::{LOG_INTERVAL, LogThrottle, connect_addr, system_resolve_fqdn};
 
 /// How many name lookups the exit runs at once, on blocking threads.
 pub const MAX_CONCURRENT_EGRESS_LOOKUPS: usize = 16;
@@ -196,6 +203,30 @@ impl Net {
         let net = Self { addr, len };
         // The prefix must be exact: `10.1.2.3/8` does not parse.
         net.contains(addr).then_some(net)
+    }
+
+    /// The prefix of length `len` that `addr` lies in (host bits cleared).
+    fn masked(addr: IpAddr, len: u8) -> Option<Self> {
+        let addr = match addr {
+            IpAddr::V4(ip) if len <= 32 => {
+                let mask = if len == 0 {
+                    0
+                } else {
+                    u32::MAX << (32 - u32::from(len))
+                };
+                IpAddr::V4(Ipv4Addr::from(u32::from(ip) & mask))
+            }
+            IpAddr::V6(ip) if len <= 128 => {
+                let mask = if len == 0 {
+                    0
+                } else {
+                    u128::MAX << (128 - u32::from(len))
+                };
+                IpAddr::V6(Ipv6Addr::from(u128::from(ip) & mask))
+            }
+            _ => return None,
+        };
+        Self::new(addr, len)
     }
 
     fn contains(&self, ip: IpAddr) -> bool {
@@ -350,6 +381,24 @@ fn parse_all(patterns: &[HostPortPattern]) -> Vec<Pattern> {
     patterns.iter().filter_map(parse_pattern).collect()
 }
 
+/// The `deny` patterns of a rule, or `None` when one of them does not parse or is an IPv4 mapped
+/// IPv6 address or prefix (`::ffff:a.b.c.d`, which no canonical address ever matches): a `deny`
+/// the exit cannot read is not dropped, it makes the whole rule allow nothing.
+fn parse_deny(patterns: &[HostPortPattern]) -> Option<Vec<Pattern>> {
+    patterns
+        .iter()
+        .map(|text| {
+            let pattern = parse_pattern(text)?;
+            let mapped = matches!(
+                &pattern,
+                Pattern::Net { net: Net { addr: IpAddr::V6(addr), .. }, .. }
+                    if addr.to_ipv4_mapped().is_some()
+            );
+            (!mapped).then_some(pattern)
+        })
+        .collect()
+}
+
 /// What a rule is matched against.
 #[derive(Debug, Clone, Copy)]
 pub enum Subject<'a> {
@@ -426,13 +475,19 @@ pub fn decide(
     port: u16,
     own: &[IpAddr],
 ) -> Verdict {
-    let best = |list: &[Pattern]| {
+    let ranks = |list: &[Pattern]| -> Vec<Specificity> {
         list.iter()
             .filter_map(|p| rank(p, subject, port, own))
-            .max()
+            .collect()
     };
-    let allow = best(allow);
-    let mut deny = best(deny);
+    let deny_ranks = ranks(deny);
+    // An `allow` that names no port never overrides a `deny` that names one.
+    let port_deny = deny_ranks.iter().any(|(_, has_port)| *has_port);
+    let allow = ranks(allow)
+        .into_iter()
+        .filter(|(_, has_port)| *has_port || !port_deny)
+        .max();
+    let mut deny = deny_ranks.into_iter().max();
     if let Subject::Addr(IpAddr::V4(ip)) = subject
         && let Some(len) = private_range_len(ip)
     {
@@ -475,7 +530,7 @@ fn v6_in(ip: Ipv6Addr, base: [u16; 8], len: u32) -> bool {
 pub fn reserved_reason(ip: IpAddr) -> Option<&'static str> {
     match ip {
         IpAddr::V4(ip) => {
-            let ranges: [([u8; 4], u32, &str); 9] = [
+            let ranges: [([u8; 4], u32, &str); 10] = [
                 ([0, 0, 0, 0], 8, "unspecified"),
                 ([127, 0, 0, 0], 8, "loopback"),
                 ([169, 254, 0, 0], 16, "link local"),
@@ -493,6 +548,7 @@ pub fn reserved_reason(ip: IpAddr) -> Option<&'static str> {
                     "IETF protocol assignments (192.0.0.0/24)",
                 ),
                 ([192, 88, 99, 0], 24, "6to4 relay anycast (192.88.99.0/24)"),
+                ([168, 63, 129, 16], 32, "Azure WireServer (168.63.129.16)"),
             ];
             ranges
                 .iter()
@@ -569,6 +625,75 @@ pub fn parse_if_inet6(text: &str) -> io::Result<Vec<IpAddr>> {
     Ok(found)
 }
 
+/// The IPv4 on-link prefixes of a `/proc/net/fib_trie` (`/N link UNICAST` under an address
+/// line).
+pub fn parse_fib_trie_links(text: &str) -> Vec<Net> {
+    let mut found: Vec<Net> = Vec::new();
+    let mut last: Option<Ipv4Addr> = None;
+    for line in text.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("|-- ") {
+            last = Ipv4Addr::from_str(rest.trim()).ok();
+        } else if line.starts_with("+--") {
+            last = None;
+        } else if let Some(rest) = line.strip_prefix('/')
+            && rest.split_whitespace().skip(1).eq(["link", "UNICAST"])
+            && let Some(ip) = last
+            && let Some(len) = rest
+                .split_whitespace()
+                .next()
+                .and_then(|len| parse_len(len, 32))
+            && len > 0
+            && let Some(net) = Net::masked(IpAddr::V4(ip), len)
+            && !found.contains(&net)
+        {
+            found.push(net);
+        }
+    }
+    found
+}
+
+/// The on-link prefixes of a `/proc/net/if_inet6` (address, interface index, prefix length in
+/// hex, ...); a line that does not parse is an error, so that a file this code does not
+/// understand fails closed.
+pub fn parse_if_inet6_links(text: &str) -> io::Result<Vec<Net>> {
+    let mut found: Vec<Net> = Vec::new();
+    for line in text.lines() {
+        let mut words = line.split_whitespace();
+        let Some(word) = words.next() else {
+            continue;
+        };
+        let bad = || io::Error::new(io::ErrorKind::InvalidData, "unreadable /proc/net/if_inet6");
+        if word.len() != 32 {
+            return Err(bad());
+        }
+        let bits = u128::from_str_radix(word, 16).map_err(|_| bad())?;
+        let len = words
+            .nth(1)
+            .and_then(|len| u8::from_str_radix(len, 16).ok())
+            .filter(|len| (1..=128).contains(len))
+            .ok_or_else(bad)?;
+        let net = Net::masked(IpAddr::V6(Ipv6Addr::from(bits)), len).ok_or_else(bad)?;
+        if !found.contains(&net) {
+            found.push(net);
+        }
+    }
+    Ok(found)
+}
+
+/// The prefixes the exit's own interfaces are on (the networks it shares a link with), from
+/// `/proc/net/fib_trie` and `/proc/net/if_inet6`: a non liftable part of the floor, like `self`.
+/// An error when either cannot be read.
+pub fn own_links() -> io::Result<Vec<Net>> {
+    let mut links = parse_fib_trie_links(&std::fs::read_to_string("/proc/net/fib_trie")?);
+    match std::fs::read_to_string("/proc/net/if_inet6") {
+        Ok(text) => links.extend(parse_if_inet6_links(&text)?),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    Ok(links)
+}
+
 /// The exit's own interface addresses, from `/proc/net/fib_trie` and `/proc/net/if_inet6`
 /// (Linux, std only). An error when they cannot be read or no IPv4 address is found (a host
 /// always has its loopback): the executor then refuses every dial.
@@ -642,6 +767,7 @@ impl EgressRules for PolicyEgressRules {
 
 type ResolveFn = Arc<dyn Fn(&str, u16) -> io::Result<Vec<SocketAddr>> + Send + Sync>;
 type OwnFn = Arc<dyn Fn() -> io::Result<Vec<IpAddr>> + Send + Sync>;
+type LinksFn = Arc<dyn Fn() -> io::Result<Vec<Net>> + Send + Sync>;
 type ConnectFuture = Pin<Box<dyn Future<Output = io::Result<TcpStream>> + Send>>;
 type ConnectFn = Arc<dyn Fn(SocketAddr, u32) -> ConnectFuture + Send + Sync>;
 
@@ -654,14 +780,56 @@ enum Fail {
     Unreachable(String),
 }
 
+/// How many name lookups one initiator may have in flight at the exit.
+pub const MAX_LOOKUPS_PER_PEER: usize = 4;
+
+/// One of an initiator's places among [`MAX_LOOKUPS_PER_PEER`], given back on drop.
+struct PeerLookup {
+    book: Arc<std::sync::Mutex<HashMap<NodeId, usize>>>,
+    peer: NodeId,
+}
+
+impl PeerLookup {
+    fn take(book: &Arc<std::sync::Mutex<HashMap<NodeId, usize>>>, peer: NodeId) -> Option<Self> {
+        let mut counts = book.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let count = counts.entry(peer).or_insert(0);
+        if *count >= MAX_LOOKUPS_PER_PEER {
+            return None;
+        }
+        *count += 1;
+        Some(Self {
+            book: book.clone(),
+            peer,
+        })
+    }
+}
+
+impl Drop for PeerLookup {
+    fn drop(&mut self) {
+        let mut counts = self
+            .book
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(count) = counts.get_mut(&self.peer) {
+            *count -= 1;
+            if *count == 0 {
+                counts.remove(&self.peer);
+            }
+        }
+    }
+}
+
 /// The exit side of `egress:*`. See the module documentation.
 pub struct EgressExecutor {
     enabled: bool,
     rules: Arc<dyn EgressRules>,
     resolver: ResolveFn,
     own: OwnFn,
+    links: LinksFn,
     connector: ConnectFn,
     lookups: Arc<Semaphore>,
+    /// Lookups in flight per initiator.
+    lookups_by_peer: Arc<std::sync::Mutex<HashMap<NodeId, usize>>>,
     refuse_log: LogThrottle,
     own_log: LogThrottle,
     /// Set only by `narrowed_floor_for_tests`; always false in a build without tests.
@@ -687,10 +855,12 @@ impl EgressExecutor {
         Self {
             enabled,
             rules,
-            resolver: Arc::new(system_resolve),
+            resolver: Arc::new(system_resolve_fqdn),
             own: Arc::new(own_addresses),
+            links: Arc::new(own_links),
             connector: Arc::new(|addr, buffer| Box::pin(connect_addr(addr, buffer))),
             lookups: Arc::new(Semaphore::new(MAX_CONCURRENT_EGRESS_LOOKUPS)),
+            lookups_by_peer: Arc::new(std::sync::Mutex::new(HashMap::new())),
             refuse_log: LogThrottle::new(LOG_INTERVAL),
             own_log: LogThrottle::new(LOG_INTERVAL),
             loopback_ok: false,
@@ -716,6 +886,16 @@ impl EgressExecutor {
         own: impl Fn() -> io::Result<Vec<IpAddr>> + Send + Sync + 'static,
     ) -> Self {
         self.own = Arc::new(own);
+        self
+    }
+
+    /// Takes the exit's on-link prefixes from `links` instead of [`own_links`]. An `Err` makes
+    /// every dial fail closed.
+    pub fn with_own_links(
+        mut self,
+        links: impl Fn() -> io::Result<Vec<Net>> + Send + Sync + 'static,
+    ) -> Self {
+        self.links = Arc::new(links);
         self
     }
 
@@ -759,6 +939,7 @@ impl EgressExecutor {
         name_allowed: bool,
         lists: (&[Pattern], &[Pattern]),
         own: &[IpAddr],
+        links: &[Net],
     ) -> Result<(), &'static str> {
         if let Some(why) = reserved_reason(ip) {
             let narrowed = self.loopback_ok && matches!(ip, IpAddr::V4(v4) if v4.is_loopback());
@@ -768,6 +949,9 @@ impl EgressExecutor {
         }
         if own.contains(&ip) {
             return Err("an address of the exit itself");
+        }
+        if links.iter().any(|net| net.contains(ip)) {
+            return Err("on a network the exit is on");
         }
         match decide(lists.0, lists.1, Subject::Addr(ip), port, own) {
             Verdict::Allow => Ok(()),
@@ -825,7 +1009,14 @@ impl EgressExecutor {
 
     /// A name looked up once on a blocking thread that owns its place among
     /// [`MAX_CONCURRENT_EGRESS_LOOKUPS`] until it returns, however long that takes.
-    async fn lookup(&self, name: &Name, port: u16) -> io::Result<Vec<SocketAddr>> {
+    async fn lookup(
+        &self,
+        initiator: NodeId,
+        name: &Name,
+        port: u16,
+    ) -> io::Result<Vec<SocketAddr>> {
+        let place = PeerLookup::take(&self.lookups_by_peer, initiator)
+            .ok_or_else(|| io::Error::other("this peer has too many lookups in flight"))?;
         let permit = self
             .lookups
             .clone()
@@ -836,6 +1027,7 @@ impl EgressExecutor {
         tokio::task::spawn_blocking(move || {
             let result = resolver(&host, port);
             drop(permit);
+            drop(place);
             result
         })
         .await
@@ -863,7 +1055,13 @@ impl EgressExecutor {
         let Some(rule) = self.rules.rule(&request.network_id) else {
             return Err(fail(Fail::NoRule));
         };
-        let (allow, deny) = (parse_all(&rule.allow), parse_all(&rule.deny));
+        let allow = parse_all(&rule.allow);
+        let Some(deny) = parse_deny(&rule.deny) else {
+            return Err(fail(Fail::Forbidden(
+                "a deny pattern does not parse or is IPv4 mapped: the rule allows nothing"
+                    .to_owned(),
+            )));
+        };
         if allow.is_empty() {
             return Err(fail(Fail::Forbidden("the allow list is empty".to_owned())));
         }
@@ -893,19 +1091,34 @@ impl EgressExecutor {
                 ))));
             }
         };
+        let links: Vec<Net> = match (self.links)() {
+            Ok(links) => links,
+            Err(error) => {
+                if let Some(left_out) = self.own_log.permit(Instant::now()) {
+                    tracing::error!(
+                        %error,
+                        left_out,
+                        "the exit's own networks cannot be read: every egress dial is refused"
+                    );
+                }
+                return Err(fail(Fail::Unreachable(format!(
+                    "the exit's own networks cannot be read: {error}"
+                ))));
+            }
+        };
         let lists = (allow.as_slice(), deny.as_slice());
 
         let work = async {
             let vetted: Vec<IpAddr> = match target.host() {
                 Host::Addr(ip) => {
-                    if let Err(why) = self.vet(*ip, port, false, lists, &own) {
+                    if let Err(why) = self.vet(*ip, port, false, lists, &own, &links) {
                         return Err(Fail::Forbidden(why.to_owned()));
                     }
                     vec![*ip]
                 }
                 Host::Name(name) => {
                     let resolved = self
-                        .lookup(name, port)
+                        .lookup(request.initiator, name, port)
                         .await
                         .map_err(|error| Fail::Unreachable(format!("did not resolve: {error}")))?;
                     let mut vetted: Vec<IpAddr> = Vec::new();
@@ -915,7 +1128,7 @@ impl EgressExecutor {
                         if vetted.contains(&ip) {
                             continue;
                         }
-                        match self.vet(ip, port, name_allowed, lists, &own) {
+                        match self.vet(ip, port, name_allowed, lists, &own, &links) {
                             Ok(()) => vetted.push(ip),
                             Err(why) if dropped.len() < 4 => dropped.push(format!("{ip} ({why})")),
                             Err(_) => {}
@@ -1418,6 +1631,7 @@ mod tests {
         let (resolver_seen, connector_seen) = (seen.clone(), seen.clone());
         let executor = EgressExecutor::new(true, Arc::new(move |_: &NetworkId| Some(rule.clone())))
             .with_own_addresses(|| Ok(Vec::new()))
+            .with_own_links(|| Ok(Vec::new()))
             .with_resolver(move |host, port| {
                 resolver_seen
                     .resolved
@@ -1616,6 +1830,7 @@ mod tests {
             Arc::new(move |_: &NetworkId| Some(rules.clone()))
         })
         .with_own_addresses(|| Ok(Vec::new()))
+        .with_own_links(|| Ok(Vec::new()))
         .with_resolver(|_, port| Ok(vec![SocketAddr::new(ip("127.0.0.1"), port)]));
         for host in ["127.0.0.1", "::ffff:127.0.0.1", "localhost"] {
             let refusal = refusal_of(&production, host, port).await;
@@ -1637,6 +1852,7 @@ mod tests {
         let narrowed =
             EgressExecutor::new(true, Arc::new(move |_: &NetworkId| Some(rules.clone())))
                 .with_own_addresses(|| Ok(Vec::new()))
+                .with_own_links(|| Ok(Vec::new()))
                 .narrowed_floor_for_tests();
         let socket = dial(&narrowed, "127.0.0.1", port).await.unwrap();
         assert_eq!(target.accepted().await, 1);
@@ -1924,6 +2140,7 @@ mod tests {
             Arc::new(move |_: &NetworkId| Some(rules.clone()))
         })
         .with_own_addresses(|| Ok(Vec::new()))
+        .with_own_links(|| Ok(Vec::new()))
         .with_resolver(|_, port| {
             Ok(vec![
                 SocketAddr::new(ip("127.0.0.1"), port),
@@ -1963,6 +2180,7 @@ mod tests {
             Arc::new(move |_: &NetworkId| Some(rules.clone()))
         })
         .with_own_addresses(|| Ok(Vec::new()))
+        .with_own_links(|| Ok(Vec::new()))
         .with_connector(|_, _| std::future::pending::<io::Result<TcpStream>>());
         let refusal = slow_connect
             .dial(
@@ -1984,6 +2202,7 @@ mod tests {
         let slow_resolve =
             EgressExecutor::new(true, Arc::new(move |_: &NetworkId| Some(rules.clone())))
                 .with_own_addresses(|| Ok(Vec::new()))
+                .with_own_links(|| Ok(Vec::new()))
                 .with_resolver(|_, _| {
                     std::thread::sleep(Duration::from_millis(500));
                     Ok(vec![SocketAddr::new(ip("203.0.113.9"), 443)])
@@ -2212,5 +2431,278 @@ fe80000000000000026ffffffe123456 02 40 20 80     eth0
         assert!(rule_of(&body, &node).is_some());
         body.egress = vec![entry(node), entry(other), entry(node)];
         assert!(rule_of(&body, &node).is_none());
+    }
+
+    // ---- Round E1 fixes (TOBEDECIDED 69) ----
+
+    #[test]
+    fn e1_m2_an_allow_without_a_port_never_overrides_a_deny_that_names_a_port() {
+        use Verdict::*;
+        let deny = ["*:25"];
+        for allow in [
+            "0.0.0.0/1",
+            "128.0.0.0/1",
+            "203.0.113.0/24",
+            "203.0.113.9",
+            "2000::/3",
+        ] {
+            let addr = if allow.contains(':') {
+                "2001:db8::1"
+            } else {
+                "203.0.113.9"
+            };
+            let addr = if allow == "128.0.0.0/1" {
+                "203.0.113.9"
+            } else {
+                addr
+            };
+            let v = addr_verdict(&[allow], &deny, addr, 25);
+            assert_ne!(v, Allow, "{allow} lifted *:25");
+        }
+        assert_eq!(
+            addr_verdict(&["203.0.113.0/24"], &deny, "203.0.113.9", 80),
+            Allow
+        );
+        // An allow that names the port still lifts it for its prefix, and names are alike.
+        assert_eq!(
+            addr_verdict(&["203.0.113.0/24:25"], &deny, "203.0.113.9", 25),
+            Allow
+        );
+        assert_eq!(
+            name_verdict(&["example.com"], &deny, "example.com", 25),
+            Deny
+        );
+        assert_eq!(
+            name_verdict(&["example.com"], &deny, "example.com", 80),
+            Allow
+        );
+        // A less specific allow with a port loses to a more specific deny with a port.
+        assert_eq!(
+            addr_verdict(
+                &["203.0.0.0/8:25"],
+                &["203.0.113.0/24:25"],
+                "203.0.113.9",
+                25
+            ),
+            Deny
+        );
+    }
+
+    #[tokio::test]
+    async fn e1_m2_a_longer_allow_prefix_without_a_port_does_not_open_port_25() {
+        let sink = counter().await;
+        let allow = ["0.0.0.0/1", "128.0.0.0/1", "2000::/3", "203.0.113.0/24"];
+        let (executor, seen) = executor_for(rule(&allow, &default_deny()), sink.addr);
+        assert_eq!(
+            refusal_of(&executor, "203.0.113.9", 25).await.code,
+            ErrorCode::Forbidden
+        );
+        assert_eq!(
+            refusal_of(&executor, "2001:db8::1", 25).await.code,
+            ErrorCode::Forbidden
+        );
+        dial(&executor, "203.0.113.9", 443).await.unwrap();
+        assert_eq!(seen.connected().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn e1_l2_a_deny_that_does_not_parse_or_is_ipv4_mapped_allows_nothing() {
+        let sink = counter().await;
+        for bad in [
+            "10.0.0.0/33",
+            "EXAMPLE.COM",
+            "::ffff:203.0.113.9",
+            "[::ffff:203.0.113.0]/120:443",
+            "::ffff:203.0.113.0/120",
+            "",
+        ] {
+            let mut deny = default_deny();
+            deny.push(bad);
+            let (executor, seen) = executor_for(rule(&internet(), &deny), sink.addr);
+            let refusal = refusal_of(&executor, "203.0.113.9", 443).await;
+            assert_eq!(refusal.code, ErrorCode::Forbidden, "{bad:?}");
+            assert!(seen.connected().is_empty(), "{bad:?}");
+        }
+        // A good deny list leaves the rule working.
+        let (executor, _) = executor_for(rule(&internet(), &default_deny()), sink.addr);
+        dial(&executor, "203.0.113.9", 443).await.unwrap();
+        // An allow that does not parse still only matches nothing.
+        let mut allow = internet();
+        allow.push("EXAMPLE.COM");
+        let (executor, _) = executor_for(rule(&allow, &default_deny()), sink.addr);
+        dial(&executor, "203.0.113.9", 443).await.unwrap();
+    }
+
+    #[test]
+    fn e1_m1_the_link_files_parse_into_prefixes() {
+        let fib = "\
+Main:
+  +-- 0.0.0.0/0 3 0 5
+     |-- 0.0.0.0
+        /0 universe UNICAST
+     +-- 203.0.113.0/24 2 0 2
+        |-- 203.0.113.0
+           /24 link UNICAST
+        |-- 203.0.113.7
+           /32 host LOCAL
+        |-- 203.0.113.255
+           /32 link BROADCAST
+";
+        let links = parse_fib_trie_links(fib);
+        assert_eq!(links.len(), 1);
+        assert!(links[0].contains(ip("203.0.113.200")));
+        assert!(!links[0].contains(ip("203.0.114.1")));
+        let inet6 = "\
+00000000000000000000000000000001 01 80 10 80       lo
+2a0001d40c741a000000000000000007 02 40 00 80     eth0
+";
+        let links = parse_if_inet6_links(inet6).unwrap();
+        assert_eq!(links.len(), 2);
+        assert!(links[1].contains(ip("2a00:1d4:c74:1a00::1")));
+        assert!(!links[1].contains(ip("2a00:1d4:c74:1a01::1")));
+        // A file this code does not understand is an error, not an empty list.
+        assert!(parse_if_inet6_links("20010db8000000000000000000000007 02 zz 00 80 eth0").is_err());
+        assert!(parse_if_inet6_links("20010db8000000000000000000000007 02 00 00 80 eth0").is_err());
+        assert!(parse_if_inet6_links("nonsense 01 80").is_err());
+        assert!(parse_if_inet6_links("").unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn e1_m1_the_exits_on_link_prefixes_are_refused_under_an_internet_allow() {
+        let sink = counter().await;
+        let table = vec![("router.example", vec!["2001:db8:1:2::1"])];
+        let (executor, seen) = executor(rule(&internet(), &default_deny()), table, sink.addr);
+        let links =
+            parse_if_inet6_links("20010db8000100020000000000000007 02 40 00 80 eth0").unwrap();
+        let executor = executor.with_own_links(move || Ok(links.clone()));
+        // The on-link /64 is refused as a literal and by name; a host outside it is not.
+        assert_eq!(
+            refusal_of(&executor, "2001:db8:1:2::1", 80).await.code,
+            ErrorCode::Forbidden
+        );
+        assert_eq!(
+            refusal_of(&executor, "router.example", 80).await.code,
+            ErrorCode::TargetUnreachable
+        );
+        dial(&executor, "2001:db8:1:3::1", 80).await.unwrap();
+        assert_eq!(seen.connected().len(), 1);
+        // Not even an allow of the exact address lifts it.
+        let mut allow = internet();
+        allow.push("[2001:db8:1:2::1]:80");
+        let (executor, seen) = executor_for(rule(&allow, &default_deny()), sink.addr);
+        let executor = executor.with_own_links(|| {
+            parse_if_inet6_links("20010db8000100020000000000000007 02 40 00 80 eth0")
+        });
+        assert_eq!(
+            refusal_of(&executor, "2001:db8:1:2::1", 80).await.code,
+            ErrorCode::Forbidden
+        );
+        assert!(seen.connected().is_empty());
+        // Unreadable: every dial fails closed.
+        let (broken, seen) = executor_for(rule(&internet(), &default_deny()), sink.addr);
+        let broken = broken.with_own_links(|| Err(io::Error::other("no /proc")));
+        assert_eq!(
+            refusal_of(&broken, "203.0.113.9", 443).await.code,
+            ErrorCode::TargetUnreachable
+        );
+        assert!(seen.connected().is_empty());
+    }
+
+    #[test]
+    fn e1_n2_the_azure_wireserver_is_in_the_floor() {
+        assert!(reserved_reason(ip("168.63.129.16")).is_some());
+        assert!(reserved_reason(ip("168.63.129.17")).is_none());
+    }
+
+    #[tokio::test]
+    async fn e1_l1_one_initiator_cannot_pin_every_lookup() {
+        use std::sync::atomic::AtomicBool;
+        let sink = counter().await;
+        let release = Arc::new(AtomicBool::new(false));
+        let gate = release.clone();
+        // Releases the hung lookups even when an assertion below fails.
+        struct Release(Arc<AtomicBool>);
+        impl Drop for Release {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        let _release_on_exit = Release(release.clone());
+        let rules = rule(&internet(), &default_deny());
+        let executor =
+            EgressExecutor::new(true, Arc::new(move |_: &NetworkId| Some(rules.clone())))
+                .with_own_addresses(|| Ok(Vec::new()))
+                .with_own_links(|| Ok(Vec::new()))
+                .with_resolver(move |host, port| {
+                    if host.starts_with("hang") {
+                        while !gate.load(Ordering::SeqCst) {
+                            std::thread::sleep(Duration::from_millis(10));
+                        }
+                    }
+                    Ok(vec![SocketAddr::new(ip("203.0.113.9"), port)])
+                })
+                .with_connector({
+                    let sink = sink.addr;
+                    move |_, _| async move { TcpStream::connect(sink).await }
+                });
+        let executor = Arc::new(executor);
+        let as_peer = |byte: u8, host: &str| {
+            let mut req = request(host, 443);
+            req.initiator = NodeId::from([byte; 32]);
+            req
+        };
+        // Peer A starts four lookups that hang; each OPEN gives up after 100 ms, the lookups
+        // keep their places.
+        for n in 0..MAX_LOOKUPS_PER_PEER {
+            let refusal = executor
+                .dial(
+                    &as_peer(0xa, &format!("hang{n}.example")),
+                    1024,
+                    Duration::from_millis(100),
+                )
+                .await
+                .map(|_| ())
+                .unwrap_err();
+            assert_eq!(refusal.code, ErrorCode::TargetUnreachable);
+        }
+        // A fifth lookup of A is refused at once, though 12 places are free.
+        let started = std::time::Instant::now();
+        let refusal = executor
+            .dial(&as_peer(0xa, "fast.example"), 1024, TIMEOUT)
+            .await
+            .map(|_| ())
+            .unwrap_err();
+        assert_eq!(refusal.code, ErrorCode::TargetUnreachable);
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(
+            executor
+                .logged()
+                .join("\n")
+                .contains("too many lookups in flight")
+        );
+        // Another initiator is not affected, and an address literal needs no lookup.
+        executor
+            .dial(&as_peer(0xb, "fast.example"), 1024, TIMEOUT)
+            .await
+            .unwrap();
+        executor
+            .dial(&as_peer(0xa, "203.0.113.9"), 1024, TIMEOUT)
+            .await
+            .unwrap();
+        // Once the blocking calls return, A's places are given back.
+        release.store(true, Ordering::SeqCst);
+        let mut ok = false;
+        for _ in 0..100 {
+            if executor
+                .dial(&as_peer(0xa, "fast.example"), 1024, TIMEOUT)
+                .await
+                .is_ok()
+            {
+                ok = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(ok, "A's lookups were never given back");
     }
 }

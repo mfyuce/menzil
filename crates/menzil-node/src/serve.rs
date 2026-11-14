@@ -209,6 +209,32 @@ pub(crate) fn system_resolve(host: &str, port: u16) -> io::Result<Vec<SocketAddr
     Ok((host, port).to_socket_addrs()?.collect())
 }
 
+/// [`system_resolve`] of the name fully qualified: the exit's egress lookups, which must not use
+/// the exit's search list (a name deny cannot be dodged with a short name). Local service
+/// targets keep [`system_resolve`], because glibc's hosts file lookup does not accept a trailing
+/// dot (`localhost.` does not resolve).
+pub(crate) fn system_resolve_fqdn(host: &str, port: u16) -> io::Result<Vec<SocketAddr>> {
+    qualified_lookup(host, port, system_resolve)
+}
+
+/// Runs `lookup` on `host` with a trailing dot.
+pub(crate) fn qualified_lookup<T>(
+    host: &str,
+    port: u16,
+    lookup: impl FnOnce(&str, u16) -> io::Result<T>,
+) -> io::Result<T> {
+    lookup(&fully_qualified(host), port)
+}
+
+/// `host` with a trailing dot, so that the resolver does not apply a search list or ndots rules.
+pub(crate) fn fully_qualified(host: &str) -> String {
+    if host.ends_with('.') {
+        host.to_owned()
+    } else {
+        format!("{host}.")
+    }
+}
+
 impl Default for LocalServices {
     fn default() -> Self {
         Self::new()
@@ -2079,6 +2105,19 @@ mod tests {
         assert_eq!(throttle.permit(at(15)), None);
         assert_eq!(throttle.permit(at(21)), Some(1));
         assert_eq!(throttle.permit(at(40)), Some(0));
+    }
+
+    #[test]
+    fn e1_l4_names_are_resolved_fully_qualified_so_the_search_list_is_not_used() {
+        assert_eq!(fully_qualified("db"), "db.");
+        assert_eq!(fully_qualified("db.corp.example"), "db.corp.example.");
+        assert_eq!(fully_qualified("db."), "db.");
+        // The egress resolver hands the lookup the qualified name.
+        let seen = qualified_lookup("db", 80, |host, port| Ok((host.to_owned(), port))).unwrap();
+        assert_eq!(seen, ("db.".to_owned(), 80));
+        // Local service targets keep the plain lookup (the hosts file has no `localhost.`).
+        let answers = system_resolve("localhost", 80).expect("localhost resolves");
+        assert!(answers.iter().any(|a| a.ip().is_loopback()));
     }
 
     mod lookups {
