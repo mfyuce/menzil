@@ -121,6 +121,22 @@ pub(crate) const MAX_QUEUED_BYTES: usize = 4 * 1024 * 1024;
 /// own `outcome` oneshot (TODO.md L4h1).
 const MAX_QUEUED_BYTES_PER_DST: usize = 3 * MAX_QUEUED_BYTES / 4;
 
+/// What permit-less sends may occupy for one destination: the per
+/// destination cap minus [`L4_SEND_BUDGET_PER_DST`], so everything a
+/// [`SendBudget`] can reserve for that destination always still fits.
+const UNRESERVED_PER_DST: usize = MAX_QUEUED_BYTES_PER_DST - L4_SEND_BUDGET_PER_DST;
+
+/// What permit-less sends may occupy in total: [`MAX_QUEUED_BYTES`] minus
+/// [`L4_SEND_BUDGET_TOTAL`].
+const UNRESERVED_TOTAL: usize = MAX_QUEUED_BYTES - L4_SEND_BUDGET_TOTAL;
+
+/// Room inside both unreserved caps that a *droppable* permit-less send
+/// (the datagram class, the only bulk permit-less sender) may not use, so
+/// a datagram flood can never starve the small reliable permit-less
+/// control sends (KEEP, REKEY, CLOSE): those may fill the caps completely,
+/// datagrams stop this far short of them.
+const UNRESERVED_CONTROL_ROOM: usize = 64 * 1024;
+
 /// One queued SEND, not yet written to the wire.
 struct QueuedSend {
     dst: NodeId,
@@ -132,6 +148,10 @@ struct QueuedSend {
     /// moved into the returned [`Record`]), and with the whole queue on a
     /// reconnect. See [`SendBudget`].
     _permit: Option<SendPermit>,
+    /// Whether this send holds no [`SendPermit`]: it then also counts
+    /// against the queue's unreserved occupancy (see
+    /// [`UNRESERVED_PER_DST`]), released together with its charge.
+    unreserved: bool,
 }
 
 impl QueuedSend {
@@ -202,11 +222,13 @@ pub struct OutboundSend {
     /// is refused or never drained. `None` for a send that did not
     /// reserve any: small control records (KEEP, REKEY, CLOSE) and every
     /// non-L4 caller. A send that holds one is not refused for lack of
-    /// queue space ([`EnqueueOutcome::QueueFull`]) **as long as the sends
-    /// that hold none stay within what the budgets leave free** (the
-    /// queue's caps minus [`L4_SEND_BUDGET_PER_DST`] / [`L4_SEND_BUDGET_TOTAL`]):
-    /// the queue does not enforce that split, it only holds today because
-    /// the permit-less senders are tiny and rare (TODO.md, L4h5's review).
+    /// queue space ([`EnqueueOutcome::QueueFull`]), structurally: the queue
+    /// caps what the sends that hold none may occupy at its caps minus
+    /// [`L4_SEND_BUDGET_PER_DST`] / [`L4_SEND_BUDGET_TOTAL`] (reliable ones
+    /// are refused, droppable ones dropped beyond that; droppable ones also
+    /// stop `UNRESERVED_CONTROL_ROOM` short, leaving KEEP, REKEY and CLOSE
+    /// room), and the budgets cap reserved sends, so the two never add up
+    /// to more than a cap.
     pub permit: Option<SendPermit>,
 }
 
@@ -298,10 +320,9 @@ const _: () = {
 /// *before* encrypting it, and the reservation travels with the record
 /// ([`OutboundSend::permit`]) until the queue sends it, so reserved
 /// sends alone can never overfill the queue and none of them is refused
-/// for lack of room. That is a guarantee about reserved sends only: the
-/// queue still admits sends that reserved nothing up to its full caps, so
-/// the guarantee holds while those stay within the headroom the budgets
-/// leave (see [`OutboundSend::permit`]). Everything above the budget
+/// for lack of room. The queue enforces that structurally: sends that
+/// reserved nothing may only occupy what the budgets leave free (see
+/// [`OutboundSend::permit`]). Everything above the budget
 /// simply waits, which is what backpressure to the stream writers means.
 ///
 /// One [`SendBudget`] per destination *peer*, not per session: several L4
@@ -436,6 +457,11 @@ pub struct OutboundQueue {
     /// cannot consume the whole shared budget and block *admission* for
     /// every other peer (TODO.md L4b's own review, finding 2).
     queued_bytes_per_dst: HashMap<NodeId, usize>,
+    /// The part of `queued_bytes` held by sends without a permit, capped
+    /// at [`UNRESERVED_TOTAL`] (and per destination at
+    /// [`UNRESERVED_PER_DST`]) so reserved sends are never refused.
+    unreserved_bytes: usize,
+    unreserved_per_dst: HashMap<NodeId, usize>,
 }
 
 impl OutboundQueue {
@@ -453,6 +479,8 @@ impl OutboundQueue {
             queue: VecDeque::new(),
             queued_bytes: 0,
             queued_bytes_per_dst: HashMap::new(),
+            unreserved_bytes: 0,
+            unreserved_per_dst: HashMap::new(),
         }
     }
 
@@ -512,6 +540,7 @@ impl OutboundQueue {
             e2e_proto,
             flags,
             payload,
+            unreserved: permit.is_none(),
             _permit: permit,
         };
         let reliable = send.is_reliable();
@@ -532,6 +561,25 @@ impl OutboundQueue {
             } else {
                 EnqueueOutcome::Dropped
             };
+        }
+        if send.unreserved {
+            // A send holding a permit is never refused for the reasons
+            // below: reserved bytes are bounded by the budgets, and
+            // unreserved ones by these caps, which leave the budgets'
+            // whole share of both caps free.
+            let room = if reliable { 0 } else { UNRESERVED_CONTROL_ROOM };
+            let dst_used = *self.unreserved_per_dst.get(&send.dst).unwrap_or(&0);
+            if dst_used + charge > UNRESERVED_PER_DST - room
+                || self.unreserved_bytes + charge > UNRESERVED_TOTAL - room
+            {
+                return if reliable {
+                    EnqueueOutcome::QueueFull
+                } else {
+                    EnqueueOutcome::Dropped
+                };
+            }
+            self.unreserved_bytes += charge;
+            *self.unreserved_per_dst.entry(send.dst).or_insert(0) += charge;
         }
 
         self.queued_bytes += charge;
@@ -614,6 +662,12 @@ impl OutboundQueue {
         self.queued_bytes -= charge;
         if let Some(per_dst) = self.queued_bytes_per_dst.get_mut(&send.dst) {
             *per_dst -= charge;
+        }
+        if send.unreserved {
+            self.unreserved_bytes -= charge;
+            if let Some(per_dst) = self.unreserved_per_dst.get_mut(&send.dst) {
+                *per_dst -= charge;
+            }
         }
         if send.is_reliable() {
             let ledger = self
@@ -859,40 +913,140 @@ mod tests {
         );
     }
 
-    #[test]
-    fn reliable_enqueue_past_the_per_destination_cap_is_refused() {
-        // Regression test for finding 2: one destination's own backlog
-        // must not be able to consume more than its own share
-        // (`MAX_QUEUED_BYTES_PER_DST`) of the shared budget, so a
-        // *different* destination still has admission room left.
-        // `initial_credit` is huge here so credit is never the limiting
-        // factor — only the per-destination occupancy cap is.
-        let mut q = q(u32::MAX);
+    /// Fills `q` for `dst` with 1000 byte permit-less sends of `flags`
+    /// until one is not accepted; returns the bytes charged and the
+    /// refusing outcome.
+    fn fill_permitless(q: &mut OutboundQueue, dst: NodeId, flags: u8) -> (usize, EnqueueOutcome) {
+        let mut used = 0;
         loop {
-            match q.enqueue(peer(1), 0x01, RELIABLE, vec![0; 1]) {
-                EnqueueOutcome::Accepted => {}
-                EnqueueOutcome::QueueFull => break,
-                other => panic!("unexpected outcome while filling peer(1): {other:?}"),
+            match q.enqueue(dst, 0x01, flags, vec![0; 1000]) {
+                EnqueueOutcome::Accepted => used += 1000,
+                other => return (used, other),
             }
         }
-        // peer(2) has sent nothing yet: still has its own full share.
+    }
+
+    #[tokio::test]
+    async fn reliable_permitless_enqueue_stops_at_the_unreserved_per_destination_cap() {
+        // Finding 2 (one destination must not take the shared budget),
+        // now through the unreserved cap: `peer(1)`'s permit-less backlog
+        // stops short of the destination cap by what a budget can reserve.
+        let mut q = q(u32::MAX);
+        let (used, outcome) = fill_permitless(&mut q, peer(1), RELIABLE);
+        assert_eq!(outcome, EnqueueOutcome::QueueFull);
+        assert!(used <= UNRESERVED_PER_DST && used + 1000 > UNRESERVED_PER_DST);
+        // A reserving send to peer(2) is still admitted.
+        let budget = SendBudgets::new().for_peer(peer(2));
+        let permit = budget.acquire(100).await;
         assert_eq!(
-            q.enqueue(peer(2), 0x01, RELIABLE, vec![0; 100]),
+            q.enqueue_with_permit(peer(2), 0x01, RELIABLE, vec![0; 100], Some(permit)),
             EnqueueOutcome::Accepted,
             "peer(1)'s full backlog must not block admission for peer(2)"
         );
     }
 
     #[test]
-    fn droppable_enqueue_past_the_per_destination_cap_is_dropped_not_refused() {
+    fn droppable_permitless_enqueue_stops_short_of_the_unreserved_cap() {
         let mut q = q(0);
-        loop {
-            match q.enqueue(peer(1), 0x01, DROPPABLE, vec![0; 1]) {
-                EnqueueOutcome::Accepted => {}
-                EnqueueOutcome::Dropped => break,
-                other => panic!("unexpected outcome while filling peer(1): {other:?}"),
-            }
+        let (used, outcome) = fill_permitless(&mut q, peer(1), DROPPABLE);
+        assert_eq!(outcome, EnqueueOutcome::Dropped);
+        assert!(used <= UNRESERVED_PER_DST - UNRESERVED_CONTROL_ROOM);
+        assert!(used + 1000 > UNRESERVED_PER_DST - UNRESERVED_CONTROL_ROOM);
+        // The room left is usable by small reliable control sends.
+        assert_eq!(
+            q.enqueue(peer(1), 0x01, RELIABLE, vec![0; 200]),
+            EnqueueOutcome::Accepted,
+            "a datagram flood must not starve KEEP, REKEY or CLOSE"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_permit_holding_send_is_accepted_after_permitless_sends_fill_their_cap() {
+        // The scenario of TODO.md L4h5's review: permit-less sends used to
+        // fill the queue to its caps and refuse a 20,000 B reserved send.
+        let mut q = q(u32::MAX);
+        let (_, outcome) = fill_permitless(&mut q, peer(1), RELIABLE);
+        assert_eq!(outcome, EnqueueOutcome::QueueFull);
+        let (_, outcome) = fill_permitless(&mut q, peer(1), DROPPABLE);
+        assert_eq!(outcome, EnqueueOutcome::Dropped);
+        let budget = SendBudgets::new().for_peer(peer(1));
+        let permit = budget.acquire(20_000).await;
+        assert_eq!(
+            q.enqueue_with_permit(peer(1), 0x01, RELIABLE, vec![0; 20_000], Some(permit)),
+            EnqueueOutcome::Accepted
+        );
+    }
+
+    #[tokio::test]
+    async fn reserved_sends_fill_their_whole_budget_after_permitless_sends_fill_theirs() {
+        let mut q = q(u32::MAX);
+        // Two destinations at their unreserved caps use the total cap.
+        fill_permitless(&mut q, peer(1), RELIABLE);
+        fill_permitless(&mut q, peer(2), RELIABLE);
+        let budgets = SendBudgets::new();
+        for p in [peer(1), peer(2)] {
+            let budget = budgets.for_peer(p);
+            let permit = budget.acquire(L4_SEND_BUDGET_PER_DST).await;
+            assert_eq!(
+                q.enqueue_with_permit(
+                    p,
+                    0x01,
+                    RELIABLE,
+                    vec![0; L4_SEND_BUDGET_PER_DST - 100],
+                    Some(permit)
+                ),
+                EnqueueOutcome::Accepted
+            );
         }
+    }
+
+    #[test]
+    fn unreserved_occupancy_is_released_when_sends_leave_and_never_underflows() {
+        let mut q = q(u32::MAX);
+        let (used, _) = fill_permitless(&mut q, peer(1), RELIABLE);
+        assert_eq!(q.unreserved_bytes, used);
+        assert_eq!(q.unreserved_per_dst[&peer(1)], used);
+        let mut left = 0;
+        while let Some(record) = q.next_ready_to_send() {
+            unwrap_send(record);
+            left += 1;
+        }
+        assert_eq!(left, used / 1000);
+        assert_eq!(q.unreserved_bytes, 0);
+        assert_eq!(q.unreserved_per_dst[&peer(1)], 0);
+        // The room is free again.
+        let (again, _) = fill_permitless(&mut q, peer(1), RELIABLE);
+        assert_eq!(again, used);
+    }
+
+    #[tokio::test]
+    async fn a_reserved_send_does_not_count_as_unreserved() {
+        let mut q = q(u32::MAX);
+        let budget = SendBudgets::new().for_peer(peer(1));
+        let permit = budget.acquire(5000).await;
+        q.enqueue_with_permit(peer(1), 0x01, RELIABLE, vec![0; 5000], Some(permit));
+        assert_eq!(q.unreserved_bytes, 0);
+        q.next_ready_to_send().unwrap();
+        assert_eq!(q.unreserved_bytes, 0);
+    }
+
+    #[test]
+    fn a_dropped_queue_and_refused_sends_leave_no_unreserved_occupancy_behind() {
+        // The queue is rebuilt per attach, so epoch end and destination
+        // removal are a drop of the whole queue: counters live inside it.
+        // A refused send must not have been counted.
+        let mut q = q(u32::MAX);
+        let (used, outcome) = fill_permitless(&mut q, peer(1), RELIABLE);
+        assert_eq!(outcome, EnqueueOutcome::QueueFull);
+        assert_eq!(q.unreserved_bytes, used);
+        assert_eq!(q.queued_bytes, used);
+        drop(q);
+        let fresh = q_fresh();
+        assert_eq!(fresh.unreserved_bytes, 0);
+    }
+
+    fn q_fresh() -> OutboundQueue {
+        q(10)
     }
 
     #[test]
