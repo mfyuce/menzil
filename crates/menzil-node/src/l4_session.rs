@@ -301,7 +301,9 @@ use menzil_proto::{
 use menzil_stream::{Mode, RECEIVE_WINDOW_GRANT, Stream, StreamMuxError};
 use tokio::sync::{mpsc, oneshot};
 
-use crate::channels::{ChannelTable, DGRAM_BUDGET_PER_SESSION, DGRAM_SEND_QUEUE, DgramOut};
+use crate::channels::{
+    ChannelTable, DGRAM_BUDGET_PER_SESSION, DGRAM_CEILING_PER_NODE, DGRAM_SEND_QUEUE, DgramOut,
+};
 use crate::outbound::{EnqueueOutcome, Epoch, OutboundSend, SendBudget, SendPermit};
 
 /// The current time as a `std::time::Instant`, read through tokio's clock.
@@ -627,6 +629,9 @@ const DETACHED: usize = 1 << (usize::BITS - 1);
 pub struct NodeInbound {
     in_use: AtomicUsize,
     ceiling: usize,
+    /// The datagram class's own node wide counter ([`DGRAM_CEILING_PER_NODE`]): past it a
+    /// datagram is dropped, nothing else happens. `None` on the counter itself.
+    dgram: Option<Arc<NodeInbound>>,
 }
 
 impl NodeInbound {
@@ -635,7 +640,28 @@ impl NodeInbound {
         Self {
             in_use: AtomicUsize::new(0),
             ceiling,
+            dgram: Some(Arc::new(Self {
+                in_use: AtomicUsize::new(0),
+                ceiling: DGRAM_CEILING_PER_NODE,
+                dgram: None,
+            })),
         }
+    }
+
+    /// The same counter with another datagram node cap (tests: the real one is 64 MiB).
+    #[cfg(test)]
+    pub(crate) fn with_dgram_ceiling(mut self, bytes: usize) -> Self {
+        self.dgram = Some(Arc::new(Self {
+            in_use: AtomicUsize::new(0),
+            ceiling: bytes,
+            dgram: None,
+        }));
+        self
+    }
+
+    /// What every session's unread inbound datagrams hold together right now.
+    pub fn dgram_in_use(&self) -> usize {
+        self.dgram.as_ref().map_or(0, |d| d.in_use())
     }
 
     /// What every session built with this counter holds right now.
@@ -671,7 +697,7 @@ impl NodeInbound {
     }
 }
 
-/// Why [`InboundBudget::try_reserve`] refused.
+/// Why [`InboundBudget::reserve`] refused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Refused {
     /// The session's own budget.
@@ -758,12 +784,6 @@ impl InboundBudget {
             node: self.node.clone(),
             charge,
         })
-    }
-
-    /// [`Self::reserve`] with the node ceiling enforced, as an `Option` (tests of other modules).
-    #[cfg(test)]
-    pub(crate) fn try_reserve(&self, charge: usize) -> Option<InboundPermit> {
-        self.reserve(charge, true).ok()
     }
 
     /// Takes everything this session holds out of the node counter now, and keeps its permits
@@ -998,7 +1018,9 @@ impl L4SessionHandle {
                 return Ok(());
             }
             let charge = ciphertext.len().saturating_add(INBOUND_RECORD_OVERHEAD);
-            if let Ok(permit) = self.dgram_budget.reserve(charge, false) {
+            // The node wide datagram cap is always enforced: a refusal (the session's own
+            // budget or the node's) drops the datagram, never anything else.
+            if let Ok(permit) = self.dgram_budget.reserve(charge, true) {
                 let _ = self.inbound_data_tx.send((counter, ciphertext, permit));
             }
             return Ok(());
@@ -1196,7 +1218,11 @@ fn build(
             .inbound_budget
             .max(2 * (largest_record + INBOUND_RECORD_OVERHEAD)),
     )
-    .with_node(config.node_inbound);
+    .with_node(config.node_inbound.clone());
+    let dgram_node = config
+        .node_inbound
+        .as_ref()
+        .and_then(|node| node.dgram.clone());
     let (command_tx, command_rx) = mpsc::unbounded_channel();
     let (ended_tx, ended_rx) = oneshot::channel();
 
@@ -1206,7 +1232,7 @@ fn build(
         stream_mux: stream_mux.clone(),
         inbound_data_tx,
         inbound_budget,
-        dgram_budget: InboundBudget::new(DGRAM_BUDGET_PER_SESSION),
+        dgram_budget: InboundBudget::new(DGRAM_BUDGET_PER_SESSION).with_node(dgram_node),
         channels: channels.clone(),
         command_tx,
     };
@@ -3681,6 +3707,15 @@ mod tests {
 
     /// A refusal by the node adds nothing to the session or the node; `enforce_node = false`
     /// charges past the ceiling; the session's own budget is checked first and wins.
+    #[test]
+    fn a_router_node_counter_carries_the_production_ceilings() {
+        let node = NodeInbound::new(L4_INBOUND_CEILING_PER_NODE);
+        assert_eq!(node.ceiling(), 1 << 30);
+        let dgram = node.dgram.as_ref().expect("a datagram counter");
+        assert_eq!(dgram.ceiling(), 64 << 20);
+        assert_eq!(dgram.ceiling(), crate::channels::DGRAM_CEILING_PER_NODE);
+    }
+
     #[test]
     fn a_node_refusal_leaves_both_counters_as_they_were() {
         let (node, _) = node_and_budgets(1000, 0);

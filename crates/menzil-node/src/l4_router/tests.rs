@@ -2210,6 +2210,11 @@ struct Three {
 }
 
 async fn three_sessions_at(ceiling: usize) -> Three {
+    three_sessions_with(ceiling, None).await
+}
+
+/// [`three_sessions_at`] with another node wide datagram cap (the real one is 64 MiB).
+async fn three_sessions_with(ceiling: usize, dgram_ceiling: Option<usize>) -> Three {
     let w = world();
     let (b, m, n, p) = (party(), party(), party(), party());
     let stores = w.stores(
@@ -2229,6 +2234,11 @@ async fn three_sessions_at(ceiling: usize) -> Three {
         Some(CEIL_BUDGET),
         Some(ceiling),
     );
+    if let Some(cap) = dgram_ceiling {
+        // Before any session exists, so every session is built with this counter.
+        d.engine.node_inbound =
+            Arc::new(crate::l4_session::NodeInbound::new(ceiling).with_dgram_ceiling(cap));
+    }
     d.engine.on_attached(Epoch::first(), LIMITS, relay_static());
     let net = Net::new();
     for peer in [&m, &n, &p] {
@@ -2266,6 +2276,25 @@ impl Three {
                 e2e_proto: E2E_PROTO_TAG,
                 flags: 0,
                 payload: junk_data(index, counter, CEIL_RECORD).encode(),
+            };
+            assert!(
+                self.d
+                    .engine
+                    .on_record(Epoch::first(), record, Now::capture())
+                    .is_none()
+            );
+        }
+    }
+
+    /// `count` junk datagram class records for the session at `index`, sequences from `from`.
+    fn feed_dgrams(&mut self, index: u32, from: u64, count: u64) {
+        let src = self.peers[(index - 7) as usize];
+        for seq in from..from + count {
+            let record = Record::Recv {
+                src,
+                e2e_proto: E2E_PROTO_TAG,
+                flags: 0x01,
+                payload: junk_data(index, (1u64 << 63) | seq, CEIL_RECORD).encode(),
             };
             assert!(
                 self.d
@@ -2373,6 +2402,54 @@ async fn an_eviction_does_not_cascade_and_the_victims_queue_is_not_subtracted_tw
     // The survivors' actors ran meanwhile and may have read some of theirs: the node counter
     // is exactly what they hold now, never less (victim subtracted twice) or more.
     assert_eq!(t.node_in_use(), t.held(8) + t.held(9));
+}
+
+/// T6: a datagram flood to the node wide datagram cap never ends or evicts a session, never
+/// touches the reliable counters and never blocks reliable data; the counter is released.
+#[tokio::test]
+async fn datagrams_past_the_node_cap_are_dropped_and_never_end_a_session() {
+    const DGRAM_CAP: usize = 1536 * 1024;
+    let mut t = three_sessions_with(CEIL_CEILING, Some(DGRAM_CAP)).await;
+    t.feed(7, 0, 37);
+    t.feed(8, 0, 18);
+    let (a, b) = (37 * CEIL_CHARGE, 18 * CEIL_CHARGE);
+    // 100 datagrams of 16 KiB per session: 1.6 MiB each, over the 1 MiB per session budget, and
+    // 4.7 MiB together, over the node cap.
+    for index in [7, 8, 9] {
+        t.feed_dgrams(index, 0, 100);
+    }
+    for index in [7, 8, 9] {
+        assert!(t.d.engine.table.get(index).is_some(), "{index} ended");
+    }
+    let node = Arc::clone(&t.d.engine.node_inbound);
+    let held = node.dgram_in_use();
+    assert!(held <= DGRAM_CAP, "the cap was passed: {held}");
+    assert!(
+        held + CEIL_CHARGE > DGRAM_CAP,
+        "the cap was not reached: {held}"
+    );
+    let per = |t: &Three, index| t.d.engine.table.get(index).unwrap().handle.dgram_in_use();
+    assert_eq!(per(&t, 7) + per(&t, 8) + per(&t, 9), held);
+    assert!(
+        per(&t, 9) < 1024 * 1024 - CEIL_CHARGE,
+        "the third session was held back by the node cap, not its own budget"
+    );
+    // The reliable counters did not move, and reliable data is not blocked.
+    assert_eq!((t.held(7), t.held(8), t.node_in_use()), (a, b, a + b));
+    t.feed(9, 0, 8);
+    assert_eq!(t.held(9), 8 * CEIL_CHARGE);
+    for index in [7, 8, 9] {
+        assert!(t.d.engine.table.get(index).is_some(), "{index} ended");
+    }
+    // The actors read the junk and give every charge back, exactly.
+    timeout(Duration::from_secs(5), async {
+        while node.dgram_in_use() != 0 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the datagram counter is released");
+    assert_eq!(per(&t, 7) + per(&t, 8) + per(&t, 9), 0);
 }
 
 /// T5: the per session budget is clamped to the node ceiling.

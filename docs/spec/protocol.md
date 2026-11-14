@@ -302,6 +302,8 @@ Receiving a datagram. The receiver keeps the highest authenticated sequence `top
 
 So the accepted range is `top - 2047` to `top`, each sequence once, and anything above `top`. A datagram that arrives late but inside the range is delivered once; one outside it, or a gap, is loss and ends nothing. Only an authenticated datagram counts as a sign of life for the idle timer. The reliable path still refuses every class 1 counter before decryption.
 
+Unread data is bounded (section 10). A reliable record that would pass the session's own budget is not queued and that session ends, CLOSE `rate_limited`. One that would pass the node wide ceiling (all sessions together) is not the end of the arriving session as such: the session holding the most unread data ends, CLOSE `rate_limited`, which is the arriving one only when it holds the most, and the record is then queued. A datagram past its per session budget or past the node wide datagram cap (64 MiB) is dropped and no session ends: a droppable class never decides which reliable session dies, and never blocks reliable data.
+
 Rekey: every 2^20 records (of both classes) or every hour a sender emits REKEY (class 0) and applies Noise `Rekey()` to its sending state; the receiver applies it on receipt. The replay window is keyed on the counter, which runs on across `Rekey()`, so neither resets the other. **Datagrams lose at a REKEY**: no grace key is kept, so a datagram the peer encrypted under the old key that arrives after the REKEY record is dropped (it fails the AEAD), and, because of 4.2, a datagram encrypted after the REKEY that leaves before the REKEY record, which waits for credit, is dropped the same way. This is at most a few datagrams once an hour (or 2^20 records) per direction, which UDP tolerates; a reliable record is never affected. A full new handshake with new indices happens every 24 hours; the old session stays valid until the first data record of the new one is received.
 
 Plaintext of a data record:
@@ -594,6 +596,15 @@ Relay principal and public shares (6.1 to 6.3), global. Of these the operator ca
 
 A share connection holds its place from the decision to route it until both ends are gone; a connection whose open failed holds it until its refusal has been sent. Together with the principal's bounds they are the memory bound of share traffic: the principal measured about 290 KiB of buffers on each side for a stream whose peer reads nothing, so 4,096 share connections are about 1.2 GiB on the relay in the worst case; the relay has no further stream cap beyond these. The front door and the piped connections need file descriptors: up to 7,168 on top of the sessions (1,024 ClientHello reads, as many on port 80, 1,024 refusals, 4,096 piped connections), so `menzil relay run` raises its soft limit to the hard one at start and warns if that is too low.
 
+Unread inbound reliable data of a node's L4 sessions (nodes; bytes held between the arrival of a class 0 record and the moment the stream layer reads it, each record charged its ciphertext length plus 128 bytes):
+
+| Item | Default | When over |
+|---|---|---|
+| Per session budget | 162.7 MiB (above the whole receive window granted to a peer; at most the node ceiling) | the record is not queued and that session ends: CLOSE `rate_limited` |
+| Per node, all sessions together (`RouterConfig::with_inbound_ceiling`, default 1 GiB; no `config.toml` key yet) | 1 GiB | the session holding the most unread data ends: CLOSE `rate_limited`; it is the session whose record just arrived only when that one holds the most; the arriving record is then queued |
+
+Datagrams are counted apart (table below) and never end a session.
+
 Datagram class (nodes, 5.2 and 5.4), fixed in the node:
 
 | Item | Default | When over |
@@ -604,6 +615,7 @@ Datagram class (nodes, 5.2 and 5.4), fixed in the node:
 | Channel id reuse | not within 60 s | OPEN refused `rate_limited` when no id is free |
 | Bucket per channel, sender and receiver; bucket per peer, sender | 20 Mbit/s, 256 KiB burst, counted on max(n + 32, 64) | dropped, counted |
 | Datagrams held per session (queue and sinks) | 1 MiB, each charged its ciphertext length plus 128 bytes | dropped on arrival, session kept |
+| Datagrams held by all of a node's sessions together | 64 MiB (`DGRAM_CEILING_PER_NODE`, fixed) | dropped on arrival, session kept, no other session affected |
 | Sink of one channel | 256 KiB of payload | dropped, counted |
 | Datagrams waiting for the session's actor to send | 64 | dropped, counted |
 

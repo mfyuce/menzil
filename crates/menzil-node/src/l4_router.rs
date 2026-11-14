@@ -104,7 +104,12 @@
 //! to the moment `yamux` reads the record, through the actor and through
 //! `menzil-stream`'s queue). A record that does not fit ends that session
 //! at once ([`Engine::end_overflowed`]): closed with `rate_limited`,
-//! removed, nothing else touched. The router never waits for a session.
+//! removed, nothing else touched. All sessions together hold at most
+//! [`L4_INBOUND_CEILING_PER_NODE`] (`RouterConfig::with_inbound_ceiling`): a record that
+//! would pass it ends the session holding the most unread data (the arriving one only when it
+//! holds the most), closed `rate_limited` too, and is then queued itself. Datagrams are
+//! counted apart (`DGRAM_CEILING_PER_NODE`, 64 MiB): past it a datagram is dropped, no
+//! session ends and none gives way. The router never waits for a session.
 //! Stopping it from reading `events` instead would hold every other peer's
 //! traffic behind one session, as often as a member can finish a handshake,
 //! and `run_session` reads the relay socket only while no event is waiting,

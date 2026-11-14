@@ -51,6 +51,13 @@ pub const SINK_CAPACITY_BYTES: usize = 256 * 1024;
 /// the sinks together.
 pub const DGRAM_BUDGET_PER_SESSION: usize = 1024 * 1024;
 
+/// What the unread inbound datagrams of all of one node's sessions may hold together (TBD 75
+/// step 3): 64 MiB. The per session budget times the 4,096 sessions a table allows would be
+/// 4 GiB. A datagram past it is dropped and nothing else happens (it never ends a session and
+/// never makes another one give way: a droppable class must not decide which reliable session
+/// dies).
+pub const DGRAM_CEILING_PER_NODE: usize = 64 * 1024 * 1024;
+
 /// How many datagrams the actor's command queue holds for sending; a datagram that finds it
 /// full is dropped.
 pub const DGRAM_SEND_QUEUE: usize = 64;
@@ -539,7 +546,7 @@ mod tests {
     }
 
     fn permit(budget: &InboundBudget) -> InboundPermit {
-        budget.try_reserve(1).expect("budget has room")
+        budget.reserve(1, true).expect("budget has room")
     }
 
     #[test]
