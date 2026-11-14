@@ -113,13 +113,16 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
-use menzil_proto::{ErrorCode, OpenBody, OpenMeta, OpenTarget, ServiceId, ServiceKind};
+use menzil_proto::{
+    ErrorCode, OpenBody, OpenMeta, OpenTarget, OpenTransport, ServiceId, ServiceKind,
+};
 use menzil_stream::{
     Authorizer, OpenDecision, OpenError, OpenRefusal, OpenRequest, Responded, ServiceHandler,
     Stream, StreamMuxError, initiate_open, respond_to_open,
 };
 use tokio::sync::Semaphore;
 
+use crate::channels::{Channel, ChannelError};
 use crate::l4_session::{L4SessionAcceptor, L4SessionHandle};
 
 /// protocol.md 5.3: "OPEN times out after 10 seconds" — applied to both
@@ -204,6 +207,12 @@ pub enum OpenStreamError {
     /// a timed-out exchange is never retried on the same stream.
     #[error("no OPEN_ACK within {0:?}")]
     Timeout(Duration),
+    /// A datagram channel (protocol.md 5.4) could not be set up and the stream was reset: this
+    /// session has no channels, the OPEN did not ask for UDP, the peer's OPEN_ACK carried no
+    /// channel for a UDP OPEN (a peer built before channels existed served it as TCP), or it
+    /// named an id this side cannot accept (the wrong parity, one already live, too many).
+    #[error("datagram channel: {0}")]
+    Channel(&'static str),
     /// The peer's OPEN_ACK carried `ok: false`.
     #[error("peer refused ({code:?}): {msg}")]
     Refused {
@@ -234,9 +243,74 @@ pub async fn open(
     if target.is_some() && service != ServiceId::new(ServiceKind::Egress, "*") {
         return Err(OpenStreamError::InvalidTarget);
     }
+    // A UDP OPEN has a channel to register and a stream that must not outlive it: it goes
+    // through [`open_udp`].
+    if target
+        .as_ref()
+        .is_some_and(|t| t.transport == Some(OpenTransport::Udp))
+        || service.kind == ServiceKind::Udp
+    {
+        return Err(OpenStreamError::Channel("a UDP OPEN needs open_udp"));
+    }
     match tokio::time::timeout(OPEN_TIMEOUT, open_inner(session, service, target)).await {
-        Ok(result) => result,
+        Ok(result) => result.map(|(stream, _ack_channel)| stream),
         Err(_elapsed) => Err(OpenStreamError::Timeout(OPEN_TIMEOUT)),
+    }
+}
+
+/// [`open`] for a UDP OPEN (protocol.md 5.3, 5.4): `target` is an `egress:*` target whose
+/// `transport` is forced to UDP here. On `ok` the peer's OPEN_ACK must carry a channel id
+/// with the other side's session role parity that is not live in this session; the id is
+/// registered and returned with the stream.
+///
+/// **The stream is reset (dropped) and an error returned** when the ack is `ok` but carries no
+/// channel (an exit built before datagram channels served the OPEN as TCP and dialled once;
+/// this side stops using that connection at once), when its id has this side's own parity or
+/// is live, or when the session is at its channel cap or has no channels at all. Keep the
+/// returned [`Channel`] exactly as long as the stream: dropping it frees the id.
+pub async fn open_udp(
+    session: &L4SessionHandle,
+    service: ServiceId,
+    target: OpenTarget,
+) -> Result<(Stream, Channel), OpenStreamError> {
+    if service != ServiceId::new(ServiceKind::Egress, "*") {
+        return Err(OpenStreamError::InvalidTarget);
+    }
+    let Some(table) = session.channels() else {
+        return Err(OpenStreamError::Channel(
+            "this session has no datagram channels",
+        ));
+    };
+    let target = OpenTarget {
+        transport: Some(OpenTransport::Udp),
+        ..target
+    };
+    let (stream, ack_channel) = match tokio::time::timeout(
+        OPEN_TIMEOUT,
+        open_inner(session, service, Some(target)),
+    )
+    .await
+    {
+        Ok(result) => result?,
+        Err(_elapsed) => return Err(OpenStreamError::Timeout(OPEN_TIMEOUT)),
+    };
+    let Some(id) = ack_channel else {
+        drop(stream);
+        return Err(OpenStreamError::Channel(
+            "the peer accepted a UDP OPEN without a channel",
+        ));
+    };
+    match table.register_remote(id) {
+        Ok(channel) => Ok((stream, channel)),
+        Err(error) => {
+            drop(stream);
+            Err(OpenStreamError::Channel(match error {
+                ChannelError::WrongParity => "the peer named a channel id of the wrong parity",
+                ChannelError::Live => "the peer named a channel id that is already live",
+                ChannelError::TooMany => "the session has too many live channels",
+                ChannelError::NoFreeId | ChannelError::Closed => "the session has ended",
+            }))
+        }
     }
 }
 
@@ -247,7 +321,7 @@ async fn open_inner(
     session: &L4SessionHandle,
     service: ServiceId,
     target: Option<OpenTarget>,
-) -> Result<Stream, OpenStreamError> {
+) -> Result<(Stream, Option<u16>), OpenStreamError> {
     let mut stream = session.open_stream().await?;
     let open = OpenBody {
         v: menzil_proto::PROTOCOL_VERSION,
@@ -257,7 +331,7 @@ async fn open_inner(
     };
     let ack = initiate_open(&mut stream, &open).await?;
     if ack.ok {
-        Ok(stream)
+        Ok((stream, ack.channel))
     } else {
         Err(OpenStreamError::Refused {
             code: ack.code,
@@ -309,6 +383,14 @@ impl<S, H: ServiceHandler<S> + Sync> ServiceHandler<S> for MemberServiceHandler<
 
     async fn open(&self, request: &OpenRequest) -> Result<Self::Opened, OpenRefusal> {
         self.0.open(&prepared(request, self.1)).await
+    }
+
+    fn open_channel(
+        &self,
+        request: &OpenRequest,
+        opened: &mut Self::Opened,
+    ) -> Result<Option<u16>, OpenRefusal> {
+        self.0.open_channel(&prepared(request, self.1), opened)
     }
 
     fn handle(&self, stream: S, request: OpenRequest, opened: Self::Opened) -> Self::Handling {
@@ -713,30 +795,40 @@ mod tests {
         mode: Mode,
         max_record: u32,
     ) -> OneSession {
+        one_session_with(transport, peer, network_id, mode, max_record, false)
+    }
+
+    /// [`one_session`], with datagram channels when `datagrams` is set.
+    fn one_session_with(
+        transport: menzil_e2e::E2eTransport,
+        peer: NodeId,
+        network_id: NetworkId,
+        mode: Mode,
+        max_record: u32,
+        datagrams: bool,
+    ) -> OneSession {
         let (outbound_tx, outbound_rx) = mpsc::channel(64);
         let (epoch_ended_tx, epoch_ended_rx) = oneshot::channel();
-        let (handle, acceptor, task) = new_l4_session(
-            L4SessionConfig {
-                transport,
-                peer,
-                network_id,
-                mode,
-                max_record,
-                epoch: Epoch::first(),
-                send_budget: crate::outbound::SendBudgets::new().for_peer(peer),
-                observer: None,
-                inbound_budget: crate::l4_session::L4_INBOUND_BUDGET_PER_SESSION,
-            },
-            outbound_tx,
-            epoch_ended_rx,
-        );
-        (
-            handle,
-            acceptor,
-            outbound_rx,
-            epoch_ended_tx,
-            tokio::spawn(task),
-        )
+        let config = L4SessionConfig {
+            transport,
+            peer,
+            network_id,
+            mode,
+            max_record,
+            epoch: Epoch::first(),
+            send_budget: crate::outbound::SendBudgets::new().for_peer(peer),
+            observer: None,
+            inbound_budget: crate::l4_session::L4_INBOUND_BUDGET_PER_SESSION,
+        };
+        let (handle, acceptor, outbound_rx, epoch_ended_tx, task) = if datagrams {
+            let (h, a, t) =
+                crate::l4_session::new_with_datagrams(config, outbound_tx, epoch_ended_rx);
+            (h, a, outbound_rx, epoch_ended_tx, tokio::spawn(t))
+        } else {
+            let (h, a, t) = new_l4_session(config, outbound_tx, epoch_ended_rx);
+            (h, a, outbound_rx, epoch_ended_tx, tokio::spawn(t))
+        };
+        (handle, acceptor, outbound_rx, epoch_ended_tx, task)
     }
 
     /// Spawns a task that drains `rx` (one side's own `OutboundSend`
@@ -769,6 +861,10 @@ mod tests {
     }
 
     fn two_sessions_with_max_record(max_record: u32) -> TwoSessions {
+        two_sessions_with(max_record, false)
+    }
+
+    fn two_sessions_with(max_record: u32, datagrams: bool) -> TwoSessions {
         let (a_priv, _a_pub) = fresh_keypair();
         let (b_priv, b_pub) = fresh_keypair();
         let network_id = NetworkId::from([1u8; 32]);
@@ -783,10 +879,22 @@ mod tests {
             .unwrap();
         let (a_transport, _payload, _b_static) = a_hs.finish(&resp, max_record).unwrap();
 
-        let (a_handle, a_acceptor, a_outbound_rx, a_epoch_ended_tx, task_a) =
-            one_session(a_transport, b_node, network_id, Mode::Client, max_record);
-        let (b_handle, b_acceptor, b_outbound_rx, b_epoch_ended_tx, task_b) =
-            one_session(b_transport, a_node, network_id, Mode::Server, max_record);
+        let (a_handle, a_acceptor, a_outbound_rx, a_epoch_ended_tx, task_a) = one_session_with(
+            a_transport,
+            b_node,
+            network_id,
+            Mode::Client,
+            max_record,
+            datagrams,
+        );
+        let (b_handle, b_acceptor, b_outbound_rx, b_epoch_ended_tx, task_b) = one_session_with(
+            b_transport,
+            a_node,
+            network_id,
+            Mode::Server,
+            max_record,
+            datagrams,
+        );
 
         let pump_a_to_b = pump(a_outbound_rx, b_handle.clone());
         let pump_b_to_a = pump(b_outbound_rx, a_handle.clone());
@@ -1988,6 +2096,297 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(&got, b"hi");
+        accept_task.abort();
+    }
+
+    // ------------------------------------------------------------------
+    // Datagram channels (protocol.md 5.3, 5.4)
+    // ------------------------------------------------------------------
+
+    /// What a [`ChannelProbe`]'s stream task saw.
+    #[derive(Debug)]
+    enum Seen {
+        /// A datagram arrived on the channel the handler holds.
+        Datagram(Vec<u8>),
+        /// The stream ended: `Ok(n)` is a read of `n` bytes (0 is a clean end), `Err` a reset.
+        StreamEnded(Result<usize, std::io::ErrorKind>),
+    }
+
+    #[derive(Clone)]
+    enum ChannelMode {
+        /// No channel in the ack, like a handler that serves no datagrams.
+        None,
+        /// A channel allocated in this table, held until the stream ends.
+        Allocate(crate::channels::ChannelTable),
+        /// This id in the ack, registered nowhere.
+        Fixed(u16),
+    }
+
+    struct ProbeOpened {
+        channel: Option<crate::channels::Channel>,
+    }
+
+    /// A [`ServiceHandler`] that accepts everything, answers per its [`ChannelMode`] and reports
+    /// what its stream task sees.
+    #[derive(Clone)]
+    struct ChannelProbe {
+        mode: ChannelMode,
+        seen: mpsc::UnboundedSender<Seen>,
+    }
+
+    impl ServiceHandler<Stream> for ChannelProbe {
+        type Opened = ProbeOpened;
+        type Handling = std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>;
+
+        async fn open(&self, _request: &OpenRequest) -> Result<ProbeOpened, OpenRefusal> {
+            Ok(ProbeOpened { channel: None })
+        }
+
+        fn open_channel(
+            &self,
+            _request: &OpenRequest,
+            opened: &mut ProbeOpened,
+        ) -> Result<Option<u16>, OpenRefusal> {
+            match &self.mode {
+                ChannelMode::None => Ok(None),
+                ChannelMode::Fixed(id) => Ok(Some(*id)),
+                ChannelMode::Allocate(table) => {
+                    let channel = table.allocate().map_err(|_| OpenRefusal {
+                        code: ErrorCode::RateLimited,
+                        msg: "no channel".to_string(),
+                    })?;
+                    let id = channel.id();
+                    opened.channel = Some(channel);
+                    Ok(Some(id))
+                }
+            }
+        }
+
+        fn handle(
+            &self,
+            mut stream: Stream,
+            _request: OpenRequest,
+            mut opened: ProbeOpened,
+        ) -> Self::Handling {
+            let seen = self.seen.clone();
+            Box::pin(async move {
+                let mut buf = [0u8; 16];
+                loop {
+                    let datagram = async {
+                        match opened.channel.as_mut() {
+                            Some(channel) => channel.recv().await,
+                            None => std::future::pending().await,
+                        }
+                    };
+                    tokio::select! {
+                        read = stream.read(&mut buf) => {
+                            let _ = seen.send(Seen::StreamEnded(read.map_err(|e| e.kind())));
+                            break;
+                        }
+                        datagram = datagram => {
+                            if let Some(datagram) = datagram {
+                                let _ = seen.send(Seen::Datagram(datagram));
+                            }
+                        }
+                    }
+                }
+                // The channel is dropped with `opened`, as a handler's task ends with its stream.
+                drop(opened);
+            })
+        }
+    }
+
+    fn egress_star() -> ServiceId {
+        ServiceId::new(ServiceKind::Egress, "*")
+    }
+
+    fn udp_target() -> OpenTarget {
+        OpenTarget {
+            host: "example.com".to_string(),
+            port: 53,
+            transport: None,
+        }
+    }
+
+    async fn next_seen(rx: &mut mpsc::UnboundedReceiver<Seen>) -> Seen {
+        tokio::time::timeout(STEP, rx.recv())
+            .await
+            .expect("the handler should have reported")
+            .unwrap()
+    }
+
+    fn assert_reset(seen: Seen) {
+        match seen {
+            Seen::StreamEnded(Err(std::io::ErrorKind::ConnectionReset)) => {}
+            other => panic!("the stream should have been reset, not {other:?}"),
+        }
+    }
+
+    /// Both sides with datagram channels, `b` accepting through the handler `mode` builds.
+    /// The last element keeps everything else alive.
+    async fn probe_rig(
+        mode: impl FnOnce(&crate::channels::ChannelTable) -> ChannelMode,
+    ) -> (
+        L4SessionHandle,
+        crate::channels::ChannelTable,
+        mpsc::UnboundedReceiver<Seen>,
+        tokio::task::JoinHandle<()>,
+        TwoSessionsKeep,
+    ) {
+        let TwoSessions {
+            a,
+            a_acceptor,
+            mut b,
+            b_handle,
+            _pump_a_to_b,
+            _pump_b_to_a,
+            _task_a,
+            _task_b,
+            _a_epoch_ended_tx,
+            _b_epoch_ended_tx,
+        } = two_sessions_with(65_535, true);
+        let b_table = b_handle.channels().unwrap().clone();
+        let (seen_tx, seen_rx) = mpsc::unbounded_channel();
+        let handler = ChannelProbe {
+            mode: mode(&b_table),
+            seen: seen_tx,
+        };
+        let accept_task = tokio::spawn(async move {
+            accept_loop(&mut b, AllowAll, handler).await;
+        });
+        let keep = TwoSessionsKeep(
+            a_acceptor,
+            b_handle,
+            _pump_a_to_b,
+            _pump_b_to_a,
+            _task_a,
+            _task_b,
+            _a_epoch_ended_tx,
+            _b_epoch_ended_tx,
+        );
+        (a, b_table, seen_rx, accept_task, keep)
+    }
+
+    /// What [`probe_rig`] hands back to keep the sessions running.
+    #[allow(dead_code)]
+    struct TwoSessionsKeep(
+        L4SessionAcceptor,
+        L4SessionHandle,
+        tokio::task::JoinHandle<()>,
+        tokio::task::JoinHandle<()>,
+        tokio::task::JoinHandle<()>,
+        tokio::task::JoinHandle<()>,
+        oneshot::Sender<()>,
+        oneshot::Sender<()>,
+    );
+
+    #[tokio::test]
+    async fn an_ok_ack_without_channel_for_a_udp_open_is_reset() {
+        // The responder serves the OPEN and acks `ok` with no channel, as a handler built before
+        // channels existed does (it read the UDP target as a TCP one).
+        let (a, _b_table, mut seen, accept_task, _keep) = probe_rig(|_| ChannelMode::None).await;
+        let error = open_udp(&a, egress_star(), udp_target())
+            .await
+            .map(|_| ())
+            .unwrap_err();
+        match error {
+            OpenStreamError::Channel(why) => assert!(why.contains("without a channel"), "{why}"),
+            other => panic!("{other:?}"),
+        }
+        assert_reset(next_seen(&mut seen).await);
+        // A plain `open` refuses a UDP target too: it has no channel to register.
+        let udp = OpenTarget {
+            transport: Some(OpenTransport::Udp),
+            ..udp_target()
+        };
+        assert!(matches!(
+            open(&a, egress_star(), Some(udp)).await,
+            Err(OpenStreamError::Channel(_))
+        ));
+        accept_task.abort();
+    }
+
+    #[tokio::test]
+    async fn the_initiator_resets_on_a_wrong_parity_or_live_channel_id() {
+        // `a` is the session initiator: the peer's ids are odd.
+        let (a, _b_table, mut seen, accept_task, _keep) =
+            probe_rig(|_| ChannelMode::Fixed(2)).await;
+        let error = open_udp(&a, egress_star(), udp_target())
+            .await
+            .map(|_| ())
+            .unwrap_err();
+        assert!(
+            matches!(error, OpenStreamError::Channel(why) if why.contains("parity")),
+            "{error:?}"
+        );
+        assert_reset(next_seen(&mut seen).await);
+        accept_task.abort();
+
+        let (a, _b_table, mut seen, accept_task, _keep) =
+            probe_rig(|_| ChannelMode::Fixed(3)).await;
+        let (first_stream, first) = open_udp(&a, egress_star(), udp_target())
+            .await
+            .expect("an odd id that is not live is accepted");
+        assert_eq!(first.id(), 3);
+        let error = open_udp(&a, egress_star(), udp_target())
+            .await
+            .map(|_| ())
+            .unwrap_err();
+        assert!(
+            matches!(error, OpenStreamError::Channel(why) if why.contains("already live")),
+            "{error:?}"
+        );
+        assert_reset(next_seen(&mut seen).await);
+        assert!(
+            a.channels().unwrap().is_live(3),
+            "the first channel is intact"
+        );
+        drop(first_stream);
+        accept_task.abort();
+    }
+
+    #[tokio::test]
+    async fn datagrams_after_the_streams_reset_are_dropped() {
+        let (a, b_table, mut seen, accept_task, _keep) =
+            probe_rig(|table| ChannelMode::Allocate(table.clone())).await;
+        let (stream, channel) = open_udp(&a, egress_star(), udp_target()).await.unwrap();
+        // The responder is the session responder: odd ids.
+        assert_eq!(channel.id() % 2, 1);
+        assert!(b_table.is_live(channel.id()));
+        channel.send(b"one").unwrap();
+        match next_seen(&mut seen).await {
+            Seen::Datagram(bytes) => assert_eq!(bytes, b"one"),
+            other => panic!("{other:?}"),
+        }
+        // The stream is reset: its task ends and takes the channel with it.
+        let id = channel.id();
+        drop(stream);
+        assert_reset(next_seen(&mut seen).await);
+        for _ in 0..100 {
+            if !b_table.is_live(id) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            !b_table.is_live(id),
+            "the channel lives as long as its stream"
+        );
+        // A datagram for it now is dropped: not delivered, not answered, no session end.
+        channel.send(b"two").unwrap();
+        for _ in 0..100 {
+            if b_table.dropped().unknown_channel == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(b_table.dropped().unknown_channel, 1);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), seen.recv())
+                .await
+                .is_err(),
+            "a datagram reached a handler after its stream ended"
+        );
         accept_task.abort();
     }
 }

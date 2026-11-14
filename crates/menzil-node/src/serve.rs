@@ -473,6 +473,18 @@ impl LocalServices {
         if request.service.label != "*" {
             return Err(refusal(ErrorCode::UnknownService, "no such service"));
         }
+        // A UDP target (egress slice 2b1): this exit has no UDP channel yet, so it answers as
+        // it does for any service it does not serve. This runs after the grant check (the
+        // authorizer ran before `open`) and before the slot, the resolver and the dial, so a
+        // UDP OPEN costs the exit nothing and reaches no network. Without this line an
+        // OPEN with `transport: "udp"` would be dialled as TCP.
+        if request
+            .target
+            .as_ref()
+            .is_some_and(|t| t.transport == Some(menzil_proto::OpenTransport::Udp))
+        {
+            return Err(refusal(ErrorCode::UnknownService, "no such service"));
+        }
         let slot = self.take_slot(request, counted)?;
         let socket = executor
             .dial(request, self.limits.socket_buffer, self.connect_timeout)
@@ -926,6 +938,14 @@ mod tests {
 
     impl Rig {
         fn new(services: LocalServices) -> Self {
+            Self::with_authorizer(services, AllowAll)
+        }
+
+        fn with_authorizer<A: Authorizer + Send + Sync + 'static>(
+            services: LocalServices,
+            authorizer: A,
+        ) -> Self {
+            let authorizer = Arc::new(authorizer);
             let (client, _client_inbound, client_out, client_driver) =
                 menzil_stream::new(Mode::Client, 65_535);
             let (server, mut server_inbound, server_out, server_driver) =
@@ -938,12 +958,13 @@ mod tests {
             tokio::spawn(async move {
                 while let Some(stream) = server_inbound.accept().await {
                     let services = services.clone();
+                    let authorizer = authorizer.clone();
                     tokio::spawn(async move {
                         let responded = respond_to_open(
                             stream,
                             NetworkId::from([1u8; 32]),
                             NodeId::from([2u8; 32]),
-                            &AllowAll,
+                            &*authorizer,
                             &*services,
                         )
                         .await;
@@ -2346,6 +2367,79 @@ mod tests {
             let (_stream, ack) = rig.open_egress("egress:*", "127.0.0.1", port).await;
             assert!(!ack.ok);
             assert_eq!(ack.code, ErrorCode::UnknownService);
+            nothing_accepted(&listener).await;
+        }
+
+        struct DenyAll;
+
+        impl Authorizer for DenyAll {
+            fn authorize(&self, _request: &OpenRequest) -> OpenDecision {
+                OpenDecision::Deny(OpenRefusal {
+                    code: ErrorCode::NoGrant,
+                    msg: "no grant".to_owned(),
+                })
+            }
+        }
+
+        fn udp_body(host: &str, port: u16) -> OpenBody {
+            OpenBody {
+                target: Some(OpenTarget {
+                    host: host.to_owned(),
+                    port,
+                    transport: Some(menzil_proto::OpenTransport::Udp),
+                }),
+                ..open_body("egress:*")
+            }
+        }
+
+        #[tokio::test]
+        async fn a_udp_egress_open_is_unknown_service_after_the_grant_and_dials_nothing() {
+            // A listener the rules would let the exit dial: a TCP OPEN for it is served, a UDP
+            // one must never touch it.
+            let listener = listener().await;
+            let port = listener.local_addr().unwrap().port();
+            let services = || LocalServices::new().with_egress(executor(&["127.0.0.0/8"], true));
+
+            // Allowed by the grant: unknown_service, on the wire, and nothing is dialled.
+            let rig = Rig::new(services());
+            let mut stream = rig.client.open().await.unwrap();
+            let ack = initiate_open(&mut stream, &udp_body("127.0.0.1", port))
+                .await
+                .unwrap();
+            assert!(!ack.ok);
+            assert_eq!(ack.code, ErrorCode::UnknownService);
+            assert_eq!(ack.channel, None);
+            nothing_accepted(&listener).await;
+
+            // Without a grant the answer is the grant's, not unknown_service: the check that
+            // comes first is the grant check.
+            let rig = Rig::with_authorizer(services(), DenyAll);
+            let mut stream = rig.client.open().await.unwrap();
+            let ack = initiate_open(&mut stream, &udp_body("127.0.0.1", port))
+                .await
+                .unwrap();
+            assert!(!ack.ok);
+            assert_eq!(ack.code, ErrorCode::NoGrant);
+            nothing_accepted(&listener).await;
+
+            // The same executor still dials a TCP OPEN for the same target, so the refusal
+            // above is the transport's and not the rules'.
+            let direct = services().open(&egress_request(port)).await.map(drop);
+            direct.expect("a TCP OPEN is dialled");
+            timeout(WAIT, listener.accept()).await.unwrap().unwrap();
+            // And at the handler, no slot was taken by a UDP request.
+            let udp = OpenRequest {
+                target: Some(OpenTarget {
+                    host: "127.0.0.1".to_owned(),
+                    port,
+                    transport: Some(menzil_proto::OpenTransport::Udp),
+                }),
+                ..request("egress:*", 1)
+            };
+            let handler = services();
+            let refused = handler.open(&udp).await.map(drop).unwrap_err();
+            assert_eq!(refused.code, ErrorCode::UnknownService);
+            assert_eq!(handler.connections(), 0);
             nothing_accepted(&listener).await;
         }
 

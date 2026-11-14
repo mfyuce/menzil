@@ -62,8 +62,8 @@ use std::future::Future;
 use futures_util::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use menzil_proto::{
-    ErrorCode, NetworkId, NodeId, OpenAckBody, OpenBody, OpenMeta, OpenTarget, ProtoError,
-    ServiceId, ServiceKind,
+    ErrorCode, NetworkId, NodeId, OpenAckBody, OpenBody, OpenMeta, OpenTarget, OpenTransport,
+    PROTOCOL_VERSION, ProtoError, ServiceId, ServiceKind,
 };
 
 /// The longest [`OpenRefusal::msg`] [`respond_to_open`] ever puts on the
@@ -259,6 +259,26 @@ pub trait ServiceHandler<S> {
         self.open(request)
     }
 
+    /// Allocates the datagram channel (protocol.md 5.4) this OPEN's OPEN_ACK carries, between
+    /// [`Self::open`] and the ack: called only for an OPEN that succeeded, with the `opened`
+    /// value `open` returned, which is where a handler keeps whatever must live as long as
+    /// the channel does (an entry dropped with `opened` when the ack cannot be written, and
+    /// moved into the stream's task by [`Self::handle`]). `Ok(None)` is no channel, which is
+    /// what every handler that serves no datagrams answers (the default).
+    ///
+    /// [`respond_to_open`] enforces one rule on the answer: an OPEN that does not ask for a
+    /// datagram channel (no `transport: "udp"` target, not a `udp:` service) never gets one.
+    /// A channel returned for it is turned into a refusal, and `opened` is dropped, so a
+    /// handler bug cannot hand a TCP stream a channel id. An `Err` becomes an OPEN_ACK with
+    /// `ok: false`.
+    fn open_channel(
+        &self,
+        _request: &OpenRequest,
+        _opened: &mut Self::Opened,
+    ) -> Result<Option<u16>, OpenRefusal> {
+        Ok(None)
+    }
+
     /// Takes ownership of `stream`, whose OPEN_ACK `ok: true` has already
     /// been written and flushed for this exact `request` (the same one
     /// [`Self::open`] just approved, whose result is `opened`). Any bytes
@@ -401,6 +421,15 @@ where
 {
     let raw = read_len_prefixed(&mut stream).await?;
     let open = OpenBody::decode(&raw).map_err(OpenError::Malformed)?;
+    // A version this build does not speak is a malformed OPEN, like any other it cannot
+    // read: no ack, the stream ends (protocol.md 5.3; before this check `v` was read by
+    // nobody and an OPEN of another version was served as version 1).
+    if open.v != PROTOCOL_VERSION {
+        return Err(OpenError::Malformed(ProtoError::MalformedRecord(format!(
+            "OPEN version {} is not supported",
+            open.v
+        ))));
+    }
     let request = OpenRequest {
         network_id,
         initiator,
@@ -423,7 +452,7 @@ where
     // downstream would have caught it either.
     let target_allowed =
         request.service.kind == ServiceKind::Egress && request.service.label == "*";
-    let outcome = if request.target.is_some() && !target_allowed {
+    let mut outcome = if request.target.is_some() && !target_allowed {
         Err(OpenRefusal {
             code: ErrorCode::InvalidTarget,
             msg: "target is only valid for the egress:* service (protocol.md 5.3)".to_string(),
@@ -435,12 +464,33 @@ where
         }
     };
 
+    // The channel of the ack (protocol.md 5.4), asked of the handler only for an OPEN that
+    // succeeded, and only ever kept for one that asked for datagrams.
+    let wants_channel = request.service.kind == ServiceKind::Udp
+        || request
+            .target
+            .as_ref()
+            .is_some_and(|t| t.transport == Some(OpenTransport::Udp));
+    let mut channel = None;
+    if let Ok(opened) = &mut outcome {
+        match handler.open_channel(&request, opened) {
+            Ok(Some(_)) if !wants_channel => {
+                outcome = Err(OpenRefusal {
+                    code: ErrorCode::InvalidTarget,
+                    msg: "a channel was allocated for an OPEN that asked for none".to_string(),
+                });
+            }
+            Ok(id) => channel = id,
+            Err(refusal) => outcome = Err(refusal),
+        }
+    }
+
     let ack = match &outcome {
         Ok(_) => OpenAckBody {
             ok: true,
             code: ErrorCode::Unknown(0),
             msg: String::new(),
-            channel: None,
+            channel,
         },
         Err(r) => OpenAckBody {
             ok: false,
@@ -1260,5 +1310,103 @@ mod tests {
             "a pending local connect must be dropped with the exchange"
         );
         assert_eq!(stream.written.len(), 0, "and no ack was sent");
+    }
+
+    #[tokio::test]
+    async fn an_open_with_v_2_is_refused() {
+        let mut open = sample_open();
+        open.v = 2;
+        let mut stream = MockStream::preloaded(open.encode().unwrap());
+        let authorizer = AllowAll::default();
+        let (handler, _ran_rx) = RecordingHandler::allow();
+        let result = respond_to_open(
+            Lent(&mut stream),
+            NetworkId::from([0u8; 32]),
+            NodeId::from([0u8; 32]),
+            &authorizer,
+            &handler,
+        )
+        .await;
+        assert!(
+            matches!(result, Err(OpenError::Malformed(_))),
+            "an OPEN of another version is a malformed OPEN: {result:?}"
+        );
+        assert_eq!(authorizer.asked.get(), 0, "no gate saw it");
+        assert_eq!(handler.asked(), 0);
+        assert!(stream.written.is_empty(), "no ack for it");
+    }
+
+    /// A handler that allocates channel `id` for every OPEN it is asked about, as a
+    /// misbehaving (or datagram serving) one would.
+    struct ChannelHandler(u16);
+
+    impl<S> ServiceHandler<S> for ChannelHandler {
+        type Opened = ();
+        type Handling = std::future::Ready<()>;
+
+        async fn open(&self, _request: &OpenRequest) -> Result<(), OpenRefusal> {
+            Ok(())
+        }
+
+        fn open_channel(
+            &self,
+            _request: &OpenRequest,
+            _opened: &mut (),
+        ) -> Result<Option<u16>, OpenRefusal> {
+            Ok(Some(self.0))
+        }
+
+        fn handle(&self, _stream: S, _request: OpenRequest, _opened: ()) -> Self::Handling {
+            std::future::ready(())
+        }
+    }
+
+    fn egress_open(transport: Option<OpenTransport>) -> OpenBody {
+        let mut open = sample_open();
+        open.service = ServiceId::new(ServiceKind::Egress, "*");
+        open.target = Some(OpenTarget {
+            host: "example.com".to_string(),
+            port: 53,
+            transport,
+        });
+        open
+    }
+
+    #[tokio::test]
+    async fn a_tcp_open_never_gets_a_channel() {
+        // A plain service and an egress target without a transport are both TCP.
+        for open in [sample_open(), egress_open(None)] {
+            let mut stream = MockStream::preloaded(open.encode().unwrap());
+            let result = respond_to_open(
+                Lent(&mut stream),
+                NetworkId::from([0u8; 32]),
+                NodeId::from([0u8; 32]),
+                &AllowAll::default(),
+                &ChannelHandler(3),
+            )
+            .await
+            .unwrap();
+            assert!(matches!(result, Responded::Refused(_)), "{open:?}");
+            let ack = OpenAckBody::decode(stream.delivered()).unwrap();
+            assert!(!ack.ok, "{open:?}");
+            assert_eq!(ack.channel, None, "no channel id reaches a TCP stream");
+        }
+        // The same handler for an OPEN that asked for datagrams: the channel is carried.
+        let mut stream =
+            MockStream::preloaded(egress_open(Some(OpenTransport::Udp)).encode().unwrap());
+        let result = respond_to_open(
+            Lent(&mut stream),
+            NetworkId::from([0u8; 32]),
+            NodeId::from([0u8; 32]),
+            &AllowAll::default(),
+            &ChannelHandler(3),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(result, Responded::Accepted(_)));
+        drop(result);
+        let ack = OpenAckBody::decode(stream.delivered()).unwrap();
+        assert!(ack.ok);
+        assert_eq!(ack.channel, Some(3));
     }
 }

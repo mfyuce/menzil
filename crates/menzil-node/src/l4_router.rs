@@ -142,6 +142,7 @@ use crate::identity::IdentityCell;
 use crate::l4_session::{
     CloseReason, E2E_PROTO_TAG, L4_INBOUND_BUDGET_PER_SESSION, L4SessionAcceptor, L4SessionConfig,
     L4SessionHandle, SessionNotice, SessionObserver, new as new_l4_session,
+    new_with_datagrams as new_l4_session_with_datagrams,
 };
 use crate::outbound::{Epoch, OutboundSend, SendBudgets};
 use crate::policy_store::PolicyStore;
@@ -565,6 +566,17 @@ pub fn new_router(
     }
 }
 
+/// What a session is for, which decides whether it has datagram channels.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SessionKind {
+    /// A member session: streams, and datagram channels.
+    Member,
+    /// Admitted for one `menzil:docs` push.
+    DocsOnly,
+    /// The attached relay's session (protocol.md 6.1).
+    RelayPrincipal,
+}
+
 enum Command {
     Ensure {
         peer: NodeId,
@@ -847,10 +859,11 @@ impl Engine {
                 payload,
             });
         }
-        if flags & 0x01 != 0 {
-            // The droppable (datagram) class: phase 2.
-            return None;
-        }
+        // The L3 `flags` droppable bit is the relay's hint, written by the relay and open to
+        // being flipped by it: the class of a record is its counter's top bit (protocol.md
+        // 5.2), which `feed_inbound` reads. A reliable record with the bit set is still a
+        // reliable record (the relay could drop it anyway), and a datagram without it is
+        // still a datagram.
         if self.stopping {
             // Nothing is answered or routed any more: the sessions are closed
             // and a new `init` would only start one that is never served.
@@ -1065,7 +1078,7 @@ impl Engine {
             },
             transport,
             attached,
-            false,
+            SessionKind::Member,
         );
         let handle = entry.handle.clone();
         match self.table.install_session(
@@ -1243,7 +1256,7 @@ impl Engine {
             },
             transport,
             attached,
-            false,
+            SessionKind::RelayPrincipal,
         );
         let handle = entry.handle.clone();
         match self.table.install_session(
@@ -1343,7 +1356,7 @@ impl Engine {
             },
             transport,
             attached,
-            true,
+            SessionKind::DocsOnly,
         );
         let handle = entry.handle.clone();
         match self.table.install_session(
@@ -1700,7 +1713,7 @@ impl Engine {
             Origin::Initiated,
             transport,
             attached,
-            false,
+            SessionKind::Member,
         );
         let handle = entry.handle.clone();
         match self
@@ -1757,7 +1770,7 @@ impl Engine {
             Origin::Initiated,
             transport,
             attached,
-            true,
+            SessionKind::DocsOnly,
         );
         let handle = entry.handle.clone();
         match self.table.install_session(
@@ -1955,8 +1968,9 @@ impl Engine {
         origin: Origin,
         transport: menzil_e2e::E2eTransport,
         attached: Attached,
-        docs_only: bool,
+        kind: SessionKind,
     ) -> (Entry, L4SessionAcceptor, SessionTask) {
+        let docs_only = kind == SessionKind::DocsOnly;
         let (mode, init) = match origin {
             Origin::Initiated => (Mode::Client, None),
             Origin::Answered {
@@ -1967,24 +1981,34 @@ impl Engine {
         let generation = self.next_generation;
         self.next_generation = self.next_generation.wrapping_add(1);
         let (epoch_ended_tx, epoch_ended_rx) = oneshot::channel();
-        let (handle, acceptor, task) = new_l4_session(
-            L4SessionConfig {
-                transport,
-                peer,
-                network_id: network,
-                mode,
-                max_record: attached.limits.max_record,
-                epoch: attached.epoch,
-                send_budget: self.budgets.for_peer(peer),
-                inbound_budget: self.inbound_budget,
-                observer: Some(SessionObserver::new(
-                    self.notices.clone(),
-                    tag_of(generation, index),
-                )),
-            },
-            self.outbound.clone(),
-            epoch_ended_rx,
-        );
+        let config = L4SessionConfig {
+            transport,
+            peer,
+            network_id: network,
+            mode,
+            max_record: attached.limits.max_record,
+            epoch: attached.epoch,
+            send_budget: self.budgets.for_peer(peer),
+            inbound_budget: self.inbound_budget,
+            observer: Some(SessionObserver::new(
+                self.notices.clone(),
+                tag_of(generation, index),
+            )),
+        };
+        // Datagram channels (protocol.md 5.4) belong to member sessions only: a docs only
+        // session serves one `menzil:docs` push and the relay principal's session serves public
+        // shares, so both drop every datagram.
+        let (handle, acceptor, task): (_, _, SessionTask) = match kind {
+            SessionKind::Member => {
+                let (h, a, t) =
+                    new_l4_session_with_datagrams(config, self.outbound.clone(), epoch_ended_rx);
+                (h, a, Box::pin(t))
+            }
+            SessionKind::DocsOnly | SessionKind::RelayPrincipal => {
+                let (h, a, t) = new_l4_session(config, self.outbound.clone(), epoch_ended_rx);
+                (h, a, Box::pin(t))
+            }
+        };
         (
             Entry {
                 handle,
@@ -1998,7 +2022,7 @@ impl Engine {
                 _epoch_ended: epoch_ended_tx,
             },
             acceptor,
-            Box::pin(task),
+            task,
         )
     }
 

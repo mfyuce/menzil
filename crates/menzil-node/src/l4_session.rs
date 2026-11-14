@@ -295,11 +295,13 @@ use std::time::{Duration, Instant};
 use futures_util::stream::{FuturesUnordered, StreamExt};
 use menzil_e2e::{E2eError, E2eTransport, Liveness, RekeySchedule};
 use menzil_proto::{
-    E2eDataBody, ErrorCode, MIN_SEND_CHARGE_BYTES, NetworkId, NodeId, e2e_data_frame_len,
+    E2eDataBody, ErrorCode, MIN_SEND_CHARGE_BYTES, NetworkId, NodeId, RecordClass,
+    e2e_data_frame_len,
 };
 use menzil_stream::{Mode, RECEIVE_WINDOW_GRANT, Stream, StreamMuxError};
 use tokio::sync::{mpsc, oneshot};
 
+use crate::channels::{ChannelTable, DGRAM_BUDGET_PER_SESSION, DGRAM_SEND_QUEUE, DgramOut};
 use crate::outbound::{EnqueueOutcome, Epoch, OutboundSend, SendBudget, SendPermit};
 
 /// The current time as a `std::time::Instant`, read through tokio's clock.
@@ -324,6 +326,11 @@ pub(crate) const E2E_PROTO_TAG: u8 = 0x01;
 /// `E2eTransport::encrypt_data` already refuses to encode one at all, see
 /// [`crate::l4_session`]'s own doc comment on what this module is not).
 const RELIABLE_FLAGS: u8 = 0x00;
+
+/// protocol.md 4.2's flags bit 0 set: the droppable class, which is where a DGRAM record
+/// goes. The receiver routes by the counter's class, not by this flag (the relay writes it
+/// and can flip it); it is the relay's hint for what it may drop under pressure.
+const DROPPABLE_FLAGS: u8 = 0x01;
 
 /// How long [`enqueue_send`] waits for `outbound` to accept one send, and
 /// separately how long it then waits for that send's own admission
@@ -608,21 +615,27 @@ const NOISE_MESSAGE_LIMIT: usize = 65_535;
 /// The counter behind [`L4_INBOUND_BUDGET_PER_SESSION`], one per session,
 /// shared by every clone of its [`L4SessionHandle`].
 #[derive(Clone)]
-struct InboundBudget {
+pub(crate) struct InboundBudget {
     in_use: Arc<AtomicUsize>,
     ceiling: usize,
 }
 
 impl InboundBudget {
-    fn new(ceiling: usize) -> Self {
+    pub(crate) fn new(ceiling: usize) -> Self {
         Self {
             in_use: Arc::new(AtomicUsize::new(0)),
             ceiling,
         }
     }
 
+    /// What is charged right now (tests).
+    #[cfg(test)]
+    pub(crate) fn in_use_for_tests(&self) -> usize {
+        self.in_use.load(Ordering::Relaxed)
+    }
+
     /// Charges `charge` bytes, or `None` if that would pass the ceiling.
-    fn try_reserve(&self, charge: usize) -> Option<InboundPermit> {
+    pub(crate) fn try_reserve(&self, charge: usize) -> Option<InboundPermit> {
         let mut current = self.in_use.load(Ordering::Relaxed);
         loop {
             let next = current.checked_add(charge)?;
@@ -648,7 +661,7 @@ impl InboundBudget {
 }
 
 /// A charge on an [`InboundBudget`], given back on drop.
-struct InboundPermit {
+pub(crate) struct InboundPermit {
     in_use: Arc<AtomicUsize>,
     charge: usize,
 }
@@ -744,6 +757,12 @@ pub struct L4SessionHandle {
     stream_mux: menzil_stream::StreamMux,
     inbound_data_tx: mpsc::UnboundedSender<InboundItem>,
     inbound_budget: InboundBudget,
+    /// The datagrams' own budget ([`DGRAM_BUDGET_PER_SESSION`]): what is past it is dropped,
+    /// never an [`InboundOverflow`].
+    dgram_budget: InboundBudget,
+    /// The channels of a member session; `None` for a docs only or relay principal session,
+    /// which drop every datagram.
+    channels: Option<ChannelTable>,
     command_tx: mpsc::UnboundedSender<Command>,
 }
 
@@ -787,7 +806,25 @@ impl L4SessionHandle {
     /// so the caller must end it; the actor is told nothing and will
     /// itself end as soon as it sees the close the caller sends, or the
     /// session's removal.
+    ///
+    /// **A datagram class counter (top bit set, protocol.md 5.2) takes another path and never
+    /// fails**: it is dropped at once when this session has no channels (docs only and relay
+    /// principal sessions), and otherwise charged to the datagrams' own budget
+    /// ([`DGRAM_BUDGET_PER_SESSION`]) and queued in the same ordered queue as the reliable
+    /// records, so the actor sees a datagram and a REKEY in the order they arrived. One past
+    /// that budget is dropped and the session lives: a datagram that goes missing leaves no gap
+    /// anyone depends on. The class is read from the counter, never from the L3 flag.
     pub fn feed_inbound(&self, counter: u64, ciphertext: Vec<u8>) -> Result<(), InboundOverflow> {
+        if RecordClass::of_counter(counter) == RecordClass::Datagram {
+            if self.channels.is_none() {
+                return Ok(());
+            }
+            let charge = ciphertext.len().saturating_add(INBOUND_RECORD_OVERHEAD);
+            if let Some(permit) = self.dgram_budget.try_reserve(charge) {
+                let _ = self.inbound_data_tx.send((counter, ciphertext, permit));
+            }
+            return Ok(());
+        }
         let charge = ciphertext.len().saturating_add(INBOUND_RECORD_OVERHEAD);
         let Some(permit) = self.inbound_budget.try_reserve(charge) else {
             return Err(InboundOverflow {
@@ -798,6 +835,18 @@ impl L4SessionHandle {
         // error; dropping it gives the charge back.
         let _ = self.inbound_data_tx.send((counter, ciphertext, permit));
         Ok(())
+    }
+
+    /// The datagram channels of this session, or `None` for a session that carries none (a docs
+    /// only or relay principal session, or one built with [`new`]).
+    pub fn channels(&self) -> Option<&ChannelTable> {
+        self.channels.as_ref()
+    }
+
+    /// How many bytes of inbound datagrams this session holds right now (the actor's queue and
+    /// the channels' sinks), against [`DGRAM_BUDGET_PER_SESSION`].
+    pub fn dgram_in_use(&self) -> usize {
+        self.dgram_budget.in_use.load(Ordering::Relaxed)
     }
 
     /// How many bytes of inbound records this session holds right now that
@@ -909,6 +958,45 @@ pub fn new(
     L4SessionAcceptor,
     impl Future<Output = ()> + Send + 'static,
 ) {
+    build(config, false, outbound, epoch_ended)
+}
+
+/// [`new`] for a member session: the same actor, with datagram channels (protocol.md 5.4,
+/// [`L4SessionHandle::channels`]). A session built with [`new`] has none and drops every
+/// datagram, which is what a docs only session and the relay principal's session must do.
+pub fn new_with_datagrams(
+    config: L4SessionConfig,
+    outbound: mpsc::Sender<OutboundSend>,
+    epoch_ended: oneshot::Receiver<()>,
+) -> (
+    L4SessionHandle,
+    L4SessionAcceptor,
+    impl Future<Output = ()> + Send + 'static,
+) {
+    build(config, true, outbound, epoch_ended)
+}
+
+fn build(
+    config: L4SessionConfig,
+    datagrams: bool,
+    outbound: mpsc::Sender<OutboundSend>,
+    epoch_ended: oneshot::Receiver<()>,
+) -> (
+    L4SessionHandle,
+    L4SessionAcceptor,
+    impl Future<Output = ()> + Send + 'static,
+) {
+    let (dgram_rx, channels) = if datagrams {
+        let (tx, rx) = mpsc::channel::<DgramOut>(DGRAM_SEND_QUEUE);
+        let table = ChannelTable::new(
+            config.mode == Mode::Client,
+            tx,
+            config.transport.max_dgram_payload(),
+        );
+        (Some(rx), Some(table))
+    } else {
+        (None, None)
+    };
     let (stream_mux, inbound, outbound_frames, driver) =
         menzil_stream::new(config.mode, config.max_record);
     let (inbound_data_tx, inbound_data_rx) = mpsc::unbounded_channel();
@@ -930,6 +1018,8 @@ pub fn new(
         stream_mux: stream_mux.clone(),
         inbound_data_tx,
         inbound_budget,
+        dgram_budget: InboundBudget::new(DGRAM_BUDGET_PER_SESSION),
+        channels: channels.clone(),
         command_tx,
     };
     let acceptor = L4SessionAcceptor {
@@ -961,6 +1051,8 @@ pub fn new(
         command_rx,
         epoch_ended,
         ended_tx,
+        dgram_rx,
+        channels,
     );
     let task = async move {
         let _end_guard = end_guard;
@@ -1139,6 +1231,61 @@ async fn send_close(
     let _ = tokio::time::timeout(CLOSE_SEND_TIMEOUT, outbound.send(req)).await;
 }
 
+/// Ends a session's channels when its actor future ends or is dropped.
+struct CloseChannelsOnDrop(Option<ChannelTable>);
+
+impl Drop for CloseChannelsOnDrop {
+    fn drop(&mut self) {
+        if let Some(channels) = &self.0 {
+            channels.close_all();
+        }
+    }
+}
+
+/// Encrypts one datagram and hands it to `outbound` as an epoch-tagged droppable SEND (flags
+/// bit 0, no permit: a datagram is never credited). **Every failure drops the datagram and
+/// nothing else**: an encrypt refusal (too large, the counter ceiling, a `snow` error), a full
+/// `outbound`, or an `outbound` that is gone. Unlike [`enqueue_send`] the admission outcome is
+/// not watched (its receiver is dropped), so a `QueueFull` or `WrongEpoch` from the node's
+/// queue cannot end the session either: a gap in the datagram sequence is harmless, and the
+/// counter was never a reliable one.
+// The same independent inputs as `enqueue_send`.
+#[allow(clippy::too_many_arguments)]
+fn send_dgram(
+    transport: &mut E2eTransport,
+    liveness: &mut Liveness,
+    rekey: &mut RekeySchedule,
+    outbound: &mpsc::Sender<OutboundSend>,
+    peer: NodeId,
+    epoch: Epoch,
+    channel: u16,
+    bytes: &[u8],
+) {
+    let frame = match transport.encrypt_dgram(channel, bytes) {
+        Ok(frame) => frame,
+        Err(err) => {
+            tracing::debug!(%peer, error = %err, "a datagram was not sent: it did not encrypt");
+            return;
+        }
+    };
+    let (outcome, _unwatched) = oneshot::channel();
+    let req = OutboundSend {
+        dst: peer,
+        e2e_proto: E2E_PROTO_TAG,
+        flags: DROPPABLE_FLAGS,
+        payload: frame.encode(),
+        epoch,
+        outcome,
+        permit: None,
+    };
+    if outbound.try_send(req).is_ok() {
+        liveness.note_sent(clock_now());
+        rekey.note_sent();
+    } else {
+        tracing::debug!(%peer, "a datagram was dropped: the send queue is full or gone");
+    }
+}
+
 /// The actor itself — see this module's own doc comment for the overall
 /// shape and why each branch ends the session the way it does.
 #[allow(clippy::too_many_arguments)] // assembled once, entirely from `new`; see
@@ -1160,7 +1307,11 @@ async fn run(
     mut command_rx: mpsc::UnboundedReceiver<Command>,
     epoch_ended: oneshot::Receiver<()>,
     ended_tx: oneshot::Sender<EndReason>,
+    mut dgram_rx: Option<mpsc::Receiver<DgramOut>>,
+    channels: Option<ChannelTable>,
 ) {
+    // However this future ends (or is dropped), the channels end with it.
+    let _channels_end = CloseChannelsOnDrop(channels.clone());
     let mut first_record_noted = false;
     tokio::pin!(driver);
     tokio::pin!(epoch_ended);
@@ -1245,6 +1396,38 @@ async fn run(
                     inbound_closed = true;
                     continue;
                 };
+                if RecordClass::of_counter(counter) == RecordClass::Datagram {
+                    // The datagram class (protocol.md 5.2): its own window and its own
+                    // failure rules. Everything short of an authenticated, malformed body
+                    // drops the one frame; none of those feeds liveness.
+                    let Some(channels) = &channels else {
+                        continue;
+                    };
+                    match transport.decrypt_dgram(counter, &ciphertext) {
+                        Ok((channel, bytes)) => {
+                            liveness.note_received(clock_now());
+                            if !first_record_noted {
+                                first_record_noted = true;
+                                if let Some(observer) = &observer {
+                                    observer.notify(SessionNotice::FirstRecord);
+                                }
+                            }
+                            drop(ciphertext);
+                            // Whatever the channel does with it, `permit` goes with the
+                            // datagram: into the sink, or back to the budget on a drop.
+                            channels.deliver(channel, bytes, permit);
+                        }
+                        Err(
+                            E2eError::Noise(_)
+                            | E2eError::NotADatagramCounter
+                            | E2eError::ReservedDatagramCounter
+                            | E2eError::DatagramReplayed
+                            | E2eError::DatagramTooOld,
+                        ) => {}
+                        Err(err) => break EndReason::Decrypt(err),
+                    }
+                    continue;
+                }
                 match transport.decrypt_data(counter, &ciphertext) {
                     Ok(body) => {
                         // Only here, never in the `Err` arms below: see
@@ -1291,6 +1474,20 @@ async fn run(
                     }
                     Err(err) => break EndReason::Decrypt(err),
                 }
+            }
+
+            out = async {
+                dgram_rx.as_mut().expect("guarded by the precondition below").recv().await
+            }, if dgram_rx.is_some() => {
+                let Some((channel, bytes)) = out else {
+                    // Every sender is gone: no channel can send any more.
+                    dgram_rx = None;
+                    continue;
+                };
+                send_dgram(
+                    &mut transport, &mut liveness, &mut rekey, &outbound, peer, epoch,
+                    channel, &bytes,
+                );
             }
 
             command = command_rx.recv() => {
@@ -2779,5 +2976,394 @@ mod tests {
                 break;
             }
         }
+    }
+
+    // ------------------------------------------------------------------
+    // Datagrams (protocol.md 5.2, 5.4)
+    // ------------------------------------------------------------------
+
+    /// [`one_session`] with datagram channels, and an outbound channel of `capacity`.
+    fn dgram_session(
+        side: OneSide,
+        max_record: u32,
+        capacity: usize,
+    ) -> (
+        L4SessionHandle,
+        L4SessionAcceptor,
+        mpsc::Receiver<OutboundSend>,
+        oneshot::Sender<()>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let send_budget = crate::outbound::SendBudgets::new().for_peer(side.peer);
+        let (outbound_tx, outbound_rx) = mpsc::channel(capacity);
+        let (epoch_ended_tx, epoch_ended_rx) = oneshot::channel();
+        let (handle, acceptor, task) = new_with_datagrams(
+            L4SessionConfig {
+                transport: side.transport,
+                peer: side.peer,
+                network_id: side.network_id,
+                mode: side.mode,
+                max_record,
+                epoch: Epoch::first(),
+                send_budget,
+                observer: None,
+                inbound_budget: L4_INBOUND_BUDGET_PER_SESSION,
+            },
+            outbound_tx,
+            epoch_ended_rx,
+        );
+        (
+            handle,
+            acceptor,
+            outbound_rx,
+            epoch_ended_tx,
+            tokio::spawn(task),
+        )
+    }
+
+    /// Both sides with datagram channels; the test reads each side's outbound itself and
+    /// forwards what it wants.
+    struct DgramPair {
+        a: L4SessionHandle,
+        a_acceptor: L4SessionAcceptor,
+        a_out: mpsc::Receiver<OutboundSend>,
+        b: L4SessionHandle,
+        b_acceptor: L4SessionAcceptor,
+        b_out: mpsc::Receiver<OutboundSend>,
+        _keep: (
+            oneshot::Sender<()>,
+            oneshot::Sender<()>,
+            tokio::task::JoinHandle<()>,
+            tokio::task::JoinHandle<()>,
+        ),
+    }
+
+    fn dgram_pair() -> DgramPair {
+        let (a_side, b_side) = two_sides(7, 65_535);
+        let (a, a_acceptor, a_out, a_tx, a_task) = dgram_session(a_side, 65_535, 64);
+        let (b, b_acceptor, b_out, b_tx, b_task) = dgram_session(b_side, 65_535, 64);
+        DgramPair {
+            a,
+            a_acceptor,
+            a_out,
+            b,
+            b_acceptor,
+            b_out,
+            _keep: (a_tx, b_tx, a_task, b_task),
+        }
+    }
+
+    /// Reads `rx` until a droppable SEND shows up, answering every one `Accepted`; the
+    /// reliable ones before it are returned too.
+    async fn next_droppable(rx: &mut mpsc::Receiver<OutboundSend>) -> (OutboundSend, usize) {
+        let mut reliable = 0;
+        loop {
+            let req = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .expect("a datagram should have been sent")
+                .expect("the session is running");
+            if req.flags & 0x01 != 0 {
+                return (req, reliable);
+            }
+            reliable += 1;
+            let _ = req.outcome.send(EnqueueOutcome::Accepted);
+        }
+    }
+
+    /// Answers `req` `Accepted` and feeds its frame to `dst` as the router would.
+    fn deliver(dst: &L4SessionHandle, req: OutboundSend) {
+        let _ = req.outcome.send(EnqueueOutcome::Accepted);
+        let E2eFrame::Data {
+            counter,
+            ciphertext,
+            ..
+        } = E2eFrame::decode(&req.payload).unwrap()
+        else {
+            panic!("not a data frame");
+        };
+        dst.feed_inbound(counter, ciphertext).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_dgram_leaves_as_a_droppable_send() {
+        let mut pair = dgram_pair();
+        // A is the session initiator: even ids; B registers it as the peer's.
+        let mut a_channel = pair.a.channels().unwrap().allocate().unwrap();
+        assert_eq!(a_channel.id() % 2, 0);
+        let mut b_channel = pair
+            .b
+            .channels()
+            .unwrap()
+            .register_remote(a_channel.id())
+            .unwrap();
+        a_channel.send(b"hello").unwrap();
+        let (req, _reliable_before) = next_droppable(&mut pair.a_out).await;
+        assert_eq!(req.flags, 0x01, "bit 0 is the droppable class");
+        assert!(req.permit.is_none(), "a datagram is never credited");
+        assert_eq!(req.dst, pair.a.peer());
+        let E2eFrame::Data { counter, .. } = E2eFrame::decode(&req.payload).unwrap() else {
+            panic!("not a data frame");
+        };
+        assert_eq!(counter >> 63, 1, "a datagram class counter");
+        deliver(&pair.b, req);
+        let got = tokio::time::timeout(Duration::from_secs(5), b_channel.recv())
+            .await
+            .expect("delivered")
+            .unwrap();
+        assert_eq!(got, b"hello");
+        // And back the other way, on the same channel id.
+        b_channel.send(b"pong").unwrap();
+        let (req, _) = next_droppable(&mut pair.b_out).await;
+        deliver(&pair.a, req);
+        let got = tokio::time::timeout(Duration::from_secs(5), a_channel.recv())
+            .await
+            .expect("delivered")
+            .unwrap();
+        assert_eq!(got, b"pong");
+        let _ = &pair.a_acceptor;
+        let _ = &pair.b_acceptor;
+    }
+
+    #[tokio::test]
+    async fn an_unknown_channel_datagram_is_dropped_and_the_session_lives() {
+        let mut pair = dgram_pair();
+        // A sends on a channel B never registered.
+        let a_channel = pair.a.channels().unwrap().allocate().unwrap();
+        a_channel.send(b"nobody listens").unwrap();
+        let (req, _) = next_droppable(&mut pair.a_out).await;
+        deliver(&pair.b, req);
+        let b_table = pair.b.channels().unwrap().clone();
+        for _ in 0..100 {
+            if b_table.dropped().unknown_channel == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(b_table.dropped().unknown_channel, 1);
+        assert_eq!(pair.b.dgram_in_use(), 0, "its charge was given back");
+        // Nothing was sent back (no CLOSE, no error record, no datagram), and neither side
+        // ended.
+        let mut sent_by_b = Vec::new();
+        while let Ok(Some(req)) =
+            tokio::time::timeout(Duration::from_millis(300), pair.b_out.recv()).await
+        {
+            sent_by_b.push(req.flags);
+            let _ = req.outcome.send(EnqueueOutcome::Accepted);
+        }
+        assert!(
+            sent_by_b.iter().all(|flags| flags & 0x01 == 0),
+            "B answered a datagram with a datagram: {sent_by_b:?}"
+        );
+        for acceptor in [&mut pair.a_acceptor, &mut pair.b_acceptor] {
+            assert!(
+                tokio::time::timeout(Duration::from_millis(200), acceptor.closed())
+                    .await
+                    .is_err(),
+                "the session ended"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn datagrams_over_the_session_budget_are_dropped_and_the_session_lives() {
+        let (a_side, b_side) = two_sides(8, 65_535);
+        let (a, _a_acceptor, _a_out, _a_tx, _a_task) = dgram_session(a_side, 65_535, 64);
+        let (b, mut b_acceptor, mut b_out, _b_tx, _b_task) = dgram_session(b_side, 65_535, 64);
+        // The actor of `b` cannot run while this test does not await, so what is fed piles up
+        // in its queue: junk of the datagram class, 16 KiB at a time.
+        let per_record = 16 * 1024 + INBOUND_RECORD_OVERHEAD;
+        let fits = DGRAM_BUDGET_PER_SESSION / per_record;
+        for n in 0..(fits as u64 * 3) {
+            b.feed_inbound((1u64 << 63) | n, vec![0xAB; 16 * 1024])
+                .expect("a datagram over its budget is dropped, never an overflow");
+        }
+        assert!(b.dgram_in_use() <= DGRAM_BUDGET_PER_SESSION);
+        assert!(b.dgram_in_use() >= fits * per_record - per_record);
+        assert_eq!(
+            b.inbound_in_use(),
+            0,
+            "the reliable budget is a different one"
+        );
+        // The actor now reads all of it (none authenticates) and gives every charge back.
+        for _ in 0..100 {
+            if b.dgram_in_use() == 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(b.dgram_in_use(), 0);
+        // The session lives and still carries a stream.
+        let drain = tokio::spawn(async move {
+            while let Some(req) = b_out.recv().await {
+                let _ = req.outcome.send(EnqueueOutcome::Accepted);
+            }
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), b_acceptor.closed())
+                .await
+                .is_err()
+        );
+        drain.abort();
+        let _ = a;
+    }
+
+    #[tokio::test]
+    async fn docs_only_and_relay_principal_sessions_drop_datagrams() {
+        // A session built with `new` has no channels: the router builds docs only and relay
+        // principal sessions that way.
+        let (a_side, b_side) = two_sides(9, 65_535);
+        let (handle, mut acceptor, _out, _tx, _task) = one_session(b_side, 65_535);
+        assert!(handle.channels().is_none());
+        let _ = a_side;
+        for n in 0..50u64 {
+            handle
+                .feed_inbound((1u64 << 63) | n, vec![0xAB; 1024])
+                .expect("never an error");
+        }
+        assert_eq!(
+            handle.dgram_in_use(),
+            0,
+            "dropped on arrival: nothing is queued or charged"
+        );
+        assert_eq!(handle.inbound_in_use(), 0);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), acceptor.closed())
+                .await
+                .is_err(),
+            "the session lives"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_forged_datagram_does_not_feed_liveness() {
+        // The peer sends nothing; a forged datagram arrives every 5 s (a relay can put frames
+        // on this receiver index). If one counted as an authenticated record, the 40 s
+        // dead-peer clock would never run out.
+        let (_a_side, b_side) = two_sides(10, 65_535);
+        let (handle, mut acceptor, mut out, _tx, _task) = dgram_session(b_side, 65_535, 64);
+        let drain = tokio::spawn(async move {
+            while let Some(req) = out.recv().await {
+                let _ = req.outcome.send(EnqueueOutcome::Accepted);
+            }
+        });
+        let ended = async {
+            for n in 0..40u64 {
+                handle
+                    .feed_inbound((1u64 << 63) | n, vec![0xCD; 64])
+                    .unwrap();
+                tokio::time::sleep(Duration::from_secs(5)).await;
+            }
+        };
+        tokio::select! {
+            reason = acceptor.closed() => {
+                assert!(matches!(reason.as_ref(), EndReason::PeerDead), "{reason:?}");
+            }
+            () = ended => panic!("forged datagrams kept a silent peer alive for 200 s"),
+        }
+        drain.abort();
+    }
+
+    #[tokio::test]
+    async fn a_datagram_enqueue_failure_drops_without_ending_the_session() {
+        // The function level: a full outbound and a closed one both drop and return.
+        let (mut a_side, _b_side) = two_sides(11, 65_535);
+        let peer = a_side.peer;
+        let now = clock_now();
+        let mut liveness = Liveness::new(now);
+        let mut rekey = RekeySchedule::new(now);
+        let (full_tx, _full_rx) = mpsc::channel(1);
+        let filler = || {
+            let (outcome, _rx) = oneshot::channel();
+            OutboundSend {
+                dst: peer,
+                e2e_proto: E2E_PROTO_TAG,
+                flags: 0,
+                payload: vec![],
+                epoch: Epoch::first(),
+                outcome,
+                permit: None,
+            }
+        };
+        full_tx.try_send(filler()).unwrap();
+        send_dgram(
+            &mut a_side.transport,
+            &mut liveness,
+            &mut rekey,
+            &full_tx,
+            peer,
+            Epoch::first(),
+            2,
+            b"dropped, the queue is full",
+        );
+        let (closed_tx, closed_rx) = mpsc::channel(1);
+        drop(closed_rx);
+        send_dgram(
+            &mut a_side.transport,
+            &mut liveness,
+            &mut rekey,
+            &closed_tx,
+            peer,
+            Epoch::first(),
+            2,
+            b"dropped, nobody is there",
+        );
+        // A datagram the transport refuses (too large) is dropped too.
+        send_dgram(
+            &mut a_side.transport,
+            &mut liveness,
+            &mut rekey,
+            &closed_tx,
+            peer,
+            Epoch::first(),
+            2,
+            &vec![0u8; 70_000],
+        );
+
+        // The session level: the node's queue refuses every datagram (QueueFull) and the
+        // session neither ends nor misses a beat for it.
+        let (a_side, b_side) = two_sides(12, 65_535);
+        let (a, mut a_acceptor, mut a_out, _a_tx, _a_task) = dgram_session(a_side, 65_535, 64);
+        let (b, mut b_acceptor, b_out, _b_tx, _b_task) = dgram_session(b_side, 65_535, 64);
+        let to_b = pump(
+            {
+                let (relay_tx, relay_rx) = mpsc::channel(64);
+                tokio::spawn(async move {
+                    while let Some(req) = a_out.recv().await {
+                        if req.flags & 0x01 != 0 {
+                            let _ = req.outcome.send(EnqueueOutcome::QueueFull);
+                        } else if relay_tx.send(req).await.is_err() {
+                            break;
+                        }
+                    }
+                });
+                relay_rx
+            },
+            b.clone(),
+        );
+        let to_a = pump(b_out, a.clone());
+        let channel = a.channels().unwrap().allocate().unwrap();
+        for _ in 0..20 {
+            channel.send(&[1; 100]).unwrap();
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        // Reliable traffic still flows both ways.
+        let mut opened = a.open_stream().await.unwrap();
+        use futures_util::io::AsyncWriteExt;
+        opened.write_all(b"still alive").await.unwrap();
+        opened.flush().await.unwrap();
+        let accepted = tokio::time::timeout(Duration::from_secs(5), b_acceptor.accept())
+            .await
+            .expect("the stream arrives");
+        assert!(accepted.is_some());
+        for acceptor in [&mut a_acceptor, &mut b_acceptor] {
+            assert!(
+                tokio::time::timeout(Duration::from_millis(200), acceptor.closed())
+                    .await
+                    .is_err(),
+                "a refused datagram ended a session"
+            );
+        }
+        to_a.abort();
+        to_b.abort();
     }
 }

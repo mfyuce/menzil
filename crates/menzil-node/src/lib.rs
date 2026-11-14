@@ -63,6 +63,7 @@ pub mod acme;
 mod admission;
 mod cert_candidates;
 mod cert_index;
+pub mod channels;
 pub mod docs;
 mod docs_access;
 mod docs_store;
@@ -102,13 +103,14 @@ pub use l4_router::{
     new_router,
 };
 pub use l4_session::new as new_l4_session;
+pub use l4_session::new_with_datagrams as new_l4_session_with_datagrams;
 pub use l4_session::{
     CloseReason, EndReason, InboundOverflow, L4_INBOUND_BUDGET_PER_SESSION, L4SessionAcceptor,
     L4SessionConfig, L4SessionHandle, SessionNotice, SessionObserver,
 };
 pub use l5_stream::{
     AcceptedStreams, OpenStreamError, accept_loop, accept_loop_relay_principal,
-    accept_loop_tracked, open as open_stream,
+    accept_loop_tracked, open as open_stream, open_udp as open_udp_stream,
 };
 pub use node::{Node, NodeConfig, NodeOpenError, RefuseAll, StartError};
 pub use outbound::{

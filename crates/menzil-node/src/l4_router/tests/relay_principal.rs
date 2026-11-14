@@ -330,6 +330,8 @@ async fn the_relay_principal_comes_up_when_every_check_passes() {
     assert_eq!(ready.network_id, rp.w.network);
     assert_eq!(ready.role, Role::Responder);
     assert!(!ready.docs_only);
+    // The relay principal's session has no datagram channels: it drops every datagram.
+    assert!(ready.handle.channels().is_none());
     assert!(
         !up.relay_ready.relay_principal,
         "only the node's end is the principal's"

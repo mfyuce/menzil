@@ -996,18 +996,7 @@ async fn data_is_delivered_only_from_the_sessions_own_peer() {
         "still alive"
     );
 
-    // The datagram class is not served in phase 1: even the right bytes
-    // from the right peer, flagged droppable, are dropped, not delivered.
-    net.deliver(a.id, b.id, E2E_PROTO_TAG, 0x01, replay.encode());
-    tokio::time::sleep(Duration::from_millis(100)).await;
-    assert!(
-        timeout(Duration::from_millis(200), at_b.acceptor.closed())
-            .await
-            .is_err(),
-        "a droppable-flagged replay must not reach the session"
-    );
-
-    // ...while the same record unflagged from its peer is a counter
+    // ...while the same record from its peer is a counter
     // violation and ends the session, which also shows the right source
     // was routed.
     net.inject(a.id, b.id, &replay);
@@ -2447,13 +2436,20 @@ async fn a_member_the_policy_cannot_vouch_for_is_answered_docs_only_and_the_othe
     assert_eq!(at_r.role, Role::Responder);
     assert_eq!(at_r.peer, m.party.id);
     assert_eq!(at_r.peer_static, m.party.x25519_public);
+    // A docs only session has no datagram channels: every datagram on it is dropped.
+    assert!(at_r.handle.channels().is_none());
 
     let (hs, init) = known.init(&r, w.network, 2);
     net.inject(known.party.id, r.id, &init);
     let (_, resp) = known.next_frame().await;
     let (_, _, payload) = finish_with_payload(hs, &resp);
     assert!(!payload.docs_only, "a member the Policy vouches for");
-    assert!(!nr.next_ready().await.docs_only);
+    let at_r = nr.next_ready().await;
+    assert!(!at_r.docs_only);
+    assert!(
+        at_r.handle.channels().is_some(),
+        "a member session has datagram channels"
+    );
 }
 
 #[tokio::test(start_paused = true)]
@@ -3224,5 +3220,160 @@ async fn the_responder_checks_its_own_floor_with_the_serial_the_cell_holds_now()
         serial_in_answer(&mut d, &w, &b, &m2, 2),
         Some(2),
         "after the renewal the floor is met"
+    );
+}
+
+// ----------------------------------------------------------------------
+// The datagram class at the router (protocol.md 5.2, 5.4)
+// ----------------------------------------------------------------------
+
+/// A responder engine with one member session to a manual initiator, whose datagram channel
+/// `channel` (an even id, the initiator's parity) is registered on the engine's side.
+struct DgramRig {
+    d: Driven,
+    ready: SessionReady,
+    channel: crate::channels::Channel,
+    transport: E2eTransport,
+    index: u32,
+    peer: NodeId,
+}
+
+fn recv_record(src: NodeId, flags: u8, frame: &E2eFrame) -> Record {
+    Record::Recv {
+        src,
+        e2e_proto: E2E_PROTO_TAG,
+        flags,
+        payload: frame.encode(),
+    }
+}
+
+async fn dgram_rig() -> DgramRig {
+    let w = world();
+    let (b, m) = (party(), party());
+    let stores = w.stores(&[&b, &m], vec![w.grant(&m, &b)]);
+    let mut d = driven(&b, &stores, NodeId::from([0xAA; 32]), 7);
+    let manual = Manual::new(&Net::new(), m);
+    d.engine.on_attached(Epoch::first(), LIMITS, relay_static());
+    let (hs, init) = manual.init(&b, w.network, 1);
+    assert!(
+        d.engine
+            .on_record(
+                Epoch::first(),
+                recv_record(manual.party.id, 0, &init),
+                Now::capture()
+            )
+            .is_none()
+    );
+    let resp = E2eFrame::decode(&d.outbound.try_recv().unwrap().payload).unwrap();
+    let (transport, index) = Manual::finish(hs, &resp);
+    let ready = d._ready.try_recv().expect("the session came up");
+    // The initiator's channels are even; this side is the responder and registers the id.
+    let channel = ready
+        .handle
+        .channels()
+        .expect("a member session has channels")
+        .register_remote(0)
+        .unwrap();
+    DgramRig {
+        d,
+        ready,
+        channel,
+        transport,
+        index,
+        peer: manual.party.id,
+    }
+}
+
+impl DgramRig {
+    /// The record the peer would send for `bytes` on channel 0, as L3 delivers it with `flags`.
+    fn datagram(&mut self, bytes: &[u8]) -> E2eFrame {
+        let E2eFrame::Data {
+            counter,
+            ciphertext,
+            ..
+        } = self.transport.encrypt_dgram(0, bytes).unwrap()
+        else {
+            panic!("not a data frame");
+        };
+        E2eFrame::Data {
+            receiver_index: self.index,
+            counter,
+            ciphertext,
+        }
+    }
+
+    fn deliver(&mut self, epoch: Epoch, flags: u8, frame: &E2eFrame) {
+        assert!(
+            self.d
+                .engine
+                .on_record(epoch, recv_record(self.peer, flags, frame), Now::capture())
+                .is_none()
+        );
+    }
+
+    async fn next_datagram(&mut self) -> Option<Vec<u8>> {
+        timeout(Duration::from_millis(500), self.channel.recv())
+            .await
+            .ok()
+            .flatten()
+    }
+}
+
+#[tokio::test]
+async fn a_droppable_recv_is_routed_by_counter_class() {
+    let mut rig = dgram_rig().await;
+
+    // A datagram the relay flagged droppable reaches its channel: it used to be dropped on the
+    // flag, before anything looked at it.
+    let first = rig.datagram(b"flagged");
+    rig.deliver(Epoch::first(), 0x01, &first);
+    assert_eq!(rig.next_datagram().await.as_deref(), Some(&b"flagged"[..]));
+
+    // The class is the counter's, not the flag's: the same kind of record with the flag
+    // cleared is a datagram too.
+    let second = rig.datagram(b"unflagged");
+    rig.deliver(Epoch::first(), 0x00, &second);
+    assert_eq!(
+        rig.next_datagram().await.as_deref(),
+        Some(&b"unflagged"[..])
+    );
+
+    // And a reliable record the relay flagged droppable is still a reliable record: if it
+    // were dropped on the flag the next one would leave a counter gap and end the session.
+    let keep0 = data_frame(&mut rig.transport, rig.index, &E2eDataBody::Keep);
+    rig.deliver(Epoch::first(), 0x01, &keep0);
+    let keep1 = data_frame(&mut rig.transport, rig.index, &E2eDataBody::Keep);
+    rig.deliver(Epoch::first(), 0x00, &keep1);
+    assert!(
+        timeout(Duration::from_millis(300), rig.ready.acceptor.closed())
+            .await
+            .is_err(),
+        "the flagged reliable record was dropped on its flag"
+    );
+    assert!(rig.d.engine.table.get(7).is_some());
+}
+
+#[tokio::test]
+async fn a_stale_epoch_datagram_is_dropped() {
+    let mut rig = dgram_rig().await;
+    // The node is on a later attachment now; a record of the one that ended can only be stale.
+    let second_epoch = Epoch::first().next();
+    rig.d
+        .engine
+        .on_attached(second_epoch, LIMITS, relay_static());
+    let stale = rig.datagram(b"from the old attachment");
+    rig.deliver(Epoch::first(), 0x01, &stale);
+    assert_eq!(
+        rig.next_datagram().await,
+        None,
+        "a datagram of an ended attachment reached its channel"
+    );
+    assert_eq!(rig.ready.handle.dgram_in_use(), 0);
+    // The same kind of record under the current epoch is delivered.
+    let current = rig.datagram(b"from the current one");
+    rig.deliver(second_epoch, 0x01, &current);
+    assert_eq!(
+        rig.next_datagram().await.as_deref(),
+        Some(&b"from the current one"[..])
     );
 }
