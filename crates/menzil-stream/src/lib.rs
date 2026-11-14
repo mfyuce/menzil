@@ -104,8 +104,8 @@ mod record_io;
 mod stream;
 
 pub use driver::{
-    Driver, Inbound, MAX_LIVE_STREAMS, MuxLimits, OutboundFrames, RECEIVE_WINDOW_GRANT, StreamMux,
-    new, new_with_limits,
+    Driver, Inbound, MAX_FRAME_BODY, MAX_LIVE_STREAMS, MuxLimits, OutboundFrames,
+    RECEIVE_WINDOW_GRANT, StreamMux, new, new_metered, new_with_limits,
 };
 pub use error::StreamMuxError;
 pub use frame_format::FrameFormatError;
@@ -115,4 +115,4 @@ pub use open::{
 };
 pub use record_io::InboundGuard;
 pub use stream::{Stream, TornDown};
-pub use yamux::Mode;
+pub use yamux::{BufferMeter, Mode};

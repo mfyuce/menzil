@@ -31,7 +31,7 @@ use std::task::{Context, Poll};
 
 use futures_channel::{mpsc, oneshot};
 use futures_util::stream::StreamExt;
-use yamux::{Config, Connection, Mode};
+use yamux::{BufferMeter, Config, Connection, Mode};
 
 use crate::error::StreamMuxError;
 use crate::frame_format::{HEADER_LEN, is_exactly_one_frame};
@@ -54,6 +54,10 @@ const YAMUX_DEFAULT_SPLIT_SEND_SIZE: usize = 16 * 1024;
 /// peer opens at it with an RST instead of a GoAway. Either way this crate
 /// stays well clear of it, see [`MAX_LIVE_STREAMS`].
 const MAX_STREAMS: usize = 512;
+
+/// The largest data frame body this crate accepts from a peer: every honest frame fits one
+/// record (see [`config_for`]), and the meter's accounting assumes it.
+pub const MAX_FRAME_BODY: usize = 65_535;
 
 /// The most streams one connection holds at once, opened and accepted together, as `yamux`
 /// counts them: its table, which also keeps a stream that was dropped until its last frames are
@@ -456,6 +460,27 @@ pub fn new_with_limits(
     max_record: u32,
     limits: MuxLimits,
 ) -> (StreamMux, Inbound, OutboundFrames, Driver) {
+    build(mode, max_record, limits, None)
+}
+
+/// [`new`] with a [`BufferMeter`] that sees every change of the bytes the connection's streams
+/// hold received but not yet read (patch 5 of the vendored `yamux`), so that a caller can bound
+/// them node wide with an account of its own.
+pub fn new_metered(
+    mode: Mode,
+    max_record: u32,
+    limits: MuxLimits,
+    meter: Arc<dyn BufferMeter>,
+) -> (StreamMux, Inbound, OutboundFrames, Driver) {
+    build(mode, max_record, limits, Some(meter))
+}
+
+fn build(
+    mode: Mode,
+    max_record: u32,
+    limits: MuxLimits,
+    meter: Option<Arc<dyn BufferMeter>>,
+) -> (StreamMux, Inbound, OutboundFrames, Driver) {
     let max_live = limits.max_live_streams.clamp(1, MAX_LIVE_STREAMS);
     let (record_io, inbound_tx, outbound_rx) = RecordIo::new();
     let (open_tx, open_requests) = mpsc::unbounded();
@@ -467,6 +492,7 @@ pub fn new_with_limits(
             max_record,
             max_live + (MAX_STREAMS - MAX_LIVE_STREAMS),
             limits.window_growth,
+            meter,
         ),
         mode,
     );
@@ -537,6 +563,12 @@ pub fn new_with_limits(
 /// session can ever be made to buffer unread is then the guaranteed share
 /// of every stream slot plus that one growth budget — about 144 MiB, down
 /// from the 1 GiB it was (128 MiB guaranteed plus 896 MiB of growth).
+/// Those bytes can also be metered node wide: [`new_metered`] installs a
+/// [`BufferMeter`] (patch 5 of the vendored `yamux`) that sees every change
+/// of the bytes held received but unread, so a caller can bound the sum
+/// over all its sessions. Every honest frame fits one record, so the frame
+/// body cap is [`MAX_FRAME_BODY`] (65,535): a larger header ends the
+/// connection.
 /// That is the deliberate answer to protocol.md 14's open item 2 for
 /// phase 1: the *policy* of when a window grows is still `yamux`'s own
 /// (double when the sender used half of it within two round trips), only
@@ -567,12 +599,17 @@ pub fn new_with_limits(
 /// up: roughly 540 MiB for one session.
 #[cfg(test)]
 fn config_for(max_record: u32) -> Config {
-    config_with(max_record, MAX_STREAMS, true)
+    config_with(max_record, MAX_STREAMS, true, None)
 }
 
 /// [`config_for`] for `table` stream slots in `yamux`'s own table, with or without the growth
 /// budget (without, the connection window is exactly the guaranteed share of every slot).
-fn config_with(max_record: u32, table: usize, window_growth: bool) -> Config {
+fn config_with(
+    max_record: u32,
+    table: usize,
+    window_growth: bool,
+    meter: Option<Arc<dyn BufferMeter>>,
+) -> Config {
     let record_budget = menzil_proto::max_e2e_data_plaintext(max_record);
     let max_body_for_this_session = record_budget
         .saturating_sub(1)
@@ -583,6 +620,8 @@ fn config_with(max_record: u32, table: usize, window_growth: bool) -> Config {
     let mut cfg = Config::default();
     cfg.set_split_send_size(split_send_size);
     cfg.set_max_num_streams(table);
+    cfg.set_max_frame_body(MAX_FRAME_BODY);
+    cfg.set_buffer_meter(meter);
     let growth = if window_growth {
         MAX_STREAM_RECEIVE_WINDOW - yamux::DEFAULT_CREDIT as usize
     } else {
@@ -699,6 +738,7 @@ mod tests {
             65_535,
             default.max_live_streams + slack,
             default.window_growth,
+            None,
         );
         assert_eq!(
             configured_usize(&cfg, "max_num_streams"),
@@ -710,7 +750,7 @@ mod tests {
             RECEIVE_WINDOW_GRANT
         );
         // 64 live streams, no growth: 64 + slack slots of 256 KiB and not a byte more.
-        let cfg = config_with(65_535, 64 + slack, false);
+        let cfg = config_with(65_535, 64 + slack, false, None);
         let slots = configured_usize(&cfg, "max_num_streams");
         assert_eq!(slots, 64 + slack);
         assert_eq!(
@@ -719,7 +759,7 @@ mod tests {
             "no growth budget: a stream never gets more than its initial window"
         );
         // With growth the same table keeps the 16 MiB ceiling of one stream.
-        let cfg = config_with(65_535, 64 + slack, true);
+        let cfg = config_with(65_535, 64 + slack, true, None);
         let growth = configured_usize(&cfg, "max_connection_receive_window")
             - slots * yamux::DEFAULT_CREDIT as usize;
         assert_eq!(
