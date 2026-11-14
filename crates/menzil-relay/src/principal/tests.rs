@@ -1427,3 +1427,327 @@ async fn measure_what_a_session_buffers() {
         grown / streams.saturating_sub(1).max(1)
     );
 }
+
+// ---- the tenant's bucket in debt (`RelaySendOutcome::Throttled`) ----
+
+/// A rig whose tenant `ali` owns `networks` with a 1 Mbit/s bucket and a 1 MiB burst.
+fn ali_rig(config: PrincipalConfig, networks: &[NetworkId]) -> (Rig, TenantId) {
+    use crate::tenant::{Class, TenantBook, TenantSpec};
+    let relay = relay_with(limits());
+    let slug = Slug::parse("ali").unwrap();
+    let specs = vec![TenantSpec {
+        slug: slug.clone(),
+        networks: networks.to_vec(),
+        class: Class::Friend,
+        overrides: [("bandwidth_mbit", 1u64), ("burst_mib", 1)]
+            .iter()
+            .map(|&(key, value)| (key.to_string(), value))
+            .collect(),
+        terminated: false,
+        extra_names: vec![],
+        added: 1,
+    }];
+    relay.set_tenants(TenantBook::build(
+        specs,
+        vec![],
+        &Default::default(),
+        &Default::default(),
+    ));
+    (rig_with(relay, config, networks), TenantId::Named(slug))
+}
+
+impl Rig {
+    async fn open_for(
+        &self,
+        tenant: &TenantId,
+        network: NetworkId,
+    ) -> Result<Stream, PrincipalError> {
+        bounded(
+            "open",
+            self.principal
+                .open(tenant, self.node.node_id, network, service("demo"), meta()),
+        )
+        .await
+    }
+
+    /// The tenant's bucket (it exists once a frame of the tenant has been taken by the node).
+    fn bucket(&self, tenant: &TenantId) -> crate::shaping::Shaper {
+        self.relay
+            .forwarding
+            .shaper_of(tenant)
+            .expect("the tenant has moved data")
+    }
+
+    /// Takes more than the burst from the tenant's bucket: it is in debt for several seconds.
+    fn put_in_debt(&self, tenant: &TenantId) {
+        let figures = *self.relay.tenants().figures_of(tenant).unwrap();
+        let bucket = self.bucket(tenant);
+        let _ = bucket.charge(&figures, 2 << 20, None, tokio::time::Instant::now());
+        assert!(bucket.in_debt(&figures, tokio::time::Instant::now()));
+    }
+
+    fn in_debt(&self, tenant: &TenantId) -> bool {
+        let figures = *self.relay.tenants().figures_of(tenant).unwrap();
+        self.bucket(tenant)
+            .in_debt(&figures, tokio::time::Instant::now())
+    }
+}
+
+/// `Throttled` on the handshake path: the `init` is held back (and retried) while the name
+/// tenant's bucket is in debt, and goes out once time has paid the debt off. It is not an error.
+#[tokio::test(start_paused = true)]
+async fn an_init_is_held_back_while_the_tenants_bucket_is_in_debt_and_sent_when_it_is_paid() {
+    let (first, second) = (network(1), network(2));
+    let config = quick().with_handshake_timeout(Duration::from_secs(60));
+    let (rig, ali) = ali_rig(config, &[first, second]);
+    // One session first, so that the tenant has moved data and has a bucket.
+    let _stream = rig.open_for(&ali, first).await.unwrap();
+    assert_eq!(rig.attached.seen.init_count(), 1);
+    rig.put_in_debt(&ali);
+
+    // The open for the second network neither fails nor sends its init while in debt.
+    let held = tokio::time::timeout(Duration::from_secs(2), rig.open_for(&ali, second)).await;
+    assert!(held.is_err(), "the open waits, it does not fail: {held:?}");
+    assert!(rig.in_debt(&ali));
+    assert_eq!(rig.attached.seen.init_count(), 1, "no init while in debt");
+
+    // Time pays the debt off; then the init goes and the open can be answered.
+    eventually("the debt is paid", || !rig.in_debt(&ali)).await;
+    eventually("the init goes out", || rig.attached.seen.init_count() == 2).await;
+    let _second = rig
+        .open_for(&ali, second)
+        .await
+        .expect("the session came up");
+}
+
+/// `Throttled` on an established session: a reliable frame is staged and retried (the session
+/// lives, nothing is lost), and it goes out once the bucket is paid off.
+#[tokio::test(start_paused = true)]
+async fn a_reliable_frame_waits_while_the_tenants_bucket_is_in_debt_and_is_not_lost() {
+    let n = network(1);
+    let (rig, ali) = ali_rig(quick(), &[n]);
+    let stream = rig.open_for(&ali, n).await.unwrap();
+    let (mut reader, mut writer) = stream.split();
+    rig.put_in_debt(&ali);
+
+    let payload = vec![0x5au8; 1000];
+    writer.write_all(&payload).await.unwrap();
+    writer.flush().await.unwrap();
+    let mut echoed = vec![0u8; payload.len()];
+    let early = tokio::time::timeout(Duration::from_secs(1), reader.read_exact(&mut echoed)).await;
+    assert!(early.is_err(), "nothing went out while in debt");
+    assert!(rig.in_debt(&ali));
+    assert_eq!(rig.principal.session_count(), 1, "waiting is not failing");
+
+    bounded("echo", reader.read_exact(&mut echoed))
+        .await
+        .expect("the frame was held, not lost");
+    assert_eq!(echoed, payload);
+    assert_eq!(rig.principal.session_count(), 1);
+}
+
+/// The wait for the bucket counts against the send wait like any other refusal for room.
+#[tokio::test(start_paused = true)]
+async fn a_bucket_in_debt_for_the_whole_send_wait_ends_the_session() {
+    let n = network(1);
+    let config = quick()
+        .with_tick(Duration::from_secs(1))
+        .with_send_wait(Duration::from_secs(2));
+    let (rig, ali) = ali_rig(config, &[n]);
+    let stream = rig.open_for(&ali, n).await.unwrap();
+    let (_reader, mut writer) = stream.split();
+    rig.put_in_debt(&ali);
+    let _ = writer.write_all(&[1u8; 1000]).await;
+    let _ = writer.flush().await;
+    eventually("the session gave up", || rig.principal.session_count() == 0).await;
+    assert!(rig.in_debt(&ali), "it gave up while the debt still stood");
+    assert!(
+        rig.principal
+            .shared
+            .ends
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|end| end.contains("SendStalled")),
+        "{:?}",
+        rig.principal.shared.ends.lock().unwrap()
+    );
+}
+
+// ---- backoff after a silent node ----
+
+fn backoff_entries(rig: &Rig) -> usize {
+    rig.principal.shared.lock().backoff.len()
+}
+
+#[tokio::test(start_paused = true)]
+async fn after_a_handshake_timeout_no_init_goes_before_the_backoff_and_the_wait_doubles() {
+    let (known, unknown) = (network(1), network(2));
+    let config = quick().with_handshake_timeout(Duration::from_secs(3));
+    let rig = rig(config, &[known]);
+    let init_count = || rig.attached.seen.init_count();
+
+    // First timeout: 1 s of backoff.
+    assert_eq!(
+        rig.open(unknown, "demo").await.unwrap_err(),
+        PrincipalError::HandshakeTimeout
+    );
+    assert_eq!(init_count(), 1);
+    let error = rig.open(unknown, "demo").await.unwrap_err();
+    match error {
+        PrincipalError::HandshakeBackoff { retry_in } => {
+            assert!(retry_in <= BACKOFF_START && retry_in > Duration::from_millis(900));
+        }
+        other => panic!("expected the backoff, got {other:?}"),
+    }
+    assert_eq!(init_count(), 1, "no init during the backoff");
+    assert_eq!(rig.principal.session_count(), 0, "and no place taken");
+    // Another network of the same node is not held back by it.
+    rig.open(known, "demo").await.expect("another key");
+
+    // After the wait an init goes again; its timeout doubles the wait.
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(
+        rig.open(unknown, "demo").await.unwrap_err(),
+        PrincipalError::HandshakeTimeout
+    );
+    assert_eq!(init_count(), 3, "the known one and the second try");
+    let PrincipalError::HandshakeBackoff { retry_in } =
+        rig.open(unknown, "demo").await.unwrap_err()
+    else {
+        panic!("expected the backoff");
+    };
+    assert!(
+        retry_in > Duration::from_millis(1900) && retry_in <= 2 * BACKOFF_START,
+        "{retry_in:?}"
+    );
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert!(matches!(
+        rig.open(unknown, "demo").await.unwrap_err(),
+        PrincipalError::HandshakeBackoff { .. }
+    ));
+    assert_eq!(init_count(), 3);
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    assert_eq!(
+        rig.open(unknown, "demo").await.unwrap_err(),
+        PrincipalError::HandshakeTimeout
+    );
+    assert_eq!(init_count(), 4);
+    assert_eq!(backoff_entries(&rig), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_backoff_is_capped() {
+    let (known, unknown) = (network(1), network(2));
+    let config = quick().with_handshake_timeout(Duration::from_secs(1));
+    let rig = rig(config, &[known]);
+    // 12 timeouts in a row: 1, 2, 4 ... would pass 2,000 s uncapped.
+    let mut last = Duration::ZERO;
+    for _ in 0..12 {
+        let _ = rig.open(unknown, "demo").await;
+        match rig.open(unknown, "demo").await {
+            Err(PrincipalError::HandshakeBackoff { retry_in }) => {
+                last = retry_in;
+                tokio::time::sleep(retry_in).await;
+            }
+            other => panic!("expected the backoff, got {other:?}"),
+        }
+    }
+    assert!(last <= BACKOFF_MAX && last > BACKOFF_MAX - Duration::from_secs(1));
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_successful_handshake_ends_the_backoff() {
+    let n = network(1);
+    let config = quick().with_handshake_timeout(Duration::from_secs(3));
+    let rig = rig(config, &[n]);
+    // The node does not read for now: two timeouts in a row.
+    let _ = rig.attached.gate.send(false);
+    for wait in [0, 1] {
+        tokio::time::sleep(Duration::from_secs(wait)).await;
+        assert_eq!(
+            rig.open(n, "demo").await.unwrap_err(),
+            PrincipalError::HandshakeTimeout
+        );
+    }
+    assert_eq!(backoff_entries(&rig), 1);
+    // It answers again (the stale inits it held are answered to nobody) and the wait passes.
+    let _ = rig.attached.gate.send(true);
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let _stream = rig.open(n, "demo").await.expect("the node answers now");
+    assert_eq!(backoff_entries(&rig), 0, "a success forgets the failures");
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_backoff_goes_with_the_node_and_with_its_attachment() {
+    let (known, unknown) = (network(1), network(2));
+    let config = quick().with_handshake_timeout(Duration::from_secs(3));
+    let rig = rig(config, &[known]);
+    let _ = rig.open(unknown, "demo").await;
+    assert_eq!(backoff_entries(&rig), 1);
+    // A re-attached node starts afresh: its next open is not held back.
+    let second = attach(&rig.relay, &rig.node, 8, Behaviour::serving(&[known]));
+    assert_eq!(
+        rig.open(unknown, "demo").await.unwrap_err(),
+        PrincipalError::HandshakeTimeout
+    );
+    assert_eq!(second.seen.init_count(), 1);
+    // A detached node: the entry is dropped by the next open.
+    assert_eq!(backoff_entries(&rig), 1);
+    assert!(rig.relay.registry.detach(&rig.node.node_id, 8));
+    assert_eq!(
+        rig.open(unknown, "demo").await.unwrap_err(),
+        PrincipalError::NotAttached
+    );
+    assert_eq!(backoff_entries(&rig), 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_backoff_table_is_bounded() {
+    let n = network(1);
+    let rig = rig(quick(), &[n]);
+    let node = rig.node.node_id;
+    let base = Instant::now();
+    let shared = &rig.principal.shared;
+    // Entries of the attached node (they survive the sweep): the soonest one makes room.
+    for i in 0..=MAX_BACKOFF_ENTRIES as u32 {
+        let mut state = shared.lock();
+        let mut id = [0u8; 32];
+        id[..4].copy_from_slice(&i.to_be_bytes());
+        shared.note_timeout(
+            &mut state,
+            (node, NetworkId::from(id)),
+            7,
+            base + Duration::from_millis(u64::from(i)),
+        );
+        assert!(state.backoff.len() <= MAX_BACKOFF_ENTRIES);
+    }
+    {
+        let state = shared.lock();
+        assert_eq!(state.backoff.len(), MAX_BACKOFF_ENTRIES);
+        let first = (node, NetworkId::from([0u8; 32]));
+        assert!(!state.backoff.contains_key(&first), "the soonest went");
+    }
+    // Entries of nodes that are not attached are swept when the table is full.
+    let stranger = NodeId::from([9u8; 32]);
+    let mut state = shared.lock();
+    state.backoff.clear();
+    for i in 0..MAX_BACKOFF_ENTRIES as u32 {
+        let mut id = [1u8; 32];
+        id[..4].copy_from_slice(&i.to_be_bytes());
+        state.backoff.insert(
+            (stranger, NetworkId::from(id)),
+            Backoff {
+                failures: 1,
+                until: base,
+                l3_session: 1,
+            },
+        );
+    }
+    shared.note_timeout(&mut state, (node, network(5)), 7, base);
+    assert_eq!(
+        state.backoff.len(),
+        1,
+        "the departed nodes' entries are swept"
+    );
+}

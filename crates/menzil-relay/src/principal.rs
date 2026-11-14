@@ -123,6 +123,15 @@ pub const DEFAULT_MAX_STREAMS_PER_SESSION: usize = 64;
 /// Streams on all the principal sessions of one tenant: about 290 MiB at the measured cost.
 pub const DEFAULT_MAX_STREAMS_PER_TENANT: usize = 1_024;
 
+/// The wait after the first `HandshakeTimeout` for one (node, network); it doubles with every
+/// consecutive timeout up to [`BACKOFF_MAX`] and is forgotten when a handshake succeeds.
+pub const BACKOFF_START: Duration = Duration::from_secs(1);
+/// The longest wait after a run of `HandshakeTimeout`s.
+pub const BACKOFF_MAX: Duration = Duration::from_secs(5 * 60);
+/// Backoff entries kept at once; past it, entries of nodes that left go first, then the one
+/// that expires soonest.
+pub const MAX_BACKOFF_ENTRIES: usize = 4_096;
+
 /// The figures of the principal. [`Default`] is the design's; tests shorten the times. Every
 /// `with_*` returns the changed copy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -282,6 +291,13 @@ pub enum PrincipalError {
     /// a share it did not advertise, a relay it does not trust).
     #[error("the node did not answer the L4 handshake in time")]
     HandshakeTimeout,
+    /// The node left the last `init` for this network unanswered, and the relay does not start
+    /// another one before the backoff is over (nothing was sent).
+    #[error("no L4 handshake is started for {retry_in:?} after the node stayed silent")]
+    HandshakeBackoff {
+        /// The time left of the wait.
+        retry_in: Duration,
+    },
     /// The `resp` was unusable (wrong key or certificate, unsupported protocol, docs only).
     #[error("the L4 handshake failed: {0}")]
     HandshakeFailed(String),
@@ -343,8 +359,23 @@ struct Route {
     tx: mpsc::UnboundedSender<InboundFrame>,
 }
 
+/// The wait before the next `init` to one (node, network) after `HandshakeTimeout`s.
+struct Backoff {
+    /// Consecutive timeouts.
+    failures: u32,
+    /// No `init` before this.
+    until: Instant,
+    /// The L3 session of the node the timeouts happened under: a node that re-attached starts
+    /// afresh.
+    l3_session: u32,
+}
+
 #[derive(Default)]
 struct State {
+    /// Per (node, network); an entry goes with a successful handshake or when its node detaches
+    /// or re-attaches (seen on the next open or at the cap), and there are at most
+    /// [`MAX_BACKOFF_ENTRIES`].
+    backoff: HashMap<Key, Backoff>,
     sessions: HashMap<Key, SessionEntry>,
     by_index: HashMap<u32, Route>,
     per_tenant: HashMap<TenantId, usize>,
@@ -390,6 +421,45 @@ struct Shared {
 impl Shared {
     fn lock(&self) -> MutexGuard<'_, State> {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Records one more consecutive `HandshakeTimeout` for `key` under `l3_session`: the wait
+    /// is [`BACKOFF_START`], doubled per consecutive timeout, at most [`BACKOFF_MAX`].
+    fn note_timeout(&self, state: &mut State, key: Key, l3_session: u32, now: Instant) {
+        let before = state
+            .backoff
+            .get(&key)
+            .filter(|entry| entry.l3_session == l3_session)
+            .map_or(0, |entry| entry.failures);
+        let failures = before.saturating_add(1);
+        let delay = BACKOFF_START
+            .saturating_mul(1u32 << (failures - 1).min(20))
+            .min(BACKOFF_MAX);
+        if !state.backoff.contains_key(&key) && state.backoff.len() >= MAX_BACKOFF_ENTRIES {
+            // Entries of nodes that left (or re-attached) are useless: they go first.
+            state.backoff.retain(|(node, _), entry| {
+                self.relay
+                    .attached_node(node)
+                    .is_some_and(|attached| attached.session_id == entry.l3_session)
+            });
+            if state.backoff.len() >= MAX_BACKOFF_ENTRIES
+                && let Some(soonest) = state
+                    .backoff
+                    .iter()
+                    .min_by_key(|(_, entry)| entry.until)
+                    .map(|(key, _)| *key)
+            {
+                state.backoff.remove(&soonest);
+            }
+        }
+        state.backoff.insert(
+            key,
+            Backoff {
+                failures,
+                until: now + delay,
+                l3_session,
+            },
+        );
     }
 
     /// Hands one frame from the endpoint to the session it belongs to, or drops it (which
@@ -592,11 +662,11 @@ impl Principal {
         let relay_id = self.shared.relay_id.ok_or(PrincipalError::NoIdentity)?;
         let mut ready = {
             let mut state = self.shared.lock();
-            let attached = self
-                .shared
-                .relay
-                .attached_node(&node)
-                .ok_or(PrincipalError::NotAttached)?;
+            let Some(attached) = self.shared.relay.attached_node(&node) else {
+                // The node detached: what the relay held against it goes too.
+                state.backoff.retain(|(held, _), _| *held != node);
+                return Err(PrincipalError::NotAttached);
+            };
             let key = (node, network);
             let existing = state
                 .sessions
@@ -613,6 +683,17 @@ impl Principal {
                     // A session pinned to an older L3 session of the node is over.
                     if let Some((index, _, _)) = other {
                         state.remove(&key, index);
+                    }
+                    // The node stayed silent to the last `init`(s): no new one yet.
+                    if let Some(entry) = state.backoff.get(&key) {
+                        let now = Instant::now();
+                        if entry.l3_session != attached.session_id {
+                            state.backoff.remove(&key);
+                        } else if now < entry.until {
+                            return Err(PrincipalError::HandshakeBackoff {
+                                retry_in: entry.until - now,
+                            });
+                        }
                     }
                     self.start_session(&mut state, tenant, key, relay_id, attached)?
                 }
@@ -858,7 +939,15 @@ impl Session {
             .unwrap_or_else(PoisonError::into_inner)
             .push(format!("{end:?}"));
         // Places first, so a caller woken by the failure below can start a new session.
-        self.shared.lock().remove(&self.key, self.index);
+        {
+            let mut state = self.shared.lock();
+            if state.remove(&self.key, self.index).is_some()
+                && matches!(end, End::Handshake(PrincipalError::HandshakeTimeout))
+            {
+                self.shared
+                    .note_timeout(&mut state, self.key, self.l3_session, Instant::now());
+            }
+        }
         let _ = ready.send(Phase::Failed(end.error()));
     }
 
@@ -873,6 +962,8 @@ impl Session {
             Ok(transport) => transport,
             Err(error) => return End::Handshake(error),
         };
+        // The node answered: the wait for this (node, network) is over.
+        self.shared.lock().backoff.remove(&self.key);
         let max_record = self.shared.relay.limits.max_record;
         let (mux, inbound_streams, mut outbound, driver) =
             menzil_stream::new_with_limits(Mode::Client, max_record, config.mux_limits());

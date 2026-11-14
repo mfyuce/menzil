@@ -307,6 +307,9 @@ async fn the_relay_principal_opens_shared_services_of_a_live_node_and_only_those
         "a failed handshake leaves no session"
     );
     assert!(opens.lock().unwrap().is_empty());
+    // The timeout started the principal's init backoff (1 s) for this node and network: the
+    // next open waits it out (a new init goes only after it, see the relay's principal tests).
+    tokio::time::sleep(Duration::from_millis(1100)).await;
 
     // --- 2. shared: bytes both ways, with the meta the node validated --------------------
     book.set_shares(vec![app_share.clone(), raw_share.clone()])
