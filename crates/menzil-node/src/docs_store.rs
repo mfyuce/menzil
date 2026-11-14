@@ -171,7 +171,7 @@ impl<'a> DocStore<'a> {
 /// The base to hold with a document: none for an owner signed one, and for a steward signed
 /// one the base the predicate has just checked. A steward signed document without its base
 /// would be a bug in the predicate; it is refused here all the same, never stored.
-fn base_of<T>(signer: Signer, base: Option<&T>) -> Result<Option<&T>, NodeError> {
+pub(crate) fn base_of<T>(signer: Signer, base: Option<&T>) -> Result<Option<&T>, NodeError> {
     match (signer, base) {
         (Signer::Owner, _) => Ok(None),
         (Signer::Steward { .. }, Some(base)) => Ok(Some(base)),
@@ -578,6 +578,138 @@ mod tests {
             Err(NodeError::DocumentRejected(Reason::Expired))
         ));
         assert_eq!(rosters.seq(&net.network_id), Some(10));
+    }
+
+    #[test]
+    fn adopt_roster_judges_a_steward_roster_with_its_base() {
+        let net = Net::new();
+        let steward_roster = net.renewal(&net.steward, 11, true).roster.unwrap();
+        let rosters = RosterStore::new();
+        assert!(rosters.adopt_owner(&net.base_roster, NOW).unwrap());
+        // Without its base: refused.
+        assert!(matches!(
+            rosters.adopt_roster(&steward_roster, None, NOW),
+            Err(NodeError::DocumentRejected(Reason::MissingBase))
+        ));
+        // A base that is not the Roster's parent: refused, nothing stored.
+        let mut other = net.roster.clone();
+        other.members.clear();
+        let wrong = Roster::sign(&net.owner, &other).unwrap();
+        assert!(matches!(
+            rosters.adopt_roster(&steward_roster, Some(&wrong), NOW),
+            Err(NodeError::DocumentRejected(_))
+        ));
+        assert_eq!(rosters.seq(&net.network_id), Some(10));
+        // With its base: adopted, held with the base and the steward as signer.
+        let mut changes = rosters.subscribe();
+        assert!(
+            rosters
+                .adopt_roster(&steward_roster, Some(&net.base_roster), NOW)
+                .unwrap()
+        );
+        assert_eq!(changes.try_recv().unwrap(), net.network_id);
+        assert_eq!(rosters.seq(&net.network_id), Some(11));
+        assert_eq!(rosters.base(&net.network_id), Some(net.base_roster.clone()));
+        assert_eq!(
+            rosters.signer(&net.network_id),
+            Some(Signer::Steward {
+                key: StewardKey::from(net.steward.verifying_key().to_bytes()),
+                base_seq: 10,
+            })
+        );
+        // Held: not adopted twice.
+        assert!(
+            !rosters
+                .adopt_roster(&steward_roster, Some(&net.base_roster), NOW)
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn adopt_roster_ignores_the_time_rules_for_the_base_and_an_owner_roster_needs_none() {
+        let net = Net::new();
+        let steward_roster = net.renewal(&net.steward, 11, true).roster.unwrap();
+        // The base expired 5 days after NOW; the steward Roster, issued at `later`, is fresh.
+        let later = NOW + 6 * DAY;
+        let mut body = net.roster.clone();
+        body.seq = 11;
+        body.issued = later;
+        body.expires = later + DAY;
+        let fresh = Roster::sign(&net.steward, &body).unwrap();
+        let rosters = RosterStore::new();
+        assert!(
+            rosters
+                .adopt_roster(&fresh, Some(&net.base_roster), later)
+                .unwrap()
+        );
+        // The same steward Roster at NOW + 30 days is itself expired.
+        let rosters = RosterStore::new();
+        assert!(matches!(
+            rosters.adopt_roster(&steward_roster, Some(&net.base_roster), NOW + 30 * DAY),
+            Err(NodeError::DocumentRejected(Reason::Expired))
+        ));
+        // An owner Roster behaves as adopt_owner, with or without a (then ignored) base.
+        let owner_roster = net.renewal(&net.owner, 11, false).roster.unwrap();
+        let rosters = RosterStore::new();
+        assert!(rosters.adopt_roster(&owner_roster, None, NOW).unwrap());
+        assert_eq!(rosters.signer(&net.network_id), Some(Signer::Owner));
+        assert!(rosters.base(&net.network_id).is_none());
+    }
+
+    #[test]
+    fn adopt_roster_refuses_an_oversize_base_and_stores_nothing() {
+        let net = Net::new();
+        let steward_roster = net.renewal(&net.steward, 11, true).roster.unwrap();
+        let mut big = net.roster.clone();
+        big.members = (0..40_000)
+            .map(|i| RosterMember {
+                node_id: NodeId::from([(i % 256) as u8; 32]),
+                min_serial: i,
+            })
+            .collect();
+        let big = Roster::sign(&net.owner, &big).unwrap();
+        assert!(big.encode().len() > menzil_proto::MAX_DOC_BYTES);
+        let rosters = RosterStore::new();
+        assert!(matches!(
+            rosters.adopt_roster(&steward_roster, Some(&big), NOW),
+            Err(NodeError::DocumentTooLarge { .. })
+        ));
+        assert!(rosters.get(&net.network_id).is_none());
+    }
+
+    #[test]
+    fn a_steward_roster_adopted_with_its_base_lets_the_policy_alone_be_adopted_with_its_base() {
+        let net = Net::new();
+        let (rosters, policies) = (RosterStore::new(), PolicyStore::new());
+        let bundle = net.renewal(&net.steward, 11, true);
+        assert!(
+            rosters
+                .adopt_roster(
+                    bundle.roster.as_ref().unwrap(),
+                    bundle.base_roster.as_ref(),
+                    NOW
+                )
+                .unwrap()
+        );
+        let policy_only = Bundle {
+            base_policy: bundle.base_policy.clone(),
+            policy: bundle.policy.clone(),
+            ..Bundle::default()
+        };
+        assert_eq!(
+            DocStore::new(&rosters, &policies)
+                .adopt(&policy_only, NOW)
+                .unwrap(),
+            Adopted {
+                roster: false,
+                policy: true
+            }
+        );
+        assert_eq!(policies.seq(&net.network_id), Some(11));
+        assert_eq!(
+            policies.base(&net.network_id),
+            Some(net.base_policy.clone())
+        );
     }
 
     type Seen = std::sync::Arc<std::sync::Mutex<Vec<AdoptedDocs>>>;

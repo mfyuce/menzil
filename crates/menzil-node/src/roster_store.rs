@@ -148,19 +148,36 @@ impl RosterStore {
     /// protocol.md 2.3 at `now` (Unix seconds): newer than the held one, `issued` at most an
     /// hour ahead, `expires - issued` at most 14 days, not expired. Returns whether it was
     /// stored. A Roster a steward signed is refused (`MissingBase`): it is only adopted as part
-    /// of a pair, by [`crate::DocStore::adopt`].
+    /// of a pair, by [`crate::DocStore::adopt`], or with its base by [`Self::adopt_roster`].
     pub fn adopt_owner(&self, roster: &Roster, now: u64) -> Result<bool, NodeError> {
+        self.adopt_roster(roster, None, now)
+    }
+
+    /// Like [`Self::adopt_owner`], but a steward signed `roster` is judged with `base`, the
+    /// owner signed Roster it was made from (protocol.md 2.3): the base is checked by the
+    /// predicate and held with the Roster. The time rules apply to `roster` only, not to the
+    /// base. Both documents are bounded by [`menzil_proto::MAX_DOC_BYTES`]. An owner signed
+    /// `roster` ignores `base`, as in [`crate::DocStore::adopt`].
+    pub fn adopt_roster(
+        &self,
+        roster: &Roster,
+        base: Option<&Roster>,
+        now: u64,
+    ) -> Result<bool, NodeError> {
         let network_id = roster.decode()?.network_id;
         let bundle = Bundle {
+            base_roster: base.cloned(),
             roster: Some(roster.clone()),
             ..Bundle::default()
         };
-        let encoded_len = roster.encode().len();
-        if encoded_len > menzil_proto::MAX_DOC_BYTES {
-            return Err(NodeError::DocumentTooLarge {
-                len: encoded_len,
-                max: menzil_proto::MAX_DOC_BYTES,
-            });
+        for doc in std::iter::once(roster).chain(base) {
+            let encoded_len = doc.encode().len();
+            if encoded_len > menzil_proto::MAX_DOC_BYTES {
+                return Err(NodeError::DocumentTooLarge {
+                    len: encoded_len,
+                    max: menzil_proto::MAX_DOC_BYTES,
+                });
+            }
         }
         let mut guard = self.by_network.write().unwrap();
         let view = HeldView {
@@ -170,7 +187,14 @@ impl RosterStore {
         };
         match check_bundle(&view, &bundle, now) {
             Verdict::Adopt(adoption) => {
-                guard.insert(network_id, Held::new(roster, None, adoption.signer)?);
+                guard.insert(
+                    network_id,
+                    Held::new(
+                        roster,
+                        crate::docs_store::base_of(adoption.signer, base)?,
+                        adoption.signer,
+                    )?,
+                );
                 self.notify(network_id);
                 Ok(true)
             }
