@@ -85,7 +85,7 @@ use std::time::{Duration, Instant};
 use menzil_proto::{EgressRule, ErrorCode, HostPortPattern, NetworkId, NodeId, PolicyBody};
 use menzil_stream::{OpenRefusal, OpenRequest};
 use tokio::net::TcpStream;
-use tokio::sync::Semaphore;
+use tokio::sync::{Mutex as AsyncMutex, Semaphore};
 
 use crate::policy_store::PolicyStore;
 use crate::serve::{LOG_INTERVAL, LogThrottle, connect_addr, system_resolve_fqdn};
@@ -880,6 +880,9 @@ pub struct EgressExecutor {
     refuse_log: LogThrottle,
     own_log: LogThrottle,
     close_log: LogThrottle,
+    /// The own addresses and on-link prefixes as the last re-vet read them, shared by every live
+    /// stream's re-vet ([`Self::own_state_shared`]). A dial never uses it.
+    own_cache: AsyncMutex<Option<(Instant, OwnState)>>,
     /// The node's own extra `deny` list (`[egress] deny`): matched without specificity, so no
     /// signed `allow` lifts it. It can only narrow.
     local_deny: Vec<Pattern>,
@@ -915,6 +918,7 @@ impl EgressExecutor {
             refuse_log: LogThrottle::new(LOG_INTERVAL),
             own_log: LogThrottle::new(LOG_INTERVAL),
             close_log: LogThrottle::new(LOG_INTERVAL),
+            own_cache: AsyncMutex::new(None),
             local_deny: Vec::new(),
             loopback_ok: false,
             #[cfg(test)]
@@ -939,6 +943,7 @@ impl EgressExecutor {
         own: impl Fn() -> io::Result<Vec<IpAddr>> + Send + Sync + 'static,
     ) -> Self {
         self.own = Arc::new(own);
+        self.own_cache = AsyncMutex::new(None);
         self
     }
 
@@ -949,6 +954,7 @@ impl EgressExecutor {
         links: impl Fn() -> io::Result<Vec<Net>> + Send + Sync + 'static,
     ) -> Self {
         self.links = Arc::new(links);
+        self.own_cache = AsyncMutex::new(None);
         self
     }
 
@@ -1150,7 +1156,7 @@ impl EgressExecutor {
     /// The exit's own addresses and on-link prefixes, read on a blocking thread (the files can be
     /// large and the runtime thread must not wait for them). Any failure, a panic of the reader
     /// included, refuses the dial: fail closed.
-    async fn own_state(&self) -> Result<(Vec<IpAddr>, Vec<Net>), Fail> {
+    async fn own_state(&self) -> Result<OwnState, Fail> {
         let (own, links) = (self.own.clone(), self.links.clone());
         let read = tokio::task::spawn_blocking(move || {
             let own = own().map_err(|error| ("addresses", error))?;
@@ -1179,6 +1185,24 @@ impl EgressExecutor {
         )))
     }
 
+    /// [`Self::own_state`] for the re-vet of a live stream, read at most once per
+    /// [`OWN_STATE_MAX_AGE`] however many streams re-vet at once (a recheck pokes every live
+    /// egress stream, and the files can be large). Staleness bound: an address or an on-link
+    /// prefix that changed is seen by the first re-vet that starts more than
+    /// [`OWN_STATE_MAX_AGE`] after the change. A failed read is not cached. The OPEN-time dial
+    /// always reads afresh.
+    async fn own_state_shared(&self) -> Result<OwnState, Fail> {
+        let mut cache = self.own_cache.lock().await;
+        if let Some((read_at, state)) = cache.as_ref()
+            && read_at.elapsed() < OWN_STATE_MAX_AGE
+        {
+            return Ok(state.clone());
+        }
+        let state = self.own_state().await?;
+        *cache = Some((Instant::now(), state.clone()));
+        Ok(state)
+    }
+
     /// Vets a live stream again against the node's rule as it is now (protocol.md 5.3 and 8: the
     /// Policy changed): the same [`Self::prepare`] and [`Self::vet`] the dial used, for the
     /// target as canonicalized and the one address that was dialled. `Err` says why it is now
@@ -1190,7 +1214,7 @@ impl EgressExecutor {
         addr: SocketAddr,
     ) -> Result<(), Fail> {
         let prepared = self.prepare(network_id, target)?;
-        let (own, links) = self.own_state().await?;
+        let (own, links) = self.own_state_shared().await?;
         let lists = (prepared.allow.as_slice(), prepared.deny.as_slice());
         self.vet(
             addr.ip().to_canonical(),
@@ -1347,6 +1371,12 @@ struct Prepared {
     deny: Vec<Pattern>,
     name_allowed: bool,
 }
+
+/// The exit's own addresses and on-link prefixes.
+type OwnState = (Vec<IpAddr>, Vec<Net>);
+
+/// How long a re-vet may reuse the own addresses and prefixes another re-vet read.
+const OWN_STATE_MAX_AGE: Duration = Duration::from_secs(1);
 
 /// What the exit keeps of a dialled egress stream so that it can be vetted again while it lives
 /// (protocol.md 5.3 and 8): the network, who asked, the target as canonicalized and the one
@@ -3128,6 +3158,51 @@ Main:
         })
         .with_connector(move |_addr, _buffer| async move { TcpStream::connect(sink).await });
         (Arc::new(executor), cell)
+    }
+
+    #[tokio::test]
+    async fn re_vets_share_one_read_of_the_own_addresses_for_a_second() {
+        let sink = counter().await;
+        let reads = Arc::new(AtomicUsize::new(0));
+        let counted = reads.clone();
+        let cell: RuleCell = Arc::new(Mutex::new(Some(rule(&internet(), &default_deny()))));
+        let read = cell.clone();
+        let sink_addr = sink.addr;
+        let executor = Arc::new(
+            EgressExecutor::new(
+                true,
+                Arc::new(move |_: &NetworkId| read.lock().unwrap().clone()),
+            )
+            .with_own_addresses(move || {
+                counted.fetch_add(1, Ordering::SeqCst);
+                Ok(Vec::new())
+            })
+            .with_own_links(|| Ok(Vec::new()))
+            .with_connector(
+                move |_addr, _buffer| async move { TcpStream::connect(sink_addr).await },
+            ),
+        );
+        let mut lives = Vec::new();
+        for _ in 0..8 {
+            let (_socket, live) = executor
+                .dial_live(&request("203.0.113.9", 443), 64 * 1024, TIMEOUT)
+                .await
+                .unwrap();
+            lives.push(live);
+        }
+        let after_dials = reads.load(Ordering::SeqCst);
+        assert_eq!(after_dials, 8, "each dial reads afresh");
+        // 8 streams x 5 rechecks, well inside the bound: one read in all.
+        for _ in 0..5 {
+            for live in &lives {
+                live.still_allowed().await.unwrap();
+            }
+        }
+        assert_eq!(reads.load(Ordering::SeqCst), after_dials + 1);
+        // Past the bound the next re-vet reads again.
+        tokio::time::sleep(OWN_STATE_MAX_AGE + Duration::from_millis(100)).await;
+        lives[0].still_allowed().await.unwrap();
+        assert_eq!(reads.load(Ordering::SeqCst), after_dials + 2);
     }
 
     #[tokio::test]

@@ -109,7 +109,7 @@
 //! without the pause semantics are in `menzil-stream`'s
 //! `tests/backpressure.rs`.
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
@@ -426,6 +426,9 @@ struct Entry {
     /// Set by a served stream that must be vetted again by something other than the
     /// [`Authorizer`] ([`attach_recheck`]); a recheck wakes it.
     poke: Option<Arc<Notify>>,
+    /// Set by [`AcceptedStreams::recheck`] just before it aborts the task because the
+    /// [`Authorizer`] denies it, so the stream's close line can tell that from a node shutdown.
+    denied: Option<Arc<AtomicBool>>,
 }
 
 tokio::task_local! {
@@ -440,11 +443,12 @@ tokio::task_local! {
 /// `false` when the caller is not a tracked stream's task (nothing will ever wake it). The
 /// stream must vet itself once after attaching: a recheck that ran before the attach is not
 /// replayed.
-pub(crate) fn attach_recheck(poke: Arc<Notify>) -> bool {
+pub(crate) fn attach_recheck(poke: Arc<Notify>, denied: Arc<AtomicBool>) -> bool {
     CURRENT
         .try_with(|(streams, id)| match streams.entries().get_mut(id) {
             Some(entry) => {
                 entry.poke = Some(poke);
+                entry.denied = Some(denied);
                 true
             }
             None => false,
@@ -490,7 +494,12 @@ impl AcceptedStreams {
     /// covers the stream, so none is missed. `authorizer` runs with no lock held.
     pub fn recheck(&self, authorizer: &dyn Authorizer) -> usize {
         self.inner.generation.fetch_add(1, Ordering::SeqCst);
-        type Seen = (OpenRequest, tokio::task::AbortHandle, Option<Arc<Notify>>);
+        type Seen = (
+            OpenRequest,
+            tokio::task::AbortHandle,
+            Option<Arc<Notify>>,
+            Option<Arc<AtomicBool>>,
+        );
         let snapshot: Vec<Seen> = self
             .entries()
             .values()
@@ -499,12 +508,16 @@ impl AcceptedStreams {
                     entry.request.clone(),
                     entry.abort.clone(),
                     entry.poke.clone(),
+                    entry.denied.clone(),
                 )
             })
             .collect();
         let mut stopped = 0;
-        for (request, abort, poke) in snapshot {
+        for (request, abort, poke, denied) in snapshot {
             if let OpenDecision::Deny(_) = authorizer.authorize(&as_member_request(&request)) {
+                if let Some(denied) = denied {
+                    denied.store(true, Ordering::SeqCst);
+                }
                 abort.abort();
                 stopped += 1;
             } else if let Some(poke) = poke {
@@ -741,6 +754,7 @@ fn register<H>(
                 request: request.clone(),
                 abort: abort.clone(),
                 poke: None,
+                denied: None,
             },
         );
         abort
@@ -2595,5 +2609,81 @@ mod tests {
             false,
         )
         .await;
+    }
+
+    #[tokio::test]
+    async fn an_authorizer_revocation_of_a_live_egress_stream_logs_no_longer_allowed() {
+        use crate::egress::EgressExecutor;
+        use crate::serve::LocalServices;
+        use menzil_proto::{EgressRule, HostPortPattern};
+
+        let TwoSessions {
+            a,
+            a_acceptor: _a_acceptor,
+            mut b,
+            b_handle: _b_handle,
+            _pump_a_to_b,
+            _pump_b_to_a,
+            _task_a,
+            _task_b,
+            _a_epoch_ended_tx,
+            _b_epoch_ended_tx,
+        } = two_sessions();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let rule = EgressRule {
+            node_id: NodeId::from([7u8; 32]),
+            allow: vec![HostPortPattern("127.0.0.0/8".into())],
+            deny: vec![],
+        };
+        let services = LocalServices::new().with_egress(
+            EgressExecutor::new(true, Arc::new(move |_: &NetworkId| Some(rule.clone())))
+                .with_own_addresses(|| Ok(Vec::new()))
+                .with_own_links(|| Ok(Vec::new()))
+                .narrowed_floor_for_tests(),
+        );
+        let observed = services.clone();
+        let switch = Switchable::default();
+        let streams = AcceptedStreams::new();
+        let accept_task = {
+            let (switch, streams) = (switch.clone(), streams.clone());
+            tokio::spawn(async move {
+                accept_loop_tracked(&mut b, switch, services, streams).await;
+            })
+        };
+        let target = OpenTarget {
+            host: "127.0.0.1".to_string(),
+            port,
+            transport: None,
+        };
+        let mut stream = open(&a, egress_star(), Some(target)).await.unwrap();
+        let (_socket, _) = tokio::time::timeout(STEP, listener.accept())
+            .await
+            .unwrap()
+            .unwrap();
+        wait_for_len(&streams, 1).await;
+        // Let the pipe attach before the recheck.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        switch.deny(egress_star());
+        assert_eq!(streams.recheck(&switch), 1);
+        expect_reset(&mut stream).await;
+        wait_for_len(&streams, 0).await;
+        let mut lines = Vec::new();
+        for _ in 0..100 {
+            lines = observed
+                .egress_logged()
+                .into_iter()
+                .filter(|line| line.starts_with("closed: "))
+                .collect();
+            if !lines.is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].contains("no longer allowed"), "{}", lines[0]);
+        assert!(!lines[0].contains("aborted"), "{}", lines[0]);
+        accept_task.abort();
     }
 }

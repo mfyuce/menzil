@@ -180,6 +180,15 @@ impl EgressSettings {
         if let Some(value) = self.max_connections_per_peer {
             limits.max_connections_per_peer = in_range("max_connections_per_peer", value)?;
         }
+        // One initiator's count above the pool would let it take the whole pool. A key that was
+        // left out counts with its default, so `max_connections = 10` alone is refused too.
+        if limits.max_connections_per_peer > limits.max_connections {
+            bail!(
+                "max_connections_per_peer in [egress] of config.toml is {}: it must not exceed max_connections, which is {} (one initiator could take the whole pool; a key left out counts with its default)",
+                limits.max_connections_per_peer,
+                limits.max_connections
+            );
+        }
         if let Some(seconds) = self.idle_secs {
             let (least, most) = (MIN_EGRESS_IDLE.as_secs(), MAX_EGRESS_IDLE.as_secs());
             if seconds < least || seconds > most {
@@ -691,9 +700,9 @@ mod tests {
         assert_eq!(plain.egress_limits().max_connections_per_peer, 32);
         assert_eq!(plain.egress_limits().idle, DEFAULT_EGRESS_IDLE);
         // The egress pool is not the serve pool.
-        let apart = services("[serve]\nmax_connections = 7\n[egress]\nmax_connections = 9\n");
+        let apart = services("[serve]\nmax_connections = 7\n[egress]\nmax_connections = 40\n");
         assert_eq!(apart.limits().max_connections, 7);
-        assert_eq!(apart.egress_limits().max_connections, 9);
+        assert_eq!(apart.egress_limits().max_connections, 40);
         assert_eq!(apart.egress_limits().max_connections_per_peer, 32);
         let all = services(
             "[egress]\nmax_connections = 20\nmax_connections_per_peer = 3\nidle_secs = 10\n",
@@ -741,6 +750,17 @@ mod tests {
                 "max_connections",
             ),
             ("[egress]\nmax_connections_per_peer = 1000001", "1000000"),
+            // One initiator may not hold more than the pool: both set, or one against the
+            // default of the other (128 in all, 32 for one initiator).
+            (
+                "[egress]\nmax_connections = 10\nmax_connections_per_peer = 11",
+                "must not exceed max_connections",
+            ),
+            (
+                "[egress]\nmax_connections_per_peer = 129",
+                "must not exceed max_connections",
+            ),
+            ("[egress]\nmax_connections = 31", "must not exceed"),
             ("[egress]\nidle_secs = 0", "idle_secs"),
             ("[egress]\nidle_secs = 9", "10 to 86400"),
             ("[egress]\nidle_secs = 86401", "10 to 86400"),

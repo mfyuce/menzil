@@ -60,7 +60,7 @@ use std::collections::HashMap;
 use std::io;
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
@@ -296,6 +296,12 @@ impl Default for LocalServices {
 }
 
 impl LocalServices {
+    /// The egress executor's log lines, for tests of other modules.
+    #[cfg(test)]
+    pub(crate) fn egress_logged(&self) -> Vec<String> {
+        self.egress.as_ref().map(|e| e.logged()).unwrap_or_default()
+    }
+
     /// A node that serves nothing yet.
     pub fn new() -> Self {
         let limits = ServeLimits::default();
@@ -729,6 +735,12 @@ impl Drop for OpenedTarget {
         if let Some(socket) = self.socket.take() {
             reset_socket(&socket);
         }
+        // A dialled egress stream that no pipe took over (the OPEN_ACK could not be written, the
+        // OPEN timed out after the dial, the handler was dropped unpolled) still gets its one
+        // close line; a piped one logs from the pipe, and `into_parts` left nothing here.
+        if let Some(live) = self.live.take() {
+            live.log_close("not started", 0, 0, Duration::ZERO);
+        }
     }
 }
 
@@ -949,6 +961,8 @@ struct EgressClose {
     up: Arc<AtomicU64>,
     down: Arc<AtomicU64>,
     outcome: String,
+    /// Set by a recheck that stopped this stream because the authorizer denies it.
+    denied: Arc<AtomicBool>,
 }
 
 /// The two ends of one served stream and the slot they hold. Dropping it before [`Pipe::run`]
@@ -975,6 +989,7 @@ impl Pipe {
                 up: Arc::new(AtomicU64::new(0)),
                 down: Arc::new(AtomicU64::new(0)),
                 outcome: "aborted".to_owned(),
+                denied: Arc::new(AtomicBool::new(false)),
             }),
         }
     }
@@ -1028,7 +1043,10 @@ impl Pipe {
             watch: self.egress.as_ref().and_then(|e| watch(e, &e.down)),
         };
         let poke = Arc::new(Notify::new());
-        let attached = self.egress.is_some() && crate::l5_stream::attach_recheck(poke.clone());
+        let attached = match &self.egress {
+            Some(egress) => crate::l5_stream::attach_recheck(poke.clone(), egress.denied.clone()),
+            None => false,
+        };
         let idle_watch = async {
             match &self.egress {
                 Some(egress) => egress.activity.idle_for(idle).await,
@@ -1102,8 +1120,14 @@ impl Drop for Pipe {
     fn drop(&mut self) {
         self.abort();
         if let Some(close) = self.egress.take() {
+            // An abort by a recheck whose authorizer said no is a revocation, not a shutdown.
+            let outcome = if close.outcome == "aborted" && close.denied.load(Ordering::SeqCst) {
+                "reset: no longer allowed: grant revoked"
+            } else {
+                close.outcome.as_str()
+            };
             close.live.log_close(
-                &close.outcome,
+                outcome,
                 close.up.load(Ordering::Relaxed),
                 close.down.load(Ordering::Relaxed),
                 close.started.elapsed(),
@@ -2884,6 +2908,19 @@ mod tests {
                 std::thread::sleep(Duration::from_millis(5));
             }
             Vec::new()
+        }
+
+        #[tokio::test]
+        async fn a_dialled_egress_stream_that_is_never_piped_still_logs_one_close_line() {
+            let listener = listener().await;
+            let port = listener.local_addr().unwrap().port();
+            let services = LocalServices::new().with_egress(executor(&["127.0.0.0/8"], true));
+            let opened = services.open(&egress_request(port)).await.unwrap();
+            // The OPEN_ACK could not be written, so the handler never ran: dropped as it is.
+            drop(opened);
+            let lines = closed_lines(&services).await;
+            assert_eq!(lines.len(), 1, "{lines:?}");
+            assert!(lines[0].contains("not started up=0 down=0"), "{}", lines[0]);
         }
 
         #[tokio::test]
