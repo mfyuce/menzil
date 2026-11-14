@@ -189,7 +189,7 @@ mod tests {
         let mut closing = Closing::new(
             stream_receivers,
             pending_frames.into(),
-            frame::Io::new(crate::connection::Id(0), &mut socket).fuse(),
+            frame::Io::new(crate::connection::Id(0), &mut socket, crate::MIB).fuse(),
         );
         futures::executor::block_on(async { poll_fn(|cx| closing.poll_unpin(cx)).await.unwrap() });
         assert!(closing.pending_frames.is_empty());

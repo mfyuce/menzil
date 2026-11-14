@@ -31,6 +31,8 @@ mod frame;
 pub(crate) mod connection;
 mod tagged_stream;
 
+use std::sync::Arc;
+
 pub use crate::connection::{Connection, Mode, Packet, Stream, TornDown};
 pub use crate::error::ConnectionError;
 pub use crate::frame::{
@@ -81,6 +83,22 @@ pub struct Config {
     max_num_streams: usize,
     read_after_close: bool,
     split_send_size: usize,
+    buffer_meter: Option<Arc<dyn BufferMeter>>,
+    max_frame_body: usize,
+}
+
+/// menzil patch (patch 5): observes the bytes a stream holds received but not yet read, summed
+/// over every stream of a connection, so that a caller can bound them with an account of its
+/// own. `buffered` is called when bytes join a stream's receive queue, `consumed` when they
+/// leave it (read, or dropped with the stream or the connection). Every call carries the exact
+/// change, so the sum of `buffered` minus the sum of `consumed` is always the number of unread
+/// bytes held. Implementations must be cheap and must not block or call back into yamux:
+/// they run with the stream's lock held.
+pub trait BufferMeter: std::fmt::Debug + Send + Sync {
+    /// `n` bytes were added to a receive queue.
+    fn buffered(&self, n: usize);
+    /// `n` bytes left a receive queue.
+    fn consumed(&self, n: usize);
 }
 
 impl Default for Config {
@@ -90,6 +108,8 @@ impl Default for Config {
             max_num_streams: 512,
             read_after_close: true,
             split_send_size: DEFAULT_SPLIT_SEND_SIZE,
+            buffer_meter: None,
+            max_frame_body: MIB,
         }
     }
 }
@@ -163,6 +183,21 @@ impl Config {
         self.split_send_size = n;
         self
     }
+
+    /// menzil patch (patch 5): report the unread bytes of every stream to `meter`, see
+    /// [`BufferMeter`]. Default: none.
+    pub fn set_buffer_meter(&mut self, meter: Option<Arc<dyn BufferMeter>>) -> &mut Self {
+        self.buffer_meter = meter;
+        self
+    }
+
+    /// menzil patch (patch 5): the largest data frame body the receiver accepts; a frame whose
+    /// header claims more is a connection error. Default 1 MiB (upstream's constant). The
+    /// receiver allocates the claimed body at once, so this bounds that allocation.
+    pub fn set_max_frame_body(&mut self, n: usize) -> &mut Self {
+        self.max_frame_body = n;
+        self
+    }
 }
 
 // Check that we can safely cast a `usize` to a `u64`.
@@ -191,6 +226,8 @@ impl quickcheck::Arbitrary for Config {
             max_num_streams,
             read_after_close: bool::arbitrary(g),
             split_send_size: g.gen_range(DEFAULT_SPLIT_SEND_SIZE..usize::MAX),
+            buffer_meter: None,
+            max_frame_body: MIB,
         }
     }
 }

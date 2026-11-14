@@ -8,7 +8,8 @@
 // at https://www.apache.org/licenses/LICENSE-2.0 and a copy of the MIT license
 // at https://opensource.org/licenses/MIT.
 
-use std::{collections::VecDeque, io};
+use crate::BufferMeter;
+use std::{collections::VecDeque, io, sync::Arc};
 
 /// menzil patch: a body shorter than this is appended to the previous chunk, see
 /// [`Chunks::push`].
@@ -22,18 +23,45 @@ const COALESCE_UP_TO: usize = 8 * 1024;
 /// [`Chunks::len`] considers all [`Chunk`] elements and computes the total
 /// result, i.e. the length of all bytes, by summing up the lengths of all
 /// [`Chunk`] elements.
+///
+/// menzil patch (patch 5): with a [`BufferMeter`] every change of [`Chunks::len`] is reported
+/// to it, exactly, and what is left when the list is dropped is reported as consumed.
 #[derive(Debug)]
 pub(crate) struct Chunks {
     seq: VecDeque<Chunk>,
     len: usize,
+    meter: Option<Arc<dyn BufferMeter>>,
 }
 
 impl Chunks {
     /// A new empty chunk list.
+    #[cfg(test)]
     pub(crate) fn new() -> Self {
+        Self::with_meter(None)
+    }
+
+    /// A new empty chunk list reporting to `meter`.
+    pub(crate) fn with_meter(meter: Option<Arc<dyn BufferMeter>>) -> Self {
         Chunks {
             seq: VecDeque::new(),
             len: 0,
+            meter,
+        }
+    }
+
+    fn report_buffered(&self, n: usize) {
+        if n > 0 {
+            if let Some(m) = &self.meter {
+                m.buffered(n);
+            }
+        }
+    }
+
+    fn report_consumed(&self, n: usize) {
+        if n > 0 {
+            if let Some(m) = &self.meter {
+                m.consumed(n);
+            }
         }
     }
 
@@ -58,6 +86,7 @@ impl Chunks {
     /// boundaries of the `Packet`s of the `futures::Stream` impl move.
     pub(crate) fn push(&mut self, x: Vec<u8>) {
         self.len += x.len();
+        self.report_buffered(x.len());
         if x.is_empty() {
             return;
         }
@@ -76,14 +105,41 @@ impl Chunks {
 
     /// Remove and return the first chunk.
     pub(crate) fn pop(&mut self) -> Option<Chunk> {
+        let before = self.len();
         let chunk = self.seq.pop_front();
         self.len -= chunk.as_ref().map(|c| c.len() + c.offset()).unwrap_or(0);
+        self.report_consumed(before - self.len());
         chunk
     }
 
-    /// Get a mutable reference to the first chunk.
-    pub(crate) fn front_mut(&mut self) -> Option<&mut Chunk> {
-        self.seq.front_mut()
+    /// menzil patch (patch 5): copy up to `buf.len()` bytes from the front chunks into `buf`,
+    /// dropping the chunks that are finished, and return the number copied. The bytes copied
+    /// are reported as consumed.
+    pub(crate) fn read_into(&mut self, buf: &mut [u8]) -> usize {
+        let mut n = 0;
+        while let Some(chunk) = self.seq.front_mut() {
+            if chunk.is_empty() {
+                // Nothing left in it; `len` still holds its consumed prefix.
+                self.len -= chunk.offset();
+                self.seq.pop_front();
+                continue;
+            }
+            let k = std::cmp::min(chunk.len(), buf.len() - n);
+            buf[n..n + k].copy_from_slice(&chunk.as_ref()[..k]);
+            n += k;
+            chunk.advance(k);
+            if n == buf.len() {
+                break;
+            }
+        }
+        self.report_consumed(n);
+        n
+    }
+}
+
+impl Drop for Chunks {
+    fn drop(&mut self) {
+        self.report_consumed(self.len());
     }
 }
 
@@ -209,7 +265,7 @@ mod tests {
     fn len_stays_exact_when_a_partly_read_chunk_grows() {
         let mut chunks = Chunks::new();
         chunks.push(vec![1, 2, 3, 4, 5]);
-        chunks.front_mut().unwrap().advance(3);
+        chunks.seq.front_mut().unwrap().advance(3);
         assert_eq!(chunks.len(), 2);
         // Appended to the chunk the reader is in the middle of.
         chunks.push(vec![6, 7]);
@@ -224,12 +280,12 @@ mod tests {
     fn a_fully_read_chunk_still_takes_an_appended_body() {
         let mut chunks = Chunks::new();
         chunks.push(vec![1, 2]);
-        let front = chunks.front_mut().unwrap();
+        let front = chunks.seq.front_mut().unwrap();
         front.advance(2);
         assert!(front.is_empty());
         chunks.push(vec![3]);
         assert_eq!(chunks.len(), 1);
-        assert!(!chunks.front_mut().unwrap().is_empty());
+        assert!(!chunks.seq.front_mut().unwrap().is_empty());
         assert_eq!(drain(&mut chunks), vec![3]);
         assert_eq!(chunks.len(), 0);
     }
@@ -259,7 +315,7 @@ mod tests {
             }
             // What `poll_read` does for a 100 byte buffer.
             let mut n = 0;
-            while let Some(chunk) = chunks.front_mut() {
+            while let Some(chunk) = chunks.seq.front_mut() {
                 if chunk.is_empty() {
                     chunks.pop();
                     continue;
@@ -325,5 +381,103 @@ mod tests {
             assert_eq!(chunks.len(), expected.len());
             assert_eq!(drain(&mut chunks), expected);
         }
+    }
+
+    /// A meter that keeps the running balance, to compare with `Chunks::len`.
+    #[derive(Debug, Default)]
+    struct Counting(std::sync::atomic::AtomicUsize);
+
+    impl BufferMeter for Counting {
+        fn buffered(&self, n: usize) {
+            assert!(n > 0, "a zero report");
+            self.0.fetch_add(n, std::sync::atomic::Ordering::SeqCst);
+        }
+        fn consumed(&self, n: usize) {
+            assert!(n > 0, "a zero report");
+            let prev = self.0.fetch_sub(n, std::sync::atomic::Ordering::SeqCst);
+            assert!(prev >= n, "consumed more than buffered");
+        }
+    }
+
+    impl Counting {
+        fn get(&self) -> usize {
+            self.0.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    /// U1: a fixed seed pseudo random sequence of push, pop, read_into and drop; after every
+    /// operation the meter equals `len()`, and after the drop it is zero.
+    #[test]
+    fn the_meter_equals_len_after_every_operation() {
+        let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for round in 0..200usize {
+            let meter = Arc::new(Counting::default());
+            let mut chunks = Chunks::with_meter(Some(meter.clone()));
+            for _ in 0..400 {
+                match next() % 6 {
+                    0..=2 => {
+                        // Short bodies (coalesce path), long ones, and empty ones.
+                        let n = match next() % 4 {
+                            0 => 0,
+                            1 => 1 + next() as usize % 20,
+                            2 => 1 + next() as usize % (COALESCE_BELOW - 1),
+                            _ => COALESCE_BELOW + next() as usize % 3000,
+                        };
+                        chunks.push(vec![round as u8; n]);
+                    }
+                    3 => {
+                        let before = chunks.len();
+                        let got = chunks.pop();
+                        // Popping a partly read chunk gives back its unread bytes.
+                        let gone = got.as_ref().map(|c| c.len()).unwrap_or(0);
+                        assert_eq!(before - chunks.len(), gone);
+                    }
+                    _ => {
+                        let mut buf = vec![0u8; next() as usize % 3000];
+                        let before = chunks.len();
+                        let n = chunks.read_into(&mut buf);
+                        assert_eq!(n, buf.len().min(before));
+                        assert_eq!(chunks.len(), before - n);
+                    }
+                }
+                assert_eq!(meter.get(), chunks.len());
+            }
+            drop(chunks);
+            assert_eq!(meter.get(), 0);
+        }
+    }
+
+    #[test]
+    fn the_coalescing_push_and_a_reader_in_the_middle_are_metered() {
+        let meter = Arc::new(Counting::default());
+        let mut chunks = Chunks::with_meter(Some(meter.clone()));
+        chunks.push(vec![1, 2, 3, 4, 5]);
+        let mut buf = [0u8; 3];
+        assert_eq!(chunks.read_into(&mut buf), 3);
+        assert_eq!(meter.get(), 2);
+        chunks.push(vec![6, 7]); // appended to the chunk being read
+        assert_eq!(chunks.seq.len(), 1);
+        assert_eq!(meter.get(), 4);
+        drop(chunks);
+        assert_eq!(meter.get(), 0);
+    }
+
+    #[test]
+    fn read_into_returns_the_bytes_in_order_across_chunks() {
+        let mut chunks = Chunks::new();
+        chunks.push(vec![1; COALESCE_BELOW]);
+        chunks.push(vec![2; COALESCE_BELOW]);
+        let mut buf = vec![0u8; COALESCE_BELOW + 10];
+        assert_eq!(chunks.read_into(&mut buf), COALESCE_BELOW + 10);
+        assert!(buf[..COALESCE_BELOW].iter().all(|b| *b == 1));
+        assert!(buf[COALESCE_BELOW..].iter().all(|b| *b == 2));
+        assert_eq!(chunks.len(), COALESCE_BELOW - 10);
+        assert_eq!(chunks.read_into(&mut []), 0);
     }
 }

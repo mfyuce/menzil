@@ -1,21 +1,69 @@
 diff -ruN a/src/chunks.rs b/src/chunks.rs
 --- a/src/chunks.rs
 +++ b/src/chunks.rs
-@@ -10,6 +10,13 @@
+@@ -8,25 +8,60 @@
+ // at https://www.apache.org/licenses/LICENSE-2.0 and a copy of the MIT license
+ // at https://opensource.org/licenses/MIT.
  
- use std::{collections::VecDeque, io};
- 
+-use std::{collections::VecDeque, io};
++use crate::BufferMeter;
++use std::{collections::VecDeque, io, sync::Arc};
++
 +/// menzil patch: a body shorter than this is appended to the previous chunk, see
 +/// [`Chunks::push`].
 +const COALESCE_BELOW: usize = 1024;
 +
 +/// menzil patch: a chunk grown by appending never holds more than this many bytes.
 +const COALESCE_UP_TO: usize = 8 * 1024;
-+
+ 
  /// A sequence of [`Chunk`] values.
  ///
  /// [`Chunks::len`] considers all [`Chunk`] elements and computes the total
-@@ -36,13 +43,35 @@
+ /// result, i.e. the length of all bytes, by summing up the lengths of all
+ /// [`Chunk`] elements.
++///
++/// menzil patch (patch 5): with a [`BufferMeter`] every change of [`Chunks::len`] is reported
++/// to it, exactly, and what is left when the list is dropped is reported as consumed.
+ #[derive(Debug)]
+ pub(crate) struct Chunks {
+     seq: VecDeque<Chunk>,
+     len: usize,
++    meter: Option<Arc<dyn BufferMeter>>,
+ }
+ 
+ impl Chunks {
+     /// A new empty chunk list.
++    #[cfg(test)]
+     pub(crate) fn new() -> Self {
++        Self::with_meter(None)
++    }
++
++    /// A new empty chunk list reporting to `meter`.
++    pub(crate) fn with_meter(meter: Option<Arc<dyn BufferMeter>>) -> Self {
+         Chunks {
+             seq: VecDeque::new(),
+             len: 0,
++            meter,
++        }
++    }
++
++    fn report_buffered(&self, n: usize) {
++        if n > 0 {
++            if let Some(m) = &self.meter {
++                m.buffered(n);
++            }
++        }
++    }
++
++    fn report_consumed(&self, n: usize) {
++        if n > 0 {
++            if let Some(m) = &self.meter {
++                m.consumed(n);
++            }
+         }
+     }
+ 
+@@ -36,25 +71,75 @@
      }
  
      /// Add another chunk of bytes to the end.
@@ -38,9 +86,10 @@ diff -ruN a/src/chunks.rs b/src/chunks.rs
 -            self.seq.push_back(Chunk {
 -                cursor: io::Cursor::new(x),
 -            })
++        self.report_buffered(x.len());
 +        if x.is_empty() {
 +            return;
-         }
++        }
 +        if x.len() < COALESCE_BELOW {
 +            if let Some(last) = self.seq.back_mut() {
 +                if last.cursor.get_ref().len() + x.len() <= COALESCE_UP_TO {
@@ -48,14 +97,56 @@ diff -ruN a/src/chunks.rs b/src/chunks.rs
 +                    return;
 +                }
 +            }
-+        }
+         }
 +        self.seq.push_back(Chunk {
 +            cursor: io::Cursor::new(x),
 +        })
      }
  
      /// Remove and return the first chunk.
-@@ -110,3 +139,191 @@
+     pub(crate) fn pop(&mut self) -> Option<Chunk> {
++        let before = self.len();
+         let chunk = self.seq.pop_front();
+         self.len -= chunk.as_ref().map(|c| c.len() + c.offset()).unwrap_or(0);
++        self.report_consumed(before - self.len());
+         chunk
+     }
+ 
+-    /// Get a mutable reference to the first chunk.
+-    pub(crate) fn front_mut(&mut self) -> Option<&mut Chunk> {
+-        self.seq.front_mut()
++    /// menzil patch (patch 5): copy up to `buf.len()` bytes from the front chunks into `buf`,
++    /// dropping the chunks that are finished, and return the number copied. The bytes copied
++    /// are reported as consumed.
++    pub(crate) fn read_into(&mut self, buf: &mut [u8]) -> usize {
++        let mut n = 0;
++        while let Some(chunk) = self.seq.front_mut() {
++            if chunk.is_empty() {
++                // Nothing left in it; `len` still holds its consumed prefix.
++                self.len -= chunk.offset();
++                self.seq.pop_front();
++                continue;
++            }
++            let k = std::cmp::min(chunk.len(), buf.len() - n);
++            buf[n..n + k].copy_from_slice(&chunk.as_ref()[..k]);
++            n += k;
++            chunk.advance(k);
++            if n == buf.len() {
++                break;
++            }
++        }
++        self.report_consumed(n);
++        n
++    }
++}
++
++impl Drop for Chunks {
++    fn drop(&mut self) {
++        self.report_consumed(self.len());
+     }
+ }
+ 
+@@ -110,3 +195,289 @@
          &self.cursor.get_ref()[self.offset()..]
      }
  }
@@ -129,7 +220,7 @@ diff -ruN a/src/chunks.rs b/src/chunks.rs
 +    fn len_stays_exact_when_a_partly_read_chunk_grows() {
 +        let mut chunks = Chunks::new();
 +        chunks.push(vec![1, 2, 3, 4, 5]);
-+        chunks.front_mut().unwrap().advance(3);
++        chunks.seq.front_mut().unwrap().advance(3);
 +        assert_eq!(chunks.len(), 2);
 +        // Appended to the chunk the reader is in the middle of.
 +        chunks.push(vec![6, 7]);
@@ -144,12 +235,12 @@ diff -ruN a/src/chunks.rs b/src/chunks.rs
 +    fn a_fully_read_chunk_still_takes_an_appended_body() {
 +        let mut chunks = Chunks::new();
 +        chunks.push(vec![1, 2]);
-+        let front = chunks.front_mut().unwrap();
++        let front = chunks.seq.front_mut().unwrap();
 +        front.advance(2);
 +        assert!(front.is_empty());
 +        chunks.push(vec![3]);
 +        assert_eq!(chunks.len(), 1);
-+        assert!(!chunks.front_mut().unwrap().is_empty());
++        assert!(!chunks.seq.front_mut().unwrap().is_empty());
 +        assert_eq!(drain(&mut chunks), vec![3]);
 +        assert_eq!(chunks.len(), 0);
 +    }
@@ -179,7 +270,7 @@ diff -ruN a/src/chunks.rs b/src/chunks.rs
 +            }
 +            // What `poll_read` does for a 100 byte buffer.
 +            let mut n = 0;
-+            while let Some(chunk) = chunks.front_mut() {
++            while let Some(chunk) = chunks.seq.front_mut() {
 +                if chunk.is_empty() {
 +                    chunks.pop();
 +                    continue;
@@ -246,7 +337,117 @@ diff -ruN a/src/chunks.rs b/src/chunks.rs
 +            assert_eq!(drain(&mut chunks), expected);
 +        }
 +    }
++
++    /// A meter that keeps the running balance, to compare with `Chunks::len`.
++    #[derive(Debug, Default)]
++    struct Counting(std::sync::atomic::AtomicUsize);
++
++    impl BufferMeter for Counting {
++        fn buffered(&self, n: usize) {
++            assert!(n > 0, "a zero report");
++            self.0.fetch_add(n, std::sync::atomic::Ordering::SeqCst);
++        }
++        fn consumed(&self, n: usize) {
++            assert!(n > 0, "a zero report");
++            let prev = self.0.fetch_sub(n, std::sync::atomic::Ordering::SeqCst);
++            assert!(prev >= n, "consumed more than buffered");
++        }
++    }
++
++    impl Counting {
++        fn get(&self) -> usize {
++            self.0.load(std::sync::atomic::Ordering::SeqCst)
++        }
++    }
++
++    /// U1: a fixed seed pseudo random sequence of push, pop, read_into and drop; after every
++    /// operation the meter equals `len()`, and after the drop it is zero.
++    #[test]
++    fn the_meter_equals_len_after_every_operation() {
++        let mut state = 0x9e37_79b9_7f4a_7c15_u64;
++        let mut next = move || {
++            state ^= state << 13;
++            state ^= state >> 7;
++            state ^= state << 17;
++            state
++        };
++        for round in 0..200usize {
++            let meter = Arc::new(Counting::default());
++            let mut chunks = Chunks::with_meter(Some(meter.clone()));
++            for _ in 0..400 {
++                match next() % 6 {
++                    0..=2 => {
++                        // Short bodies (coalesce path), long ones, and empty ones.
++                        let n = match next() % 4 {
++                            0 => 0,
++                            1 => 1 + next() as usize % 20,
++                            2 => 1 + next() as usize % (COALESCE_BELOW - 1),
++                            _ => COALESCE_BELOW + next() as usize % 3000,
++                        };
++                        chunks.push(vec![round as u8; n]);
++                    }
++                    3 => {
++                        let before = chunks.len();
++                        let got = chunks.pop();
++                        // Popping a partly read chunk gives back its unread bytes.
++                        let gone = got.as_ref().map(|c| c.len()).unwrap_or(0);
++                        assert_eq!(before - chunks.len(), gone);
++                    }
++                    _ => {
++                        let mut buf = vec![0u8; next() as usize % 3000];
++                        let before = chunks.len();
++                        let n = chunks.read_into(&mut buf);
++                        assert_eq!(n, buf.len().min(before));
++                        assert_eq!(chunks.len(), before - n);
++                    }
++                }
++                assert_eq!(meter.get(), chunks.len());
++            }
++            drop(chunks);
++            assert_eq!(meter.get(), 0);
++        }
++    }
++
++    #[test]
++    fn the_coalescing_push_and_a_reader_in_the_middle_are_metered() {
++        let meter = Arc::new(Counting::default());
++        let mut chunks = Chunks::with_meter(Some(meter.clone()));
++        chunks.push(vec![1, 2, 3, 4, 5]);
++        let mut buf = [0u8; 3];
++        assert_eq!(chunks.read_into(&mut buf), 3);
++        assert_eq!(meter.get(), 2);
++        chunks.push(vec![6, 7]); // appended to the chunk being read
++        assert_eq!(chunks.seq.len(), 1);
++        assert_eq!(meter.get(), 4);
++        drop(chunks);
++        assert_eq!(meter.get(), 0);
++    }
++
++    #[test]
++    fn read_into_returns_the_bytes_in_order_across_chunks() {
++        let mut chunks = Chunks::new();
++        chunks.push(vec![1; COALESCE_BELOW]);
++        chunks.push(vec![2; COALESCE_BELOW]);
++        let mut buf = vec![0u8; COALESCE_BELOW + 10];
++        assert_eq!(chunks.read_into(&mut buf), COALESCE_BELOW + 10);
++        assert!(buf[..COALESCE_BELOW].iter().all(|b| *b == 1));
++        assert!(buf[COALESCE_BELOW..].iter().all(|b| *b == 2));
++        assert_eq!(chunks.len(), COALESCE_BELOW - 10);
++        assert_eq!(chunks.read_into(&mut []), 0);
++    }
 +}
+diff -ruN a/src/connection/closing.rs b/src/connection/closing.rs
+--- a/src/connection/closing.rs
++++ b/src/connection/closing.rs
+@@ -189,7 +189,7 @@
+         let mut closing = Closing::new(
+             stream_receivers,
+             pending_frames.into(),
+-            frame::Io::new(crate::connection::Id(0), &mut socket).fuse(),
++            frame::Io::new(crate::connection::Id(0), &mut socket, crate::MIB).fuse(),
+         );
+         futures::executor::block_on(async { poll_fn(|cx| closing.poll_unpin(cx)).await.unwrap() });
+         assert!(closing.pending_frames.is_empty());
 diff -ruN a/src/connection/stream.rs b/src/connection/stream.rs
 --- a/src/connection/stream.rs
 +++ b/src/connection/stream.rs
@@ -337,7 +538,29 @@ diff -ruN a/src/connection/stream.rs b/src/connection/stream.rs
  impl futures::stream::Stream for Stream {
      type Item = io::Result<Packet>;
  
-@@ -450,6 +514,17 @@
+@@ -329,20 +393,7 @@
+ 
+         // Copy data from stream buffer.
+         let mut shared = self.shared();
+-        let mut n = 0;
+-        while let Some(chunk) = shared.buffer.front_mut() {
+-            if chunk.is_empty() {
+-                shared.buffer.pop();
+-                continue;
+-            }
+-            let k = std::cmp::min(chunk.len(), buf.len() - n);
+-            buf[n..n + k].copy_from_slice(&chunk.as_ref()[..k]);
+-            n += k;
+-            chunk.advance(k);
+-            if n == buf.len() {
+-                break;
+-            }
+-        }
++        let n = shared.buffer.read_into(buf);
+ 
+         if n > 0 {
+             log::trace!("{}/{}: read {} bytes", self.conn, self.id, n);
+@@ -450,6 +501,17 @@
      pub(crate) buffer: Chunks,
      pub(crate) reader: Option<Waker>,
      pub(crate) writer: Option<Waker>,
@@ -355,8 +578,20 @@ diff -ruN a/src/connection/stream.rs b/src/connection/stream.rs
  }
  
  impl Shared {
-@@ -474,6 +549,18 @@
-             buffer: Chunks::new(),
+@@ -460,6 +522,7 @@
+         rtt: Rtt,
+         config: Arc<Config>,
+     ) -> Self {
++        let meter = config.buffer_meter.clone();
+         Shared {
+             state: State::Open {
+                 acknowledged: false,
+@@ -471,9 +534,21 @@
+                 rtt,
+                 config,
+             ),
+-            buffer: Chunks::new(),
++            buffer: Chunks::with_meter(meter),
              reader: None,
              writer: None,
 +            reset_requested: false,
@@ -414,6 +649,15 @@ diff -ruN a/src/connection.rs b/src/connection.rs
  }
  
  impl<T> fmt::Debug for Active<T> {
+@@ -358,7 +372,7 @@
+     fn new(socket: T, cfg: Config, mode: Mode) -> Self {
+         let id = Id::next();
+         log::debug!("new connection: {id} ({mode:?})");
+-        let socket = frame::Io::new(id, socket).fuse();
++        let socket = frame::Io::new(id, socket, cfg.max_frame_body).fuse();
+         Active {
+             id,
+             mode,
 @@ -475,6 +489,10 @@
                                  log::trace!("{}: sending term", self.id);
                                  self.pending_read_frame.replace(f.into());
@@ -539,6 +783,87 @@ diff -ruN a/src/frame/header.rs b/src/frame/header.rs
      pub fn internal_error() -> Self {
          Self::go_away(2)
      }
+diff -ruN a/src/frame/io.rs b/src/frame/io.rs
+--- a/src/frame/io.rs
++++ b/src/frame/io.rs
+@@ -20,27 +20,23 @@
+     task::{Context, Poll},
+ };
+ 
+-/// Maximum Yamux frame body length
+-///
+-/// Limits the amount of bytes a remote can cause the local node to allocate at once when reading.
+-///
+-/// Chosen based on intuition in past iterations.
+-const MAX_FRAME_BODY_LEN: usize = crate::MIB;
+-
+ /// A [`Stream`] and writer of [`Frame`] values.
+ #[derive(Debug)]
+ pub(crate) struct Io<T> {
+     id: Id,
+     io: T,
++    /// menzil patch (patch 5): the largest data frame body accepted, from the config.
++    max_body_len: usize,
+     read_state: ReadState,
+     write_state: WriteState,
+ }
+ 
+ impl<T: AsyncRead + AsyncWrite + Unpin> Io<T> {
+-    pub(crate) fn new(id: Id, io: T) -> Self {
++    pub(crate) fn new(id: Id, io: T, max_body_len: usize) -> Self {
+         Io {
+             id,
+             io,
++            max_body_len,
+             read_state: ReadState::Init,
+             write_state: WriteState::Init,
+         }
+@@ -236,7 +232,7 @@
+ 
+                         let body_len = header.len().val() as usize;
+ 
+-                        if body_len > MAX_FRAME_BODY_LEN {
++                        if body_len > this.max_body_len {
+                             return Poll::Ready(Some(Err(FrameDecodeError::FrameTooLarge(
+                                 body_len,
+                             ))));
+@@ -385,7 +381,7 @@
+         fn property(f: Frame<()>) -> bool {
+             futures::executor::block_on(async move {
+                 let id = crate::connection::Id::next();
+-                let mut io = Io::new(id, futures::io::Cursor::new(Vec::new()));
++                let mut io = Io::new(id, futures::io::Cursor::new(Vec::new()), crate::MIB);
+                 if io.send(f.clone()).await.is_err() {
+                     return false;
+                 }
+@@ -405,4 +401,27 @@
+             .tests(10_000)
+             .quickcheck(property as fn(Frame<()>) -> bool)
+     }
++
++    /// menzil patch (patch 5): the body cap comes from the config. A header claiming a body
++    /// above it is an error before any body is allocated; one at the cap is read.
++    #[test]
++    fn a_body_above_the_configured_cap_is_refused() {
++        use futures::TryStreamExt;
++        let header = |len: u32| {
++            header::encode(&header::Header::data(header::StreamId::new(1), len)).to_vec()
++        };
++        futures::executor::block_on(async {
++            let id = crate::connection::Id::next();
++            let mut io = Io::new(id, futures::io::Cursor::new(header(70_000)), 65_535);
++            match io.try_next().await {
++                Err(FrameDecodeError::FrameTooLarge(70_000)) => {}
++                other => panic!("{other:?}"),
++            }
++            let mut bytes = header(65_535);
++            bytes.extend(std::iter::repeat_n(7u8, 65_535));
++            let mut io = Io::new(id, futures::io::Cursor::new(bytes), 65_535);
++            let frame = io.try_next().await.unwrap().unwrap();
++            assert_eq!(frame.body.len(), 65_535);
++        });
++    }
+ }
 diff -ruN a/src/frame.rs b/src/frame.rs
 --- a/src/frame.rs
 +++ b/src/frame.rs
@@ -553,12 +878,77 @@ diff -ruN a/src/frame.rs b/src/frame.rs
 diff -ruN a/src/lib.rs b/src/lib.rs
 --- a/src/lib.rs
 +++ b/src/lib.rs
-@@ -31,7 +31,7 @@
+@@ -31,7 +31,9 @@
  pub(crate) mod connection;
  mod tagged_stream;
  
 -pub use crate::connection::{Connection, Mode, Packet, Stream};
++use std::sync::Arc;
++
 +pub use crate::connection::{Connection, Mode, Packet, Stream, TornDown};
  pub use crate::error::ConnectionError;
  pub use crate::frame::{
      header::{HeaderDecodeError, StreamId},
+@@ -81,6 +83,22 @@
+     max_num_streams: usize,
+     read_after_close: bool,
+     split_send_size: usize,
++    buffer_meter: Option<Arc<dyn BufferMeter>>,
++    max_frame_body: usize,
++}
++
++/// menzil patch (patch 5): observes the bytes a stream holds received but not yet read, summed
++/// over every stream of a connection, so that a caller can bound them with an account of its
++/// own. `buffered` is called when bytes join a stream's receive queue, `consumed` when they
++/// leave it (read, or dropped with the stream or the connection). Every call carries the exact
++/// change, so the sum of `buffered` minus the sum of `consumed` is always the number of unread
++/// bytes held. Implementations must be cheap and must not block or call back into yamux:
++/// they run with the stream's lock held.
++pub trait BufferMeter: std::fmt::Debug + Send + Sync {
++    /// `n` bytes were added to a receive queue.
++    fn buffered(&self, n: usize);
++    /// `n` bytes left a receive queue.
++    fn consumed(&self, n: usize);
+ }
+ 
+ impl Default for Config {
+@@ -90,6 +108,8 @@
+             max_num_streams: 512,
+             read_after_close: true,
+             split_send_size: DEFAULT_SPLIT_SEND_SIZE,
++            buffer_meter: None,
++            max_frame_body: MIB,
+         }
+     }
+ }
+@@ -163,6 +183,21 @@
+         self.split_send_size = n;
+         self
+     }
++
++    /// menzil patch (patch 5): report the unread bytes of every stream to `meter`, see
++    /// [`BufferMeter`]. Default: none.
++    pub fn set_buffer_meter(&mut self, meter: Option<Arc<dyn BufferMeter>>) -> &mut Self {
++        self.buffer_meter = meter;
++        self
++    }
++
++    /// menzil patch (patch 5): the largest data frame body the receiver accepts; a frame whose
++    /// header claims more is a connection error. Default 1 MiB (upstream's constant). The
++    /// receiver allocates the claimed body at once, so this bounds that allocation.
++    pub fn set_max_frame_body(&mut self, n: usize) -> &mut Self {
++        self.max_frame_body = n;
++        self
++    }
+ }
+ 
+ // Check that we can safely cast a `usize` to a `u64`.
+@@ -191,6 +226,8 @@
+             max_num_streams,
+             read_after_close: bool::arbitrary(g),
+             split_send_size: g.gen_range(DEFAULT_SPLIT_SEND_SIZE..usize::MAX),
++            buffer_meter: None,
++            max_frame_body: MIB,
+         }
+     }
+ }

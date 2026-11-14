@@ -393,20 +393,7 @@ impl AsyncRead for Stream {
 
         // Copy data from stream buffer.
         let mut shared = self.shared();
-        let mut n = 0;
-        while let Some(chunk) = shared.buffer.front_mut() {
-            if chunk.is_empty() {
-                shared.buffer.pop();
-                continue;
-            }
-            let k = std::cmp::min(chunk.len(), buf.len() - n);
-            buf[n..n + k].copy_from_slice(&chunk.as_ref()[..k]);
-            n += k;
-            chunk.advance(k);
-            if n == buf.len() {
-                break;
-            }
-        }
+        let n = shared.buffer.read_into(buf);
 
         if n > 0 {
             log::trace!("{}/{}: read {} bytes", self.conn, self.id, n);
@@ -535,6 +522,7 @@ impl Shared {
         rtt: Rtt,
         config: Arc<Config>,
     ) -> Self {
+        let meter = config.buffer_meter.clone();
         Shared {
             state: State::Open {
                 acknowledged: false,
@@ -546,7 +534,7 @@ impl Shared {
                 rtt,
                 config,
             ),
-            buffer: Chunks::new(),
+            buffer: Chunks::with_meter(meter),
             reader: None,
             writer: None,
             reset_requested: false,

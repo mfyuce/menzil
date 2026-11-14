@@ -372,7 +372,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Active<T> {
     fn new(socket: T, cfg: Config, mode: Mode) -> Self {
         let id = Id::next();
         log::debug!("new connection: {id} ({mode:?})");
-        let socket = frame::Io::new(id, socket).fuse();
+        let socket = frame::Io::new(id, socket, cfg.max_frame_body).fuse();
         Active {
             id,
             mode,

@@ -20,27 +20,23 @@ use std::{
     task::{Context, Poll},
 };
 
-/// Maximum Yamux frame body length
-///
-/// Limits the amount of bytes a remote can cause the local node to allocate at once when reading.
-///
-/// Chosen based on intuition in past iterations.
-const MAX_FRAME_BODY_LEN: usize = crate::MIB;
-
 /// A [`Stream`] and writer of [`Frame`] values.
 #[derive(Debug)]
 pub(crate) struct Io<T> {
     id: Id,
     io: T,
+    /// menzil patch (patch 5): the largest data frame body accepted, from the config.
+    max_body_len: usize,
     read_state: ReadState,
     write_state: WriteState,
 }
 
 impl<T: AsyncRead + AsyncWrite + Unpin> Io<T> {
-    pub(crate) fn new(id: Id, io: T) -> Self {
+    pub(crate) fn new(id: Id, io: T, max_body_len: usize) -> Self {
         Io {
             id,
             io,
+            max_body_len,
             read_state: ReadState::Init,
             write_state: WriteState::Init,
         }
@@ -236,7 +232,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Stream for Io<T> {
 
                         let body_len = header.len().val() as usize;
 
-                        if body_len > MAX_FRAME_BODY_LEN {
+                        if body_len > this.max_body_len {
                             return Poll::Ready(Some(Err(FrameDecodeError::FrameTooLarge(
                                 body_len,
                             ))));
@@ -385,7 +381,7 @@ mod tests {
         fn property(f: Frame<()>) -> bool {
             futures::executor::block_on(async move {
                 let id = crate::connection::Id::next();
-                let mut io = Io::new(id, futures::io::Cursor::new(Vec::new()));
+                let mut io = Io::new(id, futures::io::Cursor::new(Vec::new()), crate::MIB);
                 if io.send(f.clone()).await.is_err() {
                     return false;
                 }
@@ -404,5 +400,28 @@ mod tests {
         QuickCheck::new()
             .tests(10_000)
             .quickcheck(property as fn(Frame<()>) -> bool)
+    }
+
+    /// menzil patch (patch 5): the body cap comes from the config. A header claiming a body
+    /// above it is an error before any body is allocated; one at the cap is read.
+    #[test]
+    fn a_body_above_the_configured_cap_is_refused() {
+        use futures::TryStreamExt;
+        let header = |len: u32| {
+            header::encode(&header::Header::data(header::StreamId::new(1), len)).to_vec()
+        };
+        futures::executor::block_on(async {
+            let id = crate::connection::Id::next();
+            let mut io = Io::new(id, futures::io::Cursor::new(header(70_000)), 65_535);
+            match io.try_next().await {
+                Err(FrameDecodeError::FrameTooLarge(70_000)) => {}
+                other => panic!("{other:?}"),
+            }
+            let mut bytes = header(65_535);
+            bytes.extend(std::iter::repeat_n(7u8, 65_535));
+            let mut io = Io::new(id, futures::io::Cursor::new(bytes), 65_535);
+            let frame = io.try_next().await.unwrap().unwrap();
+            assert_eq!(frame.body.len(), 65_535);
+        });
     }
 }

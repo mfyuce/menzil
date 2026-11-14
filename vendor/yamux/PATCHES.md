@@ -3,15 +3,15 @@
 This directory is the source of the `yamux` crate, version 0.14.1, as published on
 crates.io (upstream commit `cc3d0e89f615ef4f329f7a246c95a8ff1e8cc12d` of
 github.com/libp2p/rust-yamux, whose `yamux/src` is also what its release commit `6610cff`
-holds), with the four patches below. `menzil-stream` depends on it by
+holds), with the five patches below. `menzil-stream` depends on it by
 path. Licence: Apache-2.0 OR MIT, copyright Parity Technologies (UK) Ltd.; the texts are
 `LICENSE-APACHE` and `LICENSE-MIT` in this directory, copied from the upstream commit. Why
 the crate is vendored and not used from the registry: `docs/spec/decisions/0002-vendored-yamux.md`.
 
 `menzil.patch` is the complete difference to the published source (`a/` is the published
-crate, `b/` this directory), so a reviewer reads the change in one place: about 190 added lines
-outside tests (105 of them code, the rest comments and blanks), 16 removed, and 186 lines of
-unit tests. Everything the patch does
+crate, `b/` this directory), so a reviewer reads the change in one place: 606 added lines
+and 47 removed in all (comments, blanks and unit tests included; patch 5 alone is about 420 of
+the added lines, about 190 of them unit tests). Everything the patch does
 not touch is byte for byte what crates.io serves, the manifest included, so the dev-dependencies
 in it do not match what the crate's own tests need (see Tests).
 
@@ -103,9 +103,38 @@ can be awaited next to a task that holds the stream mutably; there is room for o
 one at a time, and drop it with the stream (it shares the stream's state, the unread data
 included). Nothing on the wire changes.
 
+## Patch 5: the unread bytes of every stream can be metered, and the frame cap is configurable (`src/lib.rs`, `src/chunks.rs`, `src/connection/stream.rs`, `src/connection.rs`, `src/frame/io.rs`)
+
+The receive windows (and patch 1) bound what one stream may hold, but a caller that runs many
+connections has no way to see, let alone bound, the sum of the bytes its streams hold received
+and not yet read. `menzil-node` counts unprocessed L4 records against a per session budget and
+a node wide ceiling (C1), and the stream data buffered inside yamux was outside both (round C1,
+M1).
+
+- `trait BufferMeter { fn buffered(&self, n: usize); fn consumed(&self, n: usize); }` and the
+  `Config` setter `set_buffer_meter(Option<Arc<dyn BufferMeter>>)` (default none). Every stream
+  of the connection reports to it: `Chunks` calls `buffered` for every byte that joins the
+  receive queue (the coalescing path of patch 1 included) and `consumed` for every byte that
+  leaves it, with the exact change of `Chunks::len()` each time, never a zero report. A `Drop`
+  of `Chunks` reports what is left as consumed, so a stream dropped with unread data, an RST
+  that discards it and a connection that goes away all balance the account. The meter runs with
+  the stream's lock held: it must be cheap and must not call back into yamux.
+- `Chunks::read_into(&mut [u8]) -> usize` replaces the `front_mut().advance` loop of
+  `Stream::poll_read` (same behavior, one place that reports); `front_mut` is gone.
+- `Config::set_max_frame_body(usize)` (default 1 MiB, upstream's `MAX_FRAME_BODY_LEN`, which is
+  removed): a data frame whose header claims a longer body is a connection error
+  (`FrameDecodeError::FrameTooLarge`) before the body is allocated. A receiver limit, not a wire
+  change: a peer that sends bigger frames than this receiver accepts is cut off, so callers set
+  it at or above what their own senders produce (`split_send_size`).
+
+Defaults leave behavior unchanged. Nothing on the wire changes.
+
 ## Memory this does not bound
 
-The windows (and patch 1) bound what a peer can have us hold of *its* data. Other memory is
+The windows (and patch 1) bound what a peer can have us hold of *its* data. Patch 5 makes
+that data visible to a node wide account (`BufferMeter`) and the frame body cap configurable,
+but yamux itself still enforces nothing beyond the windows: a caller that does not install a
+meter and a smaller `max_frame_body` has the figures below. Other memory is
 outside them, measured with the counting allocator of `tests/small_frames.rs`: a fixed 917
 bytes per stream (0.45 MiB at 512), and our own outbound data per stream when the peer stops
 reading, 183,028 bytes from `yamux`'s per-stream channel of 10 frames of 16 KiB, about 78 MiB at
@@ -125,14 +154,22 @@ a connection, and 256 connections at most unless configured otherwise).
   `torn_down.rs` (patch 4: a watcher that nothing else polls, for an RST, a lost connection, a
   half-closed stream, an RST on a window update, a clean end, a watcher moved between tasks). All
   run with `cargo test --workspace`.
-- `src/chunks.rs` has unit tests for patch 1. The crates.io package cannot run its own tests:
+- `src/chunks.rs` has unit tests for patch 1 and for patch 5 (U1: a fixed seed pseudo random
+  sequence of push, pop and `read_into` against a counting meter, `meter == len()` after every
+  operation and 0 after the drop; the coalescing path and a reader in the middle of a chunk
+  separately), `src/frame/io.rs` one for the configurable frame cap (a header claiming 70,000
+  bytes against a cap of 65,535 is `FrameTooLarge`, a body of exactly the cap is read). The crates.io package cannot run its own tests:
   they need `quickcheck-ext`, a path dependency of upstream's workspace that is not published.
   To run them and upstream's own suite against these sources, take the upstream commit above,
   replace its `yamux/src` with this directory's `src`, and run `cargo test -p yamux --lib -p
   test-harness --tests` (with a `CARGO_TARGET_DIR` of its own). The last time this was done
   (2026-10-13, with patch 4) all of it passed: the unit tests (14: 5 upstream, 9 for patch 1) and
   upstream's integration tests `ack_backlog`, `ack_timing` and `poll_api` (property tests over
-  random message sizes included).
+  random message sizes included). Patch 5 (2026-11-15) was checked without the upstream commit
+  (not available offline): in a scratch copy with the `quickcheck` based test modules removed,
+  `cargo test --lib` passed (15 unit tests: 2 upstream, 12 chunks incl. 3 for patch 5, 1 frame
+  cap) and `cargo test -p menzil-stream` passed (all of its test files); upstream's own suite
+  with the full `quickcheck` modules still has to be rerun against these sources.
 - Regenerate `menzil.patch` with `diff -ruN a b` after any change here, `a` being the published
   crate.
 
