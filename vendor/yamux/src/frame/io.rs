@@ -358,9 +358,12 @@ impl From<HeaderDecodeError> for FrameDecodeError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(upstream_quickcheck)]
     use quickcheck::{Arbitrary, Gen, QuickCheck};
+    #[cfg(upstream_quickcheck)]
     use rand::Rng;
 
+    #[cfg(upstream_quickcheck)]
     impl Arbitrary for Frame<()> {
         fn arbitrary(g: &mut Gen) -> Self {
             let mut header: header::Header<()> = Arbitrary::arbitrary(g);
@@ -376,6 +379,7 @@ mod tests {
         }
     }
 
+    #[cfg(upstream_quickcheck)]
     #[test]
     fn encode_decode_identity() {
         fn property(f: Frame<()>) -> bool {

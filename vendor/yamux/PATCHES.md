@@ -158,18 +158,24 @@ a connection, and 256 connections at most unless configured otherwise).
   sequence of push, pop and `read_into` against a counting meter, `meter == len()` after every
   operation and 0 after the drop; the coalescing path and a reader in the middle of a chunk
   separately), `src/frame/io.rs` one for the configurable frame cap (a header claiming 70,000
-  bytes against a cap of 65,535 is `FrameTooLarge`, a body of exactly the cap is read). The crates.io package cannot run its own tests:
-  they need `quickcheck-ext`, a path dependency of upstream's workspace that is not published.
-  To run them and upstream's own suite against these sources, take the upstream commit above,
-  replace its `yamux/src` with this directory's `src`, and run `cargo test -p yamux --lib -p
-  test-harness --tests` (with a `CARGO_TARGET_DIR` of its own). The last time this was done
-  (2026-10-13, with patch 4) all of it passed: the unit tests (14: 5 upstream, 9 for patch 1) and
-  upstream's integration tests `ack_backlog`, `ack_timing` and `poll_api` (property tests over
-  random message sizes included). Patch 5 (2026-11-15) was checked without the upstream commit
-  (not available offline): in a scratch copy with the `quickcheck` based test modules removed,
-  `cargo test --lib` passed (15 unit tests: 2 upstream, 12 chunks incl. 3 for patch 5, 1 frame
-  cap) and `cargo test -p menzil-stream` passed (all of its test files); upstream's own suite
-  with the full `quickcheck` modules still has to be rerun against these sources.
+  bytes against a cap of 65,535 is `FrameTooLarge`, a body of exactly the cap is read). The
+  quickcheck based tests and `Arbitrary` impls of upstream (`lib.rs`, `connection/rtt.rs`,
+  `frame/header.rs`, `frame/io.rs` property test, `flow_control.rs`) are behind `#[cfg(all(test,
+  upstream_quickcheck))]` since 2026-11-15 (patch 5 follow up, round T1d N1): quickcheck is not a
+  dependency of the published package (it needs `quickcheck-ext`, a path dependency of upstream's
+  workspace), so without the gate `cargo test --lib` did not even compile and the unit tests above
+  never ran. Now `cd vendor/yamux && CARGO_TARGET_DIR=<own> cargo test --offline --lib` runs 15
+  tests (2 upstream, 12 chunks, 1 frame cap); `docs/private/tools/gate.sh` runs it after the
+  workspace tests. Remove the `Cargo.lock` cargo leaves in this directory (the directory is
+  excluded from the workspace).
+- To run upstream's own suite against these sources, take the upstream commit above, replace its
+  `yamux/src` with this directory's `src`, and run `RUSTFLAGS="--cfg upstream_quickcheck" cargo
+  test -p yamux --lib -p test-harness --tests` (with a `CARGO_TARGET_DIR` of its own; without the
+  cfg the quickcheck modules are skipped). The last time this was done (2026-10-13, with patch 4,
+  before the cfg gate existed) all of it passed: the unit tests (14: 5 upstream, 9 for patch 1)
+  and upstream's integration tests `ack_backlog`, `ack_timing` and `poll_api` (property tests
+  over random message sizes included). Patches 5 and its cfg gate have not been run against the
+  upstream commit (not available offline): that run is still owed.
 - Regenerate `menzil.patch` with `diff -ruN a b` after any change here, `a` being the published
   crate.
 

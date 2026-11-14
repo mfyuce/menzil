@@ -410,7 +410,7 @@ impl std::fmt::Display for HeaderDecodeError {
 
 impl std::error::Error for HeaderDecodeError {}
 
-#[cfg(test)]
+#[cfg(all(test, upstream_quickcheck))]
 mod tests {
     use super::*;
     use quickcheck::{Arbitrary, Gen, QuickCheck};

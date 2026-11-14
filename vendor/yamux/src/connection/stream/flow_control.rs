@@ -208,7 +208,7 @@ impl Drop for FlowController {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, upstream_quickcheck))]
 mod tests {
     use super::*;
     use quickcheck::{GenRange, QuickCheck};

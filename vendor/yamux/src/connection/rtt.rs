@@ -96,7 +96,7 @@ impl Rtt {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, upstream_quickcheck))]
 impl quickcheck::Arbitrary for Rtt {
     fn arbitrary(g: &mut quickcheck::Gen) -> Self {
         Self {
@@ -113,7 +113,7 @@ struct RttInner {
     rtt: Option<Duration>,
 }
 
-#[cfg(test)]
+#[cfg(all(test, upstream_quickcheck))]
 impl quickcheck::Arbitrary for RttInner {
     fn arbitrary(g: &mut quickcheck::Gen) -> Self {
         Self {
@@ -134,7 +134,7 @@ enum RttState {
     Waiting { next: Instant },
 }
 
-#[cfg(test)]
+#[cfg(all(test, upstream_quickcheck))]
 impl quickcheck::Arbitrary for RttState {
     fn arbitrary(g: &mut quickcheck::Gen) -> Self {
         if bool::arbitrary(g) {

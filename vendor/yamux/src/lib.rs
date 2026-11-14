@@ -23,6 +23,9 @@
 //! [1]: https://github.com/hashicorp/yamux/blob/master/spec.md
 
 #![forbid(unsafe_code)]
+// menzil patch (patch 5): the quickcheck based upstream tests are behind `--cfg upstream_quickcheck`
+// (quickcheck is not a dependency of this package), so `cargo test --lib` builds offline.
+#![allow(unexpected_cfgs)]
 
 mod chunks;
 mod error;
@@ -210,7 +213,7 @@ static_assertions::const_assert! {
     std::mem::size_of::<u32>() <= std::mem::size_of::<usize>()
 }
 
-#[cfg(test)]
+#[cfg(all(test, upstream_quickcheck))]
 impl quickcheck::Arbitrary for Config {
     fn arbitrary(g: &mut quickcheck::Gen) -> Self {
         use quickcheck::GenRange;
