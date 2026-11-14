@@ -60,6 +60,7 @@ use std::collections::HashMap;
 use std::io;
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
@@ -70,9 +71,10 @@ use menzil_stream::{OpenRefusal, OpenRequest, ServiceHandler, Stream};
 use thiserror::Error;
 use tokio::io::{ReadBuf, copy_bidirectional_with_sizes};
 use tokio::net::{TcpSocket, TcpStream};
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
+use tokio::time::Instant as Clock;
 
-use crate::egress::EgressExecutor;
+use crate::egress::{EgressExecutor, LiveStream};
 use crate::l5_stream::OPEN_TIMEOUT;
 
 /// How long [`LocalServices`] waits for the local connect by default. Well
@@ -93,6 +95,23 @@ pub const DEFAULT_MAX_CONNECTIONS: usize = 256;
 /// that one member cannot fill a target's own connection limit (sshd's `MaxStartups`, a
 /// database's `max_connections`) or the node-wide count.
 pub const DEFAULT_MAX_CONNECTIONS_PER_PEER: usize = 64;
+
+/// How many egress streams (`egress:*`, protocol.md 8) a node serves at once, all initiators
+/// together, by default. Their own pool: an egress flood must not starve the member services,
+/// nor the reverse.
+pub const DEFAULT_EGRESS_MAX_CONNECTIONS: usize = 128;
+
+/// How many egress streams one initiator may hold at once by default.
+pub const DEFAULT_EGRESS_MAX_CONNECTIONS_PER_PEER: usize = 32;
+
+/// How long an egress pipe may carry no byte in either direction before it is reset, by default.
+pub const DEFAULT_EGRESS_IDLE: Duration = Duration::from_secs(300);
+
+/// The shortest egress idle timeout [`LocalServices::with_egress_limits`] keeps.
+pub const MIN_EGRESS_IDLE: Duration = Duration::from_secs(10);
+
+/// The longest egress idle timeout [`LocalServices::with_egress_limits`] keeps (one day).
+pub const MAX_EGRESS_IDLE: Duration = Duration::from_secs(86_400);
 
 /// The size asked for the send and receive buffer of each target socket, by default. The kernel
 /// doubles it, so each socket can hold about twice this in each direction.
@@ -178,6 +197,28 @@ impl Default for ServeLimits {
     }
 }
 
+/// What a node holds for the initiators of `egress:*` streams at most (protocol.md 8, 11).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EgressLimits {
+    /// Egress streams served at once, all initiators together. At least 1.
+    pub max_connections: usize,
+    /// Egress streams served at once for one initiator. At least 1.
+    pub max_connections_per_peer: usize,
+    /// A pipe with no byte in either direction for this long is reset (an RST, not a clean
+    /// end). Kept between [`MIN_EGRESS_IDLE`] and [`MAX_EGRESS_IDLE`].
+    pub idle: Duration,
+}
+
+impl Default for EgressLimits {
+    fn default() -> Self {
+        Self {
+            max_connections: DEFAULT_EGRESS_MAX_CONNECTIONS,
+            max_connections_per_peer: DEFAULT_EGRESS_MAX_CONNECTIONS_PER_PEER,
+            idle: DEFAULT_EGRESS_IDLE,
+        }
+    }
+}
+
 /// The services a node offers and the local targets behind them. See the
 /// module documentation.
 ///
@@ -200,6 +241,19 @@ pub struct LocalServices {
     resolve: Resolve,
     /// The exit side of `egress:*` ([`Self::with_egress`]); none serves no egress.
     egress: Option<Arc<EgressExecutor>>,
+    /// The places egress streams take: a pool of their own, apart from `slots`.
+    egress_slots: Arc<Slots>,
+    egress_limits: EgressLimits,
+    egress_full_log: Arc<LogThrottle>,
+}
+
+/// The egress limits as the [`ServeLimits`] a [`Slots`] pool is built from.
+fn egress_pool(limits: &EgressLimits) -> ServeLimits {
+    ServeLimits {
+        max_connections: limits.max_connections,
+        max_connections_per_peer: limits.max_connections_per_peer,
+        ..ServeLimits::default()
+    }
 }
 
 /// Resolves a host name to addresses. Blocking, so it runs on a blocking thread.
@@ -255,6 +309,9 @@ impl LocalServices {
             connect_log: Arc::new(LogThrottle::new(LOG_INTERVAL)),
             resolve: system_resolve,
             egress: None,
+            egress_slots: Slots::new(&egress_pool(&EgressLimits::default())),
+            egress_limits: EgressLimits::default(),
+            egress_full_log: Arc::new(LogThrottle::new(LOG_INTERVAL)),
         }
     }
 
@@ -335,6 +392,32 @@ impl LocalServices {
         self.slots = Slots::new(&limits);
         self.limits = limits;
         self
+    }
+
+    /// Replaces the default [`EgressLimits`]: the pool of places egress streams take (apart from
+    /// the [`ServeLimits`] ones) and the idle timeout of their pipes. Values of zero count as 1,
+    /// a total past what a semaphore can hold is cut to that, and the idle timeout is kept
+    /// between [`MIN_EGRESS_IDLE`] and [`MAX_EGRESS_IDLE`]. Starts the egress counts afresh, so
+    /// call it while configuring, before the node runs.
+    pub fn with_egress_limits(mut self, limits: EgressLimits) -> Self {
+        let limits = EgressLimits {
+            max_connections: limits.max_connections.clamp(1, Semaphore::MAX_PERMITS),
+            max_connections_per_peer: limits.max_connections_per_peer.max(1),
+            idle: limits.idle.clamp(MIN_EGRESS_IDLE, MAX_EGRESS_IDLE),
+        };
+        self.egress_slots = Slots::new(&egress_pool(&limits));
+        self.egress_limits = limits;
+        self
+    }
+
+    /// The egress limits in force.
+    pub fn egress_limits(&self) -> EgressLimits {
+        self.egress_limits
+    }
+
+    /// How many egress streams are being served now.
+    pub fn egress_connections(&self) -> usize {
+        self.egress_slots.in_use()
     }
 
     /// The target `service` is served from, if it is.
@@ -435,13 +518,24 @@ impl LocalServices {
     /// peer past a limit costs the refusal. An open that is counted elsewhere (the relay
     /// principal's) takes no place here.
     fn take_slot(&self, request: &OpenRequest, counted: bool) -> Result<Option<Slot>, OpenRefusal> {
+        self.take_slot_from(&self.slots, &self.full_log, request, counted)
+    }
+
+    /// [`Self::take_slot`] from `pool`, the node's or the egress one.
+    fn take_slot_from(
+        &self,
+        pool: &Arc<Slots>,
+        log: &LogThrottle,
+        request: &OpenRequest,
+        counted: bool,
+    ) -> Result<Option<Slot>, OpenRefusal> {
         if !counted {
             return Ok(None);
         }
-        match self.slots.take(request.initiator) {
+        match pool.take(request.initiator) {
             Ok(slot) => Ok(Some(slot)),
             Err(full) => {
-                if let Some(left_out) = self.full_log.permit(Instant::now()) {
+                if let Some(left_out) = log.permit(Instant::now()) {
                     tracing::warn!(
                         service = %request.service,
                         peer = %request.initiator,
@@ -485,13 +579,17 @@ impl LocalServices {
         {
             return Err(refusal(ErrorCode::UnknownService, "no such service"));
         }
-        let slot = self.take_slot(request, counted)?;
-        let socket = executor
-            .dial(request, self.limits.socket_buffer, self.connect_timeout)
+        // The place comes from the egress pool, before the executor looks anything up or dials:
+        // an initiator past a limit costs the exit nothing but the refusal.
+        let slot =
+            self.take_slot_from(&self.egress_slots, &self.egress_full_log, request, counted)?;
+        let (socket, live) = executor
+            .dial_live(request, self.limits.socket_buffer, self.connect_timeout)
             .await?;
         Ok(OpenedTarget {
             socket: Some(socket),
             slot,
+            live: Some(live),
         })
     }
 
@@ -514,6 +612,7 @@ impl LocalServices {
             Ok(Ok(socket)) => Ok(OpenedTarget {
                 socket: Some(socket),
                 slot,
+                live: None,
             }),
             Ok(Err(error)) => {
                 if let Some(left_out) = self.connect_log.permit(Instant::now()) {
@@ -582,10 +681,11 @@ impl LocalServices {
         prefix: Vec<u8>,
     ) -> Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
         let connect_timeout = self.connect_timeout;
+        let idle = self.egress_limits.idle;
         // A future dropped before it ran drops `stream` and `opened`, which reset themselves.
         Box::pin(async move {
             let mut pipe = Pipe::new(stream, opened);
-            pipe.run_with_prefix(&request.service, &prefix, connect_timeout)
+            pipe.run_with_prefix(&request.service, &prefix, connect_timeout, idle)
                 .await
         })
     }
@@ -599,16 +699,19 @@ impl LocalServices {
 pub struct OpenedTarget {
     socket: Option<TcpStream>,
     slot: Option<Slot>,
+    /// What an egress stream keeps to be vetted again and logged; none for a local service.
+    live: Option<LiveStream>,
 }
 
 impl OpenedTarget {
     /// The socket and the slot (none for an open counted elsewhere), for the pipe, which takes over the duty to reset.
-    fn into_parts(mut self) -> (TcpStream, Option<Slot>) {
+    fn into_parts(mut self) -> (TcpStream, Option<Slot>, Option<LiveStream>) {
         (
             self.socket
                 .take()
                 .expect("an opened target holds its socket"),
             self.slot.take(),
+            self.live.take(),
         )
     }
 
@@ -756,6 +859,98 @@ impl LogThrottle {
     }
 }
 
+/// When an egress pipe last moved a byte, on the tokio clock (so a test can pause it).
+struct Activity {
+    base: Clock,
+    last_nanos: AtomicU64,
+}
+
+impl Activity {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            base: Clock::now(),
+            last_nanos: AtomicU64::new(0),
+        })
+    }
+
+    /// A byte moved just now.
+    fn touch(&self) {
+        let nanos = u64::try_from(self.base.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        self.last_nanos.fetch_max(nanos, Ordering::Relaxed);
+    }
+
+    /// Completes once no byte has moved for `idle`; every byte that moves restarts the wait.
+    async fn idle_for(&self, idle: Duration) {
+        loop {
+            let last = self.last_nanos.load(Ordering::Relaxed);
+            tokio::time::sleep_until(self.base + Duration::from_nanos(last) + idle).await;
+            if self.last_nanos.load(Ordering::Relaxed) == last {
+                return;
+            }
+        }
+    }
+}
+
+/// One end of an egress pipe that notes every byte written to it for the idle timeout (a byte
+/// that travels either way is written to one end), and counts the bytes read from it. Without `watch` it only passes calls through.
+struct Counted<'a, T> {
+    inner: &'a mut T,
+    watch: Option<(Arc<Activity>, Arc<AtomicU64>)>,
+}
+
+impl<T: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for Counted<'_, T> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let before = buf.filled().len();
+        let poll = Pin::new(&mut *self.inner).poll_read(cx, buf);
+        if let (Poll::Ready(Ok(())), Some((_, read))) = (&poll, &self.watch) {
+            // Counted only: the byte restarts the idle timer where it is written, so that each
+            // byte does it once, in the direction it travels.
+            read.fetch_add((buf.filled().len() - before) as u64, Ordering::Relaxed);
+        }
+        poll
+    }
+}
+
+impl<T: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for Counted<'_, T> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let poll = Pin::new(&mut *self.inner).poll_write(cx, buf);
+        if let (Poll::Ready(Ok(n)), Some((activity, _))) = (&poll, &self.watch)
+            && *n > 0
+        {
+            activity.touch();
+        }
+        poll
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut *self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut *self.inner).poll_shutdown(cx)
+    }
+}
+
+/// What an egress pipe keeps for its close line (protocol.md 8): it is written when the pipe is
+/// dropped, however the pipe ended (finished, reset, aborted by a recheck or the node's end).
+struct EgressClose {
+    live: LiveStream,
+    started: Clock,
+    activity: Arc<Activity>,
+    /// Bytes read from the initiator (sent to the target) and from the target.
+    up: Arc<AtomicU64>,
+    down: Arc<AtomicU64>,
+    outcome: String,
+}
+
 /// The two ends of one served stream and the slot they hold. Dropping it before [`Pipe::run`]
 /// has seen both directions finish (the task was aborted, the node is shutting down, the
 /// future never ran) resets both ends.
@@ -763,19 +958,34 @@ struct Pipe {
     remote: Option<TokioStream>,
     local: Option<TcpStream>,
     _slot: Option<Slot>,
+    egress: Option<EgressClose>,
 }
 
 impl Pipe {
     fn new(stream: Stream, opened: OpenedTarget) -> Self {
-        let (socket, slot) = opened.into_parts();
+        let (socket, slot, live) = opened.into_parts();
         Self {
             remote: Some(TokioStream(stream)),
             local: Some(socket),
             _slot: slot,
+            egress: live.map(|live| EgressClose {
+                live,
+                started: Clock::now(),
+                activity: Activity::new(),
+                up: Arc::new(AtomicU64::new(0)),
+                down: Arc::new(AtomicU64::new(0)),
+                outcome: "aborted".to_owned(),
+            }),
         }
     }
 
-    async fn run_with_prefix(&mut self, service: &ServiceId, prefix: &[u8], limit: Duration) {
+    async fn run_with_prefix(
+        &mut self,
+        service: &ServiceId,
+        prefix: &[u8],
+        limit: Duration,
+        idle: Duration,
+    ) {
         if !prefix.is_empty() {
             let Some(local) = self.local.as_mut() else {
                 return;
@@ -792,19 +1002,53 @@ impl Pipe {
                 return;
             }
         }
-        self.run(service).await;
+        self.run(service, idle).await;
     }
 
-    async fn run(&mut self, service: &ServiceId) {
+    async fn run(&mut self, service: &ServiceId, idle: Duration) {
         let (Some(remote), Some(local)) = (self.remote.as_mut(), self.local.as_mut()) else {
             return;
         };
         // The copy polls the stream only while a direction is waiting on it. After the peer's
         // FIN with a silent target, and while a write to a target that does not read is
-        // blocked, nothing does, so no waker is registered and the peer's RST or the loss of
+        // blocked, nothing does, so no waiter is registered and the peer's RST or the loss of
         // the session would wake nobody. The watcher has a waker of its own.
         let torn_down = remote.0.torn_down();
-        let copy = copy_bidirectional_with_sizes(remote, local, PIPE_BUFFER, PIPE_BUFFER);
+        // An egress pipe also notes its bytes (idle timeout, close line) and is vetted again
+        // whenever the node rechecks its streams (protocol.md 5.3, 8).
+        let watch = |egress: &EgressClose, read: &Arc<AtomicU64>| {
+            Some((egress.activity.clone(), read.clone()))
+        };
+        let mut remote = Counted {
+            inner: remote,
+            watch: self.egress.as_ref().and_then(|e| watch(e, &e.up)),
+        };
+        let mut local = Counted {
+            inner: local,
+            watch: self.egress.as_ref().and_then(|e| watch(e, &e.down)),
+        };
+        let poke = Arc::new(Notify::new());
+        let attached = self.egress.is_some() && crate::l5_stream::attach_recheck(poke.clone());
+        let idle_watch = async {
+            match &self.egress {
+                Some(egress) => egress.activity.idle_for(idle).await,
+                None => std::future::pending().await,
+            }
+        };
+        // Attached first, vetted second: a recheck that ran before the attach changed the rule
+        // before this check reads it, one that runs after pokes the loop.
+        let revoked = async {
+            let (Some(egress), true) = (&self.egress, attached) else {
+                return std::future::pending().await;
+            };
+            loop {
+                if let Err(why) = egress.live.still_allowed().await {
+                    return why;
+                }
+                poke.notified().await;
+            }
+        };
+        let copy = copy_bidirectional_with_sizes(&mut remote, &mut local, PIPE_BUFFER, PIPE_BUFFER);
         let outcome = tokio::select! {
             // A copy that finished wins over a teardown that came with it: it moved every
             // byte and shut both directions down.
@@ -814,7 +1058,21 @@ impl Pipe {
                 io::ErrorKind::ConnectionReset,
                 "the stream was torn down under the pipe",
             )),
+            () = idle_watch => Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "idle: no byte in either direction",
+            )),
+            why = revoked => Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!("no longer allowed: {why}"),
+            )),
         };
+        if let Some(egress) = self.egress.as_mut() {
+            egress.outcome = match &outcome {
+                Ok(_) => "clean".to_owned(),
+                Err(error) => format!("reset: {error}"),
+            };
+        }
         match outcome {
             Ok((to_target, from_target)) => {
                 tracing::debug!(%service, to_target, from_target, "served stream ended cleanly");
@@ -843,6 +1101,14 @@ impl Pipe {
 impl Drop for Pipe {
     fn drop(&mut self) {
         self.abort();
+        if let Some(close) = self.egress.take() {
+            close.live.log_close(
+                &close.outcome,
+                close.up.load(Ordering::Relaxed),
+                close.down.load(Ordering::Relaxed),
+                close.started.elapsed(),
+            );
+        }
     }
 }
 
@@ -1067,6 +1333,7 @@ mod tests {
         OpenedTarget {
             socket: Some(socket),
             slot: Some(slots.take(NodeId::from([9u8; 32])).unwrap()),
+            live: None,
         }
     }
 
@@ -1527,7 +1794,10 @@ mod tests {
         let _ = &mut client_inbound;
 
         let mut pipe = Pipe::new(remote, opened_target(local));
-        let task = tokio::spawn(async move { pipe.run(&"tcp:app".parse().unwrap()).await });
+        let task = tokio::spawn(async move {
+            pipe.run(&"tcp:app".parse().unwrap(), DEFAULT_EGRESS_IDLE)
+                .await
+        });
         let mut one = [0u8; 1];
         accepted.read_exact(&mut one).await.unwrap();
         // The node shuts down: the task is aborted mid-pipe.
@@ -2513,8 +2783,9 @@ mod tests {
             gate.notify_one();
             let (mut stream, ack) = timeout(WAIT, &mut opening).await.unwrap();
             assert!(ack.ok, "{ack:?}");
-            // It holds a slot of the node like any served connection.
-            assert_eq!(counted.connections(), 1);
+            // It holds a place of the egress pool, and none of the member services' one.
+            assert_eq!(counted.egress_connections(), 1);
+            assert_eq!(counted.connections(), 0);
 
             stream.write_all(b"hello egress").await.unwrap();
             let mut back = [0u8; 12];
@@ -2533,12 +2804,24 @@ mod tests {
             timeout(WAIT, target).await.unwrap().unwrap();
             // The slot comes back with the pipe.
             for _ in 0..50 {
-                if counted.connections() == 0 {
+                if counted.egress_connections() == 0 {
                     break;
                 }
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
-            assert_eq!(counted.connections(), 0);
+            assert_eq!(counted.egress_connections(), 0);
+            // One close line, with the figures and never the payload.
+            let lines = closed_lines(&counted).await;
+            assert_eq!(lines.len(), 1, "{lines:?}");
+            let line = &lines[0];
+            assert!(
+                line.contains(&format!(
+                    "{} 127.0.0.1:{port} 127.0.0.1 clean up=12 down=12",
+                    NodeId::from([2u8; 32])
+                )),
+                "{line}"
+            );
+            assert!(!line.contains("hello"), "{line}");
         }
 
         #[tokio::test]
@@ -2564,24 +2847,324 @@ mod tests {
             assert_eq!(ack.code, ErrorCode::InvalidTarget);
             nothing_accepted(&listener).await;
             assert_eq!(counted.connections(), 0);
+            assert_eq!(counted.egress_connections(), 0);
+        }
+
+        fn egress_limits(max_connections: usize, max_connections_per_peer: usize) -> EgressLimits {
+            EgressLimits {
+                max_connections,
+                max_connections_per_peer,
+                ..EgressLimits::default()
+            }
+        }
+
+        fn egress_request_from(initiator: u8, port: u16) -> OpenRequest {
+            OpenRequest {
+                initiator: NodeId::from([initiator; 32]),
+                ..egress_request(port)
+            }
+        }
+
+        /// The close lines the executor logged (written when a pipe ends), waiting a little for
+        /// the pipe's task. Never parks the runtime, so it is fine under a paused clock.
+        async fn closed_lines(services: &LocalServices) -> Vec<String> {
+            for _ in 0..200 {
+                let lines: Vec<String> = services
+                    .egress
+                    .as_ref()
+                    .unwrap()
+                    .logged()
+                    .into_iter()
+                    .filter(|line| line.starts_with("closed: "))
+                    .collect();
+                if !lines.is_empty() {
+                    return lines;
+                }
+                tokio::task::yield_now().await;
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Vec::new()
         }
 
         #[tokio::test]
-        async fn egress_opens_share_the_slots_of_the_node_and_are_refused_past_them() {
+        async fn egress_streams_have_a_pool_of_their_own_apart_from_the_member_services() {
             let listener = listener().await;
             let port = listener.local_addr().unwrap().port();
             let services = LocalServices::new()
+                .serve(
+                    "tcp:app".parse().unwrap(),
+                    LocalTarget::new("127.0.0.1", port),
+                )
+                .unwrap()
                 .with_limits(limits(1, 1))
+                .with_egress_limits(egress_limits(2, 10))
                 .with_egress(executor(&["127.0.0.0/8"], true));
-            let first = services.open(&egress_request(port)).await.unwrap();
+            // Two initiators fill the pool; a third is refused for the total, not its own count.
+            let first = services.open(&egress_request_from(1, port)).await.unwrap();
+            let second = services.open(&egress_request_from(2, port)).await.unwrap();
+            assert_eq!(services.egress_connections(), 2);
+            assert_eq!(services.connections(), 0);
+            assert_rate_limited(
+                services.open(&egress_request_from(3, port)).await,
+                "egress total",
+            );
+            // A full egress pool does not starve a member service...
+            let member = services
+                .open(&request("tcp:app", 1))
+                .await
+                .expect("the member service has its own place");
             assert_eq!(services.connections(), 1);
-            assert_rate_limited(services.open(&egress_request(port)).await, "egress");
+            // ... and a full member pool does not stop egress once one of its places is free.
+            assert_rate_limited(services.open(&request("tcp:app", 1)).await, "member");
             drop(first);
+            let third = services
+                .open(&egress_request_from(3, port))
+                .await
+                .expect("an egress place is free again");
+            drop((second, third, member));
+            assert_eq!(services.egress_connections(), 0);
+            assert_eq!(services.connections(), 0);
+        }
+
+        #[tokio::test]
+        async fn egress_places_are_counted_for_each_initiator_apart() {
+            let listener = listener().await;
+            let port = listener.local_addr().unwrap().port();
+            let services = LocalServices::new()
+                .with_egress_limits(egress_limits(10, 2))
+                .with_egress(executor(&["127.0.0.0/8"], true));
+            let one = services.open(&egress_request_from(1, port)).await.unwrap();
+            let two = services.open(&egress_request_from(1, port)).await.unwrap();
+            assert_rate_limited(
+                services.open(&egress_request_from(1, port)).await,
+                "per initiator",
+            );
+            let other = services
+                .open(&egress_request_from(2, port))
+                .await
+                .expect("another initiator has its own count");
+            drop(one);
             services
-                .open(&egress_request(port))
+                .open(&egress_request_from(1, port))
                 .await
                 .map(drop)
-                .expect("a slot is free again");
+                .expect("a place came back");
+            drop((two, other));
+        }
+
+        #[tokio::test]
+        async fn egress_places_are_taken_before_any_lookup_or_dial() {
+            let listener = listener().await;
+            let port = listener.local_addr().unwrap().port();
+            let resolved = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let dialled = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let (r, d) = (resolved.clone(), dialled.clone());
+            let counting = executor(&["0.0.0.0/0"], true)
+                .with_resolver(move |_host, port| {
+                    r.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Ok(vec![SocketAddr::from(([127, 0, 0, 1], port))])
+                })
+                .with_connector(move |addr, buffer| {
+                    d.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    connect_addr(addr, buffer)
+                });
+            let services = LocalServices::new()
+                .with_egress_limits(egress_limits(1, 1))
+                .with_egress(counting);
+            let held = services.open(&egress_request(port)).await.unwrap();
+            assert_eq!(dialled.load(std::sync::atomic::Ordering::SeqCst), 1);
+            let by_name = OpenRequest {
+                target: Some(OpenTarget {
+                    host: "example.test".to_owned(),
+                    port,
+                    transport: None,
+                }),
+                ..egress_request(port)
+            };
+            assert_rate_limited(services.open(&by_name).await, "by name, over the total");
+            assert_rate_limited(
+                services
+                    .open(&OpenRequest {
+                        initiator: NodeId::from([5u8; 32]),
+                        ..by_name.clone()
+                    })
+                    .await,
+                "by name, another initiator, over the total",
+            );
+            assert_eq!(
+                resolved.load(std::sync::atomic::Ordering::SeqCst),
+                0,
+                "a name was looked up for an OPEN that had no place"
+            );
+            assert_eq!(
+                dialled.load(std::sync::atomic::Ordering::SeqCst),
+                1,
+                "an OPEN that had no place was dialled"
+            );
+            drop(held);
+        }
+
+        /// Polls `fut` without ever parking the runtime, so a paused clock does not jump while
+        /// real sockets make progress.
+        async fn spin<T>(fut: impl std::future::Future<Output = T>) -> T {
+            use futures_util::FutureExt as _;
+            tokio::pin!(fut);
+            for _ in 0..3000 {
+                if let Some(out) = fut.as_mut().now_or_never() {
+                    return out;
+                }
+                tokio::task::yield_now().await;
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            panic!("nothing happened");
+        }
+
+        async fn settle() {
+            for _ in 0..10 {
+                tokio::task::yield_now().await;
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+
+        /// A served egress stream: the initiator's end, the target's socket and the pipe's task.
+        struct LivePipe {
+            services: LocalServices,
+            client: Stream,
+            target: TcpStream,
+            task: JoinHandle<()>,
+        }
+
+        /// Serves one egress stream with an idle timeout of `idle_secs` and takes the byte the
+        /// stream pair starts with through to the target. The clock is real until the caller
+        /// pauses it.
+        async fn live_pipe(idle_secs: u64) -> LivePipe {
+            let listener = listener().await;
+            let port = listener.local_addr().unwrap().port();
+            let services = LocalServices::new()
+                .with_egress_limits(EgressLimits {
+                    idle: Duration::from_secs(idle_secs),
+                    ..EgressLimits::default()
+                })
+                .with_egress(executor(&["127.0.0.0/8"], true));
+            let request = egress_request(port);
+            let opened = services.open(&request).await.unwrap();
+            let (mut target, _) = listener.accept().await.unwrap();
+            let (client, server) = stream_pair().await;
+            let task = tokio::spawn(services.handle(server, request, opened));
+            let mut first = [0u8; 1];
+            timeout(WAIT, target.read_exact(&mut first))
+                .await
+                .unwrap()
+                .unwrap();
+            LivePipe {
+                services,
+                client,
+                target,
+                task,
+            }
+        }
+
+        #[tokio::test]
+        async fn a_silent_egress_pipe_is_reset_with_an_rst_after_the_idle_time_and_not_before() {
+            let LivePipe {
+                services,
+                mut client,
+                mut target,
+                task,
+            } = live_pipe(10).await;
+            tokio::time::pause();
+            tokio::time::advance(Duration::from_secs(4)).await;
+            settle().await;
+            assert!(!task.is_finished(), "reset before the idle time");
+            tokio::time::advance(Duration::from_secs(7)).await;
+            settle().await;
+            assert!(task.is_finished(), "a silent pipe outlived the idle time");
+            // An RST on the target's socket, not a clean end of file.
+            let mut byte = [0u8; 1];
+            let error = spin(target.read(&mut byte))
+                .await
+                .expect_err("the target must see a reset, not a clean end");
+            assert!(is_reset(&error), "the target saw {error:?}");
+            // The initiator's stream was reset too, not finished.
+            let mut buf = [0u8; 1];
+            spin(client.read(&mut buf))
+                .await
+                .expect_err("the initiator must see a reset, not a clean end");
+            // The close line says why.
+            let lines = closed_lines(&services).await;
+            assert_eq!(lines.len(), 1, "{lines:?}");
+            assert!(lines[0].contains("reset: idle"), "{}", lines[0]);
+            assert!(lines[0].contains("up=1 down=0"), "{}", lines[0]);
+            assert_eq!(services.egress_connections(), 0);
+        }
+
+        /// Bytes in one direction every 6 s keep a pipe with a 10 s idle timeout alive; the
+        /// silence after them ends it.
+        async fn bytes_one_way_keep_the_pipe_alive(upstream: bool) {
+            let LivePipe {
+                mut client,
+                mut target,
+                task,
+                ..
+            } = live_pipe(10).await;
+            tokio::time::pause();
+            for round in 0..5 {
+                tokio::time::advance(Duration::from_secs(6)).await;
+                let mut byte = [0u8; 1];
+                if upstream {
+                    spin(async {
+                        client.write_all(b"u").await.unwrap();
+                        client.flush().await.unwrap();
+                    })
+                    .await;
+                    spin(target.read_exact(&mut byte)).await.unwrap();
+                } else {
+                    target.write_all(b"d").await.unwrap();
+                    spin(client.read_exact(&mut byte)).await.unwrap();
+                }
+                settle().await;
+                assert!(!task.is_finished(), "reset in round {round} despite bytes");
+            }
+            tokio::time::advance(Duration::from_secs(11)).await;
+            settle().await;
+            assert!(task.is_finished(), "silence after the bytes did not end it");
+        }
+
+        #[tokio::test]
+        async fn bytes_from_the_initiator_reset_the_idle_timer() {
+            bytes_one_way_keep_the_pipe_alive(true).await;
+        }
+
+        #[tokio::test]
+        async fn bytes_from_the_target_reset_the_idle_timer() {
+            bytes_one_way_keep_the_pipe_alive(false).await;
+        }
+
+        #[tokio::test]
+        async fn the_idle_timeout_is_kept_between_ten_seconds_and_a_day() {
+            let idle = |secs: u64| {
+                LocalServices::new()
+                    .with_egress_limits(EgressLimits {
+                        idle: Duration::from_secs(secs),
+                        ..EgressLimits::default()
+                    })
+                    .egress_limits()
+                    .idle
+            };
+            assert_eq!(idle(0), MIN_EGRESS_IDLE);
+            assert_eq!(idle(9), MIN_EGRESS_IDLE);
+            assert_eq!(idle(10), Duration::from_secs(10));
+            assert_eq!(idle(86_400), MAX_EGRESS_IDLE);
+            assert_eq!(idle(86_401), MAX_EGRESS_IDLE);
+            assert_eq!(idle(u64::MAX), MAX_EGRESS_IDLE);
+            assert_eq!(
+                LocalServices::new().egress_limits(),
+                EgressLimits {
+                    max_connections: 128,
+                    max_connections_per_peer: 32,
+                    idle: Duration::from_secs(300),
+                }
+            );
         }
     }
 }

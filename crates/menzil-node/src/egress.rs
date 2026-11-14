@@ -33,6 +33,14 @@
 //! 6. The connect goes to the vetted [`SocketAddr`]s only, one after the other, inside one
 //!    connect timeout for the whole of steps 5 and 6. Nothing is resolved again.
 //!
+//! Slice 3 (limits): the place an egress OPEN needs comes from a pool of its own in
+//! [`crate::LocalServices`] before step 1 runs; the exit's own addresses and prefixes are read
+//! on a blocking thread, failing closed (a panic of the reader included); the node's own deny
+//! list ([`parse_local_deny`], [`EgressExecutor::with_local_deny`]) refuses a name before it
+//! is resolved and an address after, with no `allow` able to lift it; and a dialled stream
+//! keeps a [`LiveStream`] so that the pipe can be vetted again by the very same
+//! `prepare`/`vet` code when the Policy changes, and logs one line when it ends.
+//!
 //! The exit's own on-link prefixes ([`own_links`]: IPv6 from `/proc/net/if_inet6`, IPv4 from
 //! `/proc/net/fib_trie`) are read at each OPEN like `self` and are refused whatever the Policy
 //! says; an unreadable file refuses every dial.
@@ -387,14 +395,42 @@ fn parse_all(patterns: &[HostPortPattern]) -> Vec<Pattern> {
 fn parse_deny(patterns: &[HostPortPattern]) -> Option<Vec<Pattern>> {
     patterns
         .iter()
-        .map(|text| {
-            let pattern = parse_pattern(text)?;
-            let mapped = matches!(
-                &pattern,
-                Pattern::Net { net: Net { addr: IpAddr::V6(addr), .. }, .. }
-                    if addr.to_ipv4_mapped().is_some()
-            );
-            (!mapped).then_some(pattern)
+        .map(|text| parse_pattern(text).filter(|pattern| !is_ipv4_mapped(pattern)))
+        .collect()
+}
+
+/// Whether `pattern` is an IPv4 mapped IPv6 address or prefix, which no canonical address ever
+/// matches (a `deny` of it would silently deny nothing).
+fn is_ipv4_mapped(pattern: &Pattern) -> bool {
+    matches!(
+        pattern,
+        Pattern::Net { net: Net { addr: IpAddr::V6(addr), .. }, .. }
+            if addr.to_ipv4_mapped().is_some()
+    )
+}
+
+/// The most entries `[egress] deny` may hold.
+pub const MAX_LOCAL_DENY: usize = 256;
+
+/// The node's own `deny` list (`[egress] deny`) parsed strictly, in the grammar of
+/// protocol.md 8: an entry that does not parse, or is an IPv4 mapped IPv6 address or prefix, is
+/// an error naming it (the config load fails: an entry the exit cannot read must not deny
+/// nothing without a word), and so is a list of more than [`MAX_LOCAL_DENY`] entries.
+pub fn parse_local_deny(entries: &[String]) -> Result<Vec<Pattern>, String> {
+    if entries.len() > MAX_LOCAL_DENY {
+        return Err(format!(
+            "{} entries: at most {MAX_LOCAL_DENY} are accepted",
+            entries.len()
+        ));
+    }
+    entries
+        .iter()
+        .map(|text| match Pattern::parse(text) {
+            None => Err(format!("{text:?} is not a pattern of protocol.md section 8")),
+            Some(pattern) if is_ipv4_mapped(&pattern) => Err(format!(
+                "{text:?} is an IPv4 mapped IPv6 pattern, which matches nothing: write the IPv4 pattern"
+            )),
+            Some(pattern) => Ok(pattern),
         })
         .collect()
 }
@@ -780,6 +816,17 @@ enum Fail {
     Unreachable(String),
 }
 
+impl Fail {
+    /// The reason text, for the log only.
+    fn reason(&self) -> &str {
+        match self {
+            Fail::Invalid(reason) => reason,
+            Fail::NoRule => "no egress rule",
+            Fail::Forbidden(reason) | Fail::Unreachable(reason) => reason,
+        }
+    }
+}
+
 /// How many name lookups one initiator may have in flight at the exit.
 pub const MAX_LOOKUPS_PER_PEER: usize = 4;
 
@@ -832,6 +879,10 @@ pub struct EgressExecutor {
     lookups_by_peer: Arc<std::sync::Mutex<HashMap<NodeId, usize>>>,
     refuse_log: LogThrottle,
     own_log: LogThrottle,
+    close_log: LogThrottle,
+    /// The node's own extra `deny` list (`[egress] deny`): matched without specificity, so no
+    /// signed `allow` lifts it. It can only narrow.
+    local_deny: Vec<Pattern>,
     /// Set only by `narrowed_floor_for_tests`; always false in a build without tests.
     loopback_ok: bool,
     #[cfg(test)]
@@ -863,6 +914,8 @@ impl EgressExecutor {
             lookups_by_peer: Arc::new(std::sync::Mutex::new(HashMap::new())),
             refuse_log: LogThrottle::new(LOG_INTERVAL),
             own_log: LogThrottle::new(LOG_INTERVAL),
+            close_log: LogThrottle::new(LOG_INTERVAL),
+            local_deny: Vec::new(),
             loopback_ok: false,
             #[cfg(test)]
             log_lines: std::sync::Mutex::new(Vec::new()),
@@ -910,6 +963,15 @@ impl EgressExecutor {
         self
     }
 
+    /// Adds the node's own `deny` list (`[egress] deny`, [`parse_local_deny`]): matched against
+    /// a name before it is resolved and against every address after, and no `allow` of the signed
+    /// Policy lifts a match, whatever its specificity. It can only narrow what the Policy
+    /// allows.
+    pub fn with_local_deny(mut self, deny: Vec<Pattern>) -> Self {
+        self.local_deny = deny;
+        self
+    }
+
     /// Lets the floor pass 127.0.0.0/8 so that a test can use a loopback echo server. Compiled
     /// only into test builds: no production code can narrow the floor.
     #[cfg(test)]
@@ -950,6 +1012,9 @@ impl EgressExecutor {
         if own.contains(&ip) {
             return Err("an address of the exit itself");
         }
+        if self.locally_denied(Subject::Addr(ip), port, own) {
+            return Err("denied by the node's own deny list");
+        }
         if links.iter().any(|net| net.contains(ip)) {
             return Err("on a network the exit is on");
         }
@@ -980,11 +1045,7 @@ impl EgressExecutor {
                 reason,
             ),
         };
-        let host: String = host
-            .chars()
-            .take(255)
-            .flat_map(char::escape_default)
-            .collect();
+        let host = escape_host(host);
         #[cfg(test)]
         self.log_lines
             .lock()
@@ -1034,6 +1095,141 @@ impl EgressExecutor {
         .map_err(io::Error::other)?
     }
 
+    /// What a rule says about a target before anything is resolved or dialled: the node's own
+    /// [`EgressRule`] for the network read and parsed, and whether the name rules allow the name
+    /// (a literal address is `false`). Shared by [`Self::dial_inner`] and the vetting of a live
+    /// stream ([`Self::revet`]), so both ask the same code.
+    fn prepare(&self, network_id: &NetworkId, target: &Target) -> Result<Prepared, Fail> {
+        let port = target.port();
+        let Some(rule) = self.rules.rule(network_id) else {
+            return Err(Fail::NoRule);
+        };
+        let allow = parse_all(&rule.allow);
+        let Some(deny) = parse_deny(&rule.deny) else {
+            return Err(Fail::Forbidden(
+                "a deny pattern does not parse or is IPv4 mapped: the rule allows nothing"
+                    .to_owned(),
+            ));
+        };
+        if allow.is_empty() {
+            return Err(Fail::Forbidden("the allow list is empty".to_owned()));
+        }
+        // A name is judged by the name rules before anything is looked up.
+        let name_allowed = match target.host() {
+            Host::Addr(_) => false,
+            Host::Name(name) => {
+                if self.locally_denied(Subject::Name(name), port, &[]) {
+                    return Err(Fail::Forbidden(
+                        "denied by the node's own deny list".to_owned(),
+                    ));
+                }
+                match decide(&allow, &deny, Subject::Name(name), port, &[]) {
+                    Verdict::Deny => {
+                        return Err(Fail::Forbidden("denied by a name rule".to_owned()));
+                    }
+                    Verdict::Allow => true,
+                    Verdict::NoMatch => false,
+                }
+            }
+        };
+        Ok(Prepared {
+            allow,
+            deny,
+            name_allowed,
+        })
+    }
+
+    /// Whether the node's own `deny` list (`[egress] deny`, [`Self::with_local_deny`]) matches
+    /// `subject`: no signed `allow` lifts it.
+    fn locally_denied(&self, subject: Subject<'_>, port: u16, own: &[IpAddr]) -> bool {
+        self.local_deny
+            .iter()
+            .any(|pattern| rank(pattern, subject, port, own).is_some())
+    }
+
+    /// The exit's own addresses and on-link prefixes, read on a blocking thread (the files can be
+    /// large and the runtime thread must not wait for them). Any failure, a panic of the reader
+    /// included, refuses the dial: fail closed.
+    async fn own_state(&self) -> Result<(Vec<IpAddr>, Vec<Net>), Fail> {
+        let (own, links) = (self.own.clone(), self.links.clone());
+        let read = tokio::task::spawn_blocking(move || {
+            let own = own().map_err(|error| ("addresses", error))?;
+            let links = links().map_err(|error| ("networks", error))?;
+            Ok::<_, (&'static str, io::Error)>((own, links))
+        })
+        .await;
+        let (what, error) = match read {
+            Ok(Ok((own, links))) => {
+                let own = own.into_iter().map(|ip| ip.to_canonical()).collect();
+                return Ok((own, links));
+            }
+            Ok(Err(failed)) => failed,
+            Err(join) => ("state", io::Error::other(join)),
+        };
+        if let Some(left_out) = self.own_log.permit(Instant::now()) {
+            tracing::error!(
+                %error,
+                what,
+                left_out,
+                "the exit's own addresses or networks cannot be read: every egress dial is refused"
+            );
+        }
+        Err(Fail::Unreachable(format!(
+            "the exit's own {what} cannot be read: {error}"
+        )))
+    }
+
+    /// Vets a live stream again against the node's rule as it is now (protocol.md 5.3 and 8: the
+    /// Policy changed): the same [`Self::prepare`] and [`Self::vet`] the dial used, for the
+    /// target as canonicalized and the one address that was dialled. `Err` says why it is now
+    /// refused; a rule that is gone is refused too.
+    async fn revet(
+        &self,
+        network_id: &NetworkId,
+        target: &Target,
+        addr: SocketAddr,
+    ) -> Result<(), Fail> {
+        let prepared = self.prepare(network_id, target)?;
+        let (own, links) = self.own_state().await?;
+        let lists = (prepared.allow.as_slice(), prepared.deny.as_slice());
+        self.vet(
+            addr.ip().to_canonical(),
+            addr.port(),
+            prepared.name_allowed,
+            lists,
+            &own,
+            &links,
+        )
+        .map_err(|why| Fail::Forbidden(why.to_owned()))
+    }
+
+    /// Writes the one line a finished egress stream gets (throttled like the refusals; the host
+    /// is escaped and cut, the payload is never part of it).
+    fn log_close(&self, live: &LiveStream, outcome: &str, up: u64, down: u64, elapsed: Duration) {
+        let host = escape_host(&live.target_host());
+        let ip = live.addr.ip();
+        #[cfg(test)]
+        self.log_lines.lock().unwrap().push(format!(
+            "closed: {} {host}:{} {ip} {outcome} up={up} down={down}",
+            live.initiator,
+            live.target.port()
+        ));
+        if let Some(left_out) = self.close_log.permit(Instant::now()) {
+            tracing::info!(
+                peer = %live.initiator,
+                %host,
+                port = live.target.port(),
+                %ip,
+                outcome,
+                to_target = up,
+                from_target = down,
+                secs = elapsed.as_secs_f64(),
+                left_out,
+                "egress stream closed"
+            );
+        }
+    }
+
     /// Runs the rules of the module documentation on `request`'s target and, if they allow it,
     /// connects to a vetted address inside `connect_timeout`. `Ok` is a connected socket; every
     /// refusal is an [`OpenRefusal`] with a fixed text.
@@ -1043,6 +1239,37 @@ impl EgressExecutor {
         socket_buffer: u32,
         connect_timeout: Duration,
     ) -> Result<TcpStream, OpenRefusal> {
+        self.dial_inner(request, socket_buffer, connect_timeout)
+            .await
+            .map(|(socket, _, _)| socket)
+    }
+
+    /// [`Self::dial`], keeping what the stream needs to be vetted again while it lives.
+    pub(crate) async fn dial_live(
+        self: &Arc<Self>,
+        request: &OpenRequest,
+        socket_buffer: u32,
+        connect_timeout: Duration,
+    ) -> Result<(TcpStream, LiveStream), OpenRefusal> {
+        let (socket, target, addr) = self
+            .dial_inner(request, socket_buffer, connect_timeout)
+            .await?;
+        let live = LiveStream {
+            executor: self.clone(),
+            network_id: request.network_id,
+            initiator: request.initiator,
+            target,
+            addr,
+        };
+        Ok((socket, live))
+    }
+
+    async fn dial_inner(
+        &self,
+        request: &OpenRequest,
+        socket_buffer: u32,
+        connect_timeout: Duration,
+    ) -> Result<(TcpStream, Target, SocketAddr), OpenRefusal> {
         let Some(raw) = request.target.as_ref() else {
             return Err(self.refuse(request, "", 0, Fail::Invalid("no target")));
         };
@@ -1052,61 +1279,10 @@ impl EgressExecutor {
         let target = Target::canonicalize(host, port)
             .map_err(|_| fail(Fail::Invalid("not a canonical host or port 0")))?;
         let port = target.port();
-        let Some(rule) = self.rules.rule(&request.network_id) else {
-            return Err(fail(Fail::NoRule));
-        };
-        let allow = parse_all(&rule.allow);
-        let Some(deny) = parse_deny(&rule.deny) else {
-            return Err(fail(Fail::Forbidden(
-                "a deny pattern does not parse or is IPv4 mapped: the rule allows nothing"
-                    .to_owned(),
-            )));
-        };
-        if allow.is_empty() {
-            return Err(fail(Fail::Forbidden("the allow list is empty".to_owned())));
-        }
-        // A name is judged by the name rules before anything is looked up.
-        let name_allowed = match target.host() {
-            Host::Addr(_) => false,
-            Host::Name(name) => match decide(&allow, &deny, Subject::Name(name), port, &[]) {
-                Verdict::Deny => {
-                    return Err(fail(Fail::Forbidden("denied by a name rule".to_owned())));
-                }
-                Verdict::Allow => true,
-                Verdict::NoMatch => false,
-            },
-        };
-        let own: Vec<IpAddr> = match (self.own)() {
-            Ok(own) => own.into_iter().map(|ip| ip.to_canonical()).collect(),
-            Err(error) => {
-                if let Some(left_out) = self.own_log.permit(Instant::now()) {
-                    tracing::error!(
-                        %error,
-                        left_out,
-                        "the exit's own addresses cannot be read: every egress dial is refused"
-                    );
-                }
-                return Err(fail(Fail::Unreachable(format!(
-                    "the exit's own addresses cannot be read: {error}"
-                ))));
-            }
-        };
-        let links: Vec<Net> = match (self.links)() {
-            Ok(links) => links,
-            Err(error) => {
-                if let Some(left_out) = self.own_log.permit(Instant::now()) {
-                    tracing::error!(
-                        %error,
-                        left_out,
-                        "the exit's own networks cannot be read: every egress dial is refused"
-                    );
-                }
-                return Err(fail(Fail::Unreachable(format!(
-                    "the exit's own networks cannot be read: {error}"
-                ))));
-            }
-        };
-        let lists = (allow.as_slice(), deny.as_slice());
+        let prepared = self.prepare(&request.network_id, &target).map_err(fail)?;
+        let (own, links) = self.own_state().await.map_err(fail)?;
+        let lists = (prepared.allow.as_slice(), prepared.deny.as_slice());
+        let name_allowed = prepared.name_allowed;
 
         let work = async {
             let vetted: Vec<IpAddr> = match target.host() {
@@ -1146,8 +1322,9 @@ impl EgressExecutor {
             };
             let mut last = None;
             for ip in vetted {
-                match (self.connector)(SocketAddr::new(ip, port), socket_buffer).await {
-                    Ok(socket) => return Ok(socket),
+                let addr = SocketAddr::new(ip, port);
+                match (self.connector)(addr, socket_buffer).await {
+                    Ok(socket) => return Ok((socket, addr)),
                     Err(error) => last = Some(error),
                 }
             }
@@ -1157,11 +1334,61 @@ impl EgressExecutor {
             )))
         };
         match tokio::time::timeout(connect_timeout, work).await {
-            Ok(Ok(socket)) => Ok(socket),
+            Ok(Ok((socket, addr))) => Ok((socket, target, addr)),
             Ok(Err(why)) => Err(fail(why)),
             Err(_) => Err(fail(Fail::Unreachable("did not answer in time".to_owned()))),
         }
     }
+}
+
+/// What the rules said about a target before it was resolved ([`EgressExecutor::prepare`]).
+struct Prepared {
+    allow: Vec<Pattern>,
+    deny: Vec<Pattern>,
+    name_allowed: bool,
+}
+
+/// What the exit keeps of a dialled egress stream so that it can be vetted again while it lives
+/// (protocol.md 5.3 and 8): the network, who asked, the target as canonicalized and the one
+/// address that was dialled. No payload, no socket.
+#[derive(Debug)]
+pub(crate) struct LiveStream {
+    executor: Arc<EgressExecutor>,
+    network_id: NetworkId,
+    initiator: NodeId,
+    target: Target,
+    addr: SocketAddr,
+}
+
+impl LiveStream {
+    /// Whether the node's rule, as it is now, still allows this stream; `Err` is the reason it
+    /// does not (a deny now matches the name or the address, or the rule entry is gone).
+    pub(crate) async fn still_allowed(&self) -> Result<(), String> {
+        self.executor
+            .revet(&self.network_id, &self.target, self.addr)
+            .await
+            .map_err(|fail| fail.reason().to_owned())
+    }
+
+    /// The close line of the stream ([`EgressExecutor::log_close`]).
+    pub(crate) fn log_close(&self, outcome: &str, up: u64, down: u64, elapsed: Duration) {
+        self.executor.log_close(self, outcome, up, down, elapsed);
+    }
+
+    fn target_host(&self) -> String {
+        match self.target.host() {
+            Host::Addr(ip) => ip.to_string(),
+            Host::Name(name) => name.as_str().to_owned(),
+        }
+    }
+}
+
+/// `host` for a log line: at most 255 characters, each escaped.
+fn escape_host(host: &str) -> String {
+    host.chars()
+        .take(255)
+        .flat_map(char::escape_default)
+        .collect()
 }
 
 #[cfg(test)]
@@ -2705,5 +2932,299 @@ Main:
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         assert!(ok, "A's lookups were never given back");
+    }
+
+    // --- slice 3: the own state off the runtime thread, the node's own deny list, re-vetting ---
+
+    #[tokio::test]
+    async fn e1_n3_the_own_state_is_read_on_a_blocking_thread_and_a_panic_fails_closed() {
+        let sink = counter().await;
+        let test_thread = std::thread::current().id();
+        let readers: Arc<Mutex<Vec<std::thread::ThreadId>>> = Arc::default();
+        let (own_seen, links_seen) = (readers.clone(), readers.clone());
+        let (executor, _seen) = executor_for(rule(&internet(), &default_deny()), sink.addr);
+        let executor = executor
+            .with_own_addresses(move || {
+                own_seen.lock().unwrap().push(std::thread::current().id());
+                Ok(Vec::new())
+            })
+            .with_own_links(move || {
+                links_seen.lock().unwrap().push(std::thread::current().id());
+                Ok(Vec::new())
+            });
+        dial(&executor, "203.0.113.9", 443).await.unwrap();
+        let readers = readers.lock().unwrap().clone();
+        assert_eq!(readers.len(), 2, "each file is read once per OPEN");
+        assert!(
+            readers.iter().all(|thread| *thread != test_thread),
+            "the /proc files were read on the runtime thread"
+        );
+
+        // A reader that panics is a failure to read: nothing is dialled.
+        let (broken, seen) = executor_for(rule(&internet(), &default_deny()), sink.addr);
+        let broken = broken.with_own_addresses(|| panic!("reader panicked"));
+        for host in ["203.0.113.9", "example.com"] {
+            let refusal = refusal_of(&broken, host, 443).await;
+            assert_eq!(refusal.code, ErrorCode::TargetUnreachable, "{host}");
+        }
+        assert!(seen.connected().is_empty());
+        assert!(seen.resolved().is_empty());
+        assert!(broken.logged().join("\n").contains("cannot be read"));
+        // The on-link reader failing refuses everything too.
+        let (broken, seen) = executor_for(rule(&internet(), &default_deny()), sink.addr);
+        let broken = broken.with_own_links(|| Err(io::Error::other("no /proc")));
+        assert_eq!(
+            refusal_of(&broken, "203.0.113.9", 443).await.code,
+            ErrorCode::TargetUnreachable
+        );
+        assert!(seen.connected().is_empty());
+    }
+
+    fn local_deny(entries: &[&str]) -> Vec<Pattern> {
+        parse_local_deny(&entries.iter().map(|e| (*e).to_owned()).collect::<Vec<_>>()).unwrap()
+    }
+
+    #[test]
+    fn the_local_deny_list_is_parsed_strictly() {
+        for good in [
+            "10.0.0.0/8",
+            "203.0.113.9",
+            "203.0.113.0/24:443",
+            "*.corp.example",
+            "db.corp.example",
+            "*:25",
+            "self",
+            "[2001:db8::]/32:443",
+            "2001:db8::/32",
+        ] {
+            parse_local_deny(&[good.to_owned()]).unwrap_or_else(|e| panic!("{good}: {e}"));
+        }
+        assert!(parse_local_deny(&[]).unwrap().is_empty());
+        for bad in [
+            "",
+            "10.0.0.0/33",
+            "10.1.2.3/8",
+            "Corp.Example",
+            "*.Corp.Example",
+            "a_b.example",
+            "10.0.0.0/8:0",
+            "*:0",
+            "::ffff:10.0.0.1",
+            "::ffff:10.0.0.0/104",
+            "[::ffff:10.0.0.1]:80",
+            "http://example.com",
+            "127.1",
+        ] {
+            let error = parse_local_deny(&["10.0.0.0/8".to_owned(), bad.to_owned()])
+                .expect_err(&format!("{bad:?} parsed"));
+            assert!(error.contains(&format!("{bad:?}")), "{error}");
+        }
+        let many: Vec<String> = (0..=MAX_LOCAL_DENY).map(|_| "*:25".to_owned()).collect();
+        assert!(parse_local_deny(&many).is_err());
+        assert!(parse_local_deny(&many[..MAX_LOCAL_DENY]).is_ok());
+    }
+
+    #[tokio::test]
+    async fn the_local_deny_list_narrows_and_no_signed_allow_lifts_it() {
+        let sink = counter().await;
+        let table = vec![
+            ("db.corp.example", vec!["198.51.100.5"]),
+            ("web.example", vec!["203.0.113.9"]),
+            ("fine.example", vec!["198.51.100.77"]),
+        ];
+        // The signed rule is as generous as it gets, with an allow more specific than the local
+        // deny entries.
+        let mut allow = internet();
+        allow.extend(["203.0.113.9/32", "db.corp.example", "*:8080"]);
+        let (executor, seen) = executor(rule(&allow, &default_deny()), table, sink.addr);
+        let executor = executor.with_local_deny(local_deny(&[
+            "203.0.113.0/24",
+            "*.corp.example",
+            "198.51.100.200:9000",
+            "*:8081",
+        ]));
+        // An address literal in the list: forbidden, and not dialled.
+        assert_eq!(
+            refusal_of(&executor, "203.0.113.9", 443).await.code,
+            ErrorCode::Forbidden
+        );
+        // A name the list denies is refused before it is looked up, though the signed rule
+        // names it exactly.
+        assert_eq!(
+            refusal_of(&executor, "db.corp.example", 443).await.code,
+            ErrorCode::Forbidden
+        );
+        assert!(seen.resolved().is_empty());
+        // A name that resolves into the list is dropped like any refused address.
+        assert_eq!(
+            refusal_of(&executor, "web.example", 443).await.code,
+            ErrorCode::TargetUnreachable
+        );
+        assert!(
+            executor
+                .logged()
+                .join("\n")
+                .contains("203.0.113.9 (denied by the node's own deny list)")
+        );
+        // A port entry, for a literal and for a name.
+        assert_eq!(
+            refusal_of(&executor, "198.51.100.1", 8081).await.code,
+            ErrorCode::Forbidden
+        );
+        assert_eq!(
+            refusal_of(&executor, "fine.example", 8081).await.code,
+            ErrorCode::Forbidden
+        );
+        assert_eq!(
+            refusal_of(&executor, "198.51.100.200", 9000).await.code,
+            ErrorCode::Forbidden
+        );
+        assert!(seen.connected().is_empty());
+        // Neighbours of the entries are dialled.
+        dial(&executor, "198.51.100.200", 9001).await.unwrap();
+        dial(&executor, "fine.example", 443).await.unwrap();
+        assert_eq!(seen.connected().len(), 2);
+        // `self` in the local list is every address of the exit.
+        let (executor, _) = executor_for(rule(&internet(), &default_deny()), sink.addr);
+        let executor = executor
+            .with_own_addresses(|| Ok(vec![ip("203.0.113.9")]))
+            .with_local_deny(local_deny(&["self"]));
+        assert_eq!(
+            refusal_of(&executor, "203.0.113.9", 443).await.code,
+            ErrorCode::Forbidden
+        );
+        // Without a list nothing is added.
+        let (executor, _) = executor_for(rule(&internet(), &default_deny()), sink.addr);
+        dial(&executor, "203.0.113.9", 443).await.unwrap();
+    }
+
+    /// A rule that a test can change while a stream lives.
+    type RuleCell = Arc<Mutex<Option<EgressRule>>>;
+
+    fn switchable(
+        first: EgressRule,
+        table: Vec<(&'static str, Vec<&'static str>)>,
+        sink: SocketAddr,
+    ) -> (Arc<EgressExecutor>, RuleCell) {
+        let cell: RuleCell = Arc::new(Mutex::new(Some(first)));
+        let read = cell.clone();
+        let executor = EgressExecutor::new(
+            true,
+            Arc::new(move |_: &NetworkId| read.lock().unwrap().clone()),
+        )
+        .with_own_addresses(|| Ok(Vec::new()))
+        .with_own_links(|| Ok(Vec::new()))
+        .with_resolver(move |host, port| {
+            table
+                .iter()
+                .find(|(name, _)| *name == host)
+                .map(|(_, answers)| {
+                    answers
+                        .iter()
+                        .map(|a| SocketAddr::new(ip(a), port))
+                        .collect()
+                })
+                .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no such host"))
+        })
+        .with_connector(move |_addr, _buffer| async move { TcpStream::connect(sink).await });
+        (Arc::new(executor), cell)
+    }
+
+    #[tokio::test]
+    async fn a_live_stream_is_vetted_again_against_the_rule_as_it_is_now() {
+        let sink = counter().await;
+        let table = vec![("web.example", vec!["203.0.113.9"])];
+        let (executor, cell) = switchable(rule(&internet(), &default_deny()), table, sink.addr);
+        let live_for = |host: &'static str| {
+            let executor = executor.clone();
+            async move {
+                executor
+                    .dial_live(&request(host, 443), 64 * 1024, TIMEOUT)
+                    .await
+                    .map(|(_socket, live)| live)
+                    .unwrap_or_else(|_| panic!("{host} was refused"))
+            }
+        };
+        let by_address = live_for("203.0.113.9").await;
+        let by_name = live_for("web.example").await;
+        // Nothing changed: both are still allowed.
+        by_address.still_allowed().await.unwrap();
+        by_name.still_allowed().await.unwrap();
+
+        // The signed rule gains a more specific deny for the vetted address (the address is
+        // still inside the allow): both are refused now, the name one through its address.
+        let mut denied = rule(&internet(), &default_deny());
+        denied.deny.push(HostPortPattern("203.0.113.9/32".into()));
+        *cell.lock().unwrap() = Some(denied);
+        let why = by_address.still_allowed().await.unwrap_err();
+        assert!(why.contains("denied by a rule"), "{why}");
+        let why = by_name.still_allowed().await.unwrap_err();
+        assert!(why.contains("denied by a rule"), "{why}");
+
+        // A name deny now matches the name though the address is fine.
+        let mut denied = rule(&internet(), &default_deny());
+        denied.deny.push(HostPortPattern("*.example".into()));
+        *cell.lock().unwrap() = Some(denied);
+        let why = by_name.still_allowed().await.unwrap_err();
+        assert!(why.contains("name rule"), "{why}");
+        by_address.still_allowed().await.unwrap();
+
+        // An allow list that no longer covers the address.
+        *cell.lock().unwrap() = Some(rule(&["198.51.100.0/24"], &default_deny()));
+        assert!(by_address.still_allowed().await.is_err());
+        assert!(by_name.still_allowed().await.is_err());
+
+        // An allow list that became empty allows nothing.
+        *cell.lock().unwrap() = Some(rule(&[], &default_deny()));
+        assert!(by_address.still_allowed().await.is_err());
+
+        // A rule entry that disappeared.
+        *cell.lock().unwrap() = None;
+        let why = by_address.still_allowed().await.unwrap_err();
+        assert!(why.contains("no egress rule"), "{why}");
+        let why = by_name.still_allowed().await.unwrap_err();
+        assert!(why.contains("no egress rule"), "{why}");
+
+        // Back to the original rule: allowed again (the check reads the current rule).
+        *cell.lock().unwrap() = Some(rule(&internet(), &default_deny()));
+        by_address.still_allowed().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_live_stream_is_refused_when_the_exits_own_state_cannot_be_read_now() {
+        let sink = counter().await;
+        let (executor, _cell) =
+            switchable(rule(&internet(), &default_deny()), Vec::new(), sink.addr);
+        let live_with = |executor: Arc<EgressExecutor>| LiveStream {
+            executor,
+            network_id: NetworkId::from([1u8; 32]),
+            initiator: NodeId::from([2u8; 32]),
+            target: Target::canonicalize("203.0.113.9", 443).unwrap(),
+            addr: SocketAddr::new(ip("203.0.113.9"), 443),
+        };
+        live_with(executor.clone()).still_allowed().await.unwrap();
+        // The same stream against an executor whose reader fails: fail closed.
+        let broken = Arc::try_unwrap(executor)
+            .ok()
+            .unwrap()
+            .with_own_links(|| Err(io::Error::other("no /proc")));
+        let why = live_with(Arc::new(broken))
+            .still_allowed()
+            .await
+            .unwrap_err();
+        assert!(why.contains("cannot be read"), "{why}");
+    }
+
+    #[test]
+    fn a_log_host_is_escaped_and_cut_to_255_characters() {
+        let long = format!("{}\u{1b}[2J\n", "a".repeat(300));
+        assert_eq!(escape_host(&long), "a".repeat(255));
+        let escaped = escape_host("a\u{1b}[2J\nb\u{202e}");
+        assert!(
+            !escaped.contains('\u{1b}') && !escaped.contains('\n'),
+            "{escaped}"
+        );
+        assert!(!escaped.contains('\u{202e}'), "{escaped}");
+        assert_eq!(escape_host("example.com"), "example.com");
     }
 }

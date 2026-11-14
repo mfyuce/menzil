@@ -120,7 +120,7 @@ use menzil_stream::{
     Authorizer, OpenDecision, OpenError, OpenRefusal, OpenRequest, Responded, ServiceHandler,
     Stream, StreamMuxError, initiate_open, respond_to_open,
 };
-use tokio::sync::Semaphore;
+use tokio::sync::{Notify, Semaphore};
 
 use crate::channels::{Channel, ChannelError};
 use crate::l4_session::{L4SessionAcceptor, L4SessionHandle};
@@ -423,6 +423,33 @@ struct StreamsInner {
 struct Entry {
     request: OpenRequest,
     abort: tokio::task::AbortHandle,
+    /// Set by a served stream that must be vetted again by something other than the
+    /// [`Authorizer`] ([`attach_recheck`]); a recheck wakes it.
+    poke: Option<Arc<Notify>>,
+}
+
+tokio::task_local! {
+    /// The registry and the entry id of the accepted stream whose task is running: what
+    /// [`attach_recheck`] needs to find its entry.
+    static CURRENT: (AcceptedStreams, u64);
+}
+
+/// Called by the handling of an accepted stream, inside its task, to be woken by every
+/// [`AcceptedStreams::recheck`] from now on: an egress pipe uses it to vet its target again
+/// against the node's rule, which the [`Authorizer`] does not see (protocol.md 5.3 and 8).
+/// `false` when the caller is not a tracked stream's task (nothing will ever wake it). The
+/// stream must vet itself once after attaching: a recheck that ran before the attach is not
+/// replayed.
+pub(crate) fn attach_recheck(poke: Arc<Notify>) -> bool {
+    CURRENT
+        .try_with(|(streams, id)| match streams.entries().get_mut(id) {
+            Some(entry) => {
+                entry.poke = Some(poke);
+                true
+            }
+            None => false,
+        })
+        .unwrap_or(false)
 }
 
 impl AcceptedStreams {
@@ -454,23 +481,34 @@ impl AcceptedStreams {
 
     /// Asks `authorizer` about every served stream again and stops each one it denies: the
     /// task is aborted, so the peer reads a reset and the local target gets an RST. A stream
-    /// it allows is left alone. Returns how many were stopped.
+    /// it allows is left alone. Returns how many were stopped by the `authorizer`. A stream that
+    /// vets itself apart from it (an egress pipe, [`attach_recheck`]) is woken for every
+    /// recheck and resets itself when its own check fails, a moment later; it is not counted.
     ///
     /// The generation is bumped before the map is read, and a stream registers before it
     /// compares generations (see [`accept_loop_tracked`]): whichever of the two runs second
     /// covers the stream, so none is missed. `authorizer` runs with no lock held.
     pub fn recheck(&self, authorizer: &dyn Authorizer) -> usize {
         self.inner.generation.fetch_add(1, Ordering::SeqCst);
-        let snapshot: Vec<(OpenRequest, tokio::task::AbortHandle)> = self
+        type Seen = (OpenRequest, tokio::task::AbortHandle, Option<Arc<Notify>>);
+        let snapshot: Vec<Seen> = self
             .entries()
             .values()
-            .map(|entry| (entry.request.clone(), entry.abort.clone()))
+            .map(|entry| {
+                (
+                    entry.request.clone(),
+                    entry.abort.clone(),
+                    entry.poke.clone(),
+                )
+            })
             .collect();
         let mut stopped = 0;
-        for (request, abort) in snapshot {
+        for (request, abort, poke) in snapshot {
             if let OpenDecision::Deny(_) = authorizer.authorize(&as_member_request(&request)) {
                 abort.abort();
                 stopped += 1;
+            } else if let Some(poke) = poke {
+                poke.notify_one();
             }
         }
         stopped
@@ -691,16 +729,18 @@ fn register<H>(
         // Spawned under the lock: a task that ends at once drops its guard, which waits here
         // until the entry exists, so the entry cannot outlive the task.
         let mut entries = streams.entries();
-        let join = tokio::spawn(async move {
+        let scope = (streams.clone(), id);
+        let join = tokio::spawn(CURRENT.scope(scope, async move {
             let _guard = guard;
             handling.await;
-        });
+        }));
         let abort = join.abort_handle();
         entries.insert(
             id,
             Entry {
                 request: request.clone(),
                 abort: abort.clone(),
+                poke: None,
             },
         );
         abort
@@ -2388,5 +2428,172 @@ mod tests {
             "a datagram reached a handler after its stream ended"
         );
         accept_task.abort();
+    }
+
+    /// Slice 3 (protocol.md 5.3, 8): a live egress stream is vetted again by every recheck
+    /// against the exit node's own rule, which the authorizer does not look at. `change` edits
+    /// the rule; the stream must be reset (the target sees an RST) exactly when it says so.
+    async fn live_egress_stream_after_a_rule_change(
+        change: impl FnOnce(&mut Option<menzil_proto::EgressRule>),
+        reset: bool,
+    ) {
+        use crate::egress::EgressExecutor;
+        use crate::serve::LocalServices;
+        use menzil_proto::{EgressRule, HostPortPattern};
+
+        let TwoSessions {
+            a,
+            a_acceptor: _a_acceptor,
+            mut b,
+            b_handle: _b_handle,
+            _pump_a_to_b,
+            _pump_b_to_a,
+            _task_a,
+            _task_b,
+            _a_epoch_ended_tx,
+            _b_epoch_ended_tx,
+        } = two_sessions();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let first = EgressRule {
+            node_id: NodeId::from([7u8; 32]),
+            allow: vec![HostPortPattern("127.0.0.0/8".into())],
+            deny: vec![],
+        };
+        let cell: Arc<std::sync::Mutex<Option<EgressRule>>> =
+            Arc::new(std::sync::Mutex::new(Some(first)));
+        let read = cell.clone();
+        let services = LocalServices::new().with_egress(
+            EgressExecutor::new(
+                true,
+                Arc::new(move |_: &NetworkId| read.lock().unwrap().clone()),
+            )
+            .with_own_addresses(|| Ok(Vec::new()))
+            .with_own_links(|| Ok(Vec::new()))
+            .narrowed_floor_for_tests(),
+        );
+        let switch = Switchable::default();
+        let streams = AcceptedStreams::new();
+        let accept_task = {
+            let (switch, streams) = (switch.clone(), streams.clone());
+            tokio::spawn(async move {
+                accept_loop_tracked(&mut b, switch, services, streams).await;
+            })
+        };
+        let target = OpenTarget {
+            host: "127.0.0.1".to_string(),
+            port,
+            transport: None,
+        };
+        let mut stream = open(&a, egress_star(), Some(target)).await.unwrap();
+        let (mut socket, _) = tokio::time::timeout(STEP, listener.accept())
+            .await
+            .unwrap()
+            .unwrap();
+        wait_for_len(&streams, 1).await;
+
+        // A recheck with nothing changed leaves the stream carrying bytes both ways.
+        assert_eq!(streams.recheck(&switch), 0);
+        let mut byte = [0u8; 1];
+        stream.write_all(b"x").await.unwrap();
+        stream.flush().await.unwrap();
+        tokio::time::timeout(
+            STEP,
+            tokio::io::AsyncReadExt::read_exact(&mut socket, &mut byte),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        // Give the woken pipe time to vet itself: it must still be there.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(streams.len(), 1);
+        tokio::io::AsyncWriteExt::write_all(&mut socket, b"y")
+            .await
+            .unwrap();
+        tokio::time::timeout(STEP, stream.read_exact(&mut byte))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&byte, b"y");
+
+        // The rule changes and the node rechecks, as it does when the Policy changes.
+        change(&mut cell.lock().unwrap());
+        assert_eq!(streams.recheck(&switch), 0, "the authorizer allows it");
+        if reset {
+            expect_reset(&mut stream).await;
+            let error =
+                tokio::time::timeout(STEP, tokio::io::AsyncReadExt::read(&mut socket, &mut byte))
+                    .await
+                    .expect("the egress target was left connected")
+                    .expect_err("the target must see a reset, not a clean end");
+            assert!(
+                matches!(
+                    error.kind(),
+                    std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted
+                ),
+                "the target saw {error:?}"
+            );
+            wait_for_len(&streams, 0).await;
+        } else {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            assert_eq!(streams.len(), 1, "a stream the rule still allows was reset");
+            stream.write_all(b"z").await.unwrap();
+            stream.flush().await.unwrap();
+            tokio::time::timeout(
+                STEP,
+                tokio::io::AsyncReadExt::read_exact(&mut socket, &mut byte),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(&byte, b"z");
+        }
+        accept_task.abort();
+    }
+
+    #[tokio::test]
+    async fn recheck_resets_a_live_egress_stream_whose_rule_entry_is_gone() {
+        live_egress_stream_after_a_rule_change(|rule| *rule = None, true).await;
+    }
+
+    #[tokio::test]
+    async fn recheck_resets_a_live_egress_stream_whose_allow_no_longer_covers_its_address() {
+        live_egress_stream_after_a_rule_change(
+            |rule| {
+                rule.as_mut().unwrap().allow =
+                    vec![menzil_proto::HostPortPattern("198.51.100.0/24".into())];
+            },
+            true,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn recheck_resets_a_live_egress_stream_that_a_new_deny_matches() {
+        live_egress_stream_after_a_rule_change(
+            |rule| {
+                rule.as_mut()
+                    .unwrap()
+                    .deny
+                    .push(menzil_proto::HostPortPattern("127.0.0.1/32".into()));
+            },
+            true,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn recheck_leaves_a_live_egress_stream_the_new_rule_still_allows() {
+        live_egress_stream_after_a_rule_change(
+            |rule| {
+                let rule = rule.as_mut().unwrap();
+                rule.allow
+                    .push(menzil_proto::HostPortPattern("198.51.100.0/24".into()));
+                rule.deny
+                    .push(menzil_proto::HostPortPattern("198.51.100.9/32".into()));
+            },
+            false,
+        )
+        .await;
     }
 }

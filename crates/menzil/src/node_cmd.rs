@@ -999,10 +999,15 @@ where
     let own_node_id = keys.node_id();
     let services = config.local_services()?;
     let services = match config.egress_enabled() {
-        true => services.with_egress(EgressExecutor::new(
-            true,
-            Arc::new(PolicyEgressRules::new(policies.clone(), own_node_id)),
-        )),
+        // The limits are in `services` already (`Config::local_services`); the node's own
+        // extra deny list narrows what the Policy allows.
+        true => services.with_egress(
+            EgressExecutor::new(
+                true,
+                Arc::new(PolicyEgressRules::new(policies.clone(), own_node_id)),
+            )
+            .with_local_deny(config.egress_checked()?.deny),
+        ),
         false => services,
     };
     // The node serves from a clone; `expose` and the reload change the table through this one.

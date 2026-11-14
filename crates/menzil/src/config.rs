@@ -23,6 +23,12 @@
 //! # restart.
 //! # [egress]
 //! # enabled = true
+//! # max_connections = 128           # egress streams at once, all initiators together (a pool of
+//! #                                 # its own); at most 1000000
+//! # max_connections_per_peer = 32   # egress streams at once for one initiator
+//! # idle_secs = 300                 # reset a stream with no byte in either direction this long
+//! #                                 # (10 to 86400)
+//! # deny = ["10.9.0.0/16", "*.corp.example", "*:3389"]   # extra local denies; only narrows
 //!
 //! # Optional: the relay's share domain H (public names are `<name>.H`, or `<name>.<tenant>.H`).
 //! # Only `menzil expose` and `menzil status` use it, to print `https://<name>.H`; the relay
@@ -62,7 +68,10 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow, bail};
 use menzil_carrier::{ConnectionInfo, ProxyOverride, redact_userinfo};
 use menzil_node::validate_shares;
-use menzil_node::{LocalServices, LocalTarget, MAX_CONNECT_TIMEOUT, ServeLimits};
+use menzil_node::{
+    EgressLimits, LocalServices, LocalTarget, MAX_CONNECT_TIMEOUT, MAX_EGRESS_IDLE,
+    MIN_EGRESS_IDLE, ServeLimits,
+};
 use menzil_proto::{ServiceId, ServiceKind, Share, ShareMode};
 use serde::Deserialize;
 
@@ -103,20 +112,87 @@ pub struct Config {
 /// ```toml
 /// [egress]
 /// enabled = true
+/// max_connections = 128
+/// max_connections_per_peer = 32
+/// idle_secs = 300
+/// deny = ["10.9.0.0/16", "*.corp.example", "*:3389"]
 /// ```
 ///
 /// `enabled` is the node's own consent and it is off by default: with the table absent, or
 /// `enabled = false`, an egress OPEN is answered `unknown_service` (after the grant check), no
-/// matter what the Policy says. It is the only key (no limits yet); an unknown key is an error
-/// that stops `menzil node` at start, like everywhere in this file. The table is read at start
-/// only: a change needs a restart of `menzil node` (the periodic reload applies `[[share]]`
-/// entries, not this).
-#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+/// matter what the Policy says. The other keys are optional and keep the library's defaults:
+/// `max_connections` and `max_connections_per_peer` are the egress streams served at once (a
+/// pool of their own, apart from `[serve]`; 1 to 1000000), `idle_secs` the time without a byte
+/// in either direction after which a stream is reset (10 to 86400), and `deny` an extra list of
+/// patterns (the grammar of protocol.md 8) that the exit refuses whatever the signed Policy
+/// allows: it can only narrow. An entry that does not parse, or is an IPv4 mapped IPv6 pattern,
+/// fails the load of the file. An unknown key is an error that stops `menzil node` at start,
+/// like everywhere in this file. The table is read at start only: a change needs a restart of
+/// `menzil node` (the periodic reload applies `[[share]]` entries, not this).
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct EgressSettings {
     /// Whether this node serves as an egress exit. Default false.
     #[serde(default)]
     pub enabled: bool,
+    /// Egress streams served at once, all initiators together.
+    pub max_connections: Option<usize>,
+    /// Egress streams served at once for one initiator.
+    pub max_connections_per_peer: Option<usize>,
+    /// Seconds without a byte in either direction before a stream is reset.
+    pub idle_secs: Option<u64>,
+    /// The node's own extra deny list.
+    #[serde(default)]
+    pub deny: Vec<String>,
+}
+
+/// [`EgressSettings`] checked: the limits to serve under and the parsed local deny list.
+#[derive(Clone, Debug)]
+pub struct EgressChecked {
+    /// The limits ([`EgressLimits`]), the defaults for a key that was left out.
+    pub limits: EgressLimits,
+    /// The local deny list, parsed.
+    pub deny: Vec<menzil_node::egress::Pattern>,
+}
+
+impl EgressSettings {
+    /// Checks every key: a count of 0 or above [`MAX_SERVE_CONNECTIONS`], an idle time outside
+    /// 10 to 86400 seconds, and a `deny` entry that does not parse (or is IPv4 mapped IPv6) are
+    /// errors that name the key, never corrected quietly.
+    pub fn checked(&self) -> Result<EgressChecked> {
+        let in_range = |key: &str, value: usize| {
+            if value == 0 {
+                bail!(
+                    "{key} in [egress] of config.toml is 0: an exit that serves no stream serves nothing (leave the key out for the default)"
+                );
+            }
+            if value > MAX_SERVE_CONNECTIONS {
+                bail!(
+                    "{key} in [egress] of config.toml is {value}: it must be at most {MAX_SERVE_CONNECTIONS} (each stream holds a file descriptor)"
+                );
+            }
+            Ok(value)
+        };
+        let mut limits = EgressLimits::default();
+        if let Some(value) = self.max_connections {
+            limits.max_connections = in_range("max_connections", value)?;
+        }
+        if let Some(value) = self.max_connections_per_peer {
+            limits.max_connections_per_peer = in_range("max_connections_per_peer", value)?;
+        }
+        if let Some(seconds) = self.idle_secs {
+            let (least, most) = (MIN_EGRESS_IDLE.as_secs(), MAX_EGRESS_IDLE.as_secs());
+            if seconds < least || seconds > most {
+                bail!(
+                    "idle_secs in [egress] of config.toml is {seconds}: it must be from {least} to {most}"
+                );
+            }
+            limits.idle = Duration::from_secs(seconds);
+        }
+        let deny = menzil_node::egress::parse_local_deny(&self.deny)
+            .map_err(|e| anyhow!("deny in [egress] of config.toml: {e}"))?;
+        Ok(EgressChecked { limits, deny })
+    }
 }
 
 /// The `[acme]` table as written; [`Config::acme`] checks it. There is no default CA.
@@ -284,7 +360,7 @@ impl Config {
 
     /// Parses the text of a configuration file.
     pub fn parse(text: &str) -> Result<Self> {
-        toml::from_str(text).map_err(|e| {
+        let config: Self = toml::from_str(text).map_err(|e| {
             // The message and where it is, without the quoted line the full report adds (a
             // proxy URL in it can hold a password).
             match e.span() {
@@ -296,7 +372,11 @@ impl Config {
                 }
                 None => anyhow!("{}", e.message()),
             }
-        })
+        })?;
+        // The `[egress]` table is checked with the rest of the file: a deny entry the exit
+        // could not read must stop the load, not deny nothing in silence.
+        config.egress.checked()?;
+        Ok(config)
     }
 
     /// The relay to attach to; an error saying how to configure one if there is none.
@@ -401,6 +481,11 @@ impl Config {
         self.egress.enabled
     }
 
+    /// The `[egress]` table, checked ([`EgressSettings::checked`]).
+    pub fn egress_checked(&self) -> Result<EgressChecked> {
+        self.egress.checked()
+    }
+
     /// The services to serve, validated.
     pub fn local_services(&self) -> Result<LocalServices> {
         let mut services = LocalServices::new();
@@ -410,6 +495,7 @@ impl Config {
                 .map_err(|e| anyhow!("service {id} in config.toml: {e}"))?;
         }
         services = services.with_limits(self.serve.limits()?);
+        services = services.with_egress_limits(self.egress.checked()?.limits);
         if let Some(timeout) = self.serve.connect_timeout()? {
             services = services.with_connect_timeout(timeout);
         }
@@ -555,10 +641,16 @@ mod tests {
                 .unwrap()
                 .egress_enabled()
         );
-        assert!(Config::default().egress == EgressSettings { enabled: false });
+        assert!(Config::default().egress == EgressSettings::default());
         let on = Config::parse("[egress]\nenabled = true").unwrap();
         assert!(on.egress_enabled());
-        assert_eq!(on.egress, EgressSettings { enabled: true });
+        assert_eq!(
+            on.egress,
+            EgressSettings {
+                enabled: true,
+                ..EgressSettings::default()
+            }
+        );
         // It sits next to the other tables without disturbing them.
         let both =
             Config::parse("[services]\n\"tcp:ssh\" = \"127.0.0.1:22\"\n[egress]\nenabled = true")
@@ -570,10 +662,11 @@ mod tests {
     #[test]
     fn a_mistake_in_the_egress_table_is_an_error() {
         for (text, wanted) in [
-            // A key that is not there (no limits yet), and a typo of the one that is.
+            // A key that is not there, and a typo of one that is.
             ("[egress]\nenabled = true\nlimit = 5", "limit"),
             ("[egress]\nenable = true", "enable"),
             ("[egress]\nallow = [\"*\"]", "allow"),
+            ("[egress]\nidle = 5", "idle"),
             // The wrong type.
             ("[egress]\nenabled = \"yes\"", "boolean"),
             ("[egress]\nenabled = 1", "boolean"),
@@ -585,6 +678,100 @@ mod tests {
                 "{text:?} gave {error:#}"
             );
         }
+    }
+
+    #[test]
+    fn the_egress_table_sets_the_limits_the_idle_time_and_the_local_deny_list() {
+        use menzil_node::{DEFAULT_EGRESS_IDLE, EgressLimits};
+        let services = |text: &str| Config::parse(text).unwrap().local_services().unwrap();
+        // Nothing written: the defaults, 128 in all, 32 for one initiator, 300 s.
+        let plain = services("");
+        assert_eq!(plain.egress_limits(), EgressLimits::default());
+        assert_eq!(plain.egress_limits().max_connections, 128);
+        assert_eq!(plain.egress_limits().max_connections_per_peer, 32);
+        assert_eq!(plain.egress_limits().idle, DEFAULT_EGRESS_IDLE);
+        // The egress pool is not the serve pool.
+        let apart = services("[serve]\nmax_connections = 7\n[egress]\nmax_connections = 9\n");
+        assert_eq!(apart.limits().max_connections, 7);
+        assert_eq!(apart.egress_limits().max_connections, 9);
+        assert_eq!(apart.egress_limits().max_connections_per_peer, 32);
+        let all = services(
+            "[egress]\nmax_connections = 20\nmax_connections_per_peer = 3\nidle_secs = 10\n",
+        );
+        assert_eq!(
+            all.egress_limits(),
+            EgressLimits {
+                max_connections: 20,
+                max_connections_per_peer: 3,
+                idle: Duration::from_secs(10),
+            }
+        );
+        let top = services(&format!(
+            "[egress]\nmax_connections = {MAX_SERVE_CONNECTIONS}\nidle_secs = 86400\n"
+        ));
+        assert_eq!(top.egress_limits().max_connections, MAX_SERVE_CONNECTIONS);
+        assert_eq!(top.egress_limits().idle, Duration::from_secs(86_400));
+        // The deny list is parsed.
+        let config = Config::parse(
+            "[egress]\nenabled = true\ndeny = [\"10.9.0.0/16\", \"*.corp.example\", \"*:3389\", \"self\"]\n",
+        )
+        .unwrap();
+        assert_eq!(config.egress_checked().unwrap().deny.len(), 4);
+        assert!(
+            Config::parse("")
+                .unwrap()
+                .egress_checked()
+                .unwrap()
+                .deny
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn an_egress_value_that_would_be_changed_quietly_fails_the_load() {
+        for (text, wanted) in [
+            ("[egress]\nmax_connections = 0", "max_connections"),
+            (
+                "[egress]\nmax_connections_per_peer = 0",
+                "max_connections_per_peer",
+            ),
+            ("[egress]\nmax_connections = 1000001", "1000000"),
+            (
+                "[egress]\nmax_connections = 18446744073709551615",
+                "max_connections",
+            ),
+            ("[egress]\nmax_connections_per_peer = 1000001", "1000000"),
+            ("[egress]\nidle_secs = 0", "idle_secs"),
+            ("[egress]\nidle_secs = 9", "10 to 86400"),
+            ("[egress]\nidle_secs = 86401", "10 to 86400"),
+            ("[egress]\nidle_secs = -1", "expected u64"),
+            // A deny entry that does not parse fails the load, and so does an IPv4 mapped one.
+            ("[egress]\ndeny = [\"10.0.0.0/33\"]", "10.0.0.0/33"),
+            ("[egress]\ndeny = [\"Corp.Example\"]", "Corp.Example"),
+            ("[egress]\ndeny = [\"::ffff:10.0.0.0/104\"]", "IPv4 mapped"),
+            ("[egress]\ndeny = [\"::ffff:10.1.2.3\"]", "IPv4 mapped"),
+            (
+                "[egress]\ndeny = [\"ok.example\", \"\"]",
+                "deny in [egress]",
+            ),
+            ("[egress]\ndeny = \"*\"", "sequence"),
+            ("[egress]\ndeny = [1]", "string"),
+        ] {
+            let error = Config::parse(text).unwrap_err();
+            assert!(
+                format!("{error:#}").contains(wanted),
+                "{text:?} gave {error:#}"
+            );
+        }
+        // It fails the load of a file on disk too, not only the parse of a string.
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home::new(dir.path());
+        std::fs::write(
+            home.config_path(),
+            "[egress]\nenabled = true\ndeny = [\"::ffff:10.0.0.1\"]\n",
+        )
+        .unwrap();
+        assert!(Config::load(&home).is_err());
     }
 
     #[test]
