@@ -131,4 +131,53 @@ async fn an_evicted_node_adopts_the_roster_it_is_sent_and_keeps_its_other_networ
         );
         again.close().await;
     }
+
+    // A HELLO refused for standing: the node holds a stale Roster (seq 1) that still lists it,
+    // the relay holds seq 2. The refusal sends that Roster before the ERROR, so the node learns
+    // it; `not_member` sends none (isolation rule I2).
+    let refused: [(ErrorCode, Next, bool); 3] = [
+        (
+            ErrorCode::Revoked,
+            |node, other| (vec![(other, 1)], vec![node]),
+            true,
+        ),
+        (
+            ErrorCode::StaleSerial,
+            |node, other| (vec![(node, 2), (other, 1)], vec![]),
+            true,
+        ),
+        (
+            ErrorCode::NotMember,
+            |_node, other| (vec![(other, 1)], vec![]),
+            false,
+        ),
+    ];
+    for (expected, next, learns) in refused {
+        let node = identity();
+        let owner_a = SigningKey::generate(&mut rand::rng());
+        let (network_a, a1) = roster(&owner_a, 1, &[(node.node_id, 1), (other, 1)], &[]);
+        let (members, revoked) = next(node.node_id, other);
+        let (_, a2) = roster(&owner_a, 2, &members, &revoked);
+        relay.relay.rosters().set(&a1).unwrap();
+        relay.relay.rosters().set(&a2).unwrap();
+
+        let config = session_config(&relay, &node, network_a);
+        let held = Arc::new(RosterStore::new());
+        held.set(&a1).unwrap();
+        let mut session = Session::connect(&config, &env, Arc::clone(&held))
+            .await
+            .unwrap();
+        let told = timeout(Duration::from_secs(10), session.recv())
+            .await
+            .expect("the relay refuses the HELLO");
+        assert!(
+            matches!(&told, Ok(Record::Error(body)) if body.code == expected),
+            "refused {expected:?}: got {told:?}"
+        );
+        assert_eq!(
+            held.body(&network_a).unwrap().seq,
+            if learns { 2 } else { 1 },
+            "refused {expected:?}: the Roster is sent before the ERROR only for standing"
+        );
+    }
 }

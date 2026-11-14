@@ -286,6 +286,16 @@ async fn run_handshake_and_validate(
     match checked {
         Ok((node_id, pre_attach)) => Ok((conn, transport, node_id, hello, pre_attach)),
         Err(rejection) => {
+            // A node refused for its standing (revoked, or `min_serial` above its serial) is
+            // first sent the Roster of the network concerned, as `send_eviction` does, so that it
+            // leaves that network out of its next HELLO. Never for `not_member`: that answer
+            // must not tell a served network from an unserved one (isolation rule I2).
+            if matches!(rejection.code, ErrorCode::Revoked | ErrorCode::StaleSerial)
+                && let Some(network_id) = rejection.network
+                && let Some(records) = doc::roster_doc_records(&relay.rosters, &network_id)
+            {
+                send_all(&mut conn, &mut transport, records).await;
+            }
             let error_record = Record::Error(ErrorBody {
                 code: rejection.code,
                 msg: rejection.message.clone(),
