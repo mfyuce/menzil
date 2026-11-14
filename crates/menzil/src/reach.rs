@@ -62,7 +62,7 @@ pub const REACH_SOCKET: SocketKind = SocketKind {
 
 /// A connection that is carried: its halves are borrowed for the bridge, and closing it is made
 /// to reset or to end cleanly where the kind of socket can do both.
-trait Connection: AsyncRead + AsyncWrite + Unpin + Send + 'static {
+pub(crate) trait Connection: AsyncRead + AsyncWrite + Unpin + Send + 'static {
     /// Once, when it is accepted.
     fn prepare(&self);
     /// Makes closing it send an RST (`true`) or the usual orderly end after what is queued
@@ -90,7 +90,7 @@ impl Connection for UnixStream {
 }
 
 /// Where connections come from: a listener, or (in the tests) one that fails on purpose.
-trait Accept {
+pub(crate) trait Accept {
     type Connection: Connection;
 
     /// The next connection, and who is on the other end in a few words, for the log.
@@ -118,23 +118,35 @@ impl Accept for UserSocket {
     async fn accept(&self) -> io::Result<(UnixStream, String)> {
         loop {
             let (connection, _) = self.listener.accept().await?;
-            match connection.peer_cred() {
-                Ok(peer) if peer.uid() == self.uid => {
-                    let who = match peer.pid() {
-                        Some(pid) => format!("process {pid}"),
-                        None => "a local process".to_string(),
-                    };
-                    return Ok((connection, who));
-                }
-                Ok(peer) => eprintln!(
-                    "menzil: a process of another user (uid {}) connected to the reach socket, closing it",
-                    peer.uid()
-                ),
-                Err(error) => eprintln!(
-                    "menzil: could not tell who connected to the reach socket, closing it: {}",
-                    text::one_line(&error.to_string(), 300)
-                ),
+            if let Some(who) = admit(&connection, self.uid, "the reach socket") {
+                return Ok((connection, who));
             }
+        }
+    }
+}
+
+/// Who is on `connection`, in a few words, if it is a process of user `uid`; otherwise (another
+/// user, or not told) it says so, naming `what`, and gives `None`: the caller closes it
+/// unanswered. The one uid check of every private Unix socket (`reach`, `proxy`).
+pub(crate) fn admit(connection: &UnixStream, uid: u32, what: &str) -> Option<String> {
+    match connection.peer_cred() {
+        Ok(peer) if peer.uid() == uid => Some(match peer.pid() {
+            Some(pid) => format!("process {pid}"),
+            None => "a local process".to_string(),
+        }),
+        Ok(peer) => {
+            eprintln!(
+                "menzil: a process of another user (uid {}) connected to {what}, closing it",
+                peer.uid()
+            );
+            None
+        }
+        Err(error) => {
+            eprintln!(
+                "menzil: could not tell who connected to {what}, closing it: {}",
+                text::one_line(&error.to_string(), 300)
+            );
+            None
         }
     }
 }
@@ -169,6 +181,14 @@ impl UnixSocket {
     pub fn path(&self) -> &Path {
         &self.path
     }
+
+    /// The listener, once: for whoever runs the socket (`reach`, `proxy`). The socket file and
+    /// the lock stay with `self` and go when it is dropped.
+    pub(crate) fn take_listener(&mut self) -> UnixListener {
+        self.listener
+            .take()
+            .expect("a bound socket holds its listener until it is run")
+    }
 }
 
 impl Drop for UnixSocket {
@@ -193,19 +213,21 @@ fn lock_path(socket: &Path) -> PathBuf {
 /// socket instead (connecting to it) would make the running `reach` carry the question to its
 /// service as a connection (the fifth red-team round, N2).
 pub async fn bind_unix(path: &Path) -> Result<UnixSocket> {
-    node_cmd::prepare_socket_directory(path, &REACH_SOCKET).await?;
+    bind_unix_as(path, &REACH_SOCKET).await
+}
+
+/// [`bind_unix`] for another command that serves a private socket the same way (`proxy`): `kind`
+/// words the errors.
+pub(crate) async fn bind_unix_as(path: &Path, kind: &SocketKind) -> Result<UnixSocket> {
+    node_cmd::prepare_socket_directory(path, kind).await?;
     let lock_path = lock_path(path);
     let Some(lock) = FileLock::try_acquire(&lock_path)? else {
-        anyhow::bail!(
-            "{} is already listening on {}",
-            REACH_SOCKET.holder,
-            path.display()
-        );
+        anyhow::bail!("{} is already listening on {}", kind.holder, path.display());
     };
     let lock_identity = node_cmd::file_identity(&lock_path)
         .with_context(|| format!("looking at {}", lock_path.display()))?;
     let bound = async {
-        let listener = node_cmd::bind_in_prepared_directory(path, &REACH_SOCKET).await?;
+        let listener = node_cmd::bind_in_prepared_directory(path, kind).await?;
         let identity = node_cmd::file_identity(path)
             .with_context(|| format!("looking at {}", path.display()))?;
         Ok::<_, anyhow::Error>((listener, identity))
@@ -238,10 +260,7 @@ pub async fn run_unix(
     let uid = agent::current_uid()
         .await
         .context("finding out which user this is")?;
-    let listener = bound
-        .listener
-        .take()
-        .expect("a bound socket holds its listener until it is run");
+    let listener = bound.take_listener();
     run_on(socket, target, UserSocket { listener, uid }, stop).await
 }
 

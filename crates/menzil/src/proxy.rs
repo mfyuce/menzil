@@ -86,12 +86,14 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::{TcpListener, UnixListener, UnixStream};
 use tokio::sync::{Semaphore, watch};
 use tokio::task::JoinSet;
 use tokio::time::timeout;
 
 use crate::agent::{self, End};
+use crate::node_cmd::SocketKind;
+use crate::reach::{self, Accept, Connection, UnixSocket};
 use crate::text;
 
 mod http;
@@ -745,6 +747,79 @@ pub async fn run_with<E: Exit>(
     listener: TcpListener,
     stop: impl Future<Output = ()>,
 ) -> Result<()> {
+    run_on(exit, listener, stop).await
+}
+
+/// The socket `menzil proxy --unix` listens on.
+pub const PROXY_SOCKET: SocketKind = SocketKind {
+    what: "the proxy socket",
+    setting: "the `--unix` option",
+    holder: "another `menzil proxy`",
+};
+
+/// Binds `path` as a socket only this user can use, exactly as `reach --unix` does (mode 0600, a
+/// path nobody else can change, a lock file next to it, a stale socket replaced): see
+/// [`reach::bind_unix`]. The socket file and the lock go when the result is dropped.
+pub async fn bind_unix(path: &Path) -> Result<UnixSocket> {
+    reach::bind_unix_as(path, &PROXY_SOCKET).await
+}
+
+/// A Unix socket whose connections are accepted only from processes of one user.
+struct UserSocket {
+    listener: UnixListener,
+    uid: u32,
+}
+
+impl Accept for UserSocket {
+    type Connection = UnixStream;
+
+    async fn accept(&self) -> io::Result<(UnixStream, String)> {
+        loop {
+            let (connection, _) = self.listener.accept().await?;
+            if let Some(who) = reach::admit(&connection, self.uid, "the proxy socket") {
+                return Ok((connection, who));
+            }
+        }
+    }
+}
+
+/// [`run`] on a Unix socket bound by [`bind_unix`]: the same proxy, with connections from
+/// processes of other users closed unanswered. A Unix socket cannot be made to reset, so a
+/// connection that goes wrong ends as end of file (see `reach`).
+pub async fn run_unix(
+    socket: &Path,
+    who: &str,
+    bound: UnixSocket,
+    stop: impl Future<Output = ()>,
+) -> Result<()> {
+    let uid = agent::current_uid()
+        .await
+        .context("finding out which user this is")?;
+    run_unix_with(Arc::new(AgentExit::new(socket, who)), bound, uid, stop).await
+}
+
+/// [`run_unix`] for any [`Exit`] and a given user id.
+pub async fn run_unix_with<E: Exit>(
+    exit: Arc<E>,
+    mut bound: UnixSocket,
+    uid: u32,
+    stop: impl Future<Output = ()>,
+) -> Result<()> {
+    let listener = UserSocket {
+        listener: bound.take_listener(),
+        uid,
+    };
+    // `bound` stays alive to the end: dropping it removes the socket file and the lock.
+    let outcome = run_on(exit, listener, stop).await;
+    drop(bound);
+    outcome
+}
+
+async fn run_on<E: Exit, L: Accept>(
+    exit: Arc<E>,
+    listener: L,
+    stop: impl Future<Output = ()>,
+) -> Result<()> {
     let slots = Arc::new(Semaphore::new(MAX_CONNECTIONS));
     let (stop_tx, stop_rx) = watch::channel(false);
     let mut connections = JoinSet::new();
@@ -772,8 +847,8 @@ pub async fn run_with<E: Exit>(
                 continue;
             }
         };
-        let _ = connection.set_nodelay(true);
-        reset_on_close(&connection, true);
+        connection.prepare();
+        connection.reset_on_close(true);
         // Finished connections out of the set, so that it does not grow with every one served.
         while connections.try_join_next().is_some() {}
         let Ok(permit) = slots.clone().try_acquire_owned() else {
@@ -782,7 +857,7 @@ pub async fn run_with<E: Exit>(
         };
         let (exit, mut stop) = (exit.clone(), stop_rx.clone());
         connections.spawn(async move {
-            carry(connection, peer.to_string(), &*exit, &mut stop).await;
+            carry(connection, peer, &*exit, &mut stop).await;
             drop(permit);
         });
     }
@@ -794,15 +869,9 @@ pub async fn run_with<E: Exit>(
     Ok(())
 }
 
-/// Makes closing `connection` send an RST (`true`) or the usual orderly end (`false`).
-fn reset_on_close(connection: &TcpStream, reset: bool) {
-    let linger = reset.then_some(Duration::ZERO);
-    let _ = socket2::SockRef::from(connection).set_linger(linger);
-}
-
 /// One accepted connection, to its end.
-async fn carry<E: Exit>(
-    mut connection: TcpStream,
+async fn carry<C: Connection, E: Exit>(
+    mut connection: C,
     peer: String,
     exit: &E,
     stop: &mut watch::Receiver<bool>,
@@ -816,7 +885,7 @@ async fn carry<E: Exit>(
         }
     };
     if let Some(Done::Clean | Done::Replied) = done {
-        reset_on_close(&connection, false);
+        connection.reset_on_close(false);
     }
 }
 
@@ -826,7 +895,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use tokio::io::{AsyncBufReadExt, BufReader, duplex};
-    use tokio::net::UnixListener;
+    use tokio::net::{TcpStream, UnixListener, UnixStream};
     use tokio::sync::mpsc;
 
     use super::*;
@@ -2384,5 +2453,316 @@ mod tests {
         let multibyte = "é".repeat(300);
         let shown = log_host(&multibyte);
         assert!(shown.len() <= LOG_HOST_BYTES && shown.chars().all(|c| c == 'é'));
+    }
+
+    // ---- the private Unix socket (`--unix`) ---------------------------------------------------
+
+    /// `menzil proxy --unix` on a socket in a fresh private directory, as user `uid`; the sender
+    /// stops it. The directory is kept alive by the first element.
+    async fn start_unix_as<E: Exit>(
+        exit: Arc<E>,
+        uid: u32,
+    ) -> (
+        tempfile::TempDir,
+        PathBuf,
+        watch::Sender<bool>,
+        tokio::task::JoinHandle<Result<()>>,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("proxy.sock");
+        let bound = bind_unix(&path).await.unwrap();
+        let (stop_tx, mut stop_rx) = watch::channel(false);
+        let task = tokio::spawn(run_unix_with(exit, bound, uid, async move {
+            let _ = stop_rx.wait_for(|stopped| *stopped).await;
+        }));
+        (dir, path, stop_tx, task)
+    }
+
+    async fn start_unix<E: Exit>(
+        exit: Arc<E>,
+    ) -> (
+        tempfile::TempDir,
+        PathBuf,
+        watch::Sender<bool>,
+        tokio::task::JoinHandle<Result<()>>,
+    ) {
+        let me = agent::current_uid().await.unwrap();
+        start_unix_as(exit, me).await
+    }
+
+    fn lock_of(path: &Path) -> PathBuf {
+        let mut name = path.as_os_str().to_owned();
+        name.push(".lock");
+        PathBuf::from(name)
+    }
+
+    #[tokio::test]
+    async fn the_proxy_socket_is_private_and_goes_away_when_the_proxy_stops() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = tempfile::tempdir().unwrap();
+        // A directory this creates is private; the socket is for its owner alone.
+        let path = base.path().join("made-for-proxy").join("proxy.sock");
+        let bound = bind_unix(&path).await.unwrap();
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&path), 0o600);
+        assert_eq!(mode(path.parent().unwrap()), 0o700);
+        let lock = lock_of(&path);
+        assert!(
+            lock.exists(),
+            "the lock file is next to the socket while it runs"
+        );
+        let me = agent::current_uid().await.unwrap();
+        let (stop_tx, mut stop_rx) = watch::channel(false);
+        let task = tokio::spawn(run_unix_with(
+            FakeExit::new(Say::Open),
+            bound,
+            me,
+            async move {
+                let _ = stop_rx.wait_for(|stopped| *stopped).await;
+            },
+        ));
+        let mut client = UnixStream::connect(&path).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        stop_tx.send(true).unwrap();
+        let mut rest = Vec::new();
+        timeout(WAIT, client.read_to_end(&mut rest))
+            .await
+            .unwrap()
+            .ok();
+        timeout(WAIT, task).await.unwrap().unwrap().unwrap();
+        assert!(!path.exists(), "the socket file stays behind after a stop");
+        assert!(!lock.exists(), "the lock file stays behind after a stop");
+    }
+
+    #[tokio::test]
+    async fn socks5_over_the_unix_socket_is_carried_and_a_refusal_is_a_reply() {
+        let exit = FakeExit::new(Say::Open);
+        let (_dir, path, stop, task) = start_unix(exit.clone()).await;
+        let mut client = UnixStream::connect(&path).await.unwrap();
+        client
+            .write_all(&all(&[
+                &greeting(&[0]),
+                &request(1, &domain(b"example.org"), 443),
+            ]))
+            .await
+            .unwrap();
+        let mut head = [0u8; 12];
+        timeout(WAIT, client.read_exact(&mut head))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&head[..], &all(&[&METHOD_OK, &OK_REPLY])[..]);
+        client.write_all(b"over a unix socket").await.unwrap();
+        let mut echoed = vec![0u8; 18];
+        timeout(WAIT, client.read_exact(&mut echoed))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(echoed, b"over a unix socket");
+        stop.send(true).unwrap();
+        timeout(WAIT, task).await.unwrap().unwrap().unwrap();
+
+        let exit = FakeExit::new(Say::Refuse("refused by the other end: forbidden (x)"));
+        let (_dir, path, stop, task) = start_unix(exit).await;
+        let mut client = UnixStream::connect(&path).await.unwrap();
+        client
+            .write_all(&all(&[
+                &greeting(&[0]),
+                &request(1, &domain(b"internal.example"), 80),
+            ]))
+            .await
+            .unwrap();
+        let mut out = Vec::new();
+        timeout(WAIT, client.read_to_end(&mut out))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(out, all(&[&METHOD_OK, &failure(0x02)]));
+        stop.send(true).unwrap();
+        timeout(WAIT, task).await.unwrap().unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn http_connect_over_the_unix_socket_gets_a_403_and_a_get_a_405() {
+        let exit = FakeExit::new(Say::Refuse("refused by the other end: no_grant (x)"));
+        let (_dir, path, stop, task) = start_unix(exit.clone()).await;
+        let mut client = UnixStream::connect(&path).await.unwrap();
+        client
+            .write_all(&connect_head("example.org:443", &[]))
+            .await
+            .unwrap();
+        let mut out = Vec::new();
+        timeout(WAIT, client.read_to_end(&mut out))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(out, http::response(403));
+        let mut web = UnixStream::connect(&path).await.unwrap();
+        web.write_all(b"GET http://example.org/ HTTP/1.1\r\nHost: example.org\r\n\r\n")
+            .await
+            .unwrap();
+        let mut answer = Vec::new();
+        timeout(WAIT, web.read_to_end(&mut answer))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(answer, http::response(405));
+        stop.send(true).unwrap();
+        timeout(WAIT, task).await.unwrap().unwrap().unwrap();
+    }
+
+    /// The uid of whoever connects is checked again on accept: a process of another user is
+    /// closed without being carried or answered.
+    #[tokio::test]
+    async fn a_unix_connection_of_another_user_is_closed_unanswered() {
+        let me = agent::current_uid().await.unwrap();
+        for (uid, carried) in [(me, true), (me.wrapping_add(1), false)] {
+            let exit = FakeExit::new(Say::Open);
+            let (_dir, path, stop, task) = start_unix_as(exit.clone(), uid).await;
+            let mut client = UnixStream::connect(&path).await.unwrap();
+            // Whatever the first bytes are, a refused peer gets nothing carried or answered.
+            let _ = client
+                .write_all(&all(&[
+                    &greeting(&[0]),
+                    &request(1, &domain(b"example.org"), 443),
+                ]))
+                .await;
+            let mut byte = [0u8; 1];
+            let read = timeout(Duration::from_millis(800), client.read(&mut byte)).await;
+            if carried {
+                assert_eq!(read.expect("this user is answered").unwrap(), 1);
+                assert_eq!(exit.asked().len(), 1);
+            } else {
+                assert!(
+                    !matches!(read, Ok(Ok(n)) if n > 0),
+                    "a connection of another user must not be answered"
+                );
+                assert!(
+                    exit.asked().is_empty(),
+                    "another user's request was carried"
+                );
+            }
+            stop.send(true).unwrap();
+            timeout(WAIT, task).await.unwrap().unwrap().unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn a_live_proxy_socket_is_not_taken_over_and_a_stale_one_or_a_plain_file_is_handled_as_reach_does()
+     {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("proxy.sock");
+        let mut first = bind_unix(&path).await.unwrap();
+        let error = format!("{:#}", bind_unix(&path).await.err().unwrap());
+        assert!(
+            error.contains("another `menzil proxy` is already listening"),
+            "{error}"
+        );
+        // Asking whether it lives must not have connected to it.
+        let listener = first.take_listener();
+        assert!(
+            timeout(Duration::from_millis(300), listener.accept())
+                .await
+                .is_err(),
+            "the second proxy connected to the first"
+        );
+        drop(first);
+        drop(listener);
+        assert!(!path.exists() && !lock_of(&path).exists());
+        // What a proxy that was killed leaves behind: a socket nobody listens on, no lock held.
+        drop(UnixListener::bind(&path).unwrap());
+        assert!(path.exists());
+        let second = bind_unix(&path).await.unwrap();
+        assert!(second.path().exists());
+        drop(second);
+        // A file that is not a socket is not replaced.
+        std::fs::write(&path, b"mine").unwrap();
+        let error = format!("{:#}", bind_unix(&path).await.err().unwrap());
+        assert!(
+            error.contains("not a socket") || error.contains("exists"),
+            "{error}"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), b"mine");
+        // A path too long for a Unix socket names the option.
+        let long = PathBuf::from(format!("/tmp/{}/proxy.sock", "d".repeat(120)));
+        let error = format!("{:#}", bind_unix(&long).await.err().unwrap());
+        assert!(
+            error.contains("the proxy socket path is") && error.contains("`--unix`"),
+            "{error}"
+        );
+    }
+
+    /// At the end of a run the path may lead somewhere else (a link in it was pointed elsewhere):
+    /// only the files this run made are removed.
+    #[tokio::test]
+    async fn a_proxy_that_stops_leaves_alone_what_its_path_names_by_then() {
+        let base = tempfile::tempdir().unwrap();
+        let (real, other) = (base.path().join("real"), base.path().join("other"));
+        std::fs::create_dir(&real).unwrap();
+        std::fs::create_dir(&other).unwrap();
+        let via = base.path().join("via");
+        std::os::unix::fs::symlink("real", &via).unwrap();
+        let path = via.join("proxy.sock");
+        let bound = bind_unix(&path).await.unwrap();
+        let me = agent::current_uid().await.unwrap();
+        let (stop_tx, mut stop_rx) = watch::channel(false);
+        let task = tokio::spawn(run_unix_with(
+            FakeExit::new(Say::Open),
+            bound,
+            me,
+            async move {
+                let _ = stop_rx.wait_for(|stopped| *stopped).await;
+            },
+        ));
+        std::fs::remove_file(&via).unwrap();
+        std::os::unix::fs::symlink("other", &via).unwrap();
+        let theirs = UnixListener::bind(other.join("proxy.sock")).unwrap();
+        std::fs::write(other.join("proxy.sock.lock"), b"theirs").unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        stop_tx.send(true).unwrap();
+        timeout(WAIT, task).await.unwrap().unwrap().unwrap();
+        assert!(
+            other.join("proxy.sock").exists(),
+            "the proxy removed a socket it did not make"
+        );
+        assert_eq!(
+            std::fs::read(other.join("proxy.sock.lock")).unwrap(),
+            b"theirs"
+        );
+        drop(theirs);
+    }
+
+    /// [`run_unix`] itself (the one `main` calls) takes this user's id: with no agent running
+    /// the connection of this user is answered with the general failure, nothing else.
+    #[tokio::test]
+    async fn run_unix_answers_this_user_and_no_agent_is_the_general_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("proxy.sock");
+        let bound = bind_unix(&path).await.unwrap();
+        let agent_socket = dir.path().join("no-agent.sock");
+        let (stop_tx, mut stop_rx) = watch::channel(false);
+        let task = tokio::spawn(async move {
+            run_unix(&agent_socket, "exit", bound, async move {
+                let _ = stop_rx.wait_for(|stopped| *stopped).await;
+            })
+            .await
+        });
+        let mut client = UnixStream::connect(&path).await.unwrap();
+        client
+            .write_all(&all(&[
+                &greeting(&[0]),
+                &request(1, &domain(b"example.org"), 443),
+            ]))
+            .await
+            .unwrap();
+        let mut out = Vec::new();
+        timeout(WAIT, client.read_to_end(&mut out))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(out, all(&[&METHOD_OK, &failure(0x01)]));
+        stop_tx.send(true).unwrap();
+        timeout(WAIT, task).await.unwrap().unwrap().unwrap();
+        assert!(!path.exists());
     }
 }

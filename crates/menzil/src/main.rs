@@ -232,12 +232,29 @@ enum Command {
     /// only 10/8, 172.16/12 and 192.168/16 can be lifted by the owner, with a more specific
     /// allow. Port 25 is denied unless an allow names it. A refusal reaches the application
     /// as a SOCKS error or an HTTP status.
+    ///
+    /// With `--unix PATH` the same proxy listens on a Unix socket instead of a TCP port. A Unix
+    /// socket is private to this user: mode 0600, nothing on the way to it that other users can
+    /// change, and a peer of another uid is refused; the TCP `--listen` port is open to every
+    /// local user. For clients that speak SOCKS5 or HTTP CONNECT over a Unix socket (or through
+    /// `socat`). A program on a Unix socket is in general not told whether a stream ended
+    /// cleanly or not (no reset, unlike on TCP).
     Proxy {
         /// The node to use as the exit: a member's name, or the start of its node id.
         exit: String,
         /// Where to listen, as a loopback TCP address (or `localhost:PORT`).
-        #[arg(long, default_value = "127.0.0.1:1080", value_name = "ADDR")]
+        #[arg(
+            long,
+            default_value = "127.0.0.1:1080",
+            value_name = "ADDR",
+            conflicts_with = "unix"
+        )]
         listen: String,
+        /// Listen on a Unix socket at this path instead, private to this user (mode 0600).
+        /// Missing directories are made (0700); a socket left by a proxy that died is replaced;
+        /// the socket and the lock file `<PATH>.lock` next to it are removed when this stops.
+        #[arg(long, value_name = "PATH")]
+        unix: Option<PathBuf>,
     },
     /// Carry standard input and output to a service of another member: what an SSH
     /// `ProxyCommand` runs (`ssh -o ProxyCommand="menzil stdio %h/ssh" laptop`). Both directions
@@ -1145,22 +1162,34 @@ async fn run(cli: Cli) -> Result<()> {
             };
             print!("{out}");
         }
-        Command::Proxy { exit, listen } => {
+        Command::Proxy { exit, listen, unix } => {
             let home = home()?;
             let socket = node_cmd::agent_socket_path(&home, &Config::load(&home)?);
-            // Refused before anything is bound unless it is loopback.
-            let listener = proxy::bind(&listen).await?;
             let stop = async {
                 match signals::shutdown().await {
                     Ok(why) => eprintln!("stopping ({why})"),
                     Err(error) => eprintln!("menzil: cannot wait for a signal: {error}"),
                 }
             };
-            eprintln!(
-                "SOCKS5 and HTTP CONNECT proxy on {} through {exit}; use socks5h:// or HTTPS_PROXY=http://ADDR so that names are resolved at the exit; ctrl-c stops and resets what is open",
-                listener.local_addr()?
-            );
-            proxy::run(&socket, &exit, listener, stop).await?;
+            match unix {
+                Some(path) => {
+                    let bound = proxy::bind_unix(&path).await?;
+                    eprintln!(
+                        "SOCKS5 and HTTP CONNECT proxy on {} (private to this user) through {exit}; names are resolved at the exit; ctrl-c stops and ends what is open",
+                        bound.path().display()
+                    );
+                    proxy::run_unix(&socket, &exit, bound, stop).await?;
+                }
+                None => {
+                    // Refused before anything is bound unless it is loopback.
+                    let listener = proxy::bind(&listen).await?;
+                    eprintln!(
+                        "SOCKS5 and HTTP CONNECT proxy on {} through {exit}; use socks5h:// or HTTPS_PROXY=http://ADDR so that names are resolved at the exit; ctrl-c stops and resets what is open",
+                        listener.local_addr()?
+                    );
+                    proxy::run(&socket, &exit, listener, stop).await?;
+                }
+            }
         }
         Command::Version => println!("menzil {}", env!("CARGO_PKG_VERSION")),
     }
@@ -1178,7 +1207,7 @@ mod tests {
     #[test]
     fn proxy_takes_the_exit_and_listens_on_loopback_1080_by_default() {
         let proxy = |args: &[&str]| match parse(args)?.command {
-            Command::Proxy { exit, listen } => Ok((exit, listen)),
+            Command::Proxy { exit, listen, .. } => Ok((exit, listen)),
             _ => panic!("not proxy"),
         };
         let got: Result<(String, String), clap::Error> = proxy(&["proxy", "laptop"]);
@@ -1205,6 +1234,43 @@ mod tests {
         assert!(help.contains("[egress] enabled = true"), "{help}");
         assert!(help.contains("egress:*"), "{help}");
         assert!(help.contains("loopback"), "{help}");
+    }
+
+    #[test]
+    fn proxy_unix_takes_a_path_and_conflicts_with_listen() {
+        let unix = |args: &[&str]| match parse(args)?.command {
+            Command::Proxy { unix, .. } => Ok(unix),
+            _ => panic!("not proxy"),
+        };
+        let got: Result<Option<PathBuf>, clap::Error> = unix(&["proxy", "laptop"]);
+        assert_eq!(got.unwrap(), None);
+        let got: Result<Option<PathBuf>, clap::Error> =
+            unix(&["proxy", "laptop", "--unix", "/run/user/1000/p.sock"]);
+        assert_eq!(got.unwrap(), Some(PathBuf::from("/run/user/1000/p.sock")));
+        let error = parse(&[
+            "proxy",
+            "laptop",
+            "--unix",
+            "/x/p.sock",
+            "--listen",
+            "127.0.0.1:1",
+        ])
+        .err()
+        .expect("--unix and --listen together are refused");
+        assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+        let help = <Cli as clap::CommandFactory>::command()
+            .find_subcommand_mut("proxy")
+            .unwrap()
+            .render_long_help()
+            .to_string();
+        assert!(
+            help.contains("private to this user") && help.contains("0600"),
+            "{help}"
+        );
+        assert!(
+            help.contains("every") && help.contains("local user"),
+            "{help}"
+        );
     }
 
     fn label_command(args: &[&str]) -> Result<LabelCommand, clap::Error> {
