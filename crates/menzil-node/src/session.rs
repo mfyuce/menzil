@@ -7,7 +7,8 @@
 //! L3f) is handled transparently here too, the same way PING/REKEY/
 //! GOAWAY already were: an inbound DOC is reassembled and, once complete,
 //! verified and stored into this session's [`RosterStore`]
-//! (`Engine::accept_doc`); right after ATTACH, [`Session::connect`] pushes
+//! (`Engine::accept_doc`, logic in `crate::l3_doc`; a steward signed Roster is judged with
+//! the owner signed base the relay sends first, kept pending per network until it arrives); right after ATTACH, [`Session::connect`] pushes
 //! DOC(roster) for every network where this node's own store already
 //! holds something newer than WELCOME's `rosters` reported (protocol.md
 //! 4.3's literal node-to-relay rule, via `rosters_to_push`), and
@@ -63,7 +64,7 @@ use tokio::sync::{mpsc, watch};
 use menzil_carrier::{Backoff, Carrier, ConnectionInfo, DialConfig};
 use menzil_proto::{
     Capability, DocBody, DocReassembler, DocType, GoawayBody, HelloBody, Limits,
-    MIN_SEND_CHARGE_BYTES, NetworkId, PROTOCOL_VERSION, Record, Roster, Tai64N, WelcomeBody,
+    MIN_SEND_CHARGE_BYTES, NetworkId, PROTOCOL_VERSION, Record, Tai64N, WelcomeBody,
     X25519PublicKey,
 };
 use menzil_session::{
@@ -72,6 +73,7 @@ use menzil_session::{
 
 use crate::error::NodeError;
 use crate::identity::IdentityCell;
+use crate::l3_doc::{self, L3DocOutcome, PendingBases};
 use crate::outbound::{EnqueueOutcome, Epoch, MAX_QUEUED_BYTES, OutboundQueue, OutboundSend};
 use crate::relay_notes::{RelayNotes, listed_in_own_roster};
 use crate::roster_store::RosterStore;
@@ -106,6 +108,9 @@ struct Engine {
     rekey: RekeySchedule,
     roster_store: Arc<RosterStore>,
     doc_reassembler: DocReassembler,
+    /// Base Rosters the relay sent that wait for the Roster that follows them; dies with the
+    /// session.
+    pending_bases: PendingBases,
     /// This node's own claimed networks (`SessionConfig::networks`),
     /// checked before an inbound DOC(roster) is stored — see
     /// `Engine::accept_doc` for why.
@@ -199,6 +204,7 @@ impl Engine {
             rekey: RekeySchedule::new(now),
             roster_store,
             doc_reassembler: DocReassembler::new(),
+            pending_bases: PendingBases::new(),
             claimed_networks,
             relay_rosters: HashMap::new(),
             doc_warn: DocWarnThrottle::default(),
@@ -247,9 +253,13 @@ impl Engine {
     /// Feeds one DOC chunk (protocol.md 4.2, 4.3) into this session's
     /// reassembler; once a transfer completes, decodes and verifies it
     /// as a Roster for a network this node itself claims, and stores it
-    /// via `roster_store`. Any other `doc_type` is logged and ignored
+    /// via `roster_store` (`crate::l3_doc`). The owner signed base the relay
+    /// sends ahead of a steward signed Roster (`DocType::BaseRoster`) is kept
+    /// pending per network (one each, at most 8 per session) and judges the
+    /// Roster that follows it (protocol.md 2.3, 4.3); a base alone is never
+    /// adopted. Any other `doc_type` is logged and ignored
     /// without attempting to decode it as one (at L3, a relay only ever
-    /// sends Roster; Policy is end to end only). A malformed chunk, or a
+    /// sends Roster and its base; Policy is end to end only). A malformed chunk, or a
     /// reassembled payload that fails to decode or verify, is likewise
     /// logged and ignored rather than ending the session.
     ///
@@ -274,51 +284,37 @@ impl Engine {
                 return;
             }
         };
-        if doc_type != DocType::Roster {
-            tracing::debug!(?doc_type, "ignoring a non-Roster DOC transfer at L3");
-            return;
-        }
-        let roster = match Roster::decode_strict(&bytes) {
-            Ok(roster) => roster,
-            Err(err) => {
-                if let Some(held_back) = self.doc_warn.allow(Instant::now()) {
-                    tracing::warn!(error = %err, held_back, "reassembled DOC did not decode as a Roster");
-                }
-                return;
-            }
-        };
-        let decoded = match roster.decode() {
-            Ok(decoded) => decoded,
-            Err(err) => {
-                if let Some(held_back) = self.doc_warn.allow(Instant::now()) {
-                    tracing::warn!(error = %err, held_back, "reassembled DOC's Roster body did not decode");
-                }
-                return;
-            }
-        };
-        if !self.claimed_networks.contains(&decoded.network_id) {
-            if let Some(held_back) = self.doc_warn.allow(Instant::now()) {
-                tracing::warn!(
-                    network_id = %decoded.network_id,
-                    held_back,
-                    "ignoring a DOC(roster) for a network this node does not claim"
-                );
-            }
-            return;
-        }
-        // Owner signed Rosters only: a steward signed Roster arrives with its Policy, as a
-        // pair, through `DocStore::adopt`, and the base the relay sends first
-        // (`DocType::BaseRoster`) is not kept here.
-        match self.roster_store.adopt_owner(&roster, unix_now()) {
+        match l3_doc::accept_completed(
+            doc_type,
+            &bytes,
+            &self.claimed_networks,
+            &mut self.pending_bases,
+            &self.roster_store,
+            unix_now(),
+        ) {
+            L3DocOutcome::Nothing => {}
             // Adopted, or already held or older: either way the relay holds at least this one.
-            Ok(_) => {
-                let known = self.relay_rosters.entry(decoded.network_id).or_insert(0);
-                *known = (*known).max(decoded.seq);
+            L3DocOutcome::Adopted(network_id, seq) | L3DocOutcome::Held(network_id, seq) => {
+                let known = self.relay_rosters.entry(network_id).or_insert(0);
+                *known = (*known).max(seq);
             }
-            Err(err) => {
+            L3DocOutcome::Rejected(err) => {
                 if let Some(held_back) = self.doc_warn.allow(Instant::now()) {
                     tracing::warn!(error = %err, held_back, "reassembled DOC was not adopted as a Roster");
                 }
+            }
+            L3DocOutcome::Undecodable(err) => {
+                if let Some(held_back) = self.doc_warn.allow(Instant::now()) {
+                    tracing::warn!(error = %err, held_back, "reassembled DOC did not decode as a Roster");
+                }
+            }
+            L3DocOutcome::Dropped(why) => {
+                if let Some(held_back) = self.doc_warn.allow(Instant::now()) {
+                    tracing::warn!(held_back, "ignoring a DOC: {why}");
+                }
+            }
+            L3DocOutcome::Ignored(doc_type) => {
+                tracing::debug!(?doc_type, "ignoring a non-Roster DOC transfer at L3");
             }
         }
     }
@@ -1604,7 +1600,7 @@ mod tests {
     use crate::identity::LocalIdentity;
     use ed25519_dalek::SigningKey;
     use menzil_carrier::{ConnectionInfo, DialConfig};
-    use menzil_proto::{Limits, NodeCert, NodeCertBody, NodeId, RosterBody, RosterMember};
+    use menzil_proto::{Limits, NodeCert, NodeCertBody, NodeId, Roster, RosterBody, RosterMember};
 
     #[test]
     fn warnings_about_bad_doc_transfers_are_let_through_once_a_second() {
@@ -2187,6 +2183,159 @@ mod tests {
             engine.on_message(&ciphertext, Instant::now()).unwrap();
         }
         assert_eq!(roster_store.seq(&network_id), None);
+    }
+
+    /// Sends `doc` of `doc_type` from `relay` into `engine`, as the relay would.
+    fn relay_sends(engine: &mut Engine, relay: &mut Transport, doc_type: DocType, doc: &Roster) {
+        for record in menzil_proto::split_into_doc_records(doc_type, &doc.encode()) {
+            let ciphertext = relay.encrypt_record(&record).unwrap();
+            engine.on_message(&ciphertext, Instant::now()).unwrap();
+        }
+    }
+
+    fn doc_types_in(records: Vec<Record>) -> Vec<DocType> {
+        let mut reassembler = DocReassembler::new();
+        let mut out = Vec::new();
+        for record in records {
+            let Record::Doc(body) = record else {
+                panic!("only DOC records")
+            };
+            if let Some((doc_type, _)) = reassembler.accept(&body).unwrap() {
+                out.push(doc_type);
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn a_steward_roster_after_its_base_over_l3_is_adopted_and_pushed_base_first() {
+        use crate::l3_doc::fixture::Fix;
+        let (node_transport, mut relay) = two_live_transports();
+        let store = test_roster_store();
+        let fix = Fix::new(unix_now());
+        let mut engine = Engine::new(
+            node_transport,
+            Instant::now(),
+            Arc::clone(&store),
+            vec![fix.network_id],
+        );
+        relay_sends(&mut engine, &mut relay, DocType::BaseRoster, &fix.base);
+        assert!(
+            store.get(&fix.network_id).is_none(),
+            "a base alone is never adopted"
+        );
+        assert!(
+            engine.relay_rosters.is_empty(),
+            "nor does it raise what the relay holds"
+        );
+        relay_sends(
+            &mut engine,
+            &mut relay,
+            DocType::Roster,
+            &fix.steward_roster(11),
+        );
+        assert_eq!(store.seq(&fix.network_id), Some(11));
+        assert_eq!(store.base(&fix.network_id), Some(fix.base.clone()));
+        assert!(matches!(
+            store.signer(&fix.network_id),
+            Some(menzil_proto::trust::Signer::Steward { .. })
+        ));
+        assert_eq!(engine.relay_rosters.get(&fix.network_id), Some(&11));
+        assert!(engine.catch_up_records().is_empty(), "no echo to the relay");
+        // What this node would push (relay at 0): the base first, then the Roster.
+        let pushes = rosters_to_push(&[fix.network_id], &store, &HashMap::new());
+        assert_eq!(pushes.len(), 1);
+        assert_eq!(
+            doc_types_in(pushes.into_iter().next().unwrap().2),
+            vec![DocType::BaseRoster, DocType::Roster]
+        );
+    }
+
+    #[test]
+    fn a_rejected_steward_roster_over_l3_does_not_raise_what_the_relay_holds() {
+        use crate::l3_doc::fixture::Fix;
+        let (node_transport, mut relay) = two_live_transports();
+        let store = test_roster_store();
+        let fix = Fix::new(unix_now());
+        let mut engine = Engine::new(
+            node_transport,
+            Instant::now(),
+            Arc::clone(&store),
+            vec![fix.network_id],
+        );
+        // Not the parent of the Roster: rejected, nothing stored, relay_rosters untouched.
+        relay_sends(
+            &mut engine,
+            &mut relay,
+            DocType::BaseRoster,
+            &fix.other_base(10),
+        );
+        relay_sends(
+            &mut engine,
+            &mut relay,
+            DocType::Roster,
+            &fix.steward_roster(11),
+        );
+        assert!(store.get(&fix.network_id).is_none());
+        assert!(engine.relay_rosters.is_empty());
+        // And without any base at all.
+        relay_sends(
+            &mut engine,
+            &mut relay,
+            DocType::Roster,
+            &fix.steward_roster(12),
+        );
+        assert!(store.get(&fix.network_id).is_none());
+        assert!(engine.relay_rosters.is_empty());
+    }
+
+    #[test]
+    fn an_oversize_base_over_l3_is_not_kept() {
+        use crate::l3_doc::fixture::Fix;
+        let (node_transport, mut relay) = two_live_transports();
+        let store = test_roster_store();
+        let fix = Fix::new(unix_now());
+        let mut engine = Engine::new(
+            node_transport,
+            Instant::now(),
+            Arc::clone(&store),
+            vec![fix.network_id],
+        );
+        let mut big = fix.body.clone();
+        big.members = (0..40_000)
+            .map(|i| RosterMember {
+                node_id: NodeId::from([(i % 256) as u8; 32]),
+                min_serial: i,
+            })
+            .collect();
+        let big = Roster::sign(&fix.owner, &big).unwrap();
+        assert!(big.encode().len() > menzil_proto::MAX_DOC_BYTES);
+        // Hand made chunks (the splitter refuses an oversize document): the reassembler refuses
+        // the transfer (a chunk error, logged), on_message does not end the session, nothing is kept.
+        let bytes = big.encode();
+        let chunks: Vec<&[u8]> = bytes.chunks(menzil_proto::MAX_DOC_CHUNK_BYTES).collect();
+        let doc_id = menzil_proto::DocId::from([7u8; 16]);
+        for (index, chunk) in chunks.iter().enumerate() {
+            let record = Record::Doc(DocBody {
+                doc_type: DocType::BaseRoster,
+                doc_id,
+                index: index as u16,
+                count: chunks.len() as u16,
+                chunk: chunk.to_vec(),
+            });
+            let ciphertext = relay.encrypt_record(&record).unwrap();
+            engine.on_message(&ciphertext, Instant::now()).unwrap();
+        }
+        relay_sends(
+            &mut engine,
+            &mut relay,
+            DocType::Roster,
+            &fix.steward_roster(11),
+        );
+        assert!(
+            store.get(&fix.network_id).is_none(),
+            "the oversize base was not kept"
+        );
     }
 
     #[test]

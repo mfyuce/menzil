@@ -73,6 +73,7 @@ mod docs_sync;
 pub mod egress;
 mod error;
 mod identity;
+mod l3_doc;
 mod l4_router;
 mod l4_session;
 mod l5_stream;
