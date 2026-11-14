@@ -15,7 +15,7 @@
 //! # Optional: what this node holds for its peers at most (these are the defaults).
 //! [serve]
 //! max_connections = 256           # served at once, all peers together, at most 1000000
-//! max_connections_per_peer = 64   # served at once for one peer, at most 1000000
+//! max_connections_per_peer = 64   # served at once for one peer, at most max_connections
 //! connect_timeout_secs = 5        # giving up on a service's local target, at most 9
 //! # idle_secs = 300               # off unless set: reset a served tcp:/http:/tls: stream with no
 //! #                               # byte in either direction this long (10 to 86400)
@@ -338,6 +338,15 @@ impl ServeSettings {
         }
         if let Some(value) = self.max_connections_per_peer {
             limits.max_connections_per_peer = in_range("max_connections_per_peer", value)?;
+        }
+        // One peer's count above the node-wide count would let it take the whole pool. A key
+        // that was left out counts with its default, so `max_connections = 10` alone is refused.
+        if limits.max_connections_per_peer > limits.max_connections {
+            bail!(
+                "max_connections_per_peer in [serve] of config.toml is {}: it must not exceed max_connections, which is {} (one peer could take the whole pool; a key left out counts with its default)",
+                limits.max_connections_per_peer,
+                limits.max_connections
+            );
         }
         Ok(limits)
     }
@@ -721,8 +730,8 @@ mod tests {
         assert_eq!(plain.egress_limits().max_connections_per_peer, 32);
         assert_eq!(plain.egress_limits().idle, DEFAULT_EGRESS_IDLE);
         // The egress pool is not the serve pool.
-        let apart = services("[serve]\nmax_connections = 7\n[egress]\nmax_connections = 40\n");
-        assert_eq!(apart.limits().max_connections, 7);
+        let apart = services("[serve]\nmax_connections = 70\n[egress]\nmax_connections = 40\n");
+        assert_eq!(apart.limits().max_connections, 70);
         assert_eq!(apart.egress_limits().max_connections, 40);
         assert_eq!(apart.egress_limits().max_connections_per_peer, 32);
         let all = services(
@@ -889,8 +898,8 @@ mod tests {
             menzil_node::DEFAULT_CONNECT_TIMEOUT
         );
         // Each key alone leaves the others as they were.
-        let one = services("[serve]\nmax_connections = 10\n");
-        assert_eq!(one.limits().max_connections, 10);
+        let one = services("[serve]\nmax_connections = 100\n");
+        assert_eq!(one.limits().max_connections, 100);
         assert_eq!(
             one.limits().max_connections_per_peer,
             ServeLimits::default().max_connections_per_peer
@@ -945,6 +954,17 @@ mod tests {
                 "[serve]\nmax_connections_per_peer = 0",
                 "max_connections_per_peer",
             ),
+            // One peer may not hold more than the pool: both set, or one against the default
+            // of the other (256 in all, 64 for one peer).
+            (
+                "[serve]\nmax_connections = 10\nmax_connections_per_peer = 11",
+                "must not exceed max_connections",
+            ),
+            (
+                "[serve]\nmax_connections_per_peer = 257",
+                "must not exceed max_connections",
+            ),
+            ("[serve]\nmax_connections = 63", "must not exceed"),
             ("[serve]\nconnect_timeout_secs = 0", "connect_timeout_secs"),
             ("[serve]\nidle_secs = 0", "idle_secs"),
             ("[serve]\nidle_secs = 9", "from 10 to 86400"),
@@ -977,7 +997,7 @@ mod tests {
         let services = |text: &str| Config::parse(text).unwrap().local_services().unwrap();
         assert_eq!(services("").idle_timeout(), None);
         assert_eq!(
-            services("[serve]\nmax_connections = 5\n").idle_timeout(),
+            services("[serve]\nmax_connections = 65\n").idle_timeout(),
             None
         );
         assert_eq!(

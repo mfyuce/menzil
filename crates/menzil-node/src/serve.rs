@@ -54,8 +54,11 @@
 //! * **Idle timeout, opt in** ([`LocalServices::with_idle_timeout`]). Off by default: a pipe of
 //!   a `tcp:`, `http:` or `tls:` service then has no idle timeout. When set, a pipe with no
 //!   byte in either direction for that long is reset (an RST to the target, a reset to the
-//!   peer) and one `info` line says so; a byte in either direction, half close included, is
-//!   activity. Egress streams have their own, always on, timeout ([`EgressLimits`]).
+//!   peer) and one `info` line says so; only a byte written to either side is activity. A half
+//!   close (a FIN, a shutdown of one direction) writes no byte, so it is not activity: after
+//!   one side half closed, the pipe is reset all the same once the other direction has been
+//!   silent for the idle time. Egress streams have their own, always on, timeout
+//!   ([`EgressLimits`]).
 //! * **Not bounded here.** A service has no limit of its own (the
 //!   TODO.md line); the streams a session may hold are bounded by `menzil-stream`'s live
 //!   stream limit and the OPEN admission control of [`crate::accept_loop`]. A target that
@@ -210,7 +213,7 @@ pub struct EgressLimits {
     /// Egress streams served at once for one initiator. At least 1.
     pub max_connections_per_peer: usize,
     /// A pipe with no byte in either direction for this long is reset (an RST, not a clean
-    /// end). Kept between [`MIN_EGRESS_IDLE`] and [`MAX_EGRESS_IDLE`].
+    /// end); a half close writes no byte and does not count as activity. Kept between [`MIN_EGRESS_IDLE`] and [`MAX_EGRESS_IDLE`].
     pub idle: Duration,
 }
 

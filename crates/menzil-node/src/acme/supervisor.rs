@@ -324,6 +324,9 @@ where
         let mut key_failed = false;
         let mut no_domain_warned = false;
         let mut blocked_now: BTreeSet<String> = BTreeSet::new();
+        // Names whose status says `Failed(Local)` because the account key could not be used
+        // (no task runs for them, so nothing else would ever clear it).
+        let mut local_failed: BTreeSet<String> = BTreeSet::new();
         loop {
             let snapshot = shares.snapshot();
             let configured = configured_domain();
@@ -368,6 +371,18 @@ where
                 }
             });
             paces.reconcile(&plan.jobs);
+            // A name that is no longer planned (share removed, detached, domain dropped) must
+            // not keep a local failure from the key that never started a task for it.
+            let planned_domains: BTreeSet<&str> =
+                plan.jobs.iter().map(|job| job.domain.as_str()).collect();
+            local_failed.retain(|domain| {
+                if planned_domains.contains(domain.as_str()) {
+                    true
+                } else {
+                    status.forget(domain);
+                    false
+                }
+            });
             // A name that cannot be ordered because of the mismatch says so; one that no longer
             // is blocked forgets it.
             let blocked: BTreeSet<String> =
@@ -397,6 +412,7 @@ where
                                 key_failed = true;
                             }
                             status.record(&job.domain, Progress::Failed(FailureKind::Local));
+                            local_failed.insert(job.domain.clone());
                             continue;
                         }
                     }
@@ -415,10 +431,12 @@ where
                     Err(error) => {
                         tracing::warn!(%error, "the ACME account key cannot be read back");
                         status.record(&job.domain, Progress::Failed(FailureKind::Local));
+                        local_failed.insert(job.domain.clone());
                         continue;
                     }
                 };
                 status.forget(&job.domain);
+                local_failed.remove(&job.domain);
                 let (task_shares, share) = (shares.clone(), job.share.clone());
                 let (task_status, domain) = (status.clone(), job.domain.clone());
                 let handle = tokio::spawn(run_renewals_observed(

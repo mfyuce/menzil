@@ -467,6 +467,52 @@ async fn an_account_key_others_can_read_is_not_used_and_nothing_is_ordered() {
     supervisor.abort();
 }
 
+#[cfg(unix)]
+#[tokio::test(start_paused = true)]
+async fn a_local_failure_of_the_key_does_not_outlive_the_share() {
+    use std::os::unix::fs::PermissionsExt;
+    let scratch = Scratch::new();
+    let key_file = CertStore::account_key_path(&scratch.0);
+    std::fs::create_dir_all(key_file.parent().unwrap()).unwrap();
+    std::fs::write(&key_file, AccountKey::generate().unwrap().to_pem()).unwrap();
+    std::fs::set_permissions(&key_file, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let ca = Recording::new(never_validates());
+    let shares = ShareBook::new();
+    let status = AcmeStatus::new();
+    let supervisor = spawn_renewals(
+        setup(&scratch.0, ca.clone()),
+        shares.clone(),
+        ChallengeBook::new(),
+        status.clone(),
+        || None,
+    );
+    shares.note_sent(&[blind("myapp", &["acme-tls/1"])]);
+    shares.note_ack(&ack(&["myapp"], &["myapp"], Some(H)));
+    minutes(5).await;
+    assert_eq!(
+        state_of(&status, &scratch.0, "myapp.share.test"),
+        CertState::Failed(FailureKind::Local)
+    );
+    // The owner takes the share away while the key is still bad: no task ever ran for it, and
+    // the failure must go with the share.
+    shares.note_sent(&[blind("plain", &["h2"])]);
+    minutes(2).await;
+    assert_eq!(
+        state_of(&status, &scratch.0, "myapp.share.test"),
+        CertState::None,
+        "a withdrawn share keeps a failure of the key"
+    );
+    // The share comes back with the key still bad: the failure is noted again.
+    shares.note_sent(&[blind("myapp", &["acme-tls/1"])]);
+    shares.note_ack(&ack(&["myapp"], &["myapp"], Some(H)));
+    minutes(2).await;
+    assert_eq!(
+        state_of(&status, &scratch.0, "myapp.share.test"),
+        CertState::Failed(FailureKind::Local)
+    );
+    supervisor.abort();
+}
+
 #[tokio::test(start_paused = true)]
 async fn a_certificate_is_obtained_stored_and_reported_valid() {
     let scratch = Scratch::new();

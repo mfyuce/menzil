@@ -29,7 +29,7 @@ relay = "menzil://relay.example.org:443/_menzil/v1?id=ababababababababababababab
 
 # tuning
 [serve]
-max_connections = 10
+max_connections = 100
 "#;
 
 fn err(result: Result<Plan>) -> String {
@@ -171,7 +171,7 @@ relay = "menzil://relay.example.org:443/_menzil/v1?id=ababababababababababababab
 
 # tuning
 [serve]
-max_connections = 10
+max_connections = 100
 
 [[share]]
 name = "myapp"
@@ -199,7 +199,7 @@ service = "tls:myapp"
     );
     assert!(
         plan.new_text
-            .contains("\n# tuning\n[serve]\nmax_connections = 10\n")
+            .contains("\n# tuning\n[serve]\nmax_connections = 100\n")
     );
 }
 
