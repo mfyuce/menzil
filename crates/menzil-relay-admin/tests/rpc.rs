@@ -744,3 +744,33 @@ fn library_errors_map_to_their_codes() {
     );
     assert_eq!(fine.message(), "names must be 1 to 100000, not 0");
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_repeated_create_with_another_class_is_refused_not_ignored() {
+    let fx = Fixture::start().await;
+    let mut c = fx.client().await;
+    let a = Owner::new();
+    let with_class = |class: &str| CreateTenantRequest {
+        class: class.into(),
+        ..create("alpha", &a.token())
+    };
+    let first = c
+        .create_tenant(with_class("personal"))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(first.class, "personal");
+    // The same class is a repeat of the call.
+    let again = c
+        .create_tenant(with_class("personal"))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(first, again);
+    // Another class is refused, and the tenant keeps its class.
+    let e = c.create_tenant(with_class("friend")).await.unwrap_err();
+    assert_eq!(e.code(), Code::AlreadyExists);
+    assert!(e.message().contains("another class"), "{}", e.message());
+    let got = c.get_tenant(aref("alpha")).await.unwrap().into_inner();
+    assert_eq!(got.class, "personal");
+}

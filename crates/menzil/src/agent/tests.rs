@@ -2097,3 +2097,26 @@ async fn what_the_opener_says_about_a_connect_is_one_clean_line() {
     .unwrap();
     assert!(!got.contains('\n') && !got.contains('\u{1b}'), "{got:?}");
 }
+
+#[tokio::test]
+async fn malformed_answer_lines_count_toward_the_answer_line_limit() {
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("a.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let uid = current_uid().await.unwrap();
+    let server = tokio::spawn(async move {
+        let (mut conn, _) = listener.accept().await.unwrap();
+        let mut request = [0u8; 64];
+        let _ = conn.read(&mut request).await.unwrap();
+        let mut answer = b"ok\n".to_vec();
+        for _ in 0..MAX_ANSWER_LINES + 8 {
+            answer.extend_from_slice(b"\xff\xfe\n");
+        }
+        answer.extend_from_slice(b"late\n");
+        conn.write_all(&answer).await.unwrap();
+        conn.shutdown().await.unwrap();
+    });
+    let lines = ask_lines(&socket, "status", uid).await.unwrap();
+    server.await.unwrap();
+    assert!(lines.is_empty(), "read past the limit: {lines:?}");
+}

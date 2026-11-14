@@ -1402,10 +1402,14 @@ async fn ask_lines(socket: &Path, request: &str, uid: u32) -> Result<Vec<String>
             );
         }
         let mut lines = Vec::new();
-        while lines.len() < MAX_ANSWER_LINES {
+        // Every line read counts toward the limit, malformed ones too: a peer that sends
+        // endless non-UTF-8 or over long lines gets no more of our time than one that sends text.
+        let mut read_lines = 0;
+        while read_lines < MAX_ANSWER_LINES {
             let Some(line) = read_line_lenient(&mut read, MAX_REPLY_BYTES).await? else {
                 break;
             };
+            read_lines += 1;
             if let Line::Text(line) = line {
                 lines.push(line.trim_end_matches(['\r', '\n']).to_string());
             }

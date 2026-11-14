@@ -174,7 +174,8 @@ fn percent_decode(s: &str) -> String {
     while i < bytes.len() {
         if bytes[i] == b'%'
             && i + 2 < bytes.len()
-            && let Ok(byte) = u8::from_str_radix(&s[i + 1..i + 3], 16)
+            && let Some(pair) = s.get(i + 1..i + 3)
+            && let Ok(byte) = u8::from_str_radix(pair, 16)
         {
             out.push(byte);
             i += 3;
@@ -189,6 +190,14 @@ fn percent_decode(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn percent_decode_does_not_panic_on_a_split_character() {
+        // "%" then a two byte character then more: [i+1..i+3] would cut the character.
+        assert_eq!(percent_decode("a%aéb"), "a%aéb");
+        assert_eq!(percent_decode("%aé"), "%aé");
+        assert_eq!(percent_decode("%41%zz"), "A%zz");
+    }
 
     fn env(pairs: &[(&str, &str)]) -> HashMap<String, String> {
         pairs

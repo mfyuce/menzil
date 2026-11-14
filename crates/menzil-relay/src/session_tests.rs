@@ -339,7 +339,19 @@ fn seed_network(
 
 async fn ping_pong(client: &mut TestClient, nonce: [u8; 8]) {
     client.send(Record::Ping { nonce }).await;
-    assert_eq!(client.recv().await, Some(Record::Pong { nonce }));
+    // Under load the relay's own keepalive Ping can arrive first: answer it, as a real peer
+    // would, and go on waiting for the Pong. Anything else is still a failure.
+    loop {
+        match client.recv().await {
+            Some(Record::Ping { nonce: theirs }) => {
+                client.send(Record::Pong { nonce: theirs }).await;
+            }
+            other => {
+                assert_eq!(other, Some(Record::Pong { nonce }));
+                return;
+            }
+        }
+    }
 }
 
 #[tokio::test]

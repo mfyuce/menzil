@@ -88,8 +88,11 @@ fn parse_hex32(s: &str) -> Result<[u8; 32], String> {
     }
     let mut out = [0u8; 32];
     for (i, byte) in out.iter_mut().enumerate() {
-        *byte = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16)
-            .map_err(|_| format!("invalid hex at byte {i}"))?;
+        // `get` instead of slicing: a multibyte character may straddle a pair boundary.
+        let pair = s
+            .get(i * 2..i * 2 + 2)
+            .ok_or_else(|| format!("invalid hex at byte {i}"))?;
+        *byte = u8::from_str_radix(pair, 16).map_err(|_| format!("invalid hex at byte {i}"))?;
     }
     Ok(out)
 }
@@ -100,6 +103,14 @@ mod tests {
 
     fn hex32(byte: u8) -> String {
         (0..32).map(|_| format!("{byte:02x}")).collect()
+    }
+
+    #[test]
+    fn multibyte_hex_is_an_error_not_a_panic() {
+        // "é" is 2 bytes: 31 + 2 + 31 = 64 bytes, with the character straddling a pair boundary.
+        let s = format!("{}é{}", "a".repeat(31), "a".repeat(31));
+        assert_eq!(s.len(), 64);
+        assert!(parse_hex32(&s).is_err());
     }
 
     #[test]

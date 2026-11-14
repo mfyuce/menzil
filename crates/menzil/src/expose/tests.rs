@@ -1125,6 +1125,26 @@ fn the_public_address_is_built_from_what_the_relay_accepted_and_the_share_domain
 }
 
 #[test]
+fn a_terminated_share_is_addressed_in_the_t_zone() {
+    let mut term = view("web", ShareState::Accepted);
+    term.mode = "terminated".into();
+    term.names = vec!["web".into(), "web.ali".into()];
+    assert_eq!(
+        public_address(&term, Some("d.org")),
+        "https://web.t.d.org, https://web.ali.t.d.org"
+    );
+    let text = public_address(&term, None);
+    assert!(text.contains("web.t.<share domain>"), "{text}");
+    term.names.clear();
+    let text = public_address(&term, Some("d.org"));
+    assert!(
+        text.contains("https://web.t.d.org once the relay accepts it")
+            && text.contains("web.<tenant>.t.d.org"),
+        "{text}"
+    );
+}
+
+#[test]
 fn the_list_and_the_status_lines_say_accepted_or_rejected_with_the_relays_reason() {
     let mut accepted = view("myapp", ShareState::Accepted);
     accepted.names = vec!["myapp.ali".into()];

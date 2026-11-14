@@ -1301,29 +1301,50 @@ pub fn public_address(view: &ShareView, domain: Option<&str>) -> String {
             format!("https://{name}")
         }
     };
+    // A terminated share lives in the zone `t.H` (protocol.md 6.3), every other mode in `H`.
+    let zone = |domain: &str| {
+        if view.mode == "terminated" {
+            format!("t.{domain}")
+        } else {
+            domain.to_string()
+        }
+    };
+    let placeholder = if view.mode == "terminated" {
+        "t.<share domain>"
+    } else {
+        "<share domain>"
+    };
     match (view.names.is_empty(), domain) {
         (false, Some(domain)) => view
             .names
             .iter()
-            .map(|n| scheme(&format!("{n}.{domain}")))
+            .map(|n| scheme(&format!("{n}.{}", zone(domain))))
             .collect::<Vec<_>>()
             .join(", "),
         (false, None) => format!(
             "{} under the relay's share domain (put `share_domain = \"...\"` in config.toml to print whole addresses)",
             view.names
                 .iter()
-                .map(|n| format!("{n}.<share domain>"))
+                .map(|n| format!("{n}.{placeholder}"))
                 .collect::<Vec<_>>()
                 .join(", ")
         ),
-        (true, Some(domain)) => format!(
-            "{} once the relay accepts it ({}.<tenant>.{domain} if the relay puts your network in a tenant)",
-            scheme(&format!("{}.{domain}", view.label)),
-            view.label
-        ),
+        (true, Some(domain)) => {
+            let zone = zone(domain);
+            format!(
+                "{} once the relay accepts it ({}.<tenant>.{zone} if the relay puts your network in a tenant)",
+                scheme(&format!("{}.{zone}", view.label)),
+                view.label
+            )
+        }
         (true, None) => format!(
-            "{}.<the relay's share domain> (the domain is the relay's; `share_domain` in config.toml makes this print whole addresses)",
-            view.label
+            "{}.<the relay's {}share domain> (the domain is the relay's; `share_domain` in config.toml makes this print whole addresses)",
+            view.label,
+            if view.mode == "terminated" {
+                "`t.` zone of the "
+            } else {
+                ""
+            }
         ),
     }
 }

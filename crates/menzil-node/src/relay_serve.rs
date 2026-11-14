@@ -436,10 +436,11 @@ fn serving_names(shares: &[Share], full_names: &[String]) -> Vec<String> {
 /// one (`<name>.<the relay's domain>`, which is how the relay composes it from a name relative
 /// to its share domain, or a subdomain of a name that is a domain, one with a dot), else dropped.
 ///
-/// Known limit: the node does not know the relay's share domain, so `<name>.<anything>` passes
+/// Known limit: this check does not hold the relay's share domain, so `<name>.<anything>` passes
 /// the prefix rule, `app.attacker.example` included. The field is information the relay claims
-/// and never picks a target, so this is accepted; closing it takes the domain in the
-/// ADVERTISE_ACK (a protocol change, expose round 1 N2).
+/// and never picks a target, so this is accepted. ADVERTISE_ACK does carry `share_domain` now
+/// (TBD 53), but it is informational only (protocol.md 4.4): nothing is decided from it, so it
+/// does not close this.
 ///
 /// Dropping is not refusing: `meta` is information the relay claims, never authorization, and a
 /// stream with a bad field is served with that field empty.

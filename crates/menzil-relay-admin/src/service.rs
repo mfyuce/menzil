@@ -388,6 +388,13 @@ impl TenantAdmin for Admin {
                             "a tenant with this name and other networks exists already",
                         ));
                     }
+                    // The class is part of what the first call created: a repeat asking for
+                    // another class is not a repeat, and must not be taken for one.
+                    if existing.class != class {
+                        return Err(Status::already_exists(
+                            "a tenant with this name exists already with another class",
+                        ));
+                    }
                     command(tenants::add_network_to(
                         home,
                         &req.tokens[0],

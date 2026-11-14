@@ -6,14 +6,16 @@
 //! shape so a session layer can treat either uniformly. Deliberately not
 //! here:
 //!
-//! - Anything but the blind front door of the TLS port (`front_door`: protocol.md 6.2 to 6.4,
-//!   SNI routing of blind `tls:` and `tcp:` shares through the relay principal, and the TLS of
-//!   terminated shares); the static site is a later slice.
+//! - Anything but the front door of the TLS port (`front_door`: protocol.md 6.2 to 6.4, SNI
+//!   routing of blind `tls:` and `tcp:` shares through the relay principal, and the TLS of
+//!   terminated shares). A plain HTTPS request to the relay's own name gets the static
+//!   `--fallback-page` (`listener`), and WebSocket upgrades are served as before; there is no
+//!   static site directory.
 //! - The relay's own ACME is `acme` (TLS-ALPN-01 for the relay's host name and the names of
 //!   terminated shares, needs the front door); the certificate and key of the relay's own host
 //!   are otherwise supplied to this crate already loaded.
-//! - `http_term` is the HTTP/1.1 terminator of terminated shares (protocol.md 6.3); WebSocket
-//!   upgrade through it is not built.
+//! - `http_term` is the HTTP/1.1 terminator of terminated shares (protocol.md 6.3); a WebSocket
+//!   upgrade through it is an opaque pipe after a handshake the relay checks itself.
 
 #![forbid(unsafe_code)]
 
