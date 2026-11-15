@@ -16,6 +16,17 @@ within 15 seconds.
   CA (5 years), a server certificate (SAN: the name and 127.0.0.1) and a client certificate (1
   year each), refusing to overwrite. Move `ca.key` offline.
 
+## Key loss and rotation (read before an incident)
+
+* There is **no revocation list**: the client verifier checks the chain against `--client-ca` and
+  nothing else (no CRL, no OCSP). A leaked client key stays valid until its certificate expires
+  (1 year with `gen-certs`). The only remedy is a new CA: run `gen-certs` again, give the agent
+  the new `--client-ca` and restart it, and give menzil-ui the new client certificate.
+* The certificate, key and CA files are read **once at start**; the agent does not reload them.
+  Replacing a certificate, rotating the server key or changing the CA needs a restart of
+  `menzil-relay-admin` (in-flight requests end; the relay itself is not touched).
+* Keep `ca.key` offline so a new client certificate can only be made on purpose.
+
 See `docs/private/ui-agent-howto.md` for the commands.
 
 ## Build notes
