@@ -637,6 +637,9 @@ enum Wire {
 struct ControlledProxy {
     port: u16,
     wire: watch::Sender<Wire>,
+    /// Bytes the proxy has passed on to the relay so far, over every connection: a measure of
+    /// progress through a throttled queue that does not depend on how loaded the machine is.
+    forwarded: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 async fn controlled_proxy(relay: SocketAddr) -> ControlledProxy {
@@ -646,6 +649,8 @@ async fn controlled_proxy(relay: SocketAddr) -> ControlledProxy {
     let listener = socket.listen(16).unwrap();
     let port = listener.local_addr().unwrap().port();
     let (wire, wire_rx) = watch::channel(Wire::Flowing);
+    let forwarded = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counter = forwarded.clone();
     tokio::spawn(async move {
         while let Ok((down, _)) = listener.accept().await {
             let up = TcpStream::connect(relay).await.unwrap();
@@ -657,6 +662,7 @@ async fn controlled_proxy(relay: SocketAddr) -> ControlledProxy {
             });
             // Node to relay: according to `wire`.
             let mut wire_rx = wire_rx.clone();
+            let counter = counter.clone();
             tokio::spawn(async move {
                 let mut buf = vec![0u8; 4096];
                 loop {
@@ -674,6 +680,7 @@ async fn controlled_proxy(relay: SocketAddr) -> ControlledProxy {
                     if up_write.write_all(&buf[..n]).await.is_err() {
                         return;
                     }
+                    counter.fetch_add(n, std::sync::atomic::Ordering::SeqCst);
                     if let Wire::Throttled { bytes_per_sec } = mode {
                         tokio::time::sleep(Duration::from_secs_f64(
                             n as f64 / bytes_per_sec as f64,
@@ -684,7 +691,11 @@ async fn controlled_proxy(relay: SocketAddr) -> ControlledProxy {
             });
         }
     });
-    ControlledProxy { port, wire }
+    ControlledProxy {
+        port,
+        wire,
+        forwarded,
+    }
 }
 
 /// One sender node reaching `receiver` through a [`ControlledProxy`], both
@@ -906,7 +917,7 @@ async fn a_stop_writes_what_was_handed_over_before_it_closes(trust: &TestTrust) 
 /// The wire here is slow but flowing (64 KiB/s). 48 records of 16 KiB are
 /// admitted at once, as above, and then take about ten seconds to write.
 /// A request handed over one second into that must still be admitted
-/// within two. A loop that wrote the whole queue before looking at
+/// long before the queue has been written (see the bound below). A loop that wrote the whole queue before looking at
 /// `outbound` again would keep it waiting for the rest of those ten
 /// seconds; this is the difference between writing one record per
 /// iteration and finishing the queue, which the stalled-wire scenario
@@ -942,11 +953,32 @@ async fn an_arrival_during_a_slow_write_run_waits_for_one_write_not_the_queue(tr
     let (late, late_outcome) =
         reliable_with_outcome(node.receiver.node_id, Epoch::first(), payload(RECORDS));
     node.sender_outbound.send(late).await.unwrap();
-    let outcome = timeout(Duration::from_secs(2), late_outcome).await.expect(
-        "a request handed over during a slow write run must be admitted after at most the \
-             write in progress, not after the whole queue has been written",
-    );
+    // The bound is in bytes the wire has carried, not in seconds. A real-clock limit (this
+    // used to be `timeout(2 s)`) flakes when the machine is busy: the late request is
+    // admitted after "at most one write", but the test task or the node task can be
+    // descheduled for longer than that margin. The wire cannot outrun its throttle however
+    // busy the machine is, so how much of the queue it has passed by the moment of admission
+    // tells the two behaviours apart: admitted after the write in progress means a fraction of
+    // the 768 KiB queue has gone (about 64 KiB per second of run plus what the node was ahead
+    // by); admitted after the whole queue means all but the roughly hundred kilobytes the node
+    // can be ahead of the proxy has gone (see [`ControlledProxy`]). Half of the queue sits
+    // between the two with a wide margin on both sides. The timeout is only a backstop
+    // against a hang and exceeds the twelve seconds the whole queue needs.
+    let outcome = timeout(Duration::from_secs(60), late_outcome)
+        .await
+        .expect("the late request was never admitted");
     assert_eq!(outcome, Ok(EnqueueOutcome::Accepted));
+    let carried = node
+        .proxy
+        .forwarded
+        .load(std::sync::atomic::Ordering::SeqCst);
+    assert!(
+        carried < RECORDS * RECORD_LEN / 2,
+        "a request handed over during a slow write run must be admitted after at most the \
+         write in progress, not after the whole queue has been written: {carried} of {} \
+         bytes had been carried when it was admitted",
+        RECORDS * RECORD_LEN
+    );
 
     // Let the rest through quickly, and check nothing was lost or reordered
     // on the way, the late one last.

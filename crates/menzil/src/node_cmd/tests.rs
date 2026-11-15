@@ -1483,6 +1483,100 @@ fn a_changed_share_of_a_served_service_applies_and_one_that_needs_a_restart_keep
     assert!(plan.needs_restart.is_empty());
 }
 
+/// `reload_shares` through a node that `start` made (S-E1 leftover): a hand edit of
+/// `config.toml` is applied as one step. A service taken out of the file stays served (only
+/// `expose remove` or a restart takes it out) while its share stops being advertised; a share
+/// for a service that is in no `[services]` entry makes the whole file invalid, so nothing of
+/// that edit applies; a file that does not parse changes nothing.
+#[tokio::test]
+async fn reload_shares_applies_the_edit_keeps_a_removed_service_and_refuses_an_invalid_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = Home::new(dir.path().join("home"));
+    init(&home, clock()).unwrap();
+    network_create(&home, "laptop", clock()).unwrap();
+    let info = crate::relay_cmd::connection_info(
+        "127.0.0.1",
+        9,
+        crate::relay_cmd::DEFAULT_PATH,
+        &crate::relay_cmd::relay_identity(&home).unwrap(),
+    )
+    .unwrap();
+    let text = |body: &str| format!("relay = \"{info}\"\nproxy = \"direct\"\n{body}");
+    let both = text(
+        "[services]\n\"tls:web\" = \"127.0.0.1:7001\"\n\"tls:db\" = \"127.0.0.1:7002\"\n\n\
+         [[share]]\nname = \"web\"\nmode = \"blind\"\nservice = \"tls:web\"\n\n\
+         [[share]]\nname = \"db\"\nmode = \"blind\"\nservice = \"tls:db\"\n",
+    );
+    std::fs::write(home.config_path(), &both).unwrap();
+    let config = Config::load(&home).unwrap();
+    let node = start(&home, &config, &dir.path().join("a.sock"))
+        .await
+        .unwrap();
+    let names = |node: &RunningNode| {
+        let mut names: Vec<String> = node
+            .node
+            .shares()
+            .configured()
+            .iter()
+            .map(|share| share.name.clone())
+            .collect();
+        names.sort();
+        names
+    };
+    assert_eq!(names(&node), ["db", "web"]);
+    let db: ServiceId = "tls:db".parse().unwrap();
+    let web: ServiceId = "tls:web".parse().unwrap();
+
+    // `db` is taken out of the file entirely (share and service); `web` moves to a new port.
+    std::fs::write(
+        home.config_path(),
+        text(
+            "[services]\n\"tls:web\" = \"127.0.0.1:7003\"\n\n\
+             [[share]]\nname = \"web\"\nmode = \"blind\"\nservice = \"tls:web\"\n",
+        ),
+    )
+    .unwrap();
+    reload_shares(&home, &node.node, &node.services);
+    assert_eq!(names(&node), ["web"], "db is no longer advertised");
+    assert_eq!(
+        node.services.target(&web).unwrap().to_string(),
+        "127.0.0.1:7003",
+        "a changed target is followed"
+    );
+    assert!(
+        node.services.target(&db).is_some(),
+        "a service that left the file is still served"
+    );
+
+    // A share for a service no `[services]` entry defines: the file is invalid as a whole, so
+    // the new port of `web` in the same edit is not applied either.
+    std::fs::write(
+        home.config_path(),
+        text(
+            "[services]\n\"tls:web\" = \"127.0.0.1:7004\"\n\n\
+             [[share]]\nname = \"web\"\nmode = \"blind\"\nservice = \"tls:web\"\n\n\
+             [[share]]\nname = \"ghost\"\nmode = \"blind\"\nservice = \"tls:ghost\"\n",
+        ),
+    )
+    .unwrap();
+    reload_shares(&home, &node.node, &node.services);
+    assert_eq!(names(&node), ["web"]);
+    assert_eq!(
+        node.services.target(&web).unwrap().to_string(),
+        "127.0.0.1:7003",
+        "nothing of an invalid edit is applied"
+    );
+
+    // A file that does not parse changes nothing.
+    std::fs::write(home.config_path(), "raley = 1\n").unwrap();
+    reload_shares(&home, &node.node, &node.services);
+    assert_eq!(names(&node), ["web"]);
+    assert_eq!(
+        node.services.target(&web).unwrap().to_string(),
+        "127.0.0.1:7003"
+    );
+}
+
 // ---- the node's certificates (`[acme]`) ----
 
 mod acme_wiring {

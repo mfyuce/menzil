@@ -658,4 +658,79 @@ mod tests {
             assert_eq!(bytes, response(status));
         }
     }
+
+    /// A `MakeWriter` that collects everything the subscriber writes.
+    #[derive(Clone, Default)]
+    struct Captured(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Captured {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Captured {
+        type Writer = Captured;
+        fn make_writer(&'a self) -> Captured {
+            self.clone()
+        }
+    }
+
+    /// The value of a `Proxy-Authorization` header is a credential: whatever the parser
+    /// does with a head (accept it, refuse it for another reason, read it from a stream), no
+    /// log line at any level, nor the refusal, nor the fixed response, carries it.
+    #[test]
+    fn a_proxy_authorization_value_is_never_logged() {
+        const SECRET: &str = "Basic SUPER-SECRET-c3VwZXJzZWNyZXQ";
+        let captured = Captured::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(captured.clone())
+            .with_max_level(tracing::Level::TRACE)
+            .with_ansi(false)
+            .finish();
+        let auth = format!("Proxy-Authorization: {SECRET}");
+        let mut seen = String::new();
+        tracing::subscriber::with_default(subscriber, || {
+            let heads = [
+                // accepted
+                head("CONNECT example.org:443 HTTP/1.1", &[auth.as_str()]),
+                // refused for another reason, the credential riding along
+                head(
+                    "CONNECT example.org:443 HTTP/1.1",
+                    &[auth.as_str(), "Transfer-Encoding: chunked"],
+                ),
+                head("GET / HTTP/1.1", &[auth.as_str()]),
+                head("CONNECT example.org HTTP/1.1", &[auth.as_str()]),
+            ];
+            for bytes in &heads {
+                let parsed = parse_head(bytes);
+                seen.push_str(&format!("{parsed:?}"));
+                if let Err(refusal) = parsed {
+                    seen.push_str(&String::from_utf8_lossy(&response(refusal.status())));
+                }
+            }
+            // Through the stream reader too, with the credential in the leftover bytes.
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap();
+            for bytes in &heads {
+                let mut with_rest = bytes.clone();
+                with_rest.extend_from_slice(SECRET.as_bytes());
+                let mut reader = &with_rest[1..];
+                let result = runtime.block_on(read_head(&mut reader, with_rest[0]));
+                if let Err(error) = &result {
+                    seen.push_str(&format!("{error:?}"));
+                }
+            }
+        });
+        let logged = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+        for text in [&logged, &seen] {
+            assert!(!text.contains("SUPER-SECRET"), "{text}");
+            assert!(!text.contains("c3VwZXJzZWNyZXQ"), "{text}");
+        }
+    }
 }
