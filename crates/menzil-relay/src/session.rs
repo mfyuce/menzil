@@ -1138,6 +1138,8 @@ pub(crate) async fn handle_connection(
                 );
                 return;
             };
+            #[cfg(test)]
+            relay.run_before_loop();
             run_attached_loop(
                 conn,
                 transport,

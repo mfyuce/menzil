@@ -93,6 +93,10 @@ impl Default for SessionTimeouts {
     }
 }
 
+/// A test hook of the relay (see `Relay::before_loop`).
+#[cfg(test)]
+pub(crate) type TestHook = Arc<dyn Fn() + Send + Sync>;
+
 /// A relay's shared runtime state: cheap to clone (every field is an
 /// `Arc`, or `Copy`), so each accepted connection's spawned task gets
 /// its own handle without contending on anything but the state itself.
@@ -128,6 +132,10 @@ pub struct Relay {
     front_door: Option<Arc<FrontDoorConfig>>,
     /// The relay's own ACME (`crate::acme`); `None` answers no validation and orders nothing.
     acme: Option<RelayAcme>,
+    /// Called once per session between the HELLO judgement and the attached loop (tests: adopt
+    /// a Roster inside that window).
+    #[cfg(test)]
+    pub(crate) before_loop: Arc<std::sync::Mutex<Option<TestHook>>>,
 }
 
 /// An attached node as the relay's own endpoint needs it: the L3 session it is attached by and
@@ -206,6 +214,8 @@ impl Relay {
             principal: PrincipalConfig::default(),
             front_door: None,
             acme: None,
+            #[cfg(test)]
+            before_loop: Arc::new(std::sync::Mutex::new(None)),
         }
     }
 
@@ -336,6 +346,15 @@ impl Relay {
     /// The figures a [`crate::Principal`] made from this relay uses.
     pub fn principal_config(&self) -> PrincipalConfig {
         self.principal
+    }
+
+    /// Runs the test hook of the window between HELLO and the attached loop, if one is set.
+    #[cfg(test)]
+    pub(crate) fn run_before_loop(&self) {
+        let hook = self.before_loop.lock().unwrap().clone();
+        if let Some(hook) = hook {
+            hook();
+        }
     }
 
     /// This relay with other session time limits (tests).

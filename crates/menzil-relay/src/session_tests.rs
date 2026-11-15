@@ -2323,6 +2323,53 @@ async fn a_session_that_has_not_attached_yet_is_evicted_too() {
 }
 
 #[tokio::test]
+async fn a_roster_adopted_between_hello_and_the_attached_loop_still_evicts_the_node() {
+    // The first `out_of_standing` after `StandingWatch::new` closes the window since HELLO was
+    // judged: no notice is ever heard for a Roster adopted before the watch existed.
+    let (relay, listener, cert, relay_x25519) = bind_test_relay().await;
+    let addr = listener.local_addr().unwrap();
+    let (x, y) = (generate_identity(), generate_identity());
+    let owner = SigningKey::generate(&mut rand::rng());
+    let network = NetworkId::from(owner.verifying_key().to_bytes());
+    relay
+        .rosters()
+        .set(&evict_roster(
+            &owner,
+            network,
+            1,
+            &[(x.node_id, 1), (y.node_id, 1)],
+            &[],
+        ))
+        .unwrap();
+    let revoking = evict_roster(&owner, network, 2, &[(y.node_id, 1)], &[x.node_id]);
+    let store = std::sync::Arc::clone(&relay.rosters);
+    *relay.before_loop.lock().unwrap() = Some(std::sync::Arc::new(move || {
+        store.set(&revoking).unwrap();
+    }));
+    let serve_relay = relay.clone();
+    tokio::spawn(async move { serve_relay.serve(&listener).await });
+    let (mut client_x, _) = TestClient::connect(
+        addr,
+        cert,
+        &x,
+        relay_x25519,
+        vec![network],
+        HashMap::from([(network, 1u64)]),
+        1,
+        10,
+    )
+    .await;
+    client_x.send(Record::Attach).await;
+    let records = read_to_end(&mut client_x).await;
+    let code = records.iter().find_map(|r| match r {
+        Record::Error(e) => Some(e.code),
+        _ => None,
+    });
+    assert_eq!(code, Some(ErrorCode::Revoked), "{records:?}");
+    assert!(!relay.registry.is_attached(&x.node_id));
+}
+
+#[tokio::test]
 async fn a_roster_that_leaves_a_node_in_standing_ends_nothing() {
     // `min_serial` raised to exactly the serial the node presented is no eviction.
     let (relay, listener, cert, relay_x25519) = bind_test_relay().await;

@@ -528,6 +528,41 @@ fn a_relay_keeps_a_steward_signed_roster_with_its_base() {
     assert_eq!(fs::read(roster_path(&relay, &id)).unwrap()[0] & 0xf0, 0x80);
 }
 
+/// A revocation that reaches a running relay only through its directory (the operator copies the
+/// owner's new token in): the reload adopts it and the relay's store announces it, the notice a
+/// session's standing watch turns into an eviction (T6 d; the session side is in `menzil-relay`).
+#[tokio::test]
+async fn a_revocation_dropped_into_the_directory_is_adopted_and_announced_to_sessions() {
+    let (_o, owner, id, _docs_token) = token_of_a_network();
+    let (dir, relay_home) = home();
+    init(&relay_home, clock()).unwrap();
+    add_network(&relay_home, &relay_token(&owner), clock()).unwrap();
+    let running = running_on(dir.path(), &relay_home).await;
+    let node = crate::local::load_documents(&owner, &id)
+        .unwrap()
+        .roster_body()
+        .members[0]
+        .node_id;
+    let mut notices = running.relay.rosters().subscribe();
+    assert!(
+        running.relay.rosters().get(&id).unwrap().revoked.is_empty(),
+        "not revoked yet"
+    );
+
+    crate::local::revoke(&owner, None, &node.to_string(), true, clock() + 60).unwrap();
+    add_network(&relay_home, &relay_token(&owner), clock() + 60).unwrap();
+    reload_once(&running.relay, &relay_home, &mut Vec::new());
+
+    let held = running.relay.rosters().get(&id).unwrap();
+    assert_eq!(held.seq, 2);
+    assert!(
+        held.revoked.iter().any(|r| r.node_id == node),
+        "the relay holds the revoking Roster after one reload"
+    );
+    assert_eq!(notices.try_recv().unwrap(), id, "the sessions are told");
+    running.stop();
+}
+
 /// Protocol.md 2.3: a newer `seq` is not enough. A steward's Roster made from a base older than
 /// the base of the Roster the relay keeps would undo what the owner changed since. (The owner
 /// normally jumps past the steward's span; this is an owner who did not.)
