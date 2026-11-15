@@ -8,7 +8,7 @@
 //! GOAWAY already were: an inbound DOC is reassembled and, once complete,
 //! verified and stored into this session's [`RosterStore`]
 //! (`Engine::accept_doc`, logic in `crate::l3_doc`; a steward signed Roster is judged with
-//! the owner signed base the relay sends first, kept pending per network until it arrives); right after ATTACH, [`Session::connect`] pushes
+//! the owner signed base the relay sends first, kept pending by base seq until it arrives); right after ATTACH, [`Session::connect`] pushes
 //! DOC(roster) for every network where this node's own store already
 //! holds something newer than WELCOME's `rosters` reported (protocol.md
 //! 4.3's literal node-to-relay rule, via `rosters_to_push`), and
@@ -255,7 +255,7 @@ impl Engine {
     /// as a Roster for a network this node itself claims, and stores it
     /// via `roster_store` (`crate::l3_doc`). The owner signed base the relay
     /// sends ahead of a steward signed Roster (`DocType::BaseRoster`) is kept
-    /// pending per network (one each, at most 8 per session) and judges the
+    /// pending by base seq (at most 8 per session) and judges the
     /// Roster that follows it (protocol.md 2.3, 4.3); a base alone is never
     /// adopted. Any other `doc_type` is logged and ignored
     /// without attempting to decode it as one (at L3, a relay only ever

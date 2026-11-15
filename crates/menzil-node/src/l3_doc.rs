@@ -3,28 +3,33 @@
 //! `Engine::accept_doc` is thin glue around [`accept_completed`].
 //!
 //! The relay sends the owner signed base Roster (`DocType::BaseRoster`) ahead of a steward
-//! signed Roster. A base is kept pending, one per network, at most [`MAX_PENDING_BASES`] per
-//! session, until the Roster that follows it; the Roster is then judged with that base by the
+//! signed Roster. A base is kept pending by (network, base seq), at most [`MAX_PENDING_BASES`] per
+//! session, until the Roster that follows it; the Roster is then judged with the pending base
+//! of its network that it follows (the largest seq below its own, within the span) by the
 //! acceptance predicate of protocol.md 2.3 (`RosterStore::adopt_roster`). A base never counts
-//! alone and a base is used up by the Roster that follows it, whoever signed that. The relay
+//! alone and a base is used up by the Roster that uses it (an owner signed Roster discards the
+//! bases at or below its seq). The relay
 //! is only semi trusted, so keeping a base is cheap (strict decode, claimed network, cap) and
 //! every signature is checked when the Roster arrives. Mirrors the relay's `doc.rs`.
 
 use std::collections::HashMap;
 
+use ed25519_dalek::VerifyingKey;
+use menzil_proto::trust::STEWARD_SEQ_SPAN;
 use menzil_proto::{DocType, NetworkId, ProtoError, Roster};
 
 use crate::error::NodeError;
 use crate::roster_store::RosterStore;
 
-/// The most bases a session may have pending at once, one per network.
+/// The most bases a session may have pending at once, over all networks and seqs.
 const MAX_PENDING_BASES: usize = 8;
 
-/// The base Rosters a session was sent that wait for the Roster they belong to. Owned by the
-/// session's `Engine`, so it dies with the session.
+/// The base Rosters a session was sent that wait for the Roster they belong to, keyed by
+/// (network, base seq): the relay's fan out may interleave bases and Rosters of several
+/// pushers. Owned by the session's `Engine`, so it dies with the session.
 #[derive(Debug, Default)]
 pub(crate) struct PendingBases {
-    by_network: HashMap<NetworkId, Roster>,
+    by_key: HashMap<(NetworkId, u64), Roster>,
 }
 
 impl PendingBases {
@@ -32,25 +37,46 @@ impl PendingBases {
         Self::default()
     }
 
-    /// Keeps `base` for `network_id`, replacing a pending one of that network. Returns false,
-    /// keeping nothing, when [`MAX_PENDING_BASES`] other networks are already pending.
-    pub(crate) fn keep(&mut self, network_id: NetworkId, base: Roster) -> bool {
-        if !self.by_network.contains_key(&network_id) && self.by_network.len() >= MAX_PENDING_BASES
-        {
+    /// Keeps `base` (whose seq is `base_seq`) for `network_id`; the same (network, seq)
+    /// replaces the old entry and is always kept. Returns false, keeping nothing, when
+    /// [`MAX_PENDING_BASES`] other entries are already pending.
+    pub(crate) fn keep(&mut self, network_id: NetworkId, base_seq: u64, base: Roster) -> bool {
+        let key = (network_id, base_seq);
+        if !self.by_key.contains_key(&key) && self.by_key.len() >= MAX_PENDING_BASES {
             return false;
         }
-        self.by_network.insert(network_id, base);
+        self.by_key.insert(key, base);
         true
     }
 
-    /// The pending base of `network_id`, removed: it serves the one Roster that follows it.
-    pub(crate) fn take(&mut self, network_id: &NetworkId) -> Option<Roster> {
-        self.by_network.remove(network_id)
+    /// For a steward Roster of `network_id` at `roster_seq`: the pending base with the largest
+    /// seq below `roster_seq` and within the steward span, removed together with every pending
+    /// base of that network at or below its seq (used up or superseded). None when no base is
+    /// a candidate (nothing is removed then).
+    pub(crate) fn take(&mut self, network_id: &NetworkId, roster_seq: u64) -> Option<Roster> {
+        let best = self
+            .by_key
+            .keys()
+            .filter(|(n, b)| {
+                n == network_id
+                    && *b < roster_seq
+                    && roster_seq <= b.saturating_add(STEWARD_SEQ_SPAN)
+            })
+            .map(|(_, b)| *b)
+            .max()?;
+        let base = self.by_key.remove(&(*network_id, best));
+        self.discard_through(network_id, best);
+        base
+    }
+
+    /// Removes every pending base of `network_id` with seq at or below `seq`.
+    pub(crate) fn discard_through(&mut self, network_id: &NetworkId, seq: u64) {
+        self.by_key.retain(|(n, b), _| n != network_id || *b > seq);
     }
 
     #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
-        self.by_network.len()
+        self.by_key.len()
     }
 }
 
@@ -102,14 +128,22 @@ pub(crate) fn accept_completed(
         return L3DocOutcome::Dropped("a DOC for a network this node does not claim");
     }
     if doc_type == DocType::BaseRoster {
-        return if pending.keep(network_id, roster) {
+        return if pending.keep(network_id, body.seq, roster) {
             L3DocOutcome::Nothing
         } else {
             L3DocOutcome::Dropped("too many pending base Rosters")
         };
     }
-    // The base is used up by the Roster that follows it, whoever signed that.
-    let base = pending.take(&network_id);
+    // An owner signed Roster needs no base and discards the bases at or below its seq; a
+    // steward Roster is judged with the pending base it follows, which is then used up.
+    let owner_signed = VerifyingKey::from_bytes(&<[u8; 32]>::from(network_id))
+        .is_ok_and(|owner| roster.verify(&owner).is_ok());
+    let base = if owner_signed {
+        pending.discard_through(&network_id, body.seq);
+        None
+    } else {
+        pending.take(&network_id, body.seq)
+    };
     match store.adopt_roster(&roster, base.as_ref(), now) {
         Ok(true) => L3DocOutcome::Adopted(network_id, body.seq),
         Ok(false) => L3DocOutcome::Held(network_id, body.seq),
@@ -414,7 +448,7 @@ mod tests {
             1,
             "the other network's base is still pending"
         );
-        assert!(pending.take(&other.network_id).is_some());
+        assert!(pending.take(&other.network_id, 11).is_some());
     }
 
     #[test]
@@ -467,7 +501,7 @@ mod tests {
     }
 
     #[test]
-    fn the_cap_refuses_a_ninth_network_and_a_replacement_is_always_kept() {
+    fn the_cap_refuses_a_ninth_key_and_the_same_key_replaces() {
         let fixes: Vec<Fix> = (0..9).map(|_| Fix::new(NOW)).collect();
         let claimed: Vec<NetworkId> = fixes.iter().map(|f| f.network_id).collect();
         let (store, mut pending) = (RosterStore::new(), PendingBases::new());
@@ -492,12 +526,12 @@ mod tests {
         );
         assert!(matches!(out, L3DocOutcome::Dropped(_)), "{out:?}");
         assert_eq!(pending.len(), 8);
-        assert!(pending.take(&fixes[8].network_id).is_none());
+        assert!(pending.take(&fixes[8].network_id, 11).is_none());
         // A replacement for an already pending network is kept.
         let out = run(
             &fixes[0],
             DocType::BaseRoster,
-            &fixes[0].other_base(11),
+            &fixes[0].other_base(10),
             &claimed,
             &mut pending,
             &store,
@@ -506,9 +540,9 @@ mod tests {
         assert_eq!(pending.len(), 8);
         assert_eq!(
             pending
-                .take(&fixes[0].network_id)
-                .map(|r| r.decode().unwrap().seq),
-            Some(11)
+                .take(&fixes[0].network_id, 12)
+                .map(|r| r.decode().unwrap().members.len()),
+            Some(0)
         );
     }
 
@@ -565,5 +599,165 @@ mod tests {
         ));
         let out = base_then_roster(&fix, &store, &mut pending, &r);
         assert!(matches!(out, L3DocOutcome::Held(_, 11)), "{out:?}");
+    }
+
+    fn feed(
+        fix: &Fix,
+        dt: DocType,
+        doc: &Roster,
+        p: &mut PendingBases,
+        st: &RosterStore,
+    ) -> L3DocOutcome {
+        run(fix, dt, doc, &[fix.network_id], p, st)
+    }
+
+    #[test]
+    fn interleaved_fan_outs_adopt_both_rosters() {
+        let fix = Fix::new(NOW);
+        let (store, mut p) = (RosterStore::new(), PendingBases::new());
+        let b12 = fix.roster(&fix.owner, 12);
+        assert!(matches!(
+            feed(&fix, DocType::BaseRoster, &fix.base, &mut p, &store),
+            L3DocOutcome::Nothing
+        ));
+        assert!(matches!(
+            feed(&fix, DocType::BaseRoster, &b12, &mut p, &store),
+            L3DocOutcome::Nothing
+        ));
+        let out = feed(
+            &fix,
+            DocType::Roster,
+            &fix.steward_roster(11),
+            &mut p,
+            &store,
+        );
+        assert!(matches!(out, L3DocOutcome::Adopted(_, 11)), "{out:?}");
+        let out = feed(
+            &fix,
+            DocType::Roster,
+            &fix.steward_roster(13),
+            &mut p,
+            &store,
+        );
+        assert!(matches!(out, L3DocOutcome::Adopted(_, 13)), "{out:?}");
+        assert_eq!(store.seq(&fix.network_id), Some(13));
+        assert_eq!(store.base(&fix.network_id), Some(b12));
+        assert_eq!(p.len(), 0);
+    }
+
+    #[test]
+    fn in_order_fan_outs_adopt_both_rosters() {
+        let fix = Fix::new(NOW);
+        let (store, mut p) = (RosterStore::new(), PendingBases::new());
+        let b12 = fix.roster(&fix.owner, 12);
+        feed(&fix, DocType::BaseRoster, &fix.base, &mut p, &store);
+        let out = feed(
+            &fix,
+            DocType::Roster,
+            &fix.steward_roster(11),
+            &mut p,
+            &store,
+        );
+        assert!(matches!(out, L3DocOutcome::Adopted(_, 11)), "{out:?}");
+        feed(&fix, DocType::BaseRoster, &b12, &mut p, &store);
+        let out = feed(
+            &fix,
+            DocType::Roster,
+            &fix.steward_roster(13),
+            &mut p,
+            &store,
+        );
+        assert!(matches!(out, L3DocOutcome::Adopted(_, 13)), "{out:?}");
+    }
+
+    #[test]
+    fn a_pending_base_above_the_roster_is_not_used_and_stays() {
+        let fix = Fix::new(NOW);
+        let (store, mut p) = (RosterStore::new(), PendingBases::new());
+        let b12 = fix.roster(&fix.owner, 12);
+        feed(&fix, DocType::BaseRoster, &b12, &mut p, &store);
+        let out = feed(
+            &fix,
+            DocType::Roster,
+            &fix.steward_roster(11),
+            &mut p,
+            &store,
+        );
+        assert!(matches!(out, L3DocOutcome::Rejected(_)), "{out:?}");
+        assert_eq!(p.len(), 1);
+    }
+
+    #[test]
+    fn a_base_far_outside_the_span_is_not_chosen() {
+        let fix = Fix::new(NOW);
+        let (store, mut p) = (RosterStore::new(), PendingBases::new());
+        feed(&fix, DocType::BaseRoster, &fix.base, &mut p, &store);
+        let far = 10 + STEWARD_SEQ_SPAN + 1;
+        let out = feed(
+            &fix,
+            DocType::Roster,
+            &fix.steward_roster(far),
+            &mut p,
+            &store,
+        );
+        assert!(
+            matches!(
+                out,
+                L3DocOutcome::Rejected(NodeError::DocumentRejected(Reason::MissingBase))
+            ),
+            "{out:?}"
+        );
+        assert_eq!(p.len(), 1, "an unusable base is not consumed");
+    }
+
+    #[test]
+    fn take_picks_the_largest_seq_below_and_discards_the_lower_ones() {
+        let fix = Fix::new(NOW);
+        let mut p = PendingBases::new();
+        for s in [10u64, 12, 14] {
+            assert!(p.keep(fix.network_id, s, fix.other_base(s)));
+        }
+        let got = p.take(&fix.network_id, 13).unwrap();
+        assert_eq!(got.decode().unwrap().seq, 12);
+        assert_eq!(p.len(), 1);
+        assert_eq!(
+            p.take(&fix.network_id, 15).unwrap().decode().unwrap().seq,
+            14
+        );
+    }
+
+    #[test]
+    fn an_owner_roster_discards_only_bases_at_or_below_it() {
+        let fix = Fix::new(NOW);
+        let (store, mut p) = (RosterStore::new(), PendingBases::new());
+        feed(&fix, DocType::BaseRoster, &fix.base, &mut p, &store);
+        feed(
+            &fix,
+            DocType::BaseRoster,
+            &fix.roster(&fix.owner, 14),
+            &mut p,
+            &store,
+        );
+        let out = feed(
+            &fix,
+            DocType::Roster,
+            &fix.roster(&fix.owner, 11),
+            &mut p,
+            &store,
+        );
+        assert!(matches!(out, L3DocOutcome::Adopted(..)), "{out:?}");
+        assert_eq!(p.len(), 1, "the base above stays");
+    }
+
+    #[test]
+    fn the_cap_counts_distinct_seqs_of_one_network() {
+        let fix = Fix::new(NOW);
+        let mut p = PendingBases::new();
+        for s in 10..18u64 {
+            assert!(p.keep(fix.network_id, s, fix.other_base(s)));
+        }
+        assert!(!p.keep(fix.network_id, 18, fix.other_base(18)));
+        assert!(p.keep(fix.network_id, 12, fix.other_base(12)));
+        assert_eq!(p.len(), 8);
     }
 }
