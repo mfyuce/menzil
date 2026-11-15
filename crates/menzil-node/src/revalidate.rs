@@ -967,6 +967,32 @@ mod tests {
         assert_eq!(deadline_of(&f, &peers, 401), Some(5_000));
     }
 
+    /// Threat model 5 item 20: a renewal nobody lists ends the peer's session at its
+    /// `not_after`; listing it late (same key, higher serial) brings the peer back, so the
+    /// next look past that second finds a certificate that backs the session again.
+    #[test]
+    fn a_renewal_nobody_lists_ends_the_session_and_a_late_listing_brings_it_back() {
+        let mut f = fixture(400);
+        let peers = [(f.peer, f.peer_static)];
+        // Unlisted renewal: the session is due to be looked at the second after not_after,
+        // and from then on the certificate backs no one (the pass closes the session).
+        assert_eq!(deadline_of(&f, &peers, 400), Some(401));
+        assert!(
+            CertIndex::build(&f.policy.certs)
+                .resolve(&f.peer, &f.peer_static, 401)
+                .is_none()
+        );
+        assert_eq!(deadline_of(&f, &peers, 401), Some(5_000));
+        // The owner lists the renewal late: same key, serial 2, window past the old end.
+        let renewal = peer_cert(&f, 2, 7, (0, 900));
+        f.policy.certs.push(renewal);
+        let index = CertIndex::build(&f.policy.certs);
+        let body = index.resolve(&f.peer, &f.peer_static, 401).unwrap();
+        assert_eq!(body.serial, 2);
+        // Back in business: the next thing to watch is the renewal's own end.
+        assert_eq!(deadline_of(&f, &peers, 401), Some(901));
+    }
+
     #[test]
     fn a_higher_serial_certificate_that_starts_later_is_a_deadline() {
         // Round A N1: serial 2 (another key) starts at 300, before serial 1 ends at 400.

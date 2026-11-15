@@ -1408,6 +1408,82 @@ mod tests {
         assert!(!store.has_grant(&rosters, &network_id, &a, &b, None, 1_000));
     }
 
+    /// Threat model 5 item 3: a node in two networks that use the SAME role name. A grant to
+    /// role "r" in N1's Policy serves N1's holders of "r" only; an N2 member holding "r"
+    /// reaches nothing through it, whether N1's grant is asked about under N2 (its Policy has
+    /// no such grant) or a copy of it sits in N2's own Policy (its principal names N1).
+    #[test]
+    fn a_role_grant_in_one_network_does_not_serve_the_same_role_name_in_another() {
+        let owner1 = SigningKey::generate(&mut rand::rng());
+        let owner2 = SigningKey::generate(&mut rand::rng());
+        let n1 = network_id_for(&owner1);
+        let n2 = network_id_for(&owner2);
+        let m1 = NodeId::from([1u8; 32]);
+        let m2 = NodeId::from([2u8; 32]);
+        let target = NodeId::from([3u8; 32]);
+        let role_grant = |network_id: NetworkId| Grant {
+            from: Principal {
+                network_id,
+                target: PrincipalTarget::Role("r".to_string()),
+            },
+            to_node: NodeOrWildcard::Node(target),
+            services: vec!["tcp:ssh".parse().unwrap()],
+            expires: None,
+        };
+        let holder = |node_id: NodeId, name: &str| PolicyMember {
+            node_id,
+            name: name.to_string(),
+            roles: vec!["r".to_string()],
+        };
+        let rosters = RosterStore::new();
+        rosters
+            .set(&roster_with_members(&owner1, n1, vec![m1]))
+            .unwrap();
+        rosters
+            .set(&roster_with_members(&owner2, n2, vec![m2]))
+            .unwrap();
+        let store = PolicyStore::new();
+        store
+            .set(&signed_policy(
+                &owner1,
+                policy_body(
+                    n1,
+                    1,
+                    vec![holder(m1, "one")],
+                    vec![role_grant(n1)],
+                    4_000_000_000,
+                ),
+            ))
+            .unwrap();
+        store
+            .set(&signed_policy(
+                &owner2,
+                policy_body(n2, 1, vec![holder(m2, "two")], vec![], 4_000_000_000),
+            ))
+            .unwrap();
+        let ssh: ServiceId = "tcp:ssh".parse().unwrap();
+        assert!(store.has_grant(&rosters, &n1, &m1, &target, Some(&ssh), 1_000));
+        assert!(!store.has_grant(&rosters, &n2, &m2, &target, Some(&ssh), 1_000));
+        assert!(!store.has_grant(&rosters, &n1, &m2, &target, Some(&ssh), 1_000));
+        // N2's owner (or a bug) carries N1's grant into N2's Policy: its principal still names
+        // N1, so N2's "r" holder gains nothing.
+        store
+            .set(&signed_policy(
+                &owner2,
+                policy_body(
+                    n2,
+                    2,
+                    vec![holder(m2, "two")],
+                    vec![role_grant(n1)],
+                    4_000_000_000,
+                ),
+            ))
+            .unwrap();
+        assert!(!store.has_grant(&rosters, &n2, &m2, &target, Some(&ssh), 1_000));
+        assert!(!store.has_grant(&rosters, &n2, &m2, &target, None, 1_000));
+        assert!(store.has_grant(&rosters, &n1, &m1, &target, Some(&ssh), 1_000));
+    }
+
     #[test]
     fn has_grant_ignores_a_grant_whose_principal_names_a_foreign_network() {
         // Defensive check documented on `has_grant`: a Grant's own

@@ -159,6 +159,24 @@ mod tests {
         .unwrap()
     }
 
+    /// Threat model 5 item 20: with only the expiring certificate listed the key resolves up to
+    /// its `not_after` and no more; a renewal (same key, higher serial) listed late makes the
+    /// same key resolve again, under the renewal's serial.
+    #[test]
+    fn an_unlisted_renewal_resolves_nothing_past_not_after_and_a_late_listing_does() {
+        let key = SigningKey::generate(&mut rand::rng());
+        let id = NodeId::from(key.verifying_key().to_bytes());
+        let claimed = X25519PublicKey::from([7; 32]);
+        let old = cert_of(&key, 7, 1, 400);
+        let index = CertIndex::build(std::slice::from_ref(&old));
+        assert_eq!(index.resolve(&id, &claimed, 400).unwrap().serial, 1);
+        assert!(index.resolve(&id, &claimed, 401).is_none());
+        let late = CertIndex::build(&[old, cert_of(&key, 7, 2, 900)]);
+        assert_eq!(late.resolve(&id, &claimed, 400).unwrap().serial, 2);
+        assert_eq!(late.resolve(&id, &claimed, 401).unwrap().serial, 2);
+        assert!(late.resolve(&id, &claimed, 901).is_none());
+    }
+
     #[test]
     fn building_decodes_each_certificate_once_and_resolving_none() {
         let keys: Vec<SigningKey> = (0..5)
