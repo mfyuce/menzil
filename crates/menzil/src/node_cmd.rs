@@ -1038,9 +1038,14 @@ where
     // With ACME the node answers validation connections for the names it orders; the book is
     // shared with the renewal tasks.
     let challenges = acme.as_ref().map(|_| ChallengeBook::new());
+    let relay_limits = config.relay_limits()?;
     let started = match &challenges {
-        Some(book) => Node::start(node_config, AcmeHandler::new(services, book.clone())),
-        None => Node::start(node_config, services),
+        Some(book) => Node::start_with_relay_limits(
+            node_config,
+            AcmeHandler::new(services, book.clone()),
+            relay_limits,
+        ),
+        None => Node::start_with_relay_limits(node_config, services, relay_limits),
     };
     let node = Arc::new(started.map_err(|e| anyhow!("{e}"))?);
     node.shares()

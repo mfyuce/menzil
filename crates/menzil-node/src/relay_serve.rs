@@ -218,6 +218,7 @@ impl Authorizer for RelayAuthorizer {
 /// shared by all its relay principal sessions.
 pub struct RelayLimits {
     total: Arc<Semaphore>,
+    total_figure: usize,
     max_per_share: usize,
     per_share: Mutex<HashMap<String, usize>>,
 }
@@ -228,11 +229,17 @@ impl RelayLimits {
         Self::with_figures(MAX_RELAY_STREAMS_PER_SHARE, MAX_RELAY_STREAMS)
     }
 
+    /// The figures in force, `(per share, in all)`.
+    pub fn figures(&self) -> (usize, usize) {
+        (self.max_per_share, self.total_figure)
+    }
+
     /// Other figures (at least 1 each), for tests and for an operator who sets them.
     pub fn with_figures(per_share: usize, total: usize) -> Arc<Self> {
         let total = total.clamp(1, Semaphore::MAX_PERMITS);
         Arc::new(Self {
             total: Arc::new(Semaphore::new(total)),
+            total_figure: total,
             max_per_share: per_share.max(1),
             per_share: Mutex::new(HashMap::new()),
         })

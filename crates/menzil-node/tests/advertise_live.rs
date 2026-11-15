@@ -90,7 +90,7 @@ async fn a_node_advertises_after_every_attach_and_when_its_shares_change() {
     own.set(&roster1).unwrap();
 
     let session_config = session_config(&relay, &node, network_id);
-    let mut started = Node::start(
+    let mut started = Node::start_with_relay_limits(
         NodeConfig {
             session: session_config.clone(),
             env: HashMap::new(),
@@ -98,8 +98,10 @@ async fn a_node_advertises_after_every_attach_and_when_its_shares_change() {
             rosters: own.clone(),
         },
         RefuseAll,
+        menzil_node::RelayLimits::with_figures(3, 7),
     )
     .unwrap();
+    assert_eq!(started.relay_limits().figures(), (3, 7));
     let book = started.shares().clone();
     // What the book held at the moment each attachment ended (the event is delivered after the
     // session cleared it, and before the next attachment begins).

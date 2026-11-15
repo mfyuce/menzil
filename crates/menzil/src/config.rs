@@ -18,6 +18,9 @@
 //! max_connections_per_peer = 64   # served at once for one peer, at most max_connections
 //! # max_connections_per_service = 128   # served at once for one service, all peers together;
 //! #                                      # default half of max_connections, at most max_connections
+//! # max_relay_streams_per_share = 64   # streams the relay may hold open for one share (at most
+//! #                                     # max_relay_streams)
+//! # max_relay_streams = 256       # streams the relay may hold open in all, at most 100000
 //! # opens_per_peer_per_minute = 600    # OPENs one peer may send per minute, refused ones included
 //! # socket_buffer = 131072        # bytes asked for each target socket's buffers (4096 to 16777216)
 //! connect_timeout_secs = 5        # giving up on a service's local target, at most 9
@@ -69,6 +72,7 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -76,7 +80,7 @@ use menzil_carrier::{ConnectionInfo, ProxyOverride, redact_userinfo};
 use menzil_node::validate_shares;
 use menzil_node::{
     EgressLimits, LocalServices, LocalTarget, MAX_CONNECT_TIMEOUT, MAX_EGRESS_IDLE,
-    MIN_EGRESS_IDLE, ServeLimits,
+    MAX_RELAY_STREAMS, MAX_RELAY_STREAMS_PER_SHARE, MIN_EGRESS_IDLE, RelayLimits, ServeLimits,
 };
 use menzil_proto::{ServiceId, ServiceKind, Share, ShareMode};
 use serde::Deserialize;
@@ -312,7 +316,16 @@ pub struct ServeSettings {
     pub socket_buffer: Option<u32>,
     /// OPENs one peer may send per minute, refused ones included (default 600, 1 to 1000000).
     pub opens_per_peer_per_minute: Option<u32>,
+    /// Streams the relay principal may hold open on this node for one share (default 64, 1 to
+    /// `max_relay_streams`).
+    pub max_relay_streams_per_share: Option<usize>,
+    /// Streams the relay principal may hold open on this node in all (default 256, 1 to
+    /// [`MAX_RELAY_STREAMS_SETTING`]).
+    pub max_relay_streams: Option<usize>,
 }
+
+/// The largest `[serve] max_relay_streams`.
+pub const MAX_RELAY_STREAMS_SETTING: usize = 100_000;
 
 /// The smallest `[serve] socket_buffer`: below it the kernel's own floor decides anyway.
 pub const MIN_SOCKET_BUFFER: u32 = 4096;
@@ -393,6 +406,33 @@ impl ServeSettings {
             limits.socket_buffer = bytes;
         }
         Ok(limits)
+    }
+
+    /// The relay principal's stream limits these settings ask for, on top of the defaults.
+    fn relay_limits(&self) -> Result<Arc<RelayLimits>> {
+        let in_range = |key: &str, value: usize| {
+            if value == 0 || value > MAX_RELAY_STREAMS_SETTING {
+                bail!(
+                    "{key} in [serve] of config.toml is {value}: it must be from 1 to {MAX_RELAY_STREAMS_SETTING} (leave the key out for the default)"
+                );
+            }
+            Ok(value)
+        };
+        let mut total = MAX_RELAY_STREAMS;
+        let mut per_share = MAX_RELAY_STREAMS_PER_SHARE;
+        if let Some(value) = self.max_relay_streams {
+            total = in_range("max_relay_streams", value)?;
+        }
+        if let Some(value) = self.max_relay_streams_per_share {
+            per_share = in_range("max_relay_streams_per_share", value)?;
+        }
+        // A key left out counts with its default, so `max_relay_streams = 10` alone is refused.
+        if per_share > total {
+            bail!(
+                "max_relay_streams_per_share in [serve] of config.toml is {per_share}: it must not exceed max_relay_streams, which is {total} (a key left out counts with its default)"
+            );
+        }
+        Ok(RelayLimits::with_figures(per_share, total))
     }
 
     /// The connect timeout asked for, if any.
@@ -577,12 +617,19 @@ impl Config {
                 .map_err(|e| anyhow!("service {id} in config.toml: {e}"))?;
         }
         services = services.with_limits(self.serve.limits()?);
+        // Checked here too, so a bad figure fails the same way as the other [serve] keys.
+        self.serve.relay_limits()?;
         services = services.with_egress_limits(self.egress.checked()?.limits);
         services = services.with_idle_timeout(self.serve.idle()?);
         if let Some(timeout) = self.serve.connect_timeout()? {
             services = services.with_connect_timeout(timeout);
         }
         Ok(services)
+    }
+
+    /// The limits on the streams the relay principal holds on this node, validated.
+    pub fn relay_limits(&self) -> Result<Arc<RelayLimits>> {
+        self.serve.relay_limits()
     }
 
     /// The relay's share domain in lowercase, if one is configured: a host name of at least two
@@ -679,6 +726,34 @@ mod tests {
         // A setting with nothing secret in it prints as it is.
         let plain = Config::parse("proxy = \"direct\"\n").unwrap();
         assert!(format!("{plain:?}").contains("direct"));
+    }
+
+    #[test]
+    fn relay_stream_limits_default_and_are_taken_from_serve() {
+        let figures = |text: &str| {
+            Config::parse(text)
+                .unwrap()
+                .relay_limits()
+                .unwrap()
+                .figures()
+        };
+        assert_eq!(
+            figures(""),
+            (MAX_RELAY_STREAMS_PER_SHARE, MAX_RELAY_STREAMS)
+        );
+        assert_eq!(
+            figures("[serve]\nmax_relay_streams_per_share = 5\nmax_relay_streams = 9\n"),
+            (5, 9)
+        );
+        assert_eq!(
+            figures("[serve]\nmax_relay_streams = 100000\n"),
+            (MAX_RELAY_STREAMS_PER_SHARE, 100_000)
+        );
+        // The per share figure alone counts against the default total.
+        assert_eq!(
+            figures("[serve]\nmax_relay_streams_per_share = 256\n"),
+            (256, MAX_RELAY_STREAMS)
+        );
     }
 
     #[test]
@@ -1044,6 +1119,24 @@ mod tests {
             (
                 "[serve]\nopens_per_peer_per_minute = 1000001",
                 "from 1 to 1000000",
+            ),
+            ("[serve]\nmax_relay_streams = 0", "from 1 to 100000"),
+            ("[serve]\nmax_relay_streams = 100001", "from 1 to 100000"),
+            (
+                "[serve]\nmax_relay_streams_per_share = 0",
+                "from 1 to 100000",
+            ),
+            (
+                "[serve]\nmax_relay_streams = 10\nmax_relay_streams_per_share = 11",
+                "must not exceed max_relay_streams",
+            ),
+            (
+                "[serve]\nmax_relay_streams = 10",
+                "must not exceed max_relay_streams, which is 10",
+            ),
+            (
+                "[serve]\nmax_relay_streams_per_share = 257",
+                "must not exceed max_relay_streams, which is 256",
             ),
             ("[serve]\nsocket_buffer = 4095", "from 4096 to 16777216"),
             ("[serve]\nsocket_buffer = 16777217", "from 4096 to 16777216"),

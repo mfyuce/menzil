@@ -99,7 +99,7 @@ use crate::l5_stream::{
 use crate::outbound::{Epoch, SendBudgets};
 use crate::policy_store::PolicyStore;
 use crate::relay_notes::{RelayError, RelayNotes};
-use crate::relay_serve::{RelayAuthorizer, RelayHandler, RelayServing};
+use crate::relay_serve::{RelayAuthorizer, RelayHandler, RelayLimits, RelayServing};
 use crate::revalidate::{Kind, Revalidator};
 use crate::roster_store::RosterStore;
 use crate::session::{Observers, SessionConfig, SessionEvent, run_session_observed};
@@ -194,6 +194,8 @@ pub struct Node {
     relay_notes: RelayNotes,
     /// The shares this node advertises and what the relay answered.
     shares: ShareBook,
+    /// The limits on the streams the relay principal holds here.
+    relay_limits: Arc<RelayLimits>,
     /// Tells the relay session to write what it holds and close.
     stop_session: watch::Sender<bool>,
     /// Turns `true` when the relay session task has returned.
@@ -221,6 +223,33 @@ impl Node {
         config: NodeConfig,
         handler: H,
         sync_config: SyncConfig,
+    ) -> Result<Self, StartError>
+    where
+        H: ServiceHandler<Stream> + Send + Sync + 'static,
+        H::Handling: Send + 'static,
+    {
+        Self::start_inner(config, handler, sync_config, RelayLimits::new())
+    }
+
+    /// [`Self::start`] with other limits for the streams the relay principal holds on this node
+    /// (`[serve] max_relay_streams_per_share` and `max_relay_streams` of config.toml).
+    pub fn start_with_relay_limits<H>(
+        config: NodeConfig,
+        handler: H,
+        relay_limits: Arc<RelayLimits>,
+    ) -> Result<Self, StartError>
+    where
+        H: ServiceHandler<Stream> + Send + Sync + 'static,
+        H::Handling: Send + 'static,
+    {
+        Self::start_inner(config, handler, SyncConfig::default(), relay_limits)
+    }
+
+    fn start_inner<H>(
+        config: NodeConfig,
+        handler: H,
+        sync_config: SyncConfig,
+        relay_limits: Arc<RelayLimits>,
     ) -> Result<Self, StartError>
     where
         H: ServiceHandler<Stream> + Send + Sync + 'static,
@@ -276,6 +305,9 @@ impl Node {
             local_serial.clone(),
             local_static,
         );
+        let relay_serving = RelayServing::with_limits(shares.clone(), relay_limits);
+        // What the node reports is what the serving side holds.
+        let relay_limits = Arc::clone(&relay_serving.limits);
         let (stop_session, stop_rx) = watch::channel(false);
         let (ended_tx, session_ended) = watch::channel(false);
         let relay_notes = RelayNotes::new();
@@ -313,7 +345,7 @@ impl Node {
                 DocsGate::new(DocsLimits::default()),
                 Some(sync.clone()),
                 Some(revalidator.clone()),
-                RelayServing::new(shares.clone()),
+                relay_serving,
             )),
             // Grants, sessions and served streams, asked again on every change (protocol.md 5.3).
             tokio::spawn(revalidator.run()),
@@ -341,6 +373,7 @@ impl Node {
             sync,
             relay_notes,
             shares,
+            relay_limits,
             stop_session,
             session_ended,
             tasks,
@@ -362,6 +395,11 @@ impl Node {
     /// node advertises after every attach and whenever the set changes.
     pub fn shares(&self) -> &ShareBook {
         &self.shares
+    }
+
+    /// The limits on the streams the relay principal holds on this node.
+    pub fn relay_limits(&self) -> &Arc<RelayLimits> {
+        &self.relay_limits
     }
 
     /// Whether the node is attached to its relay right now. A relay that is about to turn the
