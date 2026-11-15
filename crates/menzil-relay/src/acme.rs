@@ -366,7 +366,11 @@ impl OrderLimiter {
     /// Starts an order for `name` if it may: none in flight for it, the least interval since
     /// its last start is over and fewer than [`MAX_PENDING_ORDERS`] orders are in flight.
     pub fn try_start(self: &Arc<Self>, name: &str) -> Option<OrderPermit> {
-        let now = Instant::now();
+        self.try_start_at(name, Instant::now())
+    }
+
+    /// [`Self::try_start`] at the given instant (the clock is injected by tests).
+    fn try_start_at(self: &Arc<Self>, name: &str, now: Instant) -> Option<OrderPermit> {
         let mut inner = self.lock();
         if inner.in_flight.len() >= MAX_PENDING_ORDERS || inner.in_flight.contains(name) {
             return None;
@@ -725,6 +729,26 @@ mod tests {
     use tokio_rustls::TlsConnector;
 
     use super::*;
+
+    /// Item 246(4): the in flight guard alone refuses a second order for a name, even long after
+    /// `next_allowed` (a clock far past the interval would otherwise let it through).
+    #[test]
+    fn an_order_in_flight_blocks_a_second_one_whatever_the_clock_says() {
+        let limiter = Arc::new(OrderLimiter::default());
+        let t0 = Instant::now();
+        let permit = limiter.try_start_at("a.example", t0).unwrap();
+        let later = t0 + ORDER_MIN_INTERVAL * 5;
+        assert!(limiter.try_start_at("a.example", later).is_none());
+        // The interval itself: after the permit is gone, a start before it is over is refused
+        // and one after it is allowed.
+        drop(permit);
+        assert!(
+            limiter
+                .try_start_at("a.example", t0 + ORDER_MIN_INTERVAL / 2)
+                .is_none()
+        );
+        assert!(limiter.try_start_at("a.example", later).is_some());
+    }
     use crate::front_door::tests::{H, OWN, World, ali, share, tests_unix_now, world};
     use crate::front_door::{FrontDoor, FrontDoorConfig, REFUSAL};
     use crate::relay::Accepting;
