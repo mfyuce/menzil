@@ -1372,3 +1372,45 @@ async fn a_reliable_relay_frame_waits_while_the_name_tenants_bucket_is_in_debt()
         RelaySendOutcome::Queued
     );
 }
+
+/// Threat model 5.8, clause 1: one source with a stalled destination (nothing drained, the whole
+/// credit of that pair spent) is not held up towards another destination. Credit is per pair, so
+/// the stalled pair runs out (a violation of the stalled pair only) while the other pair keeps
+/// carrying and keeps getting its CREDIT back.
+#[test]
+fn a_stalled_destination_does_not_block_the_same_sources_other_destination() {
+    let mut w = World::new(1024);
+    let net = w.network(3);
+    let (src, stalled, flowing) = (net.nodes[0], net.nodes[1], net.nodes[2]);
+    // Fill the stalled pair's credit to the byte: the destination never drains.
+    let credit = w.limits.credit as usize;
+    let mut sent = 0;
+    while sent < credit {
+        let len = (credit - sent).min(65_536);
+        assert!(queued(&w.send_with(&net, src, stalled, true, len)));
+        sent += len;
+    }
+    assert_eq!(w.table.remaining_credit(&src, &stalled), Some(0));
+    assert!(
+        matches!(
+            w.send_with(&net, src, stalled, true, 1),
+            ForwardOutcome::CreditViolation(_)
+        ),
+        "the stalled pair has no credit left"
+    );
+    // The same source goes on towards the other destination, round after round.
+    let mut settled = 0;
+    for _ in 0..40 {
+        assert!(queued(&w.send_with(&net, src, flowing, true, 65_536)));
+        settled += w.drain(flowing);
+    }
+    assert_eq!(settled, 40 * 65_536);
+    let back = w.credits(src);
+    assert_eq!(back.get(&flowing).copied(), Some(settled));
+    assert_eq!(
+        back.get(&stalled),
+        None,
+        "nothing was settled for the stalled pair"
+    );
+    assert_eq!(w.table.remaining_credit(&src, &flowing), Some(1 << 20));
+}

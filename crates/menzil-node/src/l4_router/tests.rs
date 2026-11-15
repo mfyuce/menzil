@@ -1344,6 +1344,52 @@ async fn a_resp_whose_cert_is_not_the_dialed_nodes_is_refused() {
     assert_eq!(outcome.err(), Some(EnsureError::Refused));
 }
 
+/// Threat model 5.5, the initiator side: the RECV `src` is the identity the responder judges
+/// (Roster, Policy, grant), and the static key that `init` really proves has to be the one the
+/// certificate of that `src` names. A member M that sends an `init` under victim V's NodeId (the
+/// prologue says V) with its own key is not V: it is never admitted as V, only answered docs
+/// only, and nothing of V's grant reaches it.
+#[tokio::test(start_paused = true)]
+async fn an_init_whose_key_is_not_the_certificate_of_the_recv_source_is_not_admitted_as_that_source()
+ {
+    let w = world();
+    let (r, victim, impostor) = (party(), party(), party());
+    // V holds a grant on R; M is a plain member with none.
+    let stores = w.stores(&[&r, &victim, &impostor], vec![w.grant(&victim, &r)]);
+    let net = Net::new();
+    let mut nr = node(&net, &r, &stores).await;
+    let mut as_victim = Manual::new(&net, victim.clone_for_test());
+
+    // The control: V itself is admitted to a full session.
+    let (hs, init) = as_victim.init(&r, w.network, 1);
+    net.inject(victim.id, r.id, &init);
+    let (_, resp) = as_victim.next_frame().await;
+    let (_, _, payload) = finish_with_payload(hs, &resp);
+    assert!(!payload.docs_only, "V with its own key is a full member");
+    assert!(!nr.next_ready().await.docs_only);
+
+    // M: V's NodeId in the prologue and as the RECV source, M's own static key.
+    let (hs, init) = E2eInitiatorHandshake::start(
+        &impostor.x25519_private,
+        &r.x25519_public,
+        w.network,
+        victim.id,
+        r.id,
+        2,
+    )
+    .unwrap();
+    net.inject(victim.id, r.id, &init);
+    let resp = as_victim.next_resp().await;
+    let (_, _, payload) = finish_with_payload(hs, &resp);
+    assert!(
+        payload.docs_only,
+        "a key that is not V's certificate key must not get V's standing"
+    );
+    let at_r = nr.next_ready().await;
+    assert!(at_r.docs_only);
+    assert_eq!(at_r.peer_static, impostor.x25519_public);
+}
+
 /// An [`Engine`] driven by hand, with its three outputs.
 struct Driven {
     engine: Engine,

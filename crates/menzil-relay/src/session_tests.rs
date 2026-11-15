@@ -5851,3 +5851,123 @@ async fn a_suspended_tenants_live_counts_are_zero() {
     assert_eq!((ali.attached_sessions, ali.live_pairs), (0, 0));
     assert_eq!(ali.bytes_period, figures.volume_gib << 30);
 }
+
+// --- threat model 5.7: a replayed HELLO, and routability only after ATTACH ---
+
+/// A HELLO recorded off the wire and replayed on a new connection (the same timestamp, then an
+/// older one) is refused and leaves the attached session exactly where it was: no GOAWAY, the
+/// same session id, still answering, still the registered attachment.
+#[tokio::test]
+async fn a_replayed_hello_does_not_supersede_the_attached_session() {
+    let (relay, listener, cert, relay_x25519) = bind_test_relay().await;
+    let addr = listener.local_addr().unwrap();
+    let serve_relay = relay.clone();
+    tokio::spawn(async move { serve_relay.serve(&listener).await });
+
+    let identity = generate_identity();
+    let (networks, seq) = seed_network(&relay, &[&identity]);
+    let (mut first, _) = TestClient::connect(
+        addr,
+        cert.clone(),
+        &identity,
+        relay_x25519,
+        networks.clone(),
+        seq.clone(),
+        1,
+        10,
+    )
+    .await;
+    first.send(Record::Attach).await;
+    ping_pong(&mut first, [1; 8]).await;
+    let session = relay.registry.attached_session_id(&identity.node_id);
+    assert!(session.is_some());
+
+    // The very same HELLO (timestamp 10), then one with an older timestamp (5).
+    for timestamp_byte in [10u8, 5] {
+        let (mut replay, _) = TestClient::connect(
+            addr,
+            cert.clone(),
+            &identity,
+            relay_x25519,
+            networks.clone(),
+            seq.clone(),
+            1,
+            timestamp_byte,
+        )
+        .await;
+        // Writes after WELCOME land as in `a_rejected_ik_hello_sees_empty_rosters_then_the_error`.
+        replay.send(Record::Attach).await;
+        match replay.recv().await {
+            Some(Record::Error(_)) => {}
+            other => panic!("expected the replay to be refused with an ERROR, got {other:?}"),
+        }
+        assert_eq!(
+            replay.recv().await,
+            None,
+            "the replayed connection is closed"
+        );
+        assert_eq!(
+            relay.registry.attached_session_id(&identity.node_id),
+            session,
+            "the replay (timestamp {timestamp_byte}) must not replace the attached session"
+        );
+    }
+
+    // The original connection never heard GOAWAY: its next record is the answer to its own PING.
+    ping_pong(&mut first, [2; 8]).await;
+    assert_eq!(
+        relay.registry.attached_session_id(&identity.node_id),
+        session
+    );
+}
+
+/// A session that has completed HELLO but not sent ATTACH is not routable: a member's SEND to it
+/// is `peer_offline` (nothing reaches it), and once it ATTACHes the same SEND is delivered.
+#[tokio::test]
+async fn a_helloed_session_is_not_routable_until_its_attach() {
+    let (relay, listener, cert, relay_x25519) = bind_test_relay().await;
+    let addr = listener.local_addr().unwrap();
+    let serve_relay = relay.clone();
+    tokio::spawn(async move { serve_relay.serve(&listener).await });
+
+    let (id_a, id_b) = (generate_identity(), generate_identity());
+    let (networks, seq) = seed_network(&relay, &[&id_a, &id_b]);
+    let (mut a, _) = TestClient::connect(
+        addr,
+        cert.clone(),
+        &id_a,
+        relay_x25519,
+        networks.clone(),
+        seq.clone(),
+        1,
+        10,
+    )
+    .await;
+    a.send(Record::Attach).await;
+    ping_pong(&mut a, [1; 8]).await;
+
+    // B has finished its HELLO and has not attached.
+    let (mut b, _) =
+        TestClient::connect(addr, cert, &id_b, relay_x25519, networks, seq, 1, 10).await;
+    assert!(!relay.registry.is_attached(&id_b.node_id));
+    a.send(send_record(id_b.node_id, vec![7; 10])).await;
+    match a.recv().await {
+        Some(Record::Error(body)) => assert_eq!(body.code, ErrorCode::PeerOffline),
+        other => {
+            panic!("expected ERROR(PeerOffline) for a HELLOed, unattached node, got {other:?}")
+        }
+    }
+    // Nothing was held back for B: after its ATTACH the next record it hears is its own PONG.
+    b.send(Record::Attach).await;
+    ping_pong(&mut b, [2; 8]).await;
+    assert!(relay.registry.is_attached(&id_b.node_id));
+
+    a.send(send_record(id_b.node_id, vec![8; 10])).await;
+    match b.recv().await {
+        Some(Record::Recv { src, payload, .. }) => {
+            assert_eq!(src, id_a.node_id);
+            assert_eq!(payload, vec![8; 10]);
+        }
+        other => panic!("expected RECV after the ATTACH, got {other:?}"),
+    }
+}
