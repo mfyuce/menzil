@@ -3426,3 +3426,162 @@ mod command_errors {
         assert_eq!(e.to_string(), "this relay serves no network");
     }
 }
+
+/// three networks whose Rosters fail on a busy lock; a flush that is
+/// reached must name all three (production keeper wait).
+#[tokio::test]
+async fn a_reached_flush_names_every_unwritten_network() {
+    let (dir, relay_home) = home();
+    init(&relay_home, clock()).unwrap();
+    let mut owners = vec![];
+    for _ in 0..3 {
+        let (o, owner, id, _) = token_of_a_network();
+        add_network(&relay_home, &relay_token(&owner), clock()).unwrap();
+        owners.push((o, owner, id));
+    }
+    let running = running_with_keeper_wait(dir.path(), &relay_home, KEEPER_LOCK_WAIT).await;
+    let busy = relay_home.lock_relay().unwrap();
+    for (_, owner, _) in &owners {
+        let renewed = crate::local::renew(owner, None, clock() + 60).unwrap();
+        let pair = crate::token::decode_documents(&renewed.token).unwrap();
+        assert!(
+            running
+                .relay
+                .rosters()
+                .adopt(pair.roster(), None, clock() + 60)
+                .unwrap()
+        );
+    }
+    let first = running.keeper.flush(FLUSH);
+    for (_, _, id) in &owners {
+        let held = load_rosters(&relay_home).unwrap();
+        let on_disk = held
+            .iter()
+            .find(|s| s.roster.decode().unwrap().network_id == *id)
+            .unwrap();
+        assert_eq!(
+            on_disk.roster.decode().unwrap().seq,
+            1,
+            "the lock is held: nothing written"
+        );
+    }
+    assert!(first.reached);
+    assert_eq!(first.unwritten.len(), 3, "{first:?}");
+    running.stop();
+    drop(busy);
+}
+
+/// the same three networks already waiting in the retry book at a stop; the
+/// stop flush (STOP_GRACE, production wait) must name all three.
+#[tokio::test]
+async fn a_stop_names_every_network_still_waiting_for_a_retry() {
+    let (dir, relay_home) = home();
+    init(&relay_home, clock()).unwrap();
+    let mut owners = vec![];
+    for _ in 0..5 {
+        let (o, owner, id, _) = token_of_a_network();
+        add_network(&relay_home, &relay_token(&owner), clock()).unwrap();
+        owners.push((o, owner, id));
+    }
+    let running = running_with_keeper_wait(dir.path(), &relay_home, KEEPER_LOCK_WAIT).await;
+    let busy = relay_home.lock_relay().unwrap();
+    for (_, owner, _) in &owners {
+        let renewed = crate::local::renew(owner, None, clock() + 60).unwrap();
+        let pair = crate::token::decode_documents(&renewed.token).unwrap();
+        assert!(
+            running
+                .relay
+                .rosters()
+                .adopt(pair.roster(), None, clock() + 60)
+                .unwrap()
+        );
+    }
+    // Wait until all three sit in the retry book (none running).
+    let started = std::time::Instant::now();
+    loop {
+        if running.keeper.pending_keys().len() == 5 {
+            break;
+        }
+        assert!(started.elapsed() < Duration::from_secs(60));
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    let mut unwritten = running.flush_rosters_blocking(STOP_GRACE).await;
+    unwritten.sort();
+    let mut expected: Vec<String> = owners.iter().map(|(_, _, id)| id.to_string()).collect();
+    expected.sort();
+    for (_, _, id) in &owners {
+        let held = load_rosters(&relay_home).unwrap();
+        let on_disk = held
+            .iter()
+            .find(|s| s.roster.decode().unwrap().network_id == *id)
+            .unwrap();
+        assert_eq!(
+            on_disk.roster.decode().unwrap().seq,
+            1,
+            "the lock is held: nothing written"
+        );
+    }
+    assert_eq!(
+        unwritten, expected,
+        "the stop notice does not name every unwritten network"
+    );
+    running.stop();
+    drop(busy);
+}
+
+/// A clean stop ends the serving task before it flushes, so that a Roster adopted over DOC while
+/// the keeper flushes is not left unwritten and unnamed.
+#[tokio::test]
+async fn a_stop_ends_the_serving_task_before_the_flush() {
+    let (_o, owner, _id, _) = token_of_a_network();
+    let (dir, relay_home) = relay_machine();
+    add_network(&relay_home, &relay_token(&owner), clock()).unwrap();
+    let mut running = running_with_keeper_wait(dir.path(), &relay_home, KEEPER_LOCK_WAIT).await;
+    assert!(!running.task.is_finished());
+    assert_eq!(run_until(&mut running, async { 1 }).await.unwrap(), Some(1));
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !running.task.is_finished() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the serving task still runs after the stop");
+}
+
+/// Both keepers stuck on the busy lock: the stop flush takes one grace, not one per keeper.
+#[tokio::test]
+async fn a_stop_flush_of_both_keepers_is_bounded_by_one_grace() {
+    let (net_a, token_a) = labeled_network(&[("myapp", 1)]);
+    let (_o, owner, _id, _) = token_of_a_network();
+    let (dir, relay_home) = relay_machine();
+    add_network(&relay_home, &token_a, clock()).unwrap();
+    add_network(&relay_home, &relay_token(&owner), clock()).unwrap();
+    let running = running_with_keeper_wait(dir.path(), &relay_home, KEEPER_LOCK_WAIT).await;
+    let busy = relay_home.lock_relay().unwrap();
+    advertise_now(&running, &net_a, 1, &["myapp"], clock());
+    let renewed = crate::local::renew(&owner, None, clock() + 60).unwrap();
+    let pair = crate::token::decode_documents(&renewed.token).unwrap();
+    assert!(
+        running
+            .relay
+            .rosters()
+            .adopt(pair.roster(), None, clock() + 60)
+            .unwrap()
+    );
+    let started = std::time::Instant::now();
+    let unwritten = running
+        .flush_rosters_blocking(Duration::from_millis(600))
+        .await;
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < Duration::from_millis(1100),
+        "two graces were spent: {elapsed:?}"
+    );
+    assert!(unwritten.len() >= 2, "{unwritten:?}");
+    assert!(
+        unwritten.contains(&"names.state".to_string()),
+        "{unwritten:?}"
+    );
+    running.stop();
+    drop(busy);
+}

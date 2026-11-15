@@ -195,8 +195,11 @@ enum Message<T> {
 struct Queue<T> {
     messages: VecDeque<Message<T>>,
     book: RetryBook<T>,
-    /// The key of the job being run now.
+    /// The key of the job being run now (set when the thread takes the job, so there is no gap
+    /// in which a taken job is in neither the book, the queue nor here).
     running: Option<String>,
+    /// The keys a flush barrier took out of the book and has not started yet.
+    barrier_left: Vec<String>,
     /// While a flush is on, the end of its grace.
     deadline: Option<Instant>,
     /// Set when the [`Worker`] is gone: the thread ends once the queue is empty.
@@ -257,6 +260,7 @@ impl<T: Send + 'static> Worker<T> {
                 messages: VecDeque::new(),
                 book: RetryBook::new(),
                 running: None,
+                barrier_left: vec![],
                 deadline: None,
                 closed: false,
             }),
@@ -274,6 +278,7 @@ impl<T: Send + 'static> Worker<T> {
                     let attempt = {
                         let mut queue = thread_shared.lock();
                         queue.running = Some(pending.key.clone());
+                        queue.barrier_left.retain(|k| *k != pending.key);
                         Attempt {
                             failures: pending.failures,
                             deadline: queue.deadline,
@@ -327,20 +332,32 @@ impl<T: Send + 'static> Worker<T> {
                 };
                 loop {
                     enum Step<T> {
-                        Message(Message<T>),
+                        Job(T),
                         Retry(Pending<T>),
+                        Barrier(std::sync::mpsc::Sender<()>, Vec<Pending<T>>),
                     }
                     let step = {
                         let mut queue = thread_shared.lock();
                         loop {
-                            if let Some(message) = queue.messages.pop_front() {
-                                break Step::Message(message);
+                            match queue.messages.pop_front() {
+                                Some(Message::Barrier(done)) => {
+                                    let all = queue.book.take_all();
+                                    queue.barrier_left =
+                                        all.iter().map(|p| p.key.clone()).collect();
+                                    break Step::Barrier(done, all);
+                                }
+                                Some(Message::Job(job)) => {
+                                    queue.running = Some(thread_key(&job));
+                                    break Step::Job(job);
+                                }
+                                None => {}
                             }
                             if queue.closed {
                                 return;
                             }
                             let now = Instant::now();
                             if let Some(pending) = queue.book.take_due(now) {
+                                queue.running = Some(pending.key.clone());
                                 break Step::Retry(pending);
                             }
                             queue = match queue.book.next_due() {
@@ -360,15 +377,15 @@ impl<T: Send + 'static> Worker<T> {
                     };
                     match step {
                         Step::Retry(pending) => run(pending),
-                        Step::Message(Message::Job(job)) => {
+                        Step::Job(job) => {
                             let key = thread_key(&job);
                             run(Pending::new(key, job, Instant::now()));
                         }
-                        Step::Message(Message::Barrier(done)) => {
-                            let all = thread_shared.lock().book.take_all();
+                        Step::Barrier(done, all) => {
                             for pending in all {
                                 run(pending);
                             }
+                            thread_shared.lock().barrier_left.clear();
                             let _ = done.send(());
                         }
                     }
@@ -413,16 +430,19 @@ impl<T: Send + 'static> Worker<T> {
         let mut queue = self.shared.lock();
         queue.deadline = None;
         let mut unwritten = queue.book.keys();
+        // Over-reporting is fine, under-reporting is not: what is running, and what the barrier
+        // took out of the book and has not run, count whether or not the flush was reached.
+        unwritten.extend(queue.running.clone());
+        unwritten.extend(queue.barrier_left.iter().cloned());
         if !reached {
-            unwritten.extend(queue.running.clone());
             for message in &queue.messages {
                 if let Message::Job(job) = message {
                     unwritten.push((self.key)(job));
                 }
             }
-            unwritten.sort();
-            unwritten.dedup();
         }
+        unwritten.sort();
+        unwritten.dedup();
         FlushReport { reached, unwritten }
     }
 
@@ -745,5 +765,43 @@ mod tests {
         worker.submit(2);
         assert!(worker.flush(WAIT).is_clean());
         assert_eq!(rx.try_recv().unwrap(), Duration::from_secs(1));
+    }
+
+    /// A flush that times out while the barrier is running the retry book's entries still names
+    /// the entries the barrier took but has not run yet (over-reporting is fine, under-reporting
+    /// is not).
+    #[test]
+    fn a_timed_out_flush_names_every_pending_key() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let slow = Arc::new(AtomicBool::new(false));
+        let s = Arc::clone(&slow);
+        let worker = Worker::spawn(
+            "test-persist",
+            |job: &(u32, u32)| job.0.to_string(),
+            move |job, _| {
+                if job.0 == 1 && s.load(Ordering::SeqCst) {
+                    std::thread::sleep(Duration::from_millis(600));
+                }
+                Outcome::Retry {
+                    class: "busy",
+                    error: "held".into(),
+                }
+            },
+        )
+        .unwrap();
+        worker.submit((1, 0));
+        worker.submit((2, 0));
+        worker.submit((3, 0));
+        let first = worker.flush(WAIT);
+        assert!(first.reached);
+        assert_eq!(first.unwritten.len(), 3, "{first:?}");
+        slow.store(true, Ordering::SeqCst);
+        let report = worker.flush(Duration::from_millis(100));
+        assert!(!report.reached);
+        assert_eq!(
+            report.unwritten,
+            vec!["1".to_string(), "2".to_string(), "3".to_string()],
+            "keys taken by the barrier but not yet run are not reported"
+        );
     }
 }

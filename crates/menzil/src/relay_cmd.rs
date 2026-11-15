@@ -491,6 +491,19 @@ fn flush_summary(rosters: FlushReport, names: FlushReport) -> (bool, bool, Vec<S
     (rosters.reached, names.reached, unwritten)
 }
 
+/// Flushes the Roster keeper and then the names keeper under one deadline: both together take
+/// at most `timeout`, not twice that.
+fn flush_both(
+    keeper: &Worker<(NetworkId, Roster, Option<Roster>)>,
+    names_keeper: &Worker<NameState>,
+    timeout: std::time::Duration,
+) -> (bool, bool, Vec<String>) {
+    let deadline = std::time::Instant::now() + timeout;
+    let rosters = keeper.flush(timeout);
+    let names = names_keeper.flush(deadline.saturating_duration_since(std::time::Instant::now()));
+    flush_summary(rosters, names)
+}
+
 /// A relay that is listening.
 pub struct RunningRelay {
     /// The address it listens on.
@@ -542,9 +555,7 @@ impl RunningRelay {
     /// Flushes both keepers: what each reached, and the names of what is not on disk (networks
     /// by id, `names.state`).
     fn flush_report(&self, timeout: std::time::Duration) -> (bool, bool, Vec<String>) {
-        let rosters = self.keeper.flush(timeout);
-        let names = self.names_keeper.flush(timeout);
-        flush_summary(rosters, names)
+        flush_both(&self.keeper, &self.names_keeper, timeout)
     }
 
     /// [`Self::flush_rosters`] off the async threads (it blocks on the keeper, which may wait
@@ -554,13 +565,9 @@ impl RunningRelay {
     pub async fn flush_rosters_blocking(&self, timeout: std::time::Duration) -> Vec<String> {
         let keeper = Arc::clone(&self.keeper);
         let names_keeper = Arc::clone(&self.names_keeper);
-        tokio::task::spawn_blocking(move || {
-            let rosters = keeper.flush(timeout);
-            let names = names_keeper.flush(timeout);
-            flush_summary(rosters, names).2
-        })
-        .await
-        .unwrap_or_else(|_| vec!["(the flush did not finish)".to_string()])
+        tokio::task::spawn_blocking(move || flush_both(&keeper, &names_keeper, timeout).2)
+            .await
+            .unwrap_or_else(|_| vec!["(the flush did not finish)".to_string()])
     }
 
     /// Stops the relay.
@@ -598,6 +605,9 @@ pub async fn run_until<F: std::future::Future>(
         joined = relay.wait() => Err(joined),
         out = stop => Ok(out),
     };
+    // Stop serving first: a Roster adopted while the keeper flushes would be neither written
+    // nor named.
+    relay.stop();
     let unwritten = relay.flush_rosters_blocking(STOP_GRACE).await;
     if let Some(line) = stop_notice(&unwritten) {
         tracing::warn!(unwritten = %unwritten.join(", "), "not on disk at the stop");
