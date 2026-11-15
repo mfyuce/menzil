@@ -285,6 +285,7 @@ impl RelayAcme {
 
     /// The caller runs [`run`] itself (with its own transport; tests): the relay's serve loop
     /// still answers validations of the pending orders but starts no renewal task of its own.
+    #[doc(hidden)]
     #[must_use]
     pub fn with_external_runner(mut self) -> Self {
         self.external_runner = true;
