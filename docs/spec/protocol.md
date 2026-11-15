@@ -678,7 +678,7 @@ Exactly one process per user, the agent, holds the identity and owns every L3 an
 | 5.2 and 5.4 the L4 datagram class (counters, replay window), channel table, OPEN `transport` and OPEN_ACK `channel` | yes (built, v0.5) | | |
 | 5.4: L4 class built, channels not served (no exit UDP channel, no `udp:` service, no `[egress] udp` key, no SOCKS UDP ASSOCIATE; a UDP `egress:*` OPEN is `unknown_service`) | | not built | |
 | 6.1, 6.2, 6.4 relay principal, blind and `tcp` shares through the SNI front door over tenant zones, port 80 | yes (built) | | |
-| 6.2 node side ACME for a blind share | | library built; not started by the node or its configuration | |
+| 6.2 node side ACME for a blind share | | built: `menzil node` with `[acme]` starts it, certificates under `<home>/acme/certs` (the service behind the share reads them itself, TBD 88) | |
 | 6.2 static site for refused names, ECH, custom domains | | not built (the refusal is the alert) | |
 | 6.3 terminated shares (`t` zone, relay ACME by TLS-ALPN-01, HTTP/1.1 terminator) | yes (built; the relay reads these shares) | | |
 | 6.3 WebSocket through a terminated share (`Upgrade: websocket` only, opaque pipe, idle limit, re-check of the name) | yes (built) | | |
