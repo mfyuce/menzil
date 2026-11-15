@@ -912,6 +912,9 @@ async fn relay_streams_take_no_place_in_the_members_serve_limits() {
             .with_limits(ServeLimits {
                 max_connections: 3,
                 max_connections_per_peer: 2,
+                // The test is about the peer and node figures; the per service default
+                // (half of three, one) would refuse a member's second stream first.
+                max_connections_per_service: Some(3),
                 ..ServeLimits::default()
             }),
     );

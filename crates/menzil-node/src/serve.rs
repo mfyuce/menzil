@@ -19,6 +19,13 @@
 //!   for it is dialled by the executor's own rules (protocol.md 8, `crate::egress`), with
 //!   the same slots and pipe; the relay principal's path, and a node without an enabled
 //!   executor, answer it `unknown_service`.
+//! * **A rate before the counts.** Each counted OPEN of a peer is first counted in that peer's
+//!   minute ([`ServeLimits::opens_per_peer_per_minute`], refused ones too); past it the OPEN is
+//!   `rate_limited` without a slot or a connect.
+//! * **Three counts, one slot.** A served connection takes a place in the node's total, in its
+//!   peer's count and in its service's count, all or none ([`ServeLimits`]); a refusal past any
+//!   of the three is `rate_limited` and takes nothing. The per service count (default half of
+//!   the total) keeps one busy service from filling the others' places.
 //! * **The local connect comes before the OPEN_ACK.** [`Self::open`]
 //!   (`ServiceHandler::open`) connects to the target inside the caller's 10
 //!   second OPEN timeout, with its own, shorter limit
@@ -103,6 +110,16 @@ pub const DEFAULT_MAX_CONNECTIONS: usize = 256;
 /// that one member cannot fill a target's own connection limit (sshd's `MaxStartups`, a
 /// database's `max_connections`) or the node-wide count.
 pub const DEFAULT_MAX_CONNECTIONS_PER_PEER: usize = 64;
+
+/// How many OPENs for served services one peer may send per minute by default, refused ones
+/// included. A peer holding its connections open is limited by the counts above; this bounds
+/// the churn of opening and closing (a target's accept loop, a connect per OPEN) that never
+/// holds more than a few at once. Ordinary use, even a browser loading a page through
+/// `menzil reach`, stays far below it.
+pub const DEFAULT_OPENS_PER_PEER_PER_MINUTE: u32 = 600;
+
+/// The window the per peer OPEN count is taken over.
+const OPEN_RATE_WINDOW: Duration = Duration::from_secs(60);
 
 /// How many egress streams (`egress:*`, protocol.md 8) a node serves at once, all initiators
 /// together, by default. Their own pool: an egress flood must not starve the member services,
@@ -193,6 +210,21 @@ pub struct ServeLimits {
     /// `SO_SNDBUF` and `SO_RCVBUF` asked for each target socket, in bytes (the kernel doubles
     /// the value and has a floor of its own).
     pub socket_buffer: u32,
+    /// Connections served at once for one service, all peers together; `None` is half of
+    /// `max_connections` (at least 1). Lower than the total, so one busy service cannot take
+    /// every slot of the others (TBD 79).
+    pub max_connections_per_service: Option<usize>,
+    /// OPENs one peer may send per minute (a fixed window; refused ones count). At least 1.
+    pub opens_per_peer_per_minute: u32,
+}
+
+impl ServeLimits {
+    /// The per service figure in force: the one set, or half the total, at least 1.
+    pub fn per_service(&self) -> usize {
+        self.max_connections_per_service
+            .unwrap_or(self.max_connections / 2)
+            .max(1)
+    }
 }
 
 impl Default for ServeLimits {
@@ -201,6 +233,8 @@ impl Default for ServeLimits {
             max_connections: DEFAULT_MAX_CONNECTIONS,
             max_connections_per_peer: DEFAULT_MAX_CONNECTIONS_PER_PEER,
             socket_buffer: DEFAULT_SOCKET_BUFFER,
+            max_connections_per_service: None,
+            opens_per_peer_per_minute: DEFAULT_OPENS_PER_PEER_PER_MINUTE,
         }
     }
 }
@@ -262,6 +296,9 @@ fn egress_pool(limits: &EgressLimits) -> ServeLimits {
     ServeLimits {
         max_connections: limits.max_connections,
         max_connections_per_peer: limits.max_connections_per_peer,
+        // Egress streams are not a service of the table: no per service cap.
+        max_connections_per_service: Some(limits.max_connections),
+        opens_per_peer_per_minute: u32::MAX,
         ..ServeLimits::default()
     }
 }
@@ -405,6 +442,8 @@ impl LocalServices {
             max_connections: limits.max_connections.clamp(1, Semaphore::MAX_PERMITS),
             max_connections_per_peer: limits.max_connections_per_peer.max(1),
             socket_buffer: limits.socket_buffer,
+            max_connections_per_service: limits.max_connections_per_service.map(|n| n.max(1)),
+            opens_per_peer_per_minute: limits.opens_per_peer_per_minute.max(1),
         };
         self.slots = Slots::new(&limits);
         self.limits = limits;
@@ -563,7 +602,7 @@ impl LocalServices {
         if !counted {
             return Ok(None);
         }
-        match pool.take(request.initiator) {
+        match pool.take(request.initiator, &request.service) {
             Ok(slot) => Ok(Some(slot)),
             Err(full) => {
                 if let Some(left_out) = log.permit(Instant::now()) {
@@ -779,8 +818,18 @@ impl Drop for OpenedTarget {
 struct Slots {
     total: Arc<Semaphore>,
     max_total: usize,
-    per_peer: Mutex<HashMap<NodeId, usize>>,
+    held: Mutex<Held>,
     max_per_peer: usize,
+    max_per_service: usize,
+    max_opens: u32,
+    opens: Mutex<HashMap<NodeId, (Clock, u32)>>,
+}
+
+/// What is held now, per peer and per service, under one lock so a slot is taken whole or not.
+#[derive(Debug, Default)]
+struct Held {
+    peers: HashMap<NodeId, usize>,
+    services: HashMap<ServiceId, usize>,
 }
 
 /// Which limit refused a slot.
@@ -790,6 +839,10 @@ enum Full {
     Everyone,
     /// This peer's own.
     Peer,
+    /// This service's own, all peers together.
+    Service,
+    /// This peer's OPEN rate.
+    Rate,
 }
 
 impl Slots {
@@ -797,29 +850,53 @@ impl Slots {
         Arc::new(Self {
             total: Arc::new(Semaphore::new(limits.max_connections)),
             max_total: limits.max_connections,
-            per_peer: Mutex::new(HashMap::new()),
+            held: Mutex::new(Held::default()),
             max_per_peer: limits.max_connections_per_peer,
+            max_per_service: limits.per_service(),
+            max_opens: limits.opens_per_peer_per_minute,
+            opens: Mutex::new(HashMap::new()),
         })
     }
 
-    fn take(self: &Arc<Self>, peer: NodeId) -> Result<Slot, Full> {
+    /// Counts one OPEN of `peer` in its window of [`OPEN_RATE_WINDOW`] and says whether it is
+    /// within the rate. Windows that have ended are dropped when the table grows, so it holds
+    /// at most the peers of the last minute plus a few thousand.
+    fn within_rate(&self, peer: NodeId) -> bool {
+        let now = Clock::now();
+        let mut opens = self.opens.lock().unwrap_or_else(PoisonError::into_inner);
+        if opens.len() >= 4096 {
+            opens.retain(|_, (start, _)| now.duration_since(*start) < OPEN_RATE_WINDOW);
+        }
+        let entry = opens.entry(peer).or_insert((now, 0));
+        if now.duration_since(entry.0) >= OPEN_RATE_WINDOW {
+            *entry = (now, 0);
+        }
+        entry.1 = entry.1.saturating_add(1);
+        entry.1 <= self.max_opens
+    }
+
+    fn take(self: &Arc<Self>, peer: NodeId, service: &ServiceId) -> Result<Slot, Full> {
+        if !self.within_rate(peer) {
+            return Err(Full::Rate);
+        }
         let permit = self
             .total
             .clone()
             .try_acquire_owned()
             .map_err(|_| Full::Everyone)?;
-        let mut held = self.per_peer.lock().unwrap_or_else(PoisonError::into_inner);
-        let count = held.entry(peer).or_insert(0);
-        if *count >= self.max_per_peer {
-            if *count == 0 {
-                held.remove(&peer);
-            }
+        let mut held = self.held.lock().unwrap_or_else(PoisonError::into_inner);
+        if held.peers.get(&peer).copied().unwrap_or(0) >= self.max_per_peer {
             return Err(Full::Peer);
         }
-        *count += 1;
+        if held.services.get(service).copied().unwrap_or(0) >= self.max_per_service {
+            return Err(Full::Service);
+        }
+        *held.peers.entry(peer).or_insert(0) += 1;
+        *held.services.entry(service.clone()).or_insert(0) += 1;
         Ok(Slot {
             _permit: permit,
             peer,
+            service: service.clone(),
             slots: self.clone(),
         })
     }
@@ -832,9 +909,20 @@ impl Slots {
     /// last connection of its peer.
     #[cfg(test)]
     fn tracked_peers(&self) -> usize {
-        self.per_peer
+        self.held
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
+            .peers
+            .len()
+    }
+
+    /// How many services have an entry in the count, for tests.
+    #[cfg(test)]
+    fn tracked_services(&self) -> usize {
+        self.held
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .services
             .len()
     }
 }
@@ -844,6 +932,7 @@ impl Slots {
 struct Slot {
     _permit: OwnedSemaphorePermit,
     peer: NodeId,
+    service: ServiceId,
     slots: Arc<Slots>,
 }
 
@@ -851,13 +940,19 @@ impl Drop for Slot {
     fn drop(&mut self) {
         let mut held = self
             .slots
-            .per_peer
+            .held
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        if let Some(count) = held.get_mut(&self.peer) {
+        if let Some(count) = held.peers.get_mut(&self.peer) {
             *count -= 1;
             if *count == 0 {
-                held.remove(&self.peer);
+                held.peers.remove(&self.peer);
+            }
+        }
+        if let Some(count) = held.services.get_mut(&self.service) {
+            *count -= 1;
+            if *count == 0 {
+                held.services.remove(&self.service);
             }
         }
     }
@@ -1412,7 +1507,14 @@ mod tests {
         let slots = Slots::new(&ServeLimits::default());
         OpenedTarget {
             socket: Some(socket),
-            slot: Some(slots.take(NodeId::from([9u8; 32])).unwrap()),
+            slot: Some(
+                slots
+                    .take(
+                        NodeId::from([9u8; 32]),
+                        &"tcp:t".parse::<ServiceId>().unwrap(),
+                    )
+                    .unwrap(),
+            ),
             live: None,
         }
     }
@@ -2276,6 +2378,9 @@ mod tests {
         ServeLimits {
             max_connections,
             max_connections_per_peer,
+            // These tests count the total and the peer figure; the service one stays out of it.
+            max_connections_per_service: Some(max_connections),
+            opens_per_peer_per_minute: u32::MAX,
             ..ServeLimits::default()
         }
     }
@@ -2342,6 +2447,99 @@ mod tests {
         drop(again);
         assert_eq!(services.connections(), 0);
         assert_eq!(services.slots.tracked_peers(), 0);
+    }
+
+    #[tokio::test]
+    async fn the_per_service_limit_counts_each_service_apart_over_all_peers() {
+        let listener = listener().await;
+        let port = listener.local_addr().unwrap().port();
+        let services = services_for(&listener)
+            .serve(
+                "tcp:other".parse().unwrap(),
+                LocalTarget::new("127.0.0.1", port),
+            )
+            .unwrap()
+            .with_limits(ServeLimits {
+                max_connections: 10,
+                max_connections_per_peer: 10,
+                max_connections_per_service: Some(2),
+                ..ServeLimits::default()
+            });
+        let first = services.open(&request("tcp:app", 1)).await.unwrap();
+        let _second = services.open(&request("tcp:app", 2)).await.unwrap();
+        // A third peer finds this service full, though node and peer are far from their limits.
+        assert_rate_limited(
+            services.open(&request("tcp:app", 3)).await,
+            "tcp:app holds its two",
+        );
+        // The refusal took nothing: the node count and the entries are what two opens left.
+        assert_eq!(services.connections(), 2);
+        assert_eq!(services.slots.tracked_peers(), 2);
+        // Another service is not affected.
+        let other = services.open(&request("tcp:other", 3)).await.unwrap();
+        assert_eq!(services.slots.tracked_services(), 2);
+
+        drop(first);
+        let _again = services.open(&request("tcp:app", 3)).await.unwrap();
+        // A service's entry goes with its last connection.
+        drop(other);
+        assert_eq!(services.slots.tracked_services(), 1);
+    }
+
+    fn peer(n: u8) -> NodeId {
+        NodeId::from([n; 32])
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_peer_over_its_open_rate_is_refused_until_its_window_ends() {
+        let slots = Slots::new(&ServeLimits {
+            opens_per_peer_per_minute: 3,
+            ..ServeLimits::default()
+        });
+        let service: ServiceId = "tcp:app".parse().unwrap();
+        // Each slot is dropped at once: the rate counts opens, not connections held.
+        for _ in 0..3 {
+            drop(slots.take(peer(1), &service).unwrap());
+        }
+        assert_eq!(slots.take(peer(1), &service).unwrap_err(), Full::Rate);
+        // Refused opens count too, and another peer has its own window.
+        drop(slots.take(peer(2), &service).unwrap());
+        tokio::time::advance(Duration::from_secs(59)).await;
+        assert_eq!(slots.take(peer(1), &service).unwrap_err(), Full::Rate);
+        tokio::time::advance(Duration::from_secs(2)).await;
+        drop(slots.take(peer(1), &service).unwrap());
+        assert_eq!(slots.in_use(), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn ended_open_windows_are_dropped_when_the_table_grows() {
+        let slots = Slots::new(&ServeLimits::default());
+        let service: ServiceId = "tcp:app".parse().unwrap();
+        for i in 0..4096u32 {
+            let mut id = [0u8; 32];
+            id[..4].copy_from_slice(&i.to_be_bytes());
+            drop(slots.take(NodeId::from(id), &service).unwrap());
+        }
+        assert_eq!(slots.opens.lock().unwrap().len(), 4096);
+        tokio::time::advance(Duration::from_secs(61)).await;
+        drop(slots.take(peer(255), &service).unwrap());
+        assert_eq!(slots.opens.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn the_default_per_service_limit_is_half_the_node_total() {
+        let listener = listener().await;
+        let services = services_for(&listener).with_limits(ServeLimits {
+            max_connections: 4,
+            max_connections_per_peer: 4,
+            ..ServeLimits::default()
+        });
+        let _a = services.open(&request("tcp:app", 1)).await.unwrap();
+        let _b = services.open(&request("tcp:app", 2)).await.unwrap();
+        assert_rate_limited(
+            services.open(&request("tcp:app", 3)).await,
+            "half of four is two",
+        );
     }
 
     /// Through the whole OPEN exchange: the refusal reaches the peer as `rate_limited`, and
@@ -2415,6 +2613,8 @@ mod tests {
             max_connections: 0,
             max_connections_per_peer: 0,
             socket_buffer: 4096,
+            max_connections_per_service: Some(0),
+            opens_per_peer_per_minute: 0,
         });
         assert_eq!(services.limits().max_connections, 1);
         assert_eq!(services.limits().max_connections_per_peer, 1);
@@ -2424,6 +2624,8 @@ mod tests {
             max_connections: usize::MAX,
             max_connections_per_peer: usize::MAX,
             socket_buffer: 4096,
+            max_connections_per_service: None,
+            opens_per_peer_per_minute: u32::MAX,
         });
         assert_eq!(huge.limits().max_connections, Semaphore::MAX_PERMITS);
         assert_eq!(huge.limits().max_connections_per_peer, usize::MAX);
@@ -2433,7 +2635,15 @@ mod tests {
                 max_connections: DEFAULT_MAX_CONNECTIONS,
                 max_connections_per_peer: DEFAULT_MAX_CONNECTIONS_PER_PEER,
                 socket_buffer: DEFAULT_SOCKET_BUFFER,
+                max_connections_per_service: None,
+                opens_per_peer_per_minute: DEFAULT_OPENS_PER_PEER_PER_MINUTE,
             }
+        );
+        assert_eq!(services.limits().opens_per_peer_per_minute, 1);
+        assert_eq!(services.limits().max_connections_per_service, Some(1));
+        assert_eq!(
+            ServeLimits::default().per_service(),
+            DEFAULT_MAX_CONNECTIONS / 2
         );
 
         assert_eq!(

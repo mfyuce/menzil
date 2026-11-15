@@ -16,6 +16,10 @@
 //! [serve]
 //! max_connections = 256           # served at once, all peers together, at most 1000000
 //! max_connections_per_peer = 64   # served at once for one peer, at most max_connections
+//! # max_connections_per_service = 128   # served at once for one service, all peers together;
+//! #                                      # default half of max_connections, at most max_connections
+//! # opens_per_peer_per_minute = 600    # OPENs one peer may send per minute, refused ones included
+//! # socket_buffer = 131072        # bytes asked for each target socket's buffers (4096 to 16777216)
 //! connect_timeout_secs = 5        # giving up on a service's local target, at most 9
 //! # idle_secs = 300               # off unless set: reset a served tcp:/http:/tls: stream with no
 //! #                               # byte in either direction this long (10 to 86400)
@@ -300,7 +304,20 @@ pub struct ServeSettings {
     /// `tls:` stream is reset (10 to 86400). Absent is off, as before. Egress has its own
     /// `idle_secs` in `[egress]`.
     pub idle_secs: Option<u64>,
+    /// Connections served at once for one service, all peers together (default: half of
+    /// `max_connections`, at least 1).
+    pub max_connections_per_service: Option<usize>,
+    /// Bytes asked for the send and receive buffer of each target socket (the kernel doubles
+    /// it), from [`MIN_SOCKET_BUFFER`] to [`MAX_SOCKET_BUFFER`].
+    pub socket_buffer: Option<u32>,
+    /// OPENs one peer may send per minute, refused ones included (default 600, 1 to 1000000).
+    pub opens_per_peer_per_minute: Option<u32>,
 }
+
+/// The smallest `[serve] socket_buffer`: below it the kernel's own floor decides anyway.
+pub const MIN_SOCKET_BUFFER: u32 = 4096;
+/// The largest `[serve] socket_buffer` (16 MiB, the per stream ceiling of protocol.md 5.3).
+pub const MAX_SOCKET_BUFFER: u32 = 16 * 1024 * 1024;
 
 impl ServeSettings {
     /// The idle timeout asked for, if any (same bounds as `[egress] idle_secs`).
@@ -347,6 +364,33 @@ impl ServeSettings {
                 limits.max_connections_per_peer,
                 limits.max_connections
             );
+        }
+        if let Some(value) = self.max_connections_per_service {
+            let value = in_range("max_connections_per_service", value)?;
+            if value > limits.max_connections {
+                bail!(
+                    "max_connections_per_service in [serve] of config.toml is {value}: it must not exceed max_connections, which is {} (a key left out counts with its default)",
+                    limits.max_connections
+                );
+            }
+            limits.max_connections_per_service = Some(value);
+        }
+        if let Some(rate) = self.opens_per_peer_per_minute {
+            let most = u32::try_from(MAX_SERVE_CONNECTIONS).unwrap_or(u32::MAX);
+            if rate == 0 || rate > most {
+                bail!(
+                    "opens_per_peer_per_minute in [serve] of config.toml is {rate}: it must be from 1 to {most} (leave the key out for the default)"
+                );
+            }
+            limits.opens_per_peer_per_minute = rate;
+        }
+        if let Some(bytes) = self.socket_buffer {
+            if !(MIN_SOCKET_BUFFER..=MAX_SOCKET_BUFFER).contains(&bytes) {
+                bail!(
+                    "socket_buffer in [serve] of config.toml is {bytes}: it must be from {MIN_SOCKET_BUFFER} to {MAX_SOCKET_BUFFER} bytes (leave the key out for the default)"
+                );
+            }
+            limits.socket_buffer = bytes;
         }
         Ok(limits)
     }
@@ -917,11 +961,27 @@ mod tests {
             MAX_CONNECT_TIMEOUT.as_secs()
         ));
         assert_eq!(longest.connect_timeout(), MAX_CONNECT_TIMEOUT);
-        // The socket buffer is not a setting.
+        // Left out, the socket buffer and the per service figure keep their defaults.
         assert_eq!(
             all.limits().socket_buffer,
             ServeLimits::default().socket_buffer
         );
+        assert_eq!(all.limits().max_connections_per_service, None);
+        let both = services(
+            "[serve]\nmax_connections = 20\nmax_connections_per_peer = 3\nmax_connections_per_service = 7\nsocket_buffer = 65536\n",
+        );
+        assert_eq!(both.limits().max_connections_per_service, Some(7));
+        assert_eq!(both.limits().socket_buffer, 65536);
+        assert_eq!(
+            all.limits().opens_per_peer_per_minute,
+            ServeLimits::default().opens_per_peer_per_minute
+        );
+        let rated = services("[serve]\nopens_per_peer_per_minute = 5\n");
+        assert_eq!(rated.limits().opens_per_peer_per_minute, 5);
+        for edge in [MIN_SOCKET_BUFFER, MAX_SOCKET_BUFFER] {
+            let at = services(&format!("[serve]\nsocket_buffer = {edge}\n"));
+            assert_eq!(at.limits().socket_buffer, edge);
+        }
         // The largest value is accepted as it is.
         let largest = services(&format!(
             "[serve]\nmax_connections = {MAX_SERVE_CONNECTIONS}\nmax_connections_per_peer = {MAX_SERVE_CONNECTIONS}\n"
@@ -965,6 +1025,28 @@ mod tests {
                 "must not exceed max_connections",
             ),
             ("[serve]\nmax_connections = 63", "must not exceed"),
+            (
+                "[serve]\nmax_connections_per_service = 0",
+                "max_connections_per_service",
+            ),
+            (
+                "[serve]\nmax_connections = 10\nmax_connections_per_service = 11",
+                "must not exceed max_connections",
+            ),
+            (
+                "[serve]\nmax_connections_per_service = 257",
+                "must not exceed max_connections",
+            ),
+            (
+                "[serve]\nopens_per_peer_per_minute = 0",
+                "from 1 to 1000000",
+            ),
+            (
+                "[serve]\nopens_per_peer_per_minute = 1000001",
+                "from 1 to 1000000",
+            ),
+            ("[serve]\nsocket_buffer = 4095", "from 4096 to 16777216"),
+            ("[serve]\nsocket_buffer = 16777217", "from 4096 to 16777216"),
             ("[serve]\nconnect_timeout_secs = 0", "connect_timeout_secs"),
             ("[serve]\nidle_secs = 0", "idle_secs"),
             ("[serve]\nidle_secs = 9", "from 10 to 86400"),
