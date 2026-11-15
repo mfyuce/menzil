@@ -241,10 +241,12 @@ async fn at_most_32_rpcs_run_at_once() {
 /// A change still queued when its request times out must not run afterwards. The agent's own
 /// deadline is short here and the transport's backstop is longer, so the agent's deadline is the
 /// one that fires (the order that hid a defect: with the agent's deadline first, the cancel flag
-/// was never set and the abandoned change ran when the mutex was released).
+/// was never set and the abandoned change ran when the mutex was released). The deadline applies
+/// to the setup requests too (first TLS handshake, relay directory creation, fsyncs), so it is
+/// several times what a loaded machine needs for those; only the held request waits it out.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_request_over_its_deadline_is_dropped_and_its_change_never_runs() {
-    let fx = Fixture::start_with_timeout(Some(Duration::from_millis(400))).await;
+    let fx = Fixture::start_with_timeout(Some(Duration::from_millis(2500))).await;
     let mut c = fx.client().await;
     let a = Owner::new();
     c.create_tenant(create("alpha", &a.token())).await.unwrap();
