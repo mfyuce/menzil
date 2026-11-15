@@ -174,13 +174,13 @@ fn keep_roster_locked(
         Verdict::Adopt(adoption) => adoption,
         Verdict::Held => return Ok(Some((body.network_id, held_seq.unwrap_or(body.seq)))),
         Verdict::Reject(Reason::Expired) => {
-            bail!("this Roster has expired: ask the owner for a current token")
+            return Err(tenants::CommandError::TokenExpired.into());
         }
         Verdict::Reject(reason) => {
-            bail!(
-                "this Roster is not acceptable: {}",
-                crate::local::refusal(reason)
-            )
+            return Err(tenants::CommandError::TokenNotAcceptable {
+                reason: crate::local::refusal(reason),
+            }
+            .into());
         }
     };
     // The owner's own signature makes a base pointless: it is not kept.

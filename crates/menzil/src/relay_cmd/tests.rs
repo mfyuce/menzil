@@ -3045,3 +3045,177 @@ async fn a_relay_reads_its_fallback_page_at_start_and_refuses_a_bad_one() {
     let running = start(&relay_home, &options).await.unwrap();
     running.stop();
 }
+
+// ---- Typed command errors (TODO 253, 2d): the admin agent matches the variant, not the text ----
+
+mod command_errors {
+    use super::super::tenants::CommandError;
+    use super::*;
+
+    /// The `CommandError` an error carries, found down the chain.
+    fn kind(error: &anyhow::Error) -> CommandError {
+        error
+            .chain()
+            .find_map(|cause| cause.downcast_ref::<CommandError>())
+            .unwrap_or_else(|| panic!("not a CommandError: {error:#}"))
+            .clone()
+    }
+
+    #[test]
+    fn the_real_commands_produce_each_variant_with_the_old_text() {
+        let (_a, _oa, id_a, token_a) = another_network();
+        let (_b, _ob, id_b, token_b) = another_network();
+        let (_c, _oc, _id_c, token_c) = another_network();
+        let (_d, relay) = relay_machine();
+
+        // NetworkInOtherTenant, Suspended.
+        add_network_to(&relay, &token_a, clock(), Some("ali")).unwrap();
+        let e = add_network_to(&relay, &token_a, clock(), Some("veli")).unwrap_err();
+        assert_eq!(
+            kind(&e),
+            CommandError::NetworkInOtherTenant {
+                network_id: id_a,
+                tenant: "ali".into()
+            }
+        );
+        assert!(e.to_string().contains("already in tenant ali"));
+        set_suspended(&relay, "ali", true).unwrap();
+        let e = add_network_to(&relay, &token_b, clock(), Some("ali")).unwrap_err();
+        assert_eq!(kind(&e), CommandError::Suspended { slug: "ali".into() });
+        assert!(
+            e.to_string()
+                .contains("is suspended: `menzil relay resume-tenant ali` first")
+        );
+        set_suspended(&relay, "ali", false).unwrap();
+
+        // NoTenant, NetworkNotServed.
+        let e = remove_tenant(&relay, "nobody", clock()).unwrap_err();
+        assert_eq!(
+            kind(&e),
+            CommandError::NoTenant {
+                slug: "nobody".into()
+            }
+        );
+        assert_eq!(e.to_string(), "this relay has no tenant nobody");
+        let e = remove_network(&relay, &id_b.to_hex()).unwrap_err();
+        assert_eq!(
+            kind(&e),
+            CommandError::NetworkNotServed { network_id: id_b }
+        );
+        assert_eq!(
+            e.to_string(),
+            format!("this relay does not serve network {id_b}")
+        );
+
+        // NameQuarantined, ListedByUnusedTenantFile (a hand written file with an unusable class is
+        // refused, and lists a network).
+        remove_tenant(&relay, "ali", clock()).unwrap();
+        let e = add_network_to(&relay, &token_b, clock(), Some("ali")).unwrap_err();
+        assert!(
+            matches!(kind(&e), CommandError::NameQuarantined { ref slug, .. } if slug == "ali")
+        );
+        assert!(
+            e.to_string()
+                .contains("belonged to a tenant that was removed; it cannot be used again until")
+        );
+        fs::write(
+            tenant_file(&relay, "ali"),
+            format!("networks = [\"{}\"]\nclass = \"bogus\"\n", id_b.to_hex()),
+        )
+        .unwrap();
+        let e = add_network_to(&relay, &token_b, clock(), Some("veli")).unwrap_err();
+        assert_eq!(
+            kind(&e),
+            CommandError::ListedByUnusedTenantFile { network_id: id_b }
+        );
+        assert!(
+            e.to_string()
+                .contains("is listed by a tenant file that is not used")
+        );
+        fs::remove_file(tenant_file(&relay, "ali")).unwrap();
+
+        // TokenExpired, TokenNotAcceptable.
+        let e = add_network_to(&relay, &token_c, clock() + 3000 * DAY, Some("zed")).unwrap_err();
+        assert_eq!(kind(&e), CommandError::TokenExpired);
+        assert_eq!(
+            e.to_string(),
+            "this Roster has expired: ask the owner for a current token"
+        );
+        let owner = OwnerKey::generate();
+        let keys = NodeKeys::generate();
+        let cert = keys.issue_cert(1, clock() - 10, clock() + 1000).unwrap();
+        let docs = create_network(&owner, &cert, "x", clock()).unwrap();
+        let thief = ed25519_dalek::SigningKey::generate(&mut rand::rng());
+        let forged = encode_roster(&Roster::sign(&thief, docs.roster_body()).unwrap(), None);
+        let e = add_network_to(&relay, &forged, clock(), Some("zed")).unwrap_err();
+        assert!(matches!(kind(&e), CommandError::TokenNotAcceptable { .. }));
+        assert!(e.to_string().contains("this Roster is not acceptable: "));
+    }
+
+    #[test]
+    fn the_real_commands_produce_refusal_and_limit_variants() {
+        // TenantCannotTake: a flat name in quarantine.
+        let (_b, _ob, _id_b, token_b) = another_network();
+        let (_d, relay) = relay_machine();
+        fs::create_dir_all(super::super::relay_dir(&relay)).unwrap();
+        let mut state = menzil_relay::NameState::default();
+        let claim = menzil_relay::Claim {
+            full: "blog",
+            tenant: Some("ali"),
+            network: NetworkId::from([7u8; 32]),
+        };
+        let _ = state.accept(&claim, None, clock() - 10);
+        assert!(state.release("blog", clock() - 5));
+        fs::write(names_state::state_path(&relay), state.render()).unwrap();
+        let e = add_network_to(&relay, &token_b, clock(), Some("blog")).unwrap_err();
+        assert!(
+            matches!(kind(&e), CommandError::TenantCannotTake { ref slug, .. } if slug == "blog")
+        );
+        assert!(e.to_string().starts_with("tenant blog cannot take it: "));
+
+        // WouldTakeTenantOffline: a grant equal to the new tenant's name.
+        let (_a, _oa, id_a, token_a) = another_network();
+        let (_d2, relay2) = relay_machine();
+        add_network(&relay2, &token_a, clock()).unwrap();
+        fs::create_dir_all(tenants_dir(&relay2)).unwrap();
+        fs::write(
+            tenant_file(&relay2, "ali"),
+            format!(
+                "networks = [\"{}\"]\nextra_names = [\"blog\"]\nadded = {}\n",
+                id_a.to_hex(),
+                clock() + 400 * DAY
+            ),
+        )
+        .unwrap();
+        let e = add_network_to(&relay2, &token_b, clock(), Some("blog")).unwrap_err();
+        assert!(
+            matches!(kind(&e), CommandError::WouldTakeTenantOffline { ref tenant, .. } if tenant == "ali")
+        );
+        assert!(
+            e.to_string()
+                .starts_with("this would take tenant ali offline: ")
+        );
+
+        // TenantNetworkLimit: the friend class has 3.
+        let (_x, relay3) = relay_machine();
+        let tokens: Vec<_> = (0..4).map(|_| another_network()).collect();
+        for t in &tokens[..3] {
+            add_network_to(&relay3, &t.3, clock(), Some("ali")).unwrap();
+        }
+        let e = add_network_to(&relay3, &tokens[3].3, clock(), Some("ali")).unwrap_err();
+        assert!(matches!(
+            kind(&e),
+            CommandError::TenantNetworkLimit { ref slug, max_networks: 3, .. } if slug == "ali"
+        ));
+        assert!(
+            e.to_string()
+                .contains("may have 3 network(s) (its class's figure)")
+        );
+
+        // RelayServesNoNetwork: no relay directory here.
+        let (_h, bare) = home();
+        let e = remove_network(&bare, &tokens[0].2.to_hex()).unwrap_err();
+        assert_eq!(kind(&e), CommandError::RelayServesNoNetwork);
+        assert_eq!(e.to_string(), "this relay serves no network");
+    }
+}

@@ -774,3 +774,87 @@ async fn a_repeated_create_with_another_class_is_refused_not_ignored() {
     let got = c.get_tenant(aref("alpha")).await.unwrap().into_inner();
     assert_eq!(got.class, "personal");
 }
+
+/// TODO 253 (2d): the class of a command error is its `CommandError` variant, never its wording.
+#[test]
+fn command_errors_map_by_variant_not_by_wording() {
+    use menzil_cli::relay_cmd::tenants::CommandError as C;
+    use menzil_proto::NetworkId;
+    use menzil_relay_admin::service::status_of_command;
+    let id = NetworkId::from([3u8; 32]);
+    let s = || "x".to_string();
+    let table: Vec<(C, Code)> = vec![
+        (
+            C::NameQuarantined {
+                slug: s(),
+                until: 1,
+            },
+            Code::FailedPrecondition,
+        ),
+        (
+            C::NetworkInOtherTenant {
+                network_id: id,
+                tenant: s(),
+            },
+            Code::FailedPrecondition,
+        ),
+        (
+            C::ListedByUnusedTenantFile { network_id: id },
+            Code::FailedPrecondition,
+        ),
+        (C::Suspended { slug: s() }, Code::FailedPrecondition),
+        (
+            C::TenantCannotTake {
+                slug: s(),
+                reason: s(),
+            },
+            Code::FailedPrecondition,
+        ),
+        (
+            C::WouldTakeTenantOffline {
+                tenant: s(),
+                reason: s(),
+            },
+            Code::FailedPrecondition,
+        ),
+        (
+            C::TenantNetworkLimit {
+                slug: s(),
+                max_networks: 3,
+                file: "/secret/path.toml".into(),
+            },
+            Code::FailedPrecondition,
+        ),
+        (C::TokenExpired, Code::InvalidArgument),
+        (C::TokenNotAcceptable { reason: s() }, Code::InvalidArgument),
+        (C::NoTenant { slug: s() }, Code::NotFound),
+        (C::RelayServesNoNetwork, Code::NotFound),
+        (C::NetworkNotServed { network_id: id }, Code::NotFound),
+    ];
+    for (error, code) in table {
+        let text = error.to_string();
+        let status = status_of_command(&anyhow::Error::new(error.clone()));
+        assert_eq!(status.code(), code, "{error:?}");
+        assert!(
+            !status.message().contains("secret") && !status.message().contains(&text),
+            "{error:?}"
+        );
+        // A context wrapper does not hide the variant.
+        let wrapped = anyhow::Error::new(error.clone()).context("while doing it");
+        assert_eq!(status_of_command(&wrapped).code(), code, "{error:?}");
+    }
+    // The old wording, untyped, is INTERNAL now.
+    for text in [
+        "belonged to a tenant that was removed",
+        "is already in tenant x",
+        "is suspended",
+        "has expired",
+        "this relay has no tenant x",
+    ] {
+        assert_eq!(
+            status_of_command(&anyhow::anyhow!("{text}")).code(),
+            Code::Internal,
+            "{text}"
+        );
+    }
+}

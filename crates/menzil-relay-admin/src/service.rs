@@ -13,7 +13,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use menzil_cli::home::{Home, parse_hex32};
 use menzil_cli::relay_cmd::status::{self, StatusDoc, StatusError};
-use menzil_cli::relay_cmd::tenants::{self, TenantError, TenantInfo, UpdateTenant};
+use menzil_cli::relay_cmd::tenants::{self, CommandError, TenantError, TenantInfo, UpdateTenant};
 use menzil_cli::token::decode_roster;
 use menzil_proto::NetworkId;
 use menzil_relay::{Class, Figures, Slug, SlugError};
@@ -203,36 +203,45 @@ pub fn status_of(error: &TenantError, home: &Home) -> Status {
     }
 }
 
-/// Classifies the text error of a command that has no typed error (`add_network_to`,
-/// `remove_network`, `remove_tenant`) by what it says, into a fixed status. Anything unknown is
+/// Classifies the error of a command that has no `TenantError` (`add_network_to`,
+/// `remove_network`, `remove_tenant`) by its [`CommandError`] variant (searched down the chain, so
+/// a context wrapper is found), into a fixed status. Wording plays no part. Anything else is
 /// INTERNAL: the text is never passed on, it can hold a path.
-fn status_of_command(error: &anyhow::Error) -> Status {
-    let text = format!("{error:#}");
-    let has = |needle: &str| text.contains(needle);
-    if has("belonged to a tenant that was removed") {
-        Status::failed_precondition(
+pub fn status_of_command(error: &anyhow::Error) -> Status {
+    let Some(kind) = error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<CommandError>())
+    else {
+        return Status::internal("the relay's files could not be read or written");
+    };
+    match kind {
+        CommandError::NameQuarantined { .. } => Status::failed_precondition(
             "the tenant name belonged to a removed tenant and is in quarantine",
-        )
-    } else if has("is already in tenant") {
-        Status::failed_precondition("the network is in another tenant: remove it there first")
-    } else if has("is listed by a tenant file that is not used") {
-        Status::failed_precondition(
+        ),
+        CommandError::NetworkInOtherTenant { .. } => {
+            Status::failed_precondition("the network is in another tenant: remove it there first")
+        }
+        CommandError::ListedByUnusedTenantFile { .. } => Status::failed_precondition(
             "a tenant file that lists the network is not used: repair it first",
-        )
-    } else if has("is suspended") {
-        Status::failed_precondition("the tenant is suspended: resume it first")
-    } else if has("cannot take it") || has("would take tenant") {
-        Status::failed_precondition("the relay would refuse the tenant with this network")
-    } else if has("network(s) (its class's figure)") {
-        Status::failed_precondition("the tenant has the most networks its class allows")
-    } else if has("has expired") {
-        Status::invalid_argument("the roster token has expired: ask the owner for a current one")
-    } else if has("is not acceptable") {
-        Status::invalid_argument("the roster token is not acceptable")
-    } else if has("has no tenant") || has("does not serve network") {
-        Status::not_found("no such tenant or network")
-    } else {
-        Status::internal("the relay's files could not be read or written")
+        ),
+        CommandError::Suspended { .. } => {
+            Status::failed_precondition("the tenant is suspended: resume it first")
+        }
+        CommandError::TenantCannotTake { .. } | CommandError::WouldTakeTenantOffline { .. } => {
+            Status::failed_precondition("the relay would refuse the tenant with this network")
+        }
+        CommandError::TenantNetworkLimit { .. } => {
+            Status::failed_precondition("the tenant has the most networks its class allows")
+        }
+        CommandError::TokenExpired => Status::invalid_argument(
+            "the roster token has expired: ask the owner for a current one",
+        ),
+        CommandError::TokenNotAcceptable { .. } => {
+            Status::invalid_argument("the roster token is not acceptable")
+        }
+        CommandError::NoTenant { .. }
+        | CommandError::RelayServesNoNetwork
+        | CommandError::NetworkNotServed { .. } => Status::not_found("no such tenant or network"),
     }
 }
 

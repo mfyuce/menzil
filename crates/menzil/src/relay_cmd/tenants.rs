@@ -35,7 +35,7 @@ use std::fmt::Write as _;
 use std::fs;
 use std::io::ErrorKind;
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow};
 use menzil_proto::NetworkId;
 use menzil_relay::{
     Class, Figures, QUARANTINE_DAYS, Refusal, Slug, Tenant, TenantBook, TenantId, TenantSpec,
@@ -396,24 +396,24 @@ pub fn add_network_to(home: &Home, token: &str, now: u64, tenant: Option<&str>) 
                 .iter()
                 .any(|(spec, suspended)| *suspended && spec.slug == slug)
             {
-                bail!(
-                    "tenant {slug} is suspended: `menzil relay resume-tenant {slug}` first (a network added now would not be served)"
-                );
+                return Err(CommandError::Suspended {
+                    slug: slug.to_string(),
+                }
+                .into());
             }
             let mut specs: Vec<TenantSpec> = files.into_iter().map(|(spec, _)| spec).collect();
             if let Some(other) = specs
                 .iter()
                 .find(|s| s.networks.contains(&network_id) && s.slug != slug)
             {
-                bail!(
-                    "network {network_id} is already in tenant {}: `menzil relay remove-network` it first",
-                    other.slug
-                );
+                return Err(CommandError::NetworkInOtherTenant {
+                    network_id,
+                    tenant: other.slug.to_string(),
+                }
+                .into());
             }
             if refused.iter().any(|r| r.networks.contains(&network_id)) {
-                bail!(
-                    "network {network_id} is listed by a tenant file that is not used (see `menzil relay tenants`): fix or remove that file first"
-                );
+                return Err(CommandError::ListedByUnusedTenantFile { network_id }.into());
             }
             let existing = specs.iter().position(|spec| spec.slug == slug);
             let created = existing.is_none();
@@ -421,9 +421,11 @@ pub fn add_network_to(home: &Home, token: &str, now: u64, tenant: Option<&str>) 
             let specs_before = specs.clone();
             if created {
                 if let Some(until) = quarantined(home, now)?.get(slug.as_str()) {
-                    bail!(
-                        "the name {slug} belonged to a tenant that was removed; it cannot be used again until {until} (Unix time, {QUARANTINE_DAYS} days after the removal)"
-                    );
+                    return Err(CommandError::NameQuarantined {
+                        slug: slug.to_string(),
+                        until: *until,
+                    }
+                    .into());
                 }
                 specs.push(TenantSpec {
                     slug: slug.clone(),
@@ -456,7 +458,11 @@ pub fn add_network_to(home: &Home, token: &str, now: u64, tenant: Option<&str>) 
             let before = names.build(specs_before, refused.clone(), &removed);
             let trial = names.build(specs.clone(), refused, &removed);
             if let Some(refusal) = trial.refused().iter().find(|r| r.name == slug.as_str()) {
-                bail!("tenant {slug} cannot take it: {}", refusal.reason);
+                return Err(CommandError::TenantCannotTake {
+                    slug: slug.to_string(),
+                    reason: refusal.reason.to_string(),
+                }
+                .into());
             }
             // The change must not take any other tenant offline: a file the book takes now and
             // would refuse after it (a slug equal to its grant, say) stops the command.
@@ -466,20 +472,21 @@ pub fn add_network_to(home: &Home, token: &str, now: u64, tenant: Option<&str>) 
                     .iter()
                     .any(|earlier| earlier.name == r.name)
             }) {
-                bail!(
-                    "this would take tenant {} offline: {}",
-                    refusal.name,
-                    refusal.reason
-                );
+                return Err(CommandError::WouldTakeTenantOffline {
+                    tenant: refusal.name.to_string(),
+                    reason: refusal.reason.to_string(),
+                }
+                .into());
             }
             if let Some(figures) = trial.named(slug.as_str()).and_then(|t| t.figures)
                 && specs[at].networks.len() as u64 > figures.max_networks
             {
-                bail!(
-                    "tenant {slug} may have {} network(s) (its class's figure); remove one first or raise `max_networks` in {}",
-                    figures.max_networks,
-                    tenant_path(home, slug.as_str()).display()
-                );
+                return Err(CommandError::TenantNetworkLimit {
+                    slug: slug.to_string(),
+                    max_networks: figures.max_networks,
+                    file: tenant_path(home, slug.as_str()).display().to_string(),
+                }
+                .into());
             }
             if created && (others_before > 0 || had_default_networks) {
                 warnings.push(PSL_WARNING.to_string());
@@ -521,6 +528,134 @@ pub fn add_network_to(home: &Home, token: &str, now: u64, tenant: Option<&str>) 
     })
 }
 
+/// The failures of [`add_network_to`], [`remove_network`], [`remove_tenant`] (and the Roster
+/// keeper they call) that the admin agent maps to a fixed gRPC status. Typed so that rewording a
+/// message cannot change a status: the agent matches the variant, never the text. The `Display`
+/// is the message the command line prints. A function returns it inside an `anyhow::Error`
+/// (find it with `downcast_ref`, also under a context).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CommandError {
+    /// The name belonged to a removed tenant and is in quarantine until `until` (Unix time).
+    NameQuarantined {
+        /// The tenant name.
+        slug: String,
+        /// When the quarantine ends.
+        until: u64,
+    },
+    /// The network is in another tenant already.
+    NetworkInOtherTenant {
+        /// The network.
+        network_id: NetworkId,
+        /// The tenant that has it.
+        tenant: String,
+    },
+    /// A tenant file the relay does not use lists the network.
+    ListedByUnusedTenantFile {
+        /// The network.
+        network_id: NetworkId,
+    },
+    /// The tenant is suspended.
+    Suspended {
+        /// The tenant name.
+        slug: String,
+    },
+    /// The relay would refuse the tenant with this network.
+    TenantCannotTake {
+        /// The tenant name.
+        slug: String,
+        /// The relay's reason.
+        reason: String,
+    },
+    /// The change would take another tenant offline.
+    WouldTakeTenantOffline {
+        /// The other tenant.
+        tenant: String,
+        /// The relay's reason.
+        reason: String,
+    },
+    /// The tenant has the most networks its class allows.
+    TenantNetworkLimit {
+        /// The tenant name.
+        slug: String,
+        /// The class's figure.
+        max_networks: u64,
+        /// The tenant file (printed on the command line only, never in a status).
+        file: String,
+    },
+    /// The Roster token has expired.
+    TokenExpired,
+    /// The Roster token is not acceptable.
+    TokenNotAcceptable {
+        /// Why, in words.
+        reason: String,
+    },
+    /// No such tenant.
+    NoTenant {
+        /// The tenant name.
+        slug: String,
+    },
+    /// No relay is running here, so it serves no network.
+    RelayServesNoNetwork,
+    /// The relay does not serve this network.
+    NetworkNotServed {
+        /// The network.
+        network_id: NetworkId,
+    },
+}
+
+impl std::fmt::Display for CommandError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NameQuarantined { slug, until } => write!(
+                f,
+                "the name {slug} belonged to a tenant that was removed; it cannot be used again until {until} (Unix time, {QUARANTINE_DAYS} days after the removal)"
+            ),
+            Self::NetworkInOtherTenant { network_id, tenant } => write!(
+                f,
+                "network {network_id} is already in tenant {tenant}: `menzil relay remove-network` it first"
+            ),
+            Self::ListedByUnusedTenantFile { network_id } => write!(
+                f,
+                "network {network_id} is listed by a tenant file that is not used (see `menzil relay tenants`): fix or remove that file first"
+            ),
+            Self::Suspended { slug } => write!(
+                f,
+                "tenant {slug} is suspended: `menzil relay resume-tenant {slug}` first (a network added now would not be served)"
+            ),
+            Self::TenantCannotTake { slug, reason } => {
+                write!(f, "tenant {slug} cannot take it: {reason}")
+            }
+            Self::WouldTakeTenantOffline { tenant, reason } => {
+                write!(f, "this would take tenant {tenant} offline: {reason}")
+            }
+            Self::TenantNetworkLimit {
+                slug,
+                max_networks,
+                file,
+            } => write!(
+                f,
+                "tenant {slug} may have {max_networks} network(s) (its class's figure); remove one first or raise `max_networks` in {file}"
+            ),
+            Self::TokenExpired => {
+                write!(
+                    f,
+                    "this Roster has expired: ask the owner for a current token"
+                )
+            }
+            Self::TokenNotAcceptable { reason } => {
+                write!(f, "this Roster is not acceptable: {reason}")
+            }
+            Self::NoTenant { slug } => write!(f, "this relay has no tenant {slug}"),
+            Self::RelayServesNoNetwork => write!(f, "this relay serves no network"),
+            Self::NetworkNotServed { network_id } => {
+                write!(f, "this relay does not serve network {network_id}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for CommandError {}
+
 /// What `remove-network` did.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Removed {
@@ -549,7 +684,7 @@ pub fn remove_network(home: &Home, network: &str) -> Result<Removed> {
         .map(NetworkId::from)
         .ok_or_else(|| anyhow!("{network:?} is not a network id (64 hex digits)"))?;
     let Some(_lock) = home.lock_relay_if_held()? else {
-        bail!("this relay serves no network");
+        return Err(CommandError::RelayServesNoNetwork.into());
     };
     let mut warnings = Vec::new();
     let mut tenant = None;
@@ -564,7 +699,7 @@ pub fn remove_network(home: &Home, network: &str) -> Result<Removed> {
     };
     let had_file = remove_if_there(&roster_path(home, &id))?;
     if !had_file && listed.is_empty() {
-        bail!("this relay does not serve network {id}");
+        return Err(CommandError::NetworkNotServed { network_id: id }.into());
     }
     for (slug, mut file) in listed {
         let id_text = id.to_hex();
@@ -620,12 +755,20 @@ fn tenant_files_listing(home: &Home, id: &NetworkId) -> Result<Vec<(String, Tena
 pub fn remove_tenant(home: &Home, slug: &str, now: u64) -> Result<Vec<NetworkId>> {
     let slug = Slug::parse(slug).map_err(|e| anyhow!("{e}"))?;
     let Some(_lock) = home.lock_relay_if_held()? else {
-        bail!("this relay has no tenant {slug}");
+        return Err(CommandError::NoTenant {
+            slug: slug.to_string(),
+        }
+        .into());
     };
     let path = tenant_path(home, slug.as_str());
     let text = match fs::read_to_string(&path) {
         Ok(text) => text,
-        Err(e) if e.kind() == ErrorKind::NotFound => bail!("this relay has no tenant {slug}"),
+        Err(e) if e.kind() == ErrorKind::NotFound => {
+            return Err(CommandError::NoTenant {
+                slug: slug.to_string(),
+            }
+            .into());
+        }
         Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
     };
     // A file whose networks cannot be told is not deleted: its Rosters would stay and be served
