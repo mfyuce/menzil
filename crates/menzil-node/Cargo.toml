@@ -30,6 +30,7 @@ thiserror.workspace = true
 tokio = { workspace = true, features = ["sync", "time", "net", "io-util", "fs"] }
 tokio-rustls.workspace = true
 tracing.workspace = true
+zeroize = "1"
 
 [dev-dependencies]
 # the in process CA of the renewal wrapper test.

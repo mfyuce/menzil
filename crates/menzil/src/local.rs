@@ -80,7 +80,7 @@ fn init_locked(home: &Home, now: u64) -> Result<InitOutcome> {
     let not_before = now.saturating_sub(CERT_BACKDATE_SECS);
     let cert = keys.issue_cert(1, not_before, not_before.saturating_add(CERT_LIFETIME_SECS))?;
     home.write_public(&home.identity_cert_path(), &cert.encode())?;
-    home.write_secret(&key_path, &Zeroizing::new(keys.secret_bytes())[..])?;
+    home.write_secret(&key_path, &keys.secret_bytes()[..])?;
     Ok(InitOutcome {
         node_id: keys.node_id(),
         join_request: encode_join_request(&cert),
@@ -178,10 +178,7 @@ pub fn network_create(home: &Home, device_name: &str, now: u64) -> Result<Networ
     let owner = OwnerKey::generate();
     let docs = menzil_admin::create_network(&owner, &cert, device_name, now)?;
     let network_id = owner.network_id();
-    home.write_secret(
-        &home.owner_key_path(&network_id),
-        &Zeroizing::new(owner.secret_bytes())[..],
-    )?;
+    home.write_secret(&home.owner_key_path(&network_id), &owner.secret_bytes()[..])?;
     save_documents(home, &docs)?;
     Ok(network_id)
 }
@@ -299,7 +296,7 @@ pub fn steward_request(home: &Home, network: Option<&str>) -> Result<StewardRequ
         (load_steward(home, &network_id)?, false)
     } else {
         let secret = StewardSecret::generate();
-        home.write_secret(&path, &Zeroizing::new(secret.secret_bytes())[..])?;
+        home.write_secret(&path, &secret.secret_bytes()[..])?;
         (secret, true)
     };
     Ok(StewardRequest {

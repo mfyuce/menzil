@@ -6,7 +6,7 @@ use menzil_proto::{
     NetworkId, NodeCert, NodeCertBody, NodeId, PROTOCOL_VERSION, StewardKey, X25519PublicKey,
 };
 use rand::Rng;
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::AdminError;
 
@@ -73,9 +73,10 @@ impl NodeKeys {
     }
 
     /// The Ed25519 seed followed by the X25519 private key: what a key file holds.
-    pub fn secret_bytes(&self) -> [u8; Self::SECRET_LEN] {
-        let mut out = [0u8; Self::SECRET_LEN];
-        out[..32].copy_from_slice(&self.signing.to_bytes());
+    pub fn secret_bytes(&self) -> Zeroizing<[u8; Self::SECRET_LEN]> {
+        let mut out = Zeroizing::new([0u8; Self::SECRET_LEN]);
+        let seed = Zeroizing::new(self.signing.to_bytes());
+        out[..32].copy_from_slice(&seed[..]);
         out[32..].copy_from_slice(&self.x25519_private);
         out
     }
@@ -91,8 +92,8 @@ impl NodeKeys {
     }
 
     /// The X25519 private key for the Noise handshakes.
-    pub fn x25519_private(&self) -> [u8; 32] {
-        self.x25519_private
+    pub fn x25519_private(&self) -> Zeroizing<[u8; 32]> {
+        Zeroizing::new(self.x25519_private)
     }
 
     /// The X25519 public key a certificate binds to the NodeId.
@@ -196,8 +197,8 @@ impl OwnerKey {
     }
 
     /// The Ed25519 seed: what an owner key file holds.
-    pub fn secret_bytes(&self) -> [u8; Self::SECRET_LEN] {
-        self.signing.to_bytes()
+    pub fn secret_bytes(&self) -> Zeroizing<[u8; Self::SECRET_LEN]> {
+        Zeroizing::new(self.signing.to_bytes())
     }
 
     /// The network this key owns.
@@ -254,8 +255,8 @@ impl StewardSecret {
     }
 
     /// The Ed25519 seed: what a steward key file holds.
-    pub fn secret_bytes(&self) -> [u8; Self::SECRET_LEN] {
-        self.signing.to_bytes()
+    pub fn secret_bytes(&self) -> Zeroizing<[u8; Self::SECRET_LEN]> {
+        Zeroizing::new(self.signing.to_bytes())
     }
 
     /// The public key the owner lists in the `Steward` entry.
@@ -276,7 +277,7 @@ mod tests {
     #[test]
     fn node_keys_round_trip_through_their_secret_bytes() {
         let keys = NodeKeys::generate();
-        let again = NodeKeys::from_secret_bytes(&keys.secret_bytes()).unwrap();
+        let again = NodeKeys::from_secret_bytes(&keys.secret_bytes()[..]).unwrap();
         assert_eq!(again.node_id(), keys.node_id());
         assert_eq!(again.x25519_public(), keys.x25519_public());
         assert_eq!(again.x25519_private(), keys.x25519_private());
@@ -296,8 +297,8 @@ mod tests {
         // keys are not derived from one another.
         let (a, b) = (NodeKeys::generate(), NodeKeys::generate());
         let mut mixed = a.secret_bytes();
-        mixed[32..].copy_from_slice(&b.x25519_private());
-        let mixed = NodeKeys::from_secret_bytes(&mixed).unwrap();
+        mixed[32..].copy_from_slice(&b.x25519_private()[..]);
+        let mixed = NodeKeys::from_secret_bytes(&mixed[..]).unwrap();
         assert_eq!(mixed.node_id(), a.node_id());
         assert_eq!(mixed.x25519_public(), b.x25519_public());
     }
@@ -311,14 +312,14 @@ mod tests {
             "Noise_IK_25519_ChaChaPoly_BLAKE2s".parse().unwrap();
         let (initiator, responder) = (NodeKeys::generate(), NodeKeys::generate());
         let mut i = snow::Builder::new(params.clone())
-            .local_private_key(&initiator.x25519_private())
+            .local_private_key(&initiator.x25519_private()[..])
             .unwrap()
             .remote_public_key(&<[u8; 32]>::from(responder.x25519_public()))
             .unwrap()
             .build_initiator()
             .unwrap();
         let mut r = snow::Builder::new(params)
-            .local_private_key(&responder.x25519_private())
+            .local_private_key(&responder.x25519_private()[..])
             .unwrap()
             .build_responder()
             .unwrap();
@@ -415,7 +416,7 @@ mod tests {
     #[test]
     fn an_owner_key_names_its_network() {
         let owner = OwnerKey::generate();
-        let again = OwnerKey::from_secret_bytes(&owner.secret_bytes()).unwrap();
+        let again = OwnerKey::from_secret_bytes(&owner.secret_bytes()[..]).unwrap();
         assert_eq!(again.network_id(), owner.network_id());
         assert_eq!(
             <[u8; 32]>::from(owner.network_id()),
@@ -426,7 +427,7 @@ mod tests {
     #[test]
     fn a_steward_key_round_trips_and_never_shows_its_secret() {
         let key = StewardSecret::generate();
-        let again = StewardSecret::from_secret_bytes(&key.secret_bytes()).unwrap();
+        let again = StewardSecret::from_secret_bytes(&key.secret_bytes()[..]).unwrap();
         assert_eq!(again.public(), key.public());
         assert_ne!(StewardSecret::generate().public(), key.public());
         assert_eq!(
@@ -447,5 +448,16 @@ mod tests {
             .map(|b| format!("{b:02x}"))
             .collect();
         assert!(!shown.contains(&hex));
+    }
+
+    #[test]
+    fn secret_copies_come_back_in_types_that_wipe_on_drop() {
+        // A compile time check: the annotations fail if a getter hands out a plain array again.
+        let node = NodeKeys::generate();
+        let _: Zeroizing<[u8; NodeKeys::SECRET_LEN]> = node.secret_bytes();
+        let _: Zeroizing<[u8; 32]> = node.x25519_private();
+        let _: Zeroizing<[u8; OwnerKey::SECRET_LEN]> = OwnerKey::generate().secret_bytes();
+        let _: Zeroizing<[u8; StewardSecret::SECRET_LEN]> =
+            StewardSecret::generate().secret_bytes();
     }
 }

@@ -985,7 +985,7 @@ where
         },
         identity: LocalIdentity {
             node_cert: cert,
-            x25519_private: keys.x25519_private(),
+            x25519_private: *keys.x25519_private(),
         }
         .into(),
         networks,

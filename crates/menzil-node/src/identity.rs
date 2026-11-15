@@ -26,6 +26,15 @@ pub struct LocalIdentity {
     pub x25519_private: [u8; 32],
 }
 
+impl Drop for LocalIdentity {
+    /// Wipes the X25519 private key when the identity goes. Copies made by `Clone` are
+    /// identities of their own and wipe themselves; a stack copy of the bare array taken out
+    /// of one (to hand to a handshake) is not covered.
+    fn drop(&mut self) {
+        zeroize::Zeroize::zeroize(&mut self.x25519_private);
+    }
+}
+
 impl std::fmt::Debug for LocalIdentity {
     /// Redacts `x25519_private`: a derived `Debug` would print the raw
     /// private key, and this type is exactly the kind of thing that ends

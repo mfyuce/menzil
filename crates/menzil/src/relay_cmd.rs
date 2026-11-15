@@ -247,7 +247,7 @@ pub fn relay_identity(home: &Home) -> Result<RelayIdentity> {
     let (keys, cert) = load_identity(home)?;
     Ok(RelayIdentity {
         node_cert: cert,
-        x25519_private: keys.x25519_private(),
+        x25519_private: *keys.x25519_private(),
     })
 }
 

@@ -76,8 +76,31 @@ impl AsyncWrite for ClosingStdout {
 #[cfg(unix)]
 fn close_stdout() -> io::Result<()> {
     let _ = socket2::SockRef::from(&std::io::stdout()).shutdown(std::net::Shutdown::Write);
+    // Looked at before descriptor 1 is replaced: afterwards the two no longer match.
+    let merged = stderr_is_the_same_pipe(&std::io::stdout(), &std::io::stderr());
     let null = std::fs::File::open("/dev/null")?;
-    rustix::stdio::dup2_stdout(&null).map_err(io::Error::from)
+    rustix::stdio::dup2_stdout(&null).map_err(io::Error::from)?;
+    if merged {
+        // `ssh -o ProxyCommand='menzil stdio %h/ssh 2>&1'`: descriptor 2 holds the pipe that
+        // descriptor 1 just let go of, so the reader would see no end of file until the process
+        // exits. What is printed to standard error after this point goes nowhere.
+        rustix::stdio::dup2_stderr(&null).map_err(io::Error::from)?;
+    }
+    Ok(())
+}
+
+/// Whether `out` and `err` are one and the same pipe (a FIFO with the same device and inode).
+/// A terminal or a file that both point at stays as it is: messages must still reach it, and
+/// closing descriptor 1 releases nothing the reader waits on there.
+#[cfg(unix)]
+fn stderr_is_the_same_pipe(out: &impl std::os::fd::AsFd, err: &impl std::os::fd::AsFd) -> bool {
+    use rustix::fs::{FileType, fstat};
+    let (Ok(out), Ok(err)) = (fstat(out), fstat(err)) else {
+        return false;
+    };
+    FileType::from_raw_mode(out.st_mode) == FileType::Fifo
+        && out.st_dev == err.st_dev
+        && out.st_ino == err.st_ino
 }
 
 #[cfg(not(unix))]
@@ -88,6 +111,21 @@ fn close_stdout() -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn two_ends_of_one_pipe_are_the_same_pipe_but_not_two_pipes_or_a_file() {
+        let (reader, writer) = std::io::pipe().unwrap();
+        let again = writer.try_clone().unwrap();
+        assert!(stderr_is_the_same_pipe(&writer, &again));
+        let (_reader2, writer2) = std::io::pipe().unwrap();
+        assert!(!stderr_is_the_same_pipe(&writer, &writer2), "two pipes");
+        // The reading end of the same pipe is another file description of the same inode: the
+        // two are one FIFO, which is the point (a `2>&1` has both on the writing end).
+        let file = std::fs::File::open("/dev/null").unwrap();
+        assert!(!stderr_is_the_same_pipe(&file, &file), "not a pipe");
+        drop(reader);
+    }
 
     #[test]
     fn a_reset_is_explained_in_plain_words_on_one_safe_line() {

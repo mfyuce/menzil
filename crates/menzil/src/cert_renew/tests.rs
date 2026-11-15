@@ -193,7 +193,7 @@ fn a_renewal_must_beat_the_serial_and_keep_the_key() {
     // The same node id under another Noise key is a new identity, not a renewal.
     let mut secret = w.keys[0].secret_bytes();
     secret[32] ^= 0xff;
-    let rekeyed = NodeKeys::from_secret_bytes(&secret).unwrap();
+    let rekeyed = NodeKeys::from_secret_bytes(&secret[..]).unwrap();
     assert_eq!(rekeyed.node_id(), w.keys[0].node_id());
     assert_ne!(rekeyed.x25519_public(), w.keys[0].x25519_public());
     assert!(plan(&w, &[renewal(&rekeyed, 2, 100 * DAY)]).is_empty());

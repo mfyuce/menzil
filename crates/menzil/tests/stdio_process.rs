@@ -261,3 +261,42 @@ fn with_one_socket_for_input_and_output_the_services_end_reaches_the_program_on_
     };
     assert!(status.success(), "{status:?}");
 }
+
+/// ProxyCommand with `2>&1`: standard output and standard error are one pipe. When the service
+/// ends, descriptor 1 is pointed at `/dev/null`, and so must descriptor 2 be, or the reader
+/// waits for an end of file that comes only when the process exits (fourth opus round, L4).
+#[test]
+fn with_standard_error_merged_into_standard_output_the_services_end_still_reaches_the_reader() {
+    let dir = short_dir();
+    let socket = dir.path().join("m.sock");
+    let _from_client = fake_agent(&socket, Script::DataThenEnd(b"greet"));
+    std::fs::write(
+        dir.path().join("config.toml"),
+        format!("agent_socket = \"{}\"\n", socket.display()),
+    )
+    .unwrap();
+    let (reader, writer) = std::io::pipe().unwrap();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_menzil"));
+    command
+        .arg("stdio")
+        .arg("peer/x")
+        .env("MENZIL_HOME", dir.path())
+        .env("RUST_LOG", "error")
+        .stdin(Stdio::piped())
+        .stdout(writer.try_clone().unwrap())
+        .stderr(writer);
+    let child = Guard(command.spawn().unwrap());
+    // Our own copies of the writing end must go, or the reader never sees the end either.
+    drop(command);
+    let mut child = child;
+    let _stdin = child.0.stdin.take().unwrap();
+    let output = read_to_end_on_a_thread(reader);
+    let got = output
+        .recv_timeout(WAIT)
+        .expect("the pipe must reach end of file when the service ends, stderr merged or not");
+    assert_eq!(got, b"greet");
+    assert!(
+        child.0.try_wait().unwrap().is_none(),
+        "the process is still carrying standard input"
+    );
+}

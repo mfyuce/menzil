@@ -23,6 +23,13 @@ pub struct RelayIdentity {
     pub x25519_private: [u8; 32],
 }
 
+impl Drop for RelayIdentity {
+    /// Wipes the X25519 private key when the identity goes (a clone wipes its own copy).
+    fn drop(&mut self) {
+        zeroize::Zeroize::zeroize(&mut self.x25519_private);
+    }
+}
+
 impl std::fmt::Debug for RelayIdentity {
     /// Redacts `x25519_private`: a derived `Debug` would print the raw
     /// private key, and this type is exactly the kind of thing that ends
