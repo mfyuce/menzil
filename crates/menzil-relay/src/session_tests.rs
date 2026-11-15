@@ -5478,6 +5478,96 @@ async fn an_evicted_senders_queued_data_is_not_delivered_to_the_destination() {
     assert!(relay.forwarding.counts_are_empty());
 }
 
+/// Round T6, N2, session level with a control: RECVs queued toward a stalled destination D by
+/// S (evicted by an adopted Roster) are dropped, while RECVs queued the same way by C (not
+/// revoked) are all delivered once D reads again. Payloads carry their sender's tag byte.
+#[tokio::test]
+async fn an_evicted_senders_queued_recvs_are_dropped_while_an_unrevoked_senders_are_delivered() {
+    let timeouts = crate::relay::SessionTimeouts {
+        attach: Duration::from_secs(60),
+        write: Duration::from_secs(60),
+    };
+    let (relay, addr, cert, relay_x25519) = stalling_relay(timeouts, 10_000).await;
+    let (is, ic, id) = (
+        generate_identity(),
+        generate_identity(),
+        generate_identity(),
+    );
+    let owner = SigningKey::generate(&mut rand::rng());
+    let network_id = NetworkId::from(owner.verifying_key().to_bytes());
+    let members = [(is.node_id, 1), (ic.node_id, 1), (id.node_id, 1)];
+    relay
+        .rosters()
+        .set(&evict_roster(&owner, network_id, 1, &members, &[]))
+        .unwrap();
+    let net = (vec![network_id], HashMap::from([(network_id, 1u64)]));
+    let mut s = attach_to(addr, cert.clone(), relay_x25519, &is, &net).await;
+    let mut c = attach_to(addr, cert.clone(), relay_x25519, &ic, &net).await;
+    let mut d = attach_to(addr, cert, relay_x25519, &id, &net).await;
+
+    const S_RECORDS: usize = 100;
+    const C_RECORDS: usize = 20;
+    const LEN: usize = 8 * 1024;
+    for _ in 0..S_RECORDS {
+        s.send(send_record(id.node_id, vec![0x51u8; LEN])).await;
+    }
+    for _ in 0..C_RECORDS {
+        c.send(send_record(id.node_id, vec![0x43u8; LEN])).await;
+    }
+    // D reads nothing: its socket is full and the rest, C's included, waits in the relay.
+    within(
+        10,
+        "the relay to queue S's and C's records toward D",
+        || {
+            relay
+                .forwarding
+                .queued_bytes(&is.node_id, &id.node_id)
+                .is_some_and(|queued| queued >= 500_000)
+                && relay
+                    .forwarding
+                    .queued_bytes(&ic.node_id, &id.node_id)
+                    .is_some_and(|queued| queued >= C_RECORDS * LEN / 2)
+        },
+    )
+    .await;
+
+    relay
+        .rosters()
+        .set(&evict_roster(
+            &owner,
+            network_id,
+            2,
+            &members,
+            &[is.node_id],
+        ))
+        .unwrap();
+    within(10, "the evicted sender to detach", || {
+        !relay.registry.is_attached(&is.node_id)
+    })
+    .await;
+
+    let (mut from_s, mut from_c) = (0usize, 0usize);
+    while let Ok(Some(record)) = tokio::time::timeout(Duration::from_secs(2), d.recv()).await {
+        if let Record::Recv { payload, .. } = record {
+            match payload.first() {
+                Some(0x51) => from_s += payload.len(),
+                Some(0x43) => from_c += payload.len(),
+                other => panic!("unexpected payload tag {other:?}"),
+            }
+        }
+    }
+    assert_eq!(
+        from_c,
+        C_RECORDS * LEN,
+        "every record of the unrevoked sender is delivered"
+    );
+    assert!(
+        from_s < S_RECORDS * LEN * 3 / 5,
+        "D received {from_s} of {} bytes of the evicted sender's queue",
+        S_RECORDS * LEN
+    );
+}
+
 // ---- MT9: names per tenant over a real session ----
 
 /// ADVERTISE over a session: the share lands in the zone of the tenant that owns the network
