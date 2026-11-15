@@ -128,7 +128,16 @@ pub fn load_for_start(home: &Home) -> Result<NameState> {
 /// The keeper's write: `snapshot` is the relay's part (held names and flat quarantine); the
 /// slug entries on disk stay. A damaged file on disk is not written over.
 pub fn write_relay_part(home: &Home, snapshot: &NameState) -> Result<()> {
-    let Some(_lock) = home.lock_relay_if_held()? else {
+    write_relay_part_within(home, snapshot, crate::home::LOCK_WAIT)
+}
+
+/// [`write_relay_part`] waiting at most `wait` for the relay lock (the keeper retries).
+pub fn write_relay_part_within(
+    home: &Home,
+    snapshot: &NameState,
+    wait: std::time::Duration,
+) -> Result<()> {
+    let Some(_lock) = home.lock_relay_if_held_within(wait)? else {
         // The relay directory was removed under a running relay: nothing to write into.
         return Ok(());
     };

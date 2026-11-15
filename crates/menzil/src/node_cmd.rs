@@ -942,7 +942,7 @@ impl RunningNode {
     /// directory, at most `timeout`; whether it got there. A clean stop calls it, so that the
     /// last adoption before a signal is not lost.
     pub fn flush_documents(&self, timeout: Duration) -> bool {
-        self.keeper.flush(timeout)
+        self.keeper.flush(timeout).reached
     }
 }
 
@@ -1362,11 +1362,12 @@ pub fn keep_adopted_documents(
         let home = home.clone();
         Worker::spawn(
             "menzil-docs-keep",
-            |adopted: &AdoptedDocs| adopted.network_id,
-            move |adopted: AdoptedDocs| {
-                if let Err(error) = keep_adopted(&home, &adopted) {
+            |adopted: &AdoptedDocs| adopted.network_id.to_string(),
+            move |adopted: &AdoptedDocs, _| {
+                if let Err(error) = keep_adopted(&home, adopted) {
                     tracing::warn!(network = %adopted.network_id, error = %format!("{error:#}"), "documents adopted over the network could not be kept on disk: a restart will start from the older pair");
                 }
+                crate::persist::Outcome::Done
             },
         )?
     };
@@ -1457,7 +1458,7 @@ pub async fn run(home: &Home) -> Result<()> {
     // lock someone else holds is not waited for forever).
     let flushed = {
         let keeper = running.keeper.clone();
-        tokio::task::spawn_blocking(move || keeper.flush(STOP_GRACE))
+        tokio::task::spawn_blocking(move || keeper.flush(STOP_GRACE).reached)
             .await
             .unwrap_or(false)
     };

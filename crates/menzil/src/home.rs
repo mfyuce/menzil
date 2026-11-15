@@ -34,7 +34,22 @@ use menzil_proto::{NetworkId, NodeId};
 static TEMPORARIES: AtomicU64 = AtomicU64::new(0);
 
 /// How long a command waits for another one that is changing the same network.
-const LOCK_WAIT: Duration = Duration::from_secs(10);
+pub(crate) const LOCK_WAIT: Duration = Duration::from_secs(10);
+
+/// The error of a lock that another process held for the whole wait (a typed marker, so that a
+/// caller tells it from an I/O failure without reading the message).
+#[derive(Debug)]
+pub struct LockBusy {
+    path: PathBuf,
+}
+
+impl std::fmt::Display for LockBusy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} is locked by another process", self.path.display())
+    }
+}
+
+impl std::error::Error for LockBusy {}
 
 /// An exclusive advisory lock on a file, held until this is dropped (or the process ends).
 #[derive(Debug)]
@@ -213,11 +228,18 @@ impl Home {
     /// [`Self::lock_relay`] when the relay's directory exists: `None` when it does not, which
     /// is not created for the lock.
     pub fn lock_relay_if_held(&self) -> Result<Option<FileLock>> {
+        self.lock_relay_if_held_within(LOCK_WAIT)
+    }
+
+    /// [`Self::lock_relay_if_held`] waiting at most `wait` (the relay's keepers wait briefly and
+    /// retry; the commands wait ten seconds). A lock that stays held is a [`LockBusy`] at the
+    /// bottom of the error.
+    pub fn lock_relay_if_held_within(&self, wait: Duration) -> Result<Option<FileLock>> {
         let dir = self.root.join("relay");
         if !dir.is_dir() {
             return Ok(None);
         }
-        match lock_file(&dir.join(".lock"), LOCK_WAIT) {
+        match lock_file(&dir.join(".lock"), wait) {
             Ok(lock) => Ok(Some(lock)),
             Err(_) if !dir.is_dir() => Ok(None),
             Err(error) => Err(error.context(format!(
@@ -372,7 +394,10 @@ fn lock_file(path: &Path, wait: Duration) -> Result<FileLock> {
             Ok(()) => return Ok(FileLock { _file: file }),
             Err(fs::TryLockError::WouldBlock) => {
                 if started.elapsed() >= wait {
-                    bail!("{} is locked by another process", path.display());
+                    return Err(LockBusy {
+                        path: path.to_path_buf(),
+                    }
+                    .into());
                 }
                 std::thread::sleep(Duration::from_millis(25));
             }

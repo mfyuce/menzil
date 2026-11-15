@@ -199,10 +199,7 @@ async fn sigterm_flushes_the_roster_adopted_last_and_exits_zero() {
     assert!(exit.success(), "exit status {exit:?} after SIGTERM");
     let errors = err_rx.recv_timeout(Duration::from_secs(5)).unwrap();
     assert!(errors.contains("stopping ("), "{errors}");
-    assert!(
-        !errors.contains("may not have reached the disk"),
-        "{errors}"
-    );
+    assert!(!errors.contains("not on disk at the stop"), "{errors}");
     assert!(!errors.contains("panicked"), "{errors}");
 
     assert_eq!(

@@ -756,9 +756,10 @@ async fn a_steward_signed_roster_adopted_over_doc_is_kept_with_its_base() {
 }
 
 /// A Roster that cannot be written stays adopted in memory (the relay keeps serving it), the
-/// damaged path is not replaced, and the next Roster is kept once the path is fine again.
+/// damaged path is not replaced, and once the path is fine again the keeper's retry writes
+/// that very Roster, before any newer one arrives.
 #[tokio::test]
-async fn a_roster_that_cannot_be_written_stays_adopted_and_the_keeper_goes_on() {
+async fn a_roster_that_cannot_be_written_stays_adopted_and_lands_by_retry() {
     let (_o, owner, id, _) = token_of_a_network();
     let (dir, relay_home) = home();
     init(&relay_home, clock()).unwrap();
@@ -766,7 +767,7 @@ async fn a_roster_that_cannot_be_written_stays_adopted_and_the_keeper_goes_on() 
     let running = start(&relay_home, &run_options(dir.path())).await.unwrap();
     let path = roster_path(&relay_home, &id);
     let good = fs::read(&path).unwrap();
-    // A directory where the file goes: the atomic rename onto it fails.
+    // A directory where the file goes: reading and the atomic rename onto it fail.
     fs::remove_file(&path).unwrap();
     fs::create_dir(&path).unwrap();
 
@@ -774,18 +775,224 @@ async fn a_roster_that_cannot_be_written_stays_adopted_and_the_keeper_goes_on() 
     let pair = crate::token::decode_documents(&second.token).unwrap();
     let rosters = running.relay.rosters();
     assert!(rosters.adopt(pair.roster(), None, clock() + 60).unwrap());
-    assert!(running.flush_rosters(FLUSH));
+    let report = running.keeper.flush(FLUSH);
+    assert!(report.reached);
+    assert_eq!(report.unwritten, vec![id.to_string()]);
     assert_eq!(running.roster_seq(&id), Some(second.seq));
     assert!(path.is_dir());
 
     fs::remove_dir(&path).unwrap();
     fs::write(&path, good).unwrap();
-    let third = crate::local::renew(&owner, None, clock() + 120).unwrap();
-    let pair = crate::token::decode_documents(&third.token).unwrap();
-    assert!(rosters.adopt(pair.roster(), None, clock() + 120).unwrap());
-    assert!(running.flush_rosters(FLUSH));
+    // No newer Roster: the retry alone puts the second on disk.
+    running.keeper.retry_now();
+    assert!(running.keeper.flush(FLUSH).is_clean());
     let stored = load_rosters(&relay_home).unwrap();
-    assert_eq!(stored[0].roster.decode().unwrap().seq, third.seq);
+    assert_eq!(stored[0].roster.decode().unwrap().seq, second.seq);
+    running.stop();
+}
+
+/// Starts a relay whose keepers wait `wait` for the relay lock in one attempt.
+async fn running_with_keeper_wait(dir: &Path, relay: &Home, wait: Duration) -> RunningRelay {
+    start_tuned(relay, &run_options(dir), None, status::EXPORT_EVERY, wait)
+        .await
+        .unwrap()
+}
+
+/// A lock held past the keeper's wait: the write is not on disk, the flush names the network,
+/// and once the lock is free the retry writes it.
+#[tokio::test]
+async fn a_roster_waits_for_a_busy_lock_and_lands_by_retry() {
+    let (_o, owner, id, _) = token_of_a_network();
+    let (dir, relay_home) = home();
+    init(&relay_home, clock()).unwrap();
+    add_network(&relay_home, &relay_token(&owner), clock()).unwrap();
+    let running =
+        running_with_keeper_wait(dir.path(), &relay_home, Duration::from_millis(50)).await;
+    let renewed = crate::local::renew(&owner, None, clock() + 60).unwrap();
+    let pair = crate::token::decode_documents(&renewed.token).unwrap();
+    let busy = relay_home.lock_relay().unwrap();
+    assert!(
+        running
+            .relay
+            .rosters()
+            .adopt(pair.roster(), None, clock() + 60)
+            .unwrap()
+    );
+    let report = running.keeper.flush(FLUSH);
+    assert!(report.reached, "a busy lock must not hold the flush up");
+    assert_eq!(report.unwritten, vec![id.to_string()]);
+    assert_eq!(running.keeper.pending_keys(), vec![id.to_string()]);
+    drop(busy);
+    assert_eq!(
+        load_rosters(&relay_home).unwrap()[0]
+            .roster
+            .decode()
+            .unwrap()
+            .seq,
+        1
+    );
+    running.keeper.retry_now();
+    assert!(running.keeper.flush(FLUSH).is_clean());
+    assert_eq!(
+        load_rosters(&relay_home).unwrap()[0]
+            .roster
+            .decode()
+            .unwrap()
+            .seq,
+        renewed.seq
+    );
+    running.stop();
+}
+
+/// A retry of an older Roster never lowers the disk: the operator's newer file wins.
+#[tokio::test]
+async fn a_pending_retry_never_lowers_a_newer_file() {
+    let (_o, owner, _id, _) = token_of_a_network();
+    let (dir, relay_home) = home();
+    init(&relay_home, clock()).unwrap();
+    add_network(&relay_home, &relay_token(&owner), clock()).unwrap();
+    let running =
+        running_with_keeper_wait(dir.path(), &relay_home, Duration::from_millis(50)).await;
+    let second = crate::local::renew(&owner, None, clock() + 60).unwrap();
+    let third = crate::local::renew(&owner, None, clock() + 120).unwrap();
+    let pair = crate::token::decode_documents(&second.token).unwrap();
+    let busy = relay_home.lock_relay().unwrap();
+    assert!(
+        running
+            .relay
+            .rosters()
+            .adopt(pair.roster(), None, clock() + 60)
+            .unwrap()
+    );
+    assert!(!running.keeper.flush(FLUSH).unwritten.is_empty());
+    drop(busy);
+    add_network(&relay_home, &relay_token(&owner), clock() + 120).unwrap();
+    running.keeper.retry_now();
+    assert!(running.keeper.flush(FLUSH).is_clean());
+    assert_eq!(
+        load_rosters(&relay_home).unwrap()[0]
+            .roster
+            .decode()
+            .unwrap()
+            .seq,
+        third.seq
+    );
+    running.stop();
+}
+
+/// A damaged file is the operator's: refused once, never retried, never written over.
+#[tokio::test]
+async fn a_damaged_roster_file_is_not_retried() {
+    let (_o, owner, id, _) = token_of_a_network();
+    let (dir, relay_home) = home();
+    init(&relay_home, clock()).unwrap();
+    add_network(&relay_home, &relay_token(&owner), clock()).unwrap();
+    let running = start(&relay_home, &run_options(dir.path())).await.unwrap();
+    let path = roster_path(&relay_home, &id);
+    fs::write(&path, b"damaged").unwrap();
+    let renewed = crate::local::renew(&owner, None, clock() + 60).unwrap();
+    let pair = crate::token::decode_documents(&renewed.token).unwrap();
+    assert!(
+        running
+            .relay
+            .rosters()
+            .adopt(pair.roster(), None, clock() + 60)
+            .unwrap()
+    );
+    let report = running.keeper.flush(FLUSH);
+    assert!(report.is_clean(), "{report:?}");
+    assert!(running.keeper.pending_keys().is_empty());
+    assert_eq!(fs::read(&path).unwrap(), b"damaged");
+    running.stop();
+}
+
+/// A file removed while a retry is pending is not brought back, and the entry clears.
+#[tokio::test]
+async fn a_pending_retry_does_not_bring_back_a_removed_file() {
+    let (_o, owner, id, _) = token_of_a_network();
+    let (dir, relay_home) = home();
+    init(&relay_home, clock()).unwrap();
+    add_network(&relay_home, &relay_token(&owner), clock()).unwrap();
+    let running =
+        running_with_keeper_wait(dir.path(), &relay_home, Duration::from_millis(50)).await;
+    let renewed = crate::local::renew(&owner, None, clock() + 60).unwrap();
+    let pair = crate::token::decode_documents(&renewed.token).unwrap();
+    let busy = relay_home.lock_relay().unwrap();
+    assert!(
+        running
+            .relay
+            .rosters()
+            .adopt(pair.roster(), None, clock() + 60)
+            .unwrap()
+    );
+    assert_eq!(running.keeper.flush(FLUSH).unwritten, vec![id.to_string()]);
+    fs::remove_file(roster_path(&relay_home, &id)).unwrap();
+    drop(busy);
+    running.keeper.retry_now();
+    assert!(running.keeper.flush(FLUSH).is_clean());
+    assert!(running.keeper.pending_keys().is_empty());
+    assert!(!roster_path(&relay_home, &id).exists());
+    running.stop();
+}
+
+/// A stop with the lock held for the whole grace names the network that is not on disk (and
+/// the process says so, `run_until`); the flush stays within its grace.
+#[tokio::test]
+async fn a_stop_with_the_lock_held_names_the_unwritten_network() {
+    let (_o, owner, id, _) = token_of_a_network();
+    let (dir, relay_home) = home();
+    init(&relay_home, clock()).unwrap();
+    add_network(&relay_home, &relay_token(&owner), clock()).unwrap();
+    // The keeper's own wait is long: the grace must cut it short.
+    let mut running = running_with_keeper_wait(dir.path(), &relay_home, FLUSH).await;
+    let renewed = crate::local::renew(&owner, None, clock() + 60).unwrap();
+    let pair = crate::token::decode_documents(&renewed.token).unwrap();
+    let busy = relay_home.lock_relay().unwrap();
+    assert!(
+        running
+            .relay
+            .rosters()
+            .adopt(pair.roster(), None, clock() + 60)
+            .unwrap()
+    );
+    let started = std::time::Instant::now();
+    let unwritten = running
+        .flush_rosters_blocking(Duration::from_millis(400))
+        .await;
+    assert_eq!(unwritten, vec![id.to_string()]);
+    assert!(started.elapsed() < Duration::from_secs(5));
+    // `run_until` itself returns with the signal (it prints the line for the operator).
+    assert_eq!(run_until(&mut running, async { 1 }).await.unwrap(), Some(1));
+    drop(busy);
+}
+
+/// The stop line names every network that is not on disk, and is silent when all is.
+#[test]
+fn the_stop_notice_names_what_is_not_on_disk() {
+    assert_eq!(stop_notice(&[]), None);
+    let line = stop_notice(&["ab12".to_string(), "names.state".to_string()]).unwrap();
+    assert!(
+        line.contains("not on disk at the stop: ab12, names.state"),
+        "{line}"
+    );
+}
+
+/// The names keeper retries too: a name accepted while the lock is busy reaches `names.state`.
+#[tokio::test]
+async fn the_names_keeper_retries_a_busy_lock() {
+    let (net_a, token_a) = labeled_network(&[("myapp", 1)]);
+    let (dir, relay) = relay_machine();
+    add_network(&relay, &token_a, clock()).unwrap();
+    let running = running_with_keeper_wait(dir.path(), &relay, Duration::from_millis(50)).await;
+    let busy = relay.lock_relay().unwrap();
+    let ack = advertise_now(&running, &net_a, 1, &["myapp"], clock());
+    assert_eq!(ack.names, vec!["myapp"]);
+    let report = running.names_keeper.flush(FLUSH);
+    assert_eq!(report.unwritten, vec!["names.state".to_string()]);
+    drop(busy);
+    running.names_keeper.retry_now();
+    assert!(running.names_keeper.flush(FLUSH).is_clean());
+    assert!(names_file(&relay).contains("name myapp"));
     running.stop();
 }
 

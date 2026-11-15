@@ -1195,7 +1195,7 @@ fn a_pair_adopted_over_the_network_is_on_disk_and_the_next_start_holds_it() {
         .adopt(&pair.bundle(), clock() + 60)
         .unwrap();
     assert!(adopted.roster && adopted.policy);
-    assert!(m.keeper.flush(FLUSH));
+    assert!(m.keeper.flush(FLUSH).reached);
     assert_eq!(
         crate::local::load_documents(&m.member, &m.id)
             .unwrap()
@@ -1220,7 +1220,7 @@ fn an_older_pair_adopted_over_the_network_does_not_replace_a_newer_one_on_disk()
         .adopt(&pair.bundle(), clock() + 120)
         .unwrap();
     assert!(adopted.roster && adopted.policy, "the stores were behind");
-    assert!(m.keeper.flush(FLUSH));
+    assert!(m.keeper.flush(FLUSH).reached);
     assert_eq!(
         crate::local::load_documents(&m.member, &m.id)
             .unwrap()
@@ -1243,7 +1243,7 @@ fn a_pair_that_cannot_be_written_stays_adopted_and_the_keeper_goes_on() {
         .adopt(&pair.bundle(), clock() + 60)
         .unwrap();
     assert!(adopted.roster && adopted.policy);
-    assert!(m.keeper.flush(FLUSH));
+    assert!(m.keeper.flush(FLUSH).reached);
     assert_eq!(m.rosters.seq(&m.id), Some(second.seq));
     assert_eq!(m.policies.seq(&m.id), Some(second.seq));
     assert_eq!(fs::read(&path).unwrap(), b"damaged");
@@ -1254,7 +1254,7 @@ fn a_pair_that_cannot_be_written_stays_adopted_and_the_keeper_goes_on() {
     DocStore::new(&m.rosters, &m.policies)
         .adopt(&pair.bundle(), clock() + 120)
         .unwrap();
-    assert!(m.keeper.flush(FLUSH));
+    assert!(m.keeper.flush(FLUSH).reached);
     assert_eq!(
         crate::local::load_documents(&m.member, &m.id)
             .unwrap()
@@ -1295,7 +1295,7 @@ fn only_a_pair_the_stores_adopted_is_written() {
         .adopt(&roster_only, clock() + 60)
         .unwrap();
     assert!(adopted.roster && !adopted.policy);
-    assert!(m.keeper.flush(FLUSH));
+    assert!(m.keeper.flush(FLUSH).reached);
     assert_eq!(
         crate::local::load_documents(&m.member, &m.id)
             .unwrap()
@@ -1310,7 +1310,7 @@ fn only_a_pair_the_stores_adopted_is_written() {
     DocStore::new(&m.rosters, &m.policies)
         .adopt(&policy_only, clock() + 60)
         .unwrap();
-    assert!(m.keeper.flush(FLUSH));
+    assert!(m.keeper.flush(FLUSH).reached);
     assert_eq!(
         crate::local::load_documents(&m.member, &m.id)
             .unwrap()
@@ -1334,7 +1334,7 @@ fn a_removed_network_is_not_brought_back_by_an_adopted_pair() {
         .adopt(&pair.bundle(), clock() + 60)
         .unwrap();
     assert!(adopted.roster && adopted.policy);
-    assert!(m.keeper.flush(FLUSH));
+    assert!(m.keeper.flush(FLUSH).reached);
     assert!(!dir.exists(), "the keeper made {}", dir.display());
     assert!(m.member.networks().unwrap().is_empty());
     assert_eq!(
@@ -1355,7 +1355,7 @@ fn a_deleted_documents_file_is_not_written_back_by_an_adopted_pair() {
     DocStore::new(&m.rosters, &m.policies)
         .adopt(&pair.bundle(), clock() + 60)
         .unwrap();
-    assert!(m.keeper.flush(FLUSH));
+    assert!(m.keeper.flush(FLUSH).reached);
     assert!(!path.exists());
     // `join` still brings the network back when the user asks for it.
     join(&m.member, &renewed.token, clock() + 60).unwrap();

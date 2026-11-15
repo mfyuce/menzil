@@ -28,7 +28,7 @@ use tokio::task::JoinHandle;
 
 use crate::home::{Home, parse_hex32};
 use crate::local::load_identity;
-use crate::persist::Worker;
+use crate::persist::{Attempt, FlushReport, Outcome, Worker};
 use crate::token::{roster_from_bytes, roster_to_bytes};
 
 pub mod names_state;
@@ -82,7 +82,7 @@ pub fn add_network(home: &Home, token: &str, now: u64) -> Result<(NetworkId, u64
     Ok((added.network_id, added.seq))
 }
 
-/// Whether [`keep_roster`] may bring a network into the relay's directory.
+/// Whether [`keep_roster_locked`] may bring a network into the relay's directory.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Keep {
     /// `add-network`: the operator asks for the network, so a missing file is made.
@@ -93,6 +93,76 @@ enum Keep {
     UpdateOnly,
 }
 
+/// A Roster file that is there and cannot be understood: the keeper never writes over it.
+#[derive(Debug)]
+struct DamagedRosterFile(String);
+
+impl std::fmt::Display for DamagedRosterFile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for DamagedRosterFile {}
+
+/// Why the keeper could not keep a Roster, by what the keeper does about it.
+#[derive(Debug)]
+enum KeepError {
+    /// The relay lock stayed held by another process: retry.
+    Busy(anyhow::Error),
+    /// Reading or writing failed (ENOSPC, EIO, a path in the way): retry.
+    Io(anyhow::Error),
+    /// The file is damaged: the operator's, never retried, never written over.
+    Damaged(anyhow::Error),
+    /// The acceptance predicate refuses the Roster against what is kept: retrying changes
+    /// nothing.
+    Refused(anyhow::Error),
+}
+
+impl KeepError {
+    /// By the typed errors at the bottom, never by their wording.
+    fn classify(error: anyhow::Error) -> Self {
+        if error.downcast_ref::<crate::home::LockBusy>().is_some() {
+            Self::Busy(error)
+        } else if error.downcast_ref::<DamagedRosterFile>().is_some() {
+            Self::Damaged(error)
+        } else if error.downcast_ref::<tenants::CommandError>().is_some() {
+            Self::Refused(error)
+        } else {
+            Self::Io(error)
+        }
+    }
+
+    fn error(&self) -> &anyhow::Error {
+        match self {
+            Self::Busy(e) | Self::Io(e) | Self::Damaged(e) | Self::Refused(e) => e,
+        }
+    }
+}
+
+/// [`keep_roster_locked`] with [`Keep::UpdateOnly`] for the keeper thread: the lock is waited for at
+/// most `wait`, and a failure says what kind it is.
+fn keep_roster_for_keeper(
+    home: &Home,
+    roster: &Roster,
+    base: Option<&Roster>,
+    now: u64,
+    wait: std::time::Duration,
+) -> Result<Option<(NetworkId, u64)>, KeepError> {
+    let Some(_lock) = home
+        .lock_relay_if_held_within(wait)
+        .map_err(KeepError::classify)?
+    else {
+        return Ok(None);
+    };
+    keep_roster_locked(home, roster, base, now, Keep::UpdateOnly).map_err(KeepError::classify)
+}
+
+/// How long the keeper threads wait for the relay lock in one attempt (the commands wait ten
+/// seconds): a failed attempt is retried with a backoff, and a long wait would hold up the
+/// other networks' jobs.
+pub const KEEPER_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
+
 /// Keeps `roster` (with its `base`, for a Roster a steward signed) as the Roster this relay
 /// starts from for its network, if the acceptance predicate of protocol.md 2.3 takes it against
 /// what is kept: [`add_network`] after decoding a token, and the relay itself for a Roster it
@@ -100,27 +170,7 @@ enum Keep {
 /// replaces a newer one on disk, whoever hands it over and in whatever order. Returns the
 /// network and the sequence number now kept; `None` for [`Keep::UpdateOnly`] when nothing is
 /// held for the network.
-fn keep_roster(
-    home: &Home,
-    roster: &Roster,
-    base: Option<&Roster>,
-    now: u64,
-    keep: Keep,
-) -> Result<Option<(NetworkId, u64)>> {
-    // From the look at what is held to the write: two runs at once could each see the older
-    // Roster and the slower write would put it over the newer, so the judgement is made under
-    // the lock.
-    let _lock = match keep {
-        Keep::Create => home.lock_relay()?,
-        Keep::UpdateOnly => match home.lock_relay_if_held()? {
-            Some(lock) => lock,
-            None => return Ok(None),
-        },
-    };
-    keep_roster_locked(home, roster, base, now, keep)
-}
-
-/// [`keep_roster`] for a caller that holds the relay lock already (`home.lock_relay()`).
+/// The caller holds the relay lock (`home.lock_relay()`, or the keeper's wait).
 fn keep_roster_locked(
     home: &Home,
     roster: &Roster,
@@ -159,10 +209,11 @@ fn keep_roster_locked(
         .and_then(|bytes| roster_from_bytes(&bytes).ok())
         .and_then(|(roster, base)| HeldRoster::new(&roster, base.as_ref()).ok());
     if held.is_none() && keep == Keep::UpdateOnly {
-        bail!(
+        return Err(DamagedRosterFile(format!(
             "the Roster file {} cannot be read; not written over",
             path.display()
-        );
+        ))
+        .into());
     }
     let held_seq = held.as_ref().map(HeldRoster::seq);
     let view = HeldView {
@@ -429,6 +480,17 @@ pub const STOP_GRACE: std::time::Duration = std::time::Duration::from_secs(3);
 /// How often a relay reloads its Rosters unless told otherwise.
 pub const DEFAULT_RELOAD_EVERY: std::time::Duration = std::time::Duration::from_secs(15);
 
+/// Both keepers' reports as (rosters reached, names reached, what is not on disk).
+fn flush_summary(rosters: FlushReport, names: FlushReport) -> (bool, bool, Vec<String>) {
+    let mut unwritten = rosters.unwritten;
+    unwritten.extend(names.unwritten);
+    // A flush that was not reached may not know which job it was (a panic): say so.
+    if (!rosters.reached || !names.reached) && unwritten.is_empty() {
+        unwritten.push("(unknown)".to_string());
+    }
+    (rosters.reached, names.reached, unwritten)
+}
+
 /// A relay that is listening.
 pub struct RunningRelay {
     /// The address it listens on.
@@ -469,26 +531,36 @@ impl RunningRelay {
 
     /// Waits until every Roster the relay adopted over DOC so far has been written to (or
     /// refused by) the relay directory, and the name state as it was has been written to
-    /// `names.state`, at most `timeout` for each; whether it got there.
+    /// `names.state`, at most `timeout` for each; whether it got there. A write that keeps
+    /// failing is run once more and then left to the retry backoff: see
+    /// [`Self::flush_report`] for what is still not on disk.
     pub fn flush_rosters(&self, timeout: std::time::Duration) -> bool {
+        let report = self.flush_report(timeout);
+        report.0 && report.1
+    }
+
+    /// Flushes both keepers: what each reached, and the names of what is not on disk (networks
+    /// by id, `names.state`).
+    fn flush_report(&self, timeout: std::time::Duration) -> (bool, bool, Vec<String>) {
         let rosters = self.keeper.flush(timeout);
         let names = self.names_keeper.flush(timeout);
-        rosters && names
+        flush_summary(rosters, names)
     }
 
     /// [`Self::flush_rosters`] off the async threads (it blocks on the keeper, which may wait
     /// for a lock another command holds): for a clean stop of `menzil relay run`, so that the
-    /// last Roster adopted over DOC is on disk before the process goes.
-    pub async fn flush_rosters_blocking(&self, timeout: std::time::Duration) -> bool {
+    /// last Roster adopted over DOC is on disk before the process goes. The names of what is
+    /// still not on disk (networks by id, `names.state`); empty when all is written.
+    pub async fn flush_rosters_blocking(&self, timeout: std::time::Duration) -> Vec<String> {
         let keeper = Arc::clone(&self.keeper);
         let names_keeper = Arc::clone(&self.names_keeper);
         tokio::task::spawn_blocking(move || {
             let rosters = keeper.flush(timeout);
             let names = names_keeper.flush(timeout);
-            rosters && names
+            flush_summary(rosters, names).2
         })
         .await
-        .unwrap_or(false)
+        .unwrap_or_else(|_| vec!["(the flush did not finish)".to_string()])
     }
 
     /// Stops the relay.
@@ -497,6 +569,18 @@ impl RunningRelay {
         self.reload.abort();
         self.status.abort();
     }
+}
+
+/// The line for the operator when `unwritten` (networks by id, `names.state`) did not reach the
+/// disk at the stop; `None` when all did.
+fn stop_notice(unwritten: &[String]) -> Option<String> {
+    if unwritten.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "menzil: not on disk at the stop: {} (a restart starts from the older file; add the network again with a current token if its Roster changed)",
+        unwritten.join(", ")
+    ))
 }
 
 /// What `menzil relay run` does after it has started: waits until `stop` is ready (a signal) or
@@ -514,8 +598,10 @@ pub async fn run_until<F: std::future::Future>(
         joined = relay.wait() => Err(joined),
         out = stop => Ok(out),
     };
-    if !relay.flush_rosters_blocking(STOP_GRACE).await {
-        eprintln!("menzil: the Rosters adopted last may not have reached the disk");
+    let unwritten = relay.flush_rosters_blocking(STOP_GRACE).await;
+    if let Some(line) = stop_notice(&unwritten) {
+        tracing::warn!(unwritten = %unwritten.join(", "), "not on disk at the stop");
+        eprintln!("{line}");
     }
     match ended {
         Ok(out) => Ok(Some(out)),
@@ -558,6 +644,17 @@ pub(crate) async fn start_with_status_every(
     options: &RunOptions,
     front: Option<&FrontDoorOptions>,
     status_every: std::time::Duration,
+) -> Result<RunningRelay> {
+    start_tuned(home, options, front, status_every, KEEPER_LOCK_WAIT).await
+}
+
+/// [`start_with_status_every`] with the keepers' lock wait given (tests make it short).
+pub(crate) async fn start_tuned(
+    home: &Home,
+    options: &RunOptions,
+    front: Option<&FrontDoorOptions>,
+    status_every: std::time::Duration,
+    keeper_lock_wait: std::time::Duration,
 ) -> Result<RunningRelay> {
     // The front door needs the relay's own host name to tell its nodes from the public, before
     // anything is bound or read.
@@ -726,17 +823,36 @@ pub(crate) async fn start_with_status_every(
         let home = home.clone();
         Worker::spawn(
             "menzil-relay-keep",
-            |job: &(NetworkId, Roster, Option<Roster>)| job.0,
-            move |(_, roster, base): (NetworkId, Roster, Option<Roster>)| {
-                let Ok(body) = roster.decode() else { return };
+            |job: &(NetworkId, Roster, Option<Roster>)| job.0.to_string(),
+            move |(_, roster, base): &(NetworkId, Roster, Option<Roster>), attempt: &Attempt| {
+                let Ok(body) = roster.decode() else {
+                    return Outcome::Done;
+                };
                 let network = Some(body.network_id);
                 // Judged at the Roster's own `issued` time, like the held-but-expired start: the
                 // time rules were checked when the store took it, and what is left to ask here is
-                // its signatures and `seq` against the file.
-                if let Err(error) =
-                    keep_roster(&home, &roster, base.as_ref(), body.issued, Keep::UpdateOnly)
-                {
-                    tracing::warn!(?network, error = %format!("{error:#}"), "the Roster adopted over DOC could not be kept on disk: a restart will start from the older file");
+                // its signatures and `seq` against the file. A retry of an older Roster against a
+                // newer file is `Held` (never a lower `seq` on disk).
+                match keep_roster_for_keeper(
+                    &home,
+                    roster,
+                    base.as_ref(),
+                    body.issued,
+                    attempt.lock_wait(keeper_lock_wait),
+                ) {
+                    Ok(_) => Outcome::Done,
+                    Err(error @ (KeepError::Busy(_) | KeepError::Io(_))) => Outcome::Retry {
+                        class: if matches!(error, KeepError::Busy(_)) {
+                            "busy"
+                        } else {
+                            "io"
+                        },
+                        error: format!("network {}: {:#}", body.network_id, error.error()),
+                    },
+                    Err(error) => {
+                        tracing::warn!(?network, error = %format!("{:#}", error.error()), "the Roster adopted over DOC could not be kept on disk: a restart will start from the older file");
+                        Outcome::Done
+                    }
                 }
             },
         )?
@@ -755,10 +871,22 @@ pub(crate) async fn start_with_status_every(
         let home = home.clone();
         Worker::spawn(
             "menzil-relay-names",
-            |_: &NameState| (),
-            move |snapshot: NameState| {
-                if let Err(error) = names_state::write_relay_part(&home, &snapshot) {
-                    tracing::warn!(error = %format!("{error:#}"), "the name state could not be kept on disk: a restart will start from the older file");
+            |_: &NameState| "names.state".to_string(),
+            move |snapshot: &NameState, attempt: &Attempt| {
+                match names_state::write_relay_part_within(
+                    &home,
+                    snapshot,
+                    attempt.lock_wait(keeper_lock_wait),
+                ) {
+                    Ok(()) => Outcome::Done,
+                    Err(error) => Outcome::Retry {
+                        class: if error.downcast_ref::<crate::home::LockBusy>().is_some() {
+                            "busy"
+                        } else {
+                            "io"
+                        },
+                        error: format!("{error:#}"),
+                    },
                 }
             },
         )?

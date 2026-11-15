@@ -643,7 +643,7 @@ fn a_removal_adopted_over_the_network_survives_a_restart_of_the_removed_steward(
     DocStore::new(&rosters, &policies)
         .adopt(&pair.bundle(), clock() + 1)
         .unwrap();
-    assert!(keeper.flush(std::time::Duration::from_secs(10)));
+    assert!(keeper.flush(std::time::Duration::from_secs(10)).reached);
     assert_eq!(
         crate::local::load_documents(&f.steward, &f.id)
             .unwrap()
@@ -683,7 +683,7 @@ fn a_steward_signed_pair_adopted_over_the_network_is_kept_with_its_bases() {
     DocStore::new(&member_rosters, &member_policies)
         .adopt(&steward_pair.bundle(), now)
         .unwrap();
-    assert!(keeper.flush(std::time::Duration::from_secs(10)));
+    assert!(keeper.flush(std::time::Duration::from_secs(10)).reached);
     let kept = crate::local::load_documents(&f.owner, &f.id).unwrap();
     assert_eq!(kept.seq(), steward_pair.seq());
     assert_eq!(
