@@ -116,7 +116,9 @@ struct Engine {
     /// `Engine::accept_doc` for why.
     claimed_networks: Vec<NetworkId>,
     /// The newest Roster `seq` this relay is known to hold, per network: what WELCOME reported,
-    /// raised by every Roster the relay sends that this node verified (protocol.md 4.3, 5.5). A
+    /// raised by every Roster the relay sends that this node adopted, and by one it already holds or
+    /// that is older (`Held`, decided on the unsigned `seq` before any signature check; the
+    /// figure stays at or below this node's own held `seq`) (protocol.md 4.3, 5.5). A
     /// Roster newer than this is pushed to the relay on the live session, not only at attach.
     relay_rosters: HashMap<NetworkId, u64>,
     /// When the last warning about a bad DOC transfer was written, and how many were held back
@@ -2326,16 +2328,16 @@ mod tests {
             let ciphertext = relay.encrypt_record(&record).unwrap();
             engine.on_message(&ciphertext, Instant::now()).unwrap();
         }
+        // Checked on the pending set itself: a kept oversize base would show here (the Roster
+        // below is refused either way, since this base's content differs from the steward's).
+        assert_eq!(engine.pending_bases.len(), 0, "the oversize base was kept");
         relay_sends(
             &mut engine,
             &mut relay,
             DocType::Roster,
             &fix.steward_roster(11),
         );
-        assert!(
-            store.get(&fix.network_id).is_none(),
-            "the oversize base was not kept"
-        );
+        assert!(store.get(&fix.network_id).is_none());
     }
 
     #[test]

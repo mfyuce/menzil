@@ -164,7 +164,19 @@ impl RosterStore {
         base: Option<&Roster>,
         now: u64,
     ) -> Result<bool, NodeError> {
-        let network_id = roster.decode()?.network_id;
+        let body = roster.decode()?;
+        let network_id = body.network_id;
+        // The cheap answer first, as `check_bundle` gives it: a Roster not newer than the held
+        // one is `Held` without a signature check and without the write lock or a view copy.
+        if self
+            .by_network
+            .read()
+            .unwrap()
+            .get(&network_id)
+            .is_some_and(|held| body.seq <= held.seq())
+        {
+            return Ok(false);
+        }
         let bundle = Bundle {
             base_roster: base.cloned(),
             roster: Some(roster.clone()),
@@ -445,5 +457,21 @@ mod tests {
         let err = store.set(&roster).unwrap_err();
         assert!(matches!(err, NodeError::DocumentTooLarge { .. }));
         assert!(store.get(&network_id).is_none());
+    }
+
+    #[test]
+    fn adopt_roster_answers_held_for_a_forged_roster_not_newer_than_the_held_one() {
+        let owner = SigningKey::generate(&mut rand::rng());
+        let network_id = NetworkId::from(owner.verifying_key().to_bytes());
+        let store = RosterStore::new();
+        assert!(store.set(&signed_roster(&owner, network_id, 4)).unwrap());
+        let stranger = SigningKey::generate(&mut rand::rng());
+        for seq in [3, 4] {
+            let forged = signed_roster(&stranger, network_id, seq);
+            assert!(!store.adopt_roster(&forged, None, 10).unwrap());
+        }
+        let newer = signed_roster(&stranger, network_id, 5);
+        assert!(store.adopt_roster(&newer, None, 10).is_err());
+        assert_eq!(store.seq(&network_id), Some(4));
     }
 }

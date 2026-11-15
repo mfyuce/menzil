@@ -134,6 +134,11 @@ pub(crate) fn accept_completed(
             L3DocOutcome::Dropped("too many pending base Rosters")
         };
     }
+    // Not newer than the held one: held, before any signature is checked (a forged old
+    // Roster costs a map lookup, not an Ed25519 verify).
+    if store.seq(&network_id).is_some_and(|held| body.seq <= held) {
+        return L3DocOutcome::Held(network_id, body.seq);
+    }
     // An owner signed Roster needs no base and discards the bases at or below its seq; a
     // steward Roster is judged with the pending base it follows, which is then used up.
     let owner_signed = VerifyingKey::from_bytes(&<[u8; 32]>::from(network_id))
@@ -238,6 +243,7 @@ pub(crate) mod fixture {
 mod tests {
     use super::fixture::*;
     use super::*;
+    use ed25519_dalek::SigningKey as TestKey;
     use menzil_proto::StewardKey;
     use menzil_proto::trust::{Reason, Signer};
 
@@ -759,5 +765,34 @@ mod tests {
         assert!(!p.keep(fix.network_id, 18, fix.other_base(18)));
         assert!(p.keep(fix.network_id, 12, fix.other_base(12)));
         assert_eq!(p.len(), 8);
+    }
+
+    #[test]
+    fn a_roster_not_newer_than_the_held_one_is_held_even_when_forged() {
+        let fix = Fix::new(NOW);
+        let (store, mut p) = (RosterStore::new(), PendingBases::new());
+        assert!(store.adopt_owner(&fix.roster(&fix.owner, 11), NOW).unwrap());
+        let stranger = TestKey::from_bytes(&[9u8; 32]);
+        for seq in [5, 11] {
+            let out = feed(
+                &fix,
+                DocType::Roster,
+                &fix.roster(&stranger, seq),
+                &mut p,
+                &store,
+            );
+            assert!(
+                matches!(out, L3DocOutcome::Held(_, s) if s == seq),
+                "{out:?}"
+            );
+        }
+        let out = feed(
+            &fix,
+            DocType::Roster,
+            &fix.roster(&stranger, 12),
+            &mut p,
+            &store,
+        );
+        assert!(matches!(out, L3DocOutcome::Rejected(_)), "{out:?}");
     }
 }
