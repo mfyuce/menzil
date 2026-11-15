@@ -46,8 +46,12 @@ async fn silent_forged_stream(
 ) -> (TestNode, SessionReady, menzil_stream::Stream) {
     let forged = forged_as(member);
     let mut node = node(net, &forged, stores).await;
+    // A docs dial: a full dial refuses first, the forged key not being the certified one.
     assert_eq!(
-        ensure(&node, target.id, w.network).await.err(),
+        node.handle
+            .ensure_session_for_docs(target.id, w.network)
+            .await
+            .err(),
         Some(EnsureError::DocsOnly)
     );
     let at = node.next_ready().await;

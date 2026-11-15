@@ -1695,6 +1695,22 @@ impl Engine {
                 EnsureError::NotAMember
             });
         }
+        // A full session dial also needs this node's own certificate to stand (listed in the
+        // held Policy, valid now, serial not below min_serial): otherwise the session would
+        // open and the first revalidation pass would close it. A docs-only dial keeps the
+        // current behaviour: it exists to fetch or push documents when the standing is
+        // incomplete.
+        if !docs && let Err(reason) = self.own_cert_standing(&network, now.unix) {
+            tracing::debug!(
+                ?reason,
+                "not dialing: this node's own certificate does not stand"
+            );
+            return Err(if matches!(reason, ErrorCode::UnknownNetwork) {
+                EnsureError::UnknownPeer
+            } else {
+                EnsureError::NotAMember
+            });
+        }
         let resolve = if docs {
             resolve_dial_cert_for_docs
         } else {

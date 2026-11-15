@@ -1105,6 +1105,35 @@ async fn a_responder_without_its_own_certificate_in_the_policy_answers_docs_only
     assert!(at_r.docs_only);
 }
 
+/// N1 (initiator): a full dial is refused while this node's own certificate is not in its
+/// held Policy: no `init` is sent and no table index is kept; a docs-only dial is not blocked.
+#[tokio::test(start_paused = true)]
+async fn a_dial_without_its_own_certificate_in_the_policy_sends_nothing_unless_docs_only() {
+    let w = world();
+    let (r, m) = (party(), party());
+    // R's Policy lists both as members and holds M's certificate, but not R's own.
+    let r_stores = w.split_stores(&[&r, &m], &[&r, &m], &[&m]);
+    let net = Net::new();
+    let nr = node(&net, &r, &r_stores).await;
+    let _m = Manual::new(&net, m.clone_for_test());
+    for _ in 0..3 {
+        assert_eq!(
+            ensure(&nr, m.id, w.network).await.err(),
+            Some(EnsureError::NotAMember)
+        );
+    }
+    assert_eq!(net.count_from(&r.id, "init"), 0, "nothing was sent");
+    // The docs-only dial passes the same standing.
+    let docs = {
+        let handle = nr.handle.clone();
+        let (peer, network) = (m.id, w.network);
+        tokio::spawn(async move { handle.ensure_session_for_docs(peer, network).await })
+    };
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(net.count_from(&r.id, "init"), 1, "a docs dial still starts");
+    docs.abort();
+}
+
 /// N1 (router): a session is not handed out while this node's own certificate is not in the
 /// Policy it now holds: it is closed with CLOSE `grant_removed` first.
 #[tokio::test(start_paused = true)]

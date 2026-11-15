@@ -383,7 +383,9 @@ async fn a_docs_only_push_that_was_not_adopted_starts_no_new_handshake() {
     let (r1, _) = w.fresh_pair(1, &[&r, &m], &[&r, &m], &[&r]);
     let p1 = w.policy(&[&r, &m], &[&r], vec![]);
     let stores_r = stores_from(&r1, &p1);
-    let stores_m = stores_from(&r1, &p1);
+    // M's own view lists both certificates (a full dial needs M's own to stand).
+    let p1_m = w.policy(&[&r, &m], &[&r, &m], vec![]);
+    let stores_m = stores_from(&r1, &p1_m);
     let net = Net::new();
     let mut nr = node(&net, &r, &stores_r).await;
     let mut nm = node(&net, &m, &stores_m).await;
