@@ -2059,6 +2059,22 @@ mod tests {
         assert!(handed.is_none(), "the destination was handed a record");
     }
 
+    /// Round T2 test gap: the claims of `d` are checked against the networks that authorize the
+    /// pair, not against the claims of `s`. `s` claims A (authorizes) and B (lists only `d`, so
+    /// it authorizes nothing); `d` is attached claiming only B, a network both claim.
+    #[test]
+    fn a_network_both_claim_that_does_not_authorize_the_pair_does_not_reach_the_destination() {
+        let (outcome, handed) = send_across_claims(|n| vec![n[0], n[1]], |n| vec![n[1]]);
+        match outcome {
+            ForwardOutcome::Refused(err) => assert_eq!(err.code, ErrorCode::PeerOffline),
+            other => panic!(
+                "expected Refused(PeerOffline), got {}",
+                outcome_name(&other)
+            ),
+        }
+        assert!(handed.is_none(), "the destination was handed a record");
+    }
+
     #[test]
     fn a_destination_claiming_the_authorizing_network_among_others_is_reached() {
         // d claims B first and A second: one common claimed network is enough, wherever it is.
