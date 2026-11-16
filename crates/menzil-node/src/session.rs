@@ -1619,6 +1619,83 @@ mod tests {
         assert_eq!(throttle.allow(t0 + Duration::from_millis(1500)), None);
     }
 
+    fn held_send(
+        dst: u8,
+        len: usize,
+        epoch: Epoch,
+        permit: Option<crate::outbound::SendPermit>,
+    ) -> (OutboundSend, tokio::sync::oneshot::Receiver<EnqueueOutcome>) {
+        let (outcome, rx) = tokio::sync::oneshot::channel();
+        (
+            OutboundSend {
+                dst: NodeId::from([dst; 32]),
+                e2e_proto: 1,
+                flags: 0,
+                payload: vec![0; len],
+                epoch,
+                outcome,
+                permit,
+            },
+            rx,
+        )
+    }
+
+    /// Round C1 "not checked" (pre attach `waiting` path): what is held while the node dials is
+    /// bounded by the queue's own 4 MiB total whether the sends hold a reserved permit or not;
+    /// a send tagged for another epoch is refused at once; and when the held sends are admitted
+    /// to the fresh queue every one of them gets an outcome (the permit-less share may be
+    /// refused there, the permitted ones never are) and the reserved space comes back.
+    #[tokio::test]
+    async fn the_sends_held_while_dialing_are_bounded_and_all_get_an_outcome() {
+        const CHUNK: usize = 256 * 1024;
+        let budgets = crate::outbound::SendBudgets::new();
+        let epoch = Epoch::first();
+        let (mut waiting, mut bytes, mut receivers) = (Vec::new(), 0usize, Vec::new());
+        // 4 permitted sends (1 MiB) and 12 permit-less ones (3 MiB): exactly the 4 MiB total.
+        for i in 0..16u8 {
+            let permit = if i < 4 {
+                Some(budgets.for_peer(NodeId::from([i; 32])).acquire(CHUNK).await)
+            } else {
+                None
+            };
+            let (req, rx) = held_send(i, CHUNK, epoch, permit);
+            hold_or_refuse(req, epoch, &mut waiting, &mut bytes);
+            receivers.push((i, rx));
+        }
+        assert_eq!(waiting.len(), 16);
+        assert_eq!(bytes, crate::outbound::MAX_QUEUED_BYTES);
+        // One more is over the total: refused now, with its outcome.
+        let (over, mut over_rx) = held_send(40, CHUNK, epoch, None);
+        hold_or_refuse(over, epoch, &mut waiting, &mut bytes);
+        assert_eq!(over_rx.try_recv().unwrap(), EnqueueOutcome::QueueFull);
+        assert_eq!(waiting.len(), 16);
+        // Another epoch: refused at once, not held.
+        let (stale, mut stale_rx) = held_send(41, 10, Epoch::first().next(), None);
+        hold_or_refuse(stale, epoch, &mut waiting, &mut bytes);
+        assert_eq!(stale_rx.try_recv().unwrap(), EnqueueOutcome::WrongEpoch);
+        assert_eq!(waiting.len(), 16);
+        // The fresh queue after the attach.
+        let mut queue = OutboundQueue::new(u32::MAX, 1 << 20);
+        for req in waiting {
+            admit(req, epoch, &mut queue);
+        }
+        let mut refused = 0;
+        for (i, mut rx) in receivers {
+            let outcome = rx.try_recv().expect("every held send has an outcome");
+            if i < 4 {
+                assert_eq!(outcome, EnqueueOutcome::Accepted, "permitted send {i}");
+            } else if outcome == EnqueueOutcome::QueueFull {
+                refused += 1;
+            } else {
+                assert_eq!(outcome, EnqueueOutcome::Accepted);
+            }
+        }
+        assert!(
+            refused > 0,
+            "3 MiB of permit-less sends do not all fit the 2 MiB share the queue keeps for them"
+        );
+    }
+
     fn node_cert(seed: u8) -> NodeCert {
         let key = SigningKey::generate(&mut rand::rng());
         let body = NodeCertBody {
