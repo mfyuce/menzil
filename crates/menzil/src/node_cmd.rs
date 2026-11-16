@@ -1364,16 +1364,44 @@ pub fn keep_adopted_documents(
             "menzil-docs-keep",
             |adopted: &AdoptedDocs| adopted.network_id.to_string(),
             move |adopted: &AdoptedDocs, _| {
-                if let Err(error) = keep_adopted(&home, adopted) {
-                    tracing::warn!(network = %adopted.network_id, error = %format!("{error:#}"), "documents adopted over the network could not be kept on disk: a restart will start from the older pair");
+                match keep_adopted(&home, adopted) {
+                    Ok(()) => crate::persist::Outcome::Done,
+                    // A lock held by another command or a failing disk may pass: run again
+                    // with a backoff (an older pair retried against a newer file is a
+                    // `Held`, never a lower `seq` on disk).
+                    Err(error) => match retry_class(&error) {
+                        Some(class) => crate::persist::Outcome::Retry {
+                            class,
+                            error: format!("network {}: {error:#}", adopted.network_id),
+                        },
+                        None => {
+                            tracing::warn!(network = %adopted.network_id, error = %format!("{error:#}"), "documents adopted over the network could not be kept on disk: a restart will start from the older pair");
+                            crate::persist::Outcome::Done
+                        }
+                    },
                 }
-                crate::persist::Outcome::Done
             },
         )?
     };
     let hook = Arc::clone(&keeper);
     rosters.set_on_adopted(move |adopted| hook.submit(adopted.clone()));
     Ok(keeper)
+}
+
+/// Whether a failed keep may pass by itself, by the typed errors at the bottom (never by
+/// wording): a lock that stayed held is `busy`, a failing read or write is `io`; a refusal or a
+/// damaged file is neither and is not retried.
+fn retry_class(error: &anyhow::Error) -> Option<&'static str> {
+    if error.downcast_ref::<crate::home::LockBusy>().is_some() {
+        Some("busy")
+    } else if error
+        .chain()
+        .any(|cause| cause.downcast_ref::<std::io::Error>().is_some())
+    {
+        Some("io")
+    } else {
+        None
+    }
 }
 
 /// Writes what `adopted` holds as the pair on disk, if it is a pair and newer than the disk's.

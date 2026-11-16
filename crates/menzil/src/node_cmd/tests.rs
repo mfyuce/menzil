@@ -1263,6 +1263,41 @@ fn a_pair_that_cannot_be_written_stays_adopted_and_the_keeper_goes_on() {
     );
 }
 
+/// A read or write that fails with an I/O error (here the documents path is a directory for a
+/// while) is retried by the keeper and lands once the path is a file again (K1 residual 4).
+#[test]
+fn a_pair_that_fails_on_io_is_retried_until_it_lands() {
+    let m = running_member();
+    let path = m.member.documents_path(&m.id);
+    let aside = path.with_extension("aside");
+    fs::rename(&path, &aside).unwrap();
+    fs::create_dir(&path).unwrap();
+    let second = renew(&m.owner, None, clock() + 60).unwrap();
+    let pair = crate::token::decode_documents(&second.token).unwrap();
+    DocStore::new(&m.rosters, &m.policies)
+        .adopt(&pair.bundle(), clock() + 60)
+        .unwrap();
+    let until = std::time::Instant::now() + FLUSH;
+    while m.keeper.pending_keys().is_empty() {
+        assert!(
+            std::time::Instant::now() < until,
+            "the failed write was not queued for a retry"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    fs::remove_dir(&path).unwrap();
+    fs::rename(&aside, &path).unwrap();
+    m.keeper.retry_now();
+    assert!(m.keeper.flush(FLUSH).reached);
+    assert!(m.keeper.pending_keys().is_empty());
+    assert_eq!(
+        crate::local::load_documents(&m.member, &m.id)
+            .unwrap()
+            .seq(),
+        second.seq
+    );
+}
+
 /// A refused bundle reaches neither the stores nor the disk, and a Roster adopted without its
 /// Policy is not a pair: the disk keeps the pair it has until the Policy arrives.
 #[test]
