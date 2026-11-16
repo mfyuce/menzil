@@ -1298,6 +1298,105 @@ fn a_pair_that_fails_on_io_is_retried_until_it_lands() {
     );
 }
 
+/// What the keeper judges by itself (132): `AdoptedDocs` handed to `keep_adopted` directly, so
+/// that the stores' own judgement does not stand in for it. A Roster held without its Policy is
+/// not a pair: Ok, and the disk keeps what it has.
+#[test]
+fn keep_adopted_leaves_a_roster_without_its_policy_alone() {
+    let m = running_member();
+    let start = crate::local::load_documents(&m.member, &m.id)
+        .unwrap()
+        .seq();
+    let second = renew(&m.owner, None, clock() + 60).unwrap();
+    let pair = crate::token::decode_documents(&second.token).unwrap();
+    let adopted = AdoptedDocs {
+        network_id: m.id,
+        adopted: Default::default(),
+        roster: Some((pair.roster().clone(), None)),
+        policy: None,
+    };
+    keep_adopted(&m.member, &adopted).unwrap();
+    assert_eq!(
+        crate::local::load_documents(&m.member, &m.id)
+            .unwrap()
+            .seq(),
+        start
+    );
+}
+
+/// The keeper judges the signatures again (`into_verified`): a pair whose Roster a stranger
+/// signed is an error and never reaches the disk, even if it came through a hook.
+#[test]
+fn keep_adopted_refuses_a_pair_that_does_not_stand_on_its_signatures() {
+    let m = running_member();
+    let start = crate::local::load_documents(&m.member, &m.id)
+        .unwrap()
+        .seq();
+    let second = renew(&m.owner, None, clock() + 60).unwrap();
+    let pair = crate::token::decode_documents(&second.token).unwrap();
+    let stranger = menzil_admin::OwnerKey::generate();
+    let body = pair.roster().decode().unwrap();
+    let forged = menzil_proto::Roster::sign(stranger.signing_key(), &body).unwrap();
+    let adopted = AdoptedDocs {
+        network_id: m.id,
+        adopted: Default::default(),
+        roster: Some((forged, None)),
+        policy: Some((pair.policy().clone(), None)),
+    };
+    assert!(keep_adopted(&m.member, &adopted).is_err());
+    assert_eq!(
+        crate::local::load_documents(&m.member, &m.id)
+            .unwrap()
+            .seq(),
+        start
+    );
+}
+
+/// Two networks adopted at once through one keeper: both pairs land, each under its own key.
+#[test]
+fn two_networks_adopted_at_once_both_land_through_the_keeper() {
+    let m = running_member();
+    let owner2_dir = tempfile::tempdir().unwrap();
+    let owner2 = Home::new(owner2_dir.path());
+    init(&owner2, clock()).unwrap();
+    let id2 = network_create(&owner2, "desk", clock()).unwrap();
+    let request = crate::local::join_request(&m.member).unwrap();
+    let admitted = admit(&owner2, None, &request, "phone", &[], clock()).unwrap();
+    join(&m.member, &admitted.token, clock()).unwrap();
+    let (policies, rosters, _) = load_stores(&m.member).unwrap();
+    let keeper = keep_adopted_documents(&m.member, &rosters).unwrap();
+    let first = renew(&m.owner, None, clock() + 60).unwrap();
+    let second = renew(&owner2, None, clock() + 60).unwrap();
+    let (a, b) = (
+        crate::token::decode_documents(&first.token).unwrap(),
+        crate::token::decode_documents(&second.token).unwrap(),
+    );
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            DocStore::new(&rosters, &policies)
+                .adopt(&a.bundle(), clock() + 60)
+                .unwrap();
+        });
+        scope.spawn(|| {
+            DocStore::new(&rosters, &policies)
+                .adopt(&b.bundle(), clock() + 60)
+                .unwrap();
+        });
+    });
+    assert!(keeper.flush(FLUSH).reached);
+    assert_eq!(
+        crate::local::load_documents(&m.member, &m.id)
+            .unwrap()
+            .seq(),
+        first.seq
+    );
+    assert_eq!(
+        crate::local::load_documents(&m.member, &id2).unwrap().seq(),
+        second.seq
+    );
+    drop(owner2_dir);
+}
+
 /// A refused bundle reaches neither the stores nor the disk, and a Roster adopted without its
 /// Policy is not a pair: the disk keeps the pair it has until the Policy arrives.
 #[test]

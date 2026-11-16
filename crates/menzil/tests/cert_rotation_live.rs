@@ -19,6 +19,9 @@
 //! the same reason the other live tests have exactly one: `SSL_CERT_FILE` and the knobs are
 //! process-global.
 
+// The shortened timers are read by debug builds only (`cert_renew::test_knob`): a release build
+// would run this test on the real 6 hour timers and time out, so it is not built there.
+#![cfg(debug_assertions)]
 #![cfg(target_os = "linux")]
 
 use std::path::Path;
