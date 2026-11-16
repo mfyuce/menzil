@@ -1119,3 +1119,24 @@ async fn a_docs_only_dialer_that_is_listed_pushes_only_its_documents() {
     assert_eq!(held(&stores_r, w.network), (Some(2), Some(2)));
     assert!(sync_r.candidates().candidates(w.network).is_empty());
 }
+
+/// Round 14 leftover: `wait_docs_only_push` subscribes before it looks, so a push that ends
+/// between the look and the wait wakes it at once. Subscribing after the look would lose that
+/// wake up and the waiter would sit out the whole `DOCS_ONLY_WAIT` (the closing look then says
+/// yes anyway, so only the time tells).
+#[tokio::test(start_paused = true)]
+async fn a_push_that_ends_between_the_look_and_the_wait_wakes_the_waiter() {
+    let (w, r, _m, _stores_r, _net, _nr, _nm, sync_m) = behind_responder().await;
+    let key = (r.id, w.network);
+    let since = tokio::time::Instant::now();
+    let id = sync_m.test_start_running(key);
+    let ender = sync_m.clone();
+    sync_m.test_after_look(move || ender.end_push(key, id, true));
+    let began = tokio::time::Instant::now();
+    assert!(sync_m.wait_docs_only_push(r.id, w.network, since).await);
+    assert!(
+        began.elapsed() < Duration::from_secs(1),
+        "the wake up was lost: waited {:?}",
+        began.elapsed()
+    );
+}

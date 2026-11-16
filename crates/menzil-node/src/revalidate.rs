@@ -917,6 +917,56 @@ mod tests {
         }
     }
 
+    /// Measurement, not a check (round 11 leftover): one `next_deadline` with 500 live peers in a
+    /// Policy of 3000 certificates, and the cost of building the index once per adopted Policy.
+    /// Run with `cargo test --release -p menzil-node --lib measure_next_deadline -- --ignored
+    /// --nocapture`. Before the index the deadline alone took 615 ms.
+    #[test]
+    #[ignore = "a measurement; prints the times"]
+    fn measure_next_deadline_with_500_peers_and_3000_certs() {
+        let (n, live) = (3000usize, 500usize);
+        let mut certs = Vec::new();
+        let mut peers = Vec::new();
+        for i in 0..n {
+            let key = SigningKey::generate(&mut rand::rng());
+            let id = NodeId::from(key.verifying_key().to_bytes());
+            let mut x = [0u8; 32];
+            x[..8].copy_from_slice(&(i as u64).to_le_bytes());
+            let x = X25519PublicKey::from(x);
+            certs.push(
+                NodeCert::sign(
+                    &key,
+                    &NodeCertBody {
+                        v: PROTOCOL_VERSION,
+                        node_id: id,
+                        x25519_pub: x,
+                        serial: 1,
+                        not_before: 0,
+                        not_after: 4_000_000_000,
+                    },
+                )
+                .unwrap(),
+            );
+            if i >= n - live {
+                peers.push((id, x));
+            }
+        }
+        let mut f = fixture(u64::MAX);
+        f.roster.expires = 4_000_000_000;
+        f.policy.expires = 4_000_000_000;
+        f.policy.certs = certs;
+        let start = std::time::Instant::now();
+        let index = CertIndex::build(&f.policy.certs);
+        let built = start.elapsed();
+        let start = std::time::Instant::now();
+        let deadline = next_deadline(&f.roster, &f.policy, &index, &peers, 1_000);
+        println!(
+            "MEASURE index of {n} certs: {built:?}; next_deadline with {live} peers: {:?} (deadline {deadline:?})",
+            start.elapsed()
+        );
+        assert!(deadline.is_some());
+    }
+
     #[test]
     fn nothing_ahead_gives_no_deadline() {
         let mut f = fixture(u64::MAX);

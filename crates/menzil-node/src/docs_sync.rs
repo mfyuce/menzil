@@ -575,6 +575,10 @@ pub struct DocsSync {
     pushes: Mutex<PushState>,
     /// Bumped whenever `pushes` changes in a way a waiter must look at again.
     push_tick: watch::Sender<u64>,
+    /// Test only: run once by [`Self::wait_docs_only_push`] between its first look and its wait,
+    /// to end a push exactly there (the wake up that must not be lost).
+    #[cfg(test)]
+    after_look: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     /// This node's own certificate, read at each push of a `node_cert`. `None`: it pushes none.
     identity: Option<IdentityCell>,
     /// The `node_cert` candidates other nodes pushed to this one.
@@ -647,6 +651,8 @@ impl DocsSync {
             catching_up: Mutex::default(),
             pushes: Mutex::default(),
             push_tick: watch::channel(0).0,
+            #[cfg(test)]
+            after_look: Mutex::default(),
             cert_pushing: Mutex::default(),
         })
     }
@@ -1126,6 +1132,10 @@ impl DocsSync {
                 Verdict::No => return false,
                 Verdict::Wait { .. } => {}
             }
+            #[cfg(test)]
+            if let Some(hook) = self.after_look.lock().unwrap().take() {
+                hook();
+            }
             match tokio::time::timeout_at(deadline, tick.changed()).await {
                 Ok(Ok(())) => {}
                 _ => {
@@ -1136,6 +1146,28 @@ impl DocsSync {
                 }
             }
         }
+    }
+
+    /// Test only: a push of `key` that is running (as `docs_only_push` would register it);
+    /// returns its id for [`Self::end_push`].
+    #[cfg(test)]
+    pub(crate) fn test_start_running(&self, key: (NodeId, NetworkId)) -> u64 {
+        let mut state = self.pushes.lock().unwrap_or_else(|e| e.into_inner());
+        let id = state.next_id;
+        state.next_id += 1;
+        state.running.entry(key).or_default().push(Running {
+            id,
+            started: Instant::now(),
+            handshaking: false,
+        });
+        id
+    }
+
+    /// Test only: `hook` runs once, in the next [`Self::wait_docs_only_push`], after its first
+    /// look and before its wait.
+    #[cfg(test)]
+    pub(crate) fn test_after_look(&self, hook: impl FnOnce() + Send + 'static) {
+        *self.after_look.lock().unwrap() = Some(Box::new(hook));
     }
 
     /// Starts one handshake with `peer`, unless one was started for it a moment ago. A session
