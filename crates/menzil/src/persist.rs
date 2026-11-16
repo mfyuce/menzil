@@ -200,8 +200,13 @@ struct Queue<T> {
     running: Option<String>,
     /// The keys a flush barrier took out of the book and has not started yet.
     barrier_left: Vec<String>,
-    /// While a flush is on, the end of its grace.
+    /// While a flush is on, the end of its grace: the latest of the flushes that are on (several
+    /// callers may flush at once; one that ends must not take the others' grace away).
     deadline: Option<Instant>,
+    /// The flushes that are on: an id and the end of the grace of each.
+    flushes: Vec<(u64, Instant)>,
+    /// The id of the next flush.
+    next_flush: u64,
     /// Set when the [`Worker`] is gone: the thread ends once the queue is empty.
     closed: bool,
 }
@@ -262,6 +267,8 @@ impl<T: Send + 'static> Worker<T> {
                 running: None,
                 barrier_left: vec![],
                 deadline: None,
+                flushes: Vec::new(),
+                next_flush: 0,
                 closed: false,
             }),
             wake: Condvar::new(),
@@ -420,15 +427,20 @@ impl<T: Send + 'static> Worker<T> {
     /// done and what did not: for a clean shutdown, and for tests.
     pub fn flush(&self, timeout: Duration) -> FlushReport {
         let (done, wait) = std::sync::mpsc::channel();
-        {
+        let id = {
             let mut queue = self.shared.lock();
-            queue.deadline = Some(Instant::now() + timeout);
+            let id = queue.next_flush;
+            queue.next_flush += 1;
+            queue.flushes.push((id, Instant::now() + timeout));
+            queue.deadline = queue.flushes.iter().map(|(_, end)| *end).max();
             queue.messages.push_back(Message::Barrier(done));
-        }
+            id
+        };
         self.shared.wake.notify_one();
         let reached = wait.recv_timeout(timeout).is_ok();
         let mut queue = self.shared.lock();
-        queue.deadline = None;
+        queue.flushes.retain(|(other, _)| *other != id);
+        queue.deadline = queue.flushes.iter().map(|(_, end)| *end).max();
         let mut unwritten = queue.book.keys();
         // Over-reporting is fine, under-reporting is not: what is running, and what the barrier
         // took out of the book and has not run, count whether or not the flush was reached.
@@ -720,14 +732,16 @@ mod tests {
         let report = worker.flush(WAIT);
         assert!(report.reached);
         assert_eq!(report.unwritten, vec!["7".to_string(), "8".to_string()]);
+        let before = runs.load(Ordering::SeqCst);
         left.store(0, Ordering::SeqCst);
         worker.submit((7, 2));
-        assert_eq!(worker.pending_keys(), vec!["8".to_string()]);
-        let before = runs.load(Ordering::SeqCst);
         let report = worker.flush(WAIT);
         assert!(report.is_clean());
-        // (7, 2) ran once, the retry of 8 once.
-        assert_eq!(runs.load(Ordering::SeqCst), before + 2);
+        assert!(worker.pending_keys().is_empty());
+        // (7, 2) ran once and 8 got through once; the thread's own retry of 8 (the 1 s backoff
+        // may fall inside this test on a busy machine) may add runs, never fewer. The count
+        // used to be compared for equality: flaky 4 in 30 runs.
+        assert!(runs.load(Ordering::SeqCst) >= before + 2);
     }
 
     /// Jobs failing for ever do not grow the book beyond one entry per key.
@@ -765,6 +779,47 @@ mod tests {
         worker.submit(2);
         assert!(worker.flush(WAIT).is_clean());
         assert_eq!(rx.try_recv().unwrap(), Duration::from_secs(1));
+    }
+
+    /// K1 residual 1: a flush that ends (here by its timeout) must not take the grace of another
+    /// flush that is still on: the job that runs under the first one still sees its end.
+    #[test]
+    fn a_flush_that_ends_leaves_the_grace_of_another_that_is_on() {
+        let (gate_tx, gate_rx) = mpsc::channel::<()>();
+        let gate_rx = Mutex::new(gate_rx);
+        let (seen_tx, seen_rx) = mpsc::channel();
+        let worker = Arc::new(
+            Worker::spawn(
+                "test-two-flushes",
+                |job: &u32| job.to_string(),
+                move |job, attempt| {
+                    if *job == 0 {
+                        let _ = gate_rx.lock().unwrap().recv();
+                    } else {
+                        let _ = seen_tx.send(attempt.deadline);
+                    }
+                    Outcome::Done
+                },
+            )
+            .unwrap(),
+        );
+        worker.submit(0);
+        worker.submit(1);
+        let long = {
+            let worker = Arc::clone(&worker);
+            std::thread::spawn(move || worker.flush(Duration::from_secs(20)))
+        };
+        // The long flush is on before the short one starts.
+        std::thread::sleep(Duration::from_millis(300));
+        let short = worker.flush(Duration::from_millis(100));
+        assert!(!short.reached, "job 0 holds the worker");
+        gate_tx.send(()).unwrap();
+        let deadline = seen_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        assert!(
+            deadline.is_some(),
+            "the end of the short flush took the grace of the long one"
+        );
+        assert!(long.join().unwrap().is_clean());
     }
 
     /// A flush that times out while the barrier is running the retry book's entries still names
