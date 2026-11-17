@@ -3691,12 +3691,18 @@ async fn finished_handshakes_do_not_count_against_the_handshake_cap() {
 /// paused time in `admission.rs`.
 #[tokio::test]
 async fn the_61st_connection_in_a_minute_is_dropped_before_tls() {
+    // The mechanism at a small figure; the default (240) is asserted below.
     let (relay, listener, cert, _relay_x25519) = bind_test_relay_admitting(AdmissionLimits {
         max_unattached_per_ip: 10_000,
+        connections_per_ip_per_minute: 60,
         ..AdmissionLimits::default()
     })
     .await;
-    assert_eq!(AdmissionLimits::default().connections_per_ip_per_minute, 60);
+    assert_eq!(
+        AdmissionLimits::default().connections_per_ip_per_minute,
+        240,
+        "the default is sized for many users behind one address (TBD 54 b)"
+    );
     let addr = listener.local_addr().unwrap();
     let serve_relay = relay.clone();
     tokio::spawn(async move { serve_relay.serve(&listener).await });

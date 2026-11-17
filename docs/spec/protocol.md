@@ -531,7 +531,7 @@ Global limits:
 
 | Item | Default |
 |---|---|
-| New connections per source address (an IPv6 address counts by its /64) | 60 per minute; the next one is closed before TLS, without an answer |
+| New connections per source address (an IPv6 address counts by its /64) | 240 per minute; the next one is closed before TLS, without an answer |
 | TLS and WebSocket handshakes in flight | 256 in all, 8 per source address, 16 per IPv6 /48; 10 s each |
 | Sessions not yet attached, per source address | 32 |
 | Noise handshake and HELLO | 10 s from the first message |

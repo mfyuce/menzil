@@ -30,7 +30,7 @@
 //!
 //! The address counted is the TCP peer address the relay sees. When the relay is placed behind
 //! a TLS terminating reverse proxy or a TCP load balancer without PROXY protocol support, every
-//! peer shares the proxy's address and the per address figures (60 connections a minute, 8
+//! peer shares the proxy's address and the per address figures (240 connections a minute, 8
 //! handshakes in flight, 32 unattached) become figures for the whole relay. Such a deployment must raise them through
 //! [`AdmissionLimits`] (`Relay::with_admission_limits`). An IPv6 peer is counted by its /64
 //! prefix, because one subscriber commonly holds a whole /64 and a single host can pick any
@@ -45,7 +45,7 @@ use menzil_proto::NodeId;
 use tokio::time::Instant;
 
 /// How many connections one peer address may open per [`RATE_WINDOW`].
-pub const CONNECTIONS_PER_IP_PER_MINUTE: usize = 60;
+pub const CONNECTIONS_PER_IP_PER_MINUTE: usize = 240;
 
 /// The window over which [`AdmissionLimits::connections_per_ip_per_minute`] counts.
 pub const RATE_WINDOW: Duration = Duration::from_secs(60);
@@ -66,9 +66,9 @@ pub const MAX_HANDSHAKES_PER_V6_48: usize = 16;
 
 /// The most peers the connection rate table tracks. Past it the oldest are forgotten (their
 /// rate history with them), so a peer that rotates addresses cannot grow the table without
-/// bound. Each entry holds up to [`CONNECTIONS_PER_IP_PER_MINUTE`] times, so the table is at
-/// most a few tens of megabytes.
-pub const MAX_TRACKED_PEERS: usize = 65_536;
+/// bound. Each entry holds up to [`CONNECTIONS_PER_IP_PER_MINUTE`] times (16 bytes each), so the
+/// table is at most about 63 MB (it was 65,536 peers at a rate of 60: the same bound).
+pub const MAX_TRACKED_PEERS: usize = 16_384;
 
 /// How many handshaken but not yet attached sessions one NodeId may have. One is the normal
 /// case; the second covers a reconnect that races the first one's teardown.
@@ -465,12 +465,12 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn the_61st_connection_in_a_minute_from_one_address_is_rate_limited() {
+    async fn the_241st_connection_in_a_minute_from_one_address_is_rate_limited() {
         let admission = admission(roomy());
-        for n in 1..=60 {
+        for n in 1..=CONNECTIONS_PER_IP_PER_MINUTE {
             assert!(!knock(&admission, IP_A), "connection {n} must be admitted");
         }
-        assert!(knock(&admission, IP_A), "the 61st must be rate limited");
+        assert!(knock(&admission, IP_A), "the next one must be rate limited");
         // Another address is unaffected.
         assert!(!knock(&admission, IP_B));
     }
@@ -478,7 +478,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn the_rate_window_slides_and_refused_knocks_do_not_extend_it() {
         let admission = admission(roomy());
-        for _ in 0..60 {
+        for _ in 0..CONNECTIONS_PER_IP_PER_MINUTE {
             assert!(!knock(&admission, IP_A));
         }
         assert!(knock(&admission, IP_A));
@@ -490,7 +490,7 @@ mod tests {
         tokio::time::advance(Duration::from_secs(2)).await;
         assert!(
             !knock(&admission, IP_A),
-            "the 60 admissions are older than a minute now, the refused knocks did not count"
+            "the admissions are older than a minute now, the refused knocks did not count"
         );
     }
 
