@@ -165,7 +165,7 @@ impl AcmeTransport for HttpsTransport {
     async fn send(&self, request: HttpRequest) -> Result<HttpResponse, AcmeError> {
         tokio::time::timeout(EXCHANGE_TIMEOUT, self.exchange(&request))
             .await
-            .map_err(|_| AcmeError::Timeout("the exchange with the CA"))?
+            .map_err(|_| AcmeError::Http("timed out: the exchange with the CA".to_string()))?
     }
 }
 

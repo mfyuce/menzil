@@ -738,6 +738,27 @@ async fn the_https_transport_sends_a_post_and_reads_a_chunked_answer_in_pieces()
     assert!(request.ends_with("\r\n\r\n{\"payload\":1}"));
 }
 
+#[tokio::test(start_paused = true)]
+async fn a_silent_ca_is_unreachable_not_a_validation_failure() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let _hold = tokio::spawn(async move {
+        let _conn = listener.accept().await;
+        std::future::pending::<()>().await;
+    });
+    let error = HttpsTransport::with_config(client_config(&[]))
+        .send(HttpRequest {
+            method: Method::Get,
+            url: format!("https://localhost:{port}/dir"),
+            headers: Vec::new(),
+            body: Vec::new(),
+        })
+        .await
+        .unwrap_err();
+    assert!(matches!(error, AcmeError::Http(_)), "{error:?}");
+    assert_eq!(error.failure_kind(), FailureKind::Unreachable);
+}
+
 #[tokio::test]
 async fn the_https_transport_reads_a_head_answer_without_a_body() {
     let reply = b"HTTP/1.1 200 OK\r\nReplay-Nonce: fresh\r\nContent-Length: 4\r\n\r\n".to_vec();
