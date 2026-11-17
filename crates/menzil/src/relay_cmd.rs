@@ -1026,14 +1026,21 @@ fn reload_once_with(
             Ok(present) => {
                 for network in relay.rosters().networks() {
                     let held_back = book.is_held_back(&network);
-                    if (held_back || !present.contains(&network))
-                        && relay.rosters().remove(&network)
-                    {
-                        // Its names are released: a flat one waits 180 days for the network to
-                        // come back (design 2.2, rule 9).
-                        relay
-                            .labels()
-                            .network_removed(relay.rosters(), book, &network, unix_now());
+                    let file_gone = !present.contains(&network);
+                    if (held_back || file_gone) && relay.rosters().remove(&network) {
+                        // The Roster file is gone: its names are released, a flat one waits 180
+                        // days for the network to come back (design 2.2, rule 9). A suspended
+                        // tenant's network keeps its names, as the tenant book says: resume
+                        // brings the network back with them, not as new names against the
+                        // weekly quota (review medium R-2).
+                        if file_gone {
+                            relay.labels().network_removed(
+                                relay.rosters(),
+                                book,
+                                &network,
+                                unix_now(),
+                            );
+                        }
                         tracing::warn!(
                             %network,
                             held_back,

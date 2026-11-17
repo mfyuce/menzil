@@ -847,7 +847,10 @@ pub fn expose(home: &Home, spec: &ExposeSpec, runtime: Option<&Runtime<'_>>) -> 
         home.write_config(plan.new_text.as_bytes())?;
     }
     if let Some(runtime) = runtime {
-        apply_runtime(&plan.config, runtime, &[])?;
+        // A share moved to another mode leaves its old service: the running node drops it too
+        // (review R-4), or it would keep answering OPENs with the old target.
+        let removed: Vec<ServiceId> = plan.removed_service.iter().cloned().collect();
+        apply_runtime(&plan.config, runtime, &removed)?;
     }
     Ok(plan)
 }

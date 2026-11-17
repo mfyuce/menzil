@@ -759,7 +759,7 @@ struct Engine {
     /// Mirrors `attached`'s epoch for [`RouterParts::attachment`].
     attachment: watch::Sender<Option<Epoch>>,
     /// Handshake frames the outbound channel had no room for, oldest first.
-    unsent: VecDeque<OutboundSend>,
+    unsent: VecDeque<(OutboundSend, oneshot::Sender<()>)>,
     /// For the line about refused `init`s.
     refused_log: LogThrottle,
     /// For the line about a session ended for passing its inbound budget:
@@ -873,7 +873,7 @@ impl Engine {
             self.table
                 .remove_pending_where(|pending| pending.epoch == epoch),
         );
-        self.unsent.retain(|request| request.epoch != epoch);
+        self.unsent.retain(|(request, _)| request.epoch != epoch);
         // Nothing of that epoch is left to wait for.
         if current {
             for (_, waiting) in std::mem::take(&mut self.waiters) {
@@ -1211,8 +1211,15 @@ impl Engine {
                 return;
             }
         }
-        self.send(src, attached.epoch, resp.encode());
-        tokio::spawn(task);
+        let resp_placed = self.send_gated(src, attached.epoch, resp.encode());
+        tokio::spawn(async move {
+            // Nothing of this session goes out before its `resp` is in `outbound` (see
+            // `send_gated`); a dropped frame lets it run on.
+            if let Some(placed) = resp_placed {
+                let _ = placed.await;
+            }
+            task.await
+        });
         let _ = self.ready.send(SessionReady {
             peer: src,
             network_id,
@@ -1386,8 +1393,15 @@ impl Engine {
                 return;
             }
         }
-        self.send(src, attached.epoch, resp.encode());
-        tokio::spawn(task);
+        let resp_placed = self.send_gated(src, attached.epoch, resp.encode());
+        tokio::spawn(async move {
+            // Nothing of this session goes out before its `resp` is in `outbound` (see
+            // `send_gated`); a dropped frame lets it run on.
+            if let Some(placed) = resp_placed {
+                let _ = placed.await;
+            }
+            task.await
+        });
         let _ = self.ready.send(SessionReady {
             peer: src,
             network_id,
@@ -1495,8 +1509,15 @@ impl Engine {
                 deadline: now.instant + DOCS_ONLY_LIFETIME,
             },
         );
-        self.send(src, attached.epoch, resp.encode());
-        tokio::spawn(task);
+        let resp_placed = self.send_gated(src, attached.epoch, resp.encode());
+        tokio::spawn(async move {
+            // Nothing of this session goes out before its `resp` is in `outbound` (see
+            // `send_gated`); a dropped frame lets it run on.
+            if let Some(placed) = resp_placed {
+                let _ = placed.await;
+            }
+            task.await
+        });
         let _ = self.ready.send(SessionReady {
             peer: src,
             network_id,
@@ -2169,6 +2190,21 @@ impl Engine {
     /// waits in [`Self::unsent`] (behind anything already waiting there, so
     /// frames keep their order) and goes out on a later tick.
     fn send(&mut self, dst: NodeId, epoch: Epoch, payload: Vec<u8>) {
+        drop(self.send_gated(dst, epoch, payload));
+    }
+
+    /// [`Self::send`]; when the frame had to wait in [`Self::unsent`], the receiver that
+    /// resolves once it has been put into `outbound` (or dropped, which resolves it with an
+    /// error). A responder holds its session task back until then: the task writes to
+    /// `outbound` itself, so a `resp` waiting in `unsent` would otherwise be overtaken by the
+    /// session's first `data` record (the initiator would see data before its `resp`). `None`
+    /// when the frame was placed at once: nothing can overtake it.
+    fn send_gated(
+        &mut self,
+        dst: NodeId,
+        epoch: Epoch,
+        payload: Vec<u8>,
+    ) -> Option<oneshot::Receiver<()>> {
         let (outcome, _) = oneshot::channel();
         let request = OutboundSend {
             dst,
@@ -2180,34 +2216,38 @@ impl Engine {
             permit: None,
         };
         if !self.unsent.is_empty() {
-            self.hold_back(request);
-            return;
+            return Some(self.hold_back(request));
         }
         match self.outbound.try_send(request) {
-            Ok(()) => {}
-            Err(mpsc::error::TrySendError::Full(request)) => self.hold_back(request),
+            Ok(()) => None,
+            Err(mpsc::error::TrySendError::Full(request)) => Some(self.hold_back(request)),
             Err(mpsc::error::TrySendError::Closed(_)) => {
                 tracing::debug!(%dst, "the L3 session is gone; an L4 handshake frame is dropped");
+                None
             }
         }
     }
 
-    fn hold_back(&mut self, request: OutboundSend) {
+    fn hold_back(&mut self, request: OutboundSend) -> oneshot::Receiver<()> {
         if self.unsent.len() >= MAX_UNSENT {
             self.unsent.pop_front();
             tracing::debug!("dropped the oldest held back L4 handshake frame");
         }
-        self.unsent.push_back(request);
+        let (placed, placed_rx) = oneshot::channel();
+        self.unsent.push_back((request, placed));
+        placed_rx
     }
 
     /// Sends the held back frames, oldest first, until the channel is full
     /// again.
     fn flush_unsent(&mut self) {
-        while let Some(request) = self.unsent.pop_front() {
+        while let Some((request, placed)) = self.unsent.pop_front() {
             match self.outbound.try_send(request) {
-                Ok(()) => {}
+                Ok(()) => {
+                    let _ = placed.send(());
+                }
                 Err(mpsc::error::TrySendError::Full(request)) => {
-                    self.unsent.push_front(request);
+                    self.unsent.push_front((request, placed));
                     break;
                 }
                 Err(mpsc::error::TrySendError::Closed(_)) => {

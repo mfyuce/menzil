@@ -230,6 +230,14 @@ impl Engine {
         records
     }
 
+    /// The relay refused a Roster transfer without keeping it (`over_quota`, protocol.md 4.2:
+    /// its limit on Roster updates for the network is reached): what [`Self::catch_up_records`]
+    /// marked as sent was not taken, so the figures go back to what the relay is known to hold,
+    /// `known` being WELCOME's. The next catch up sends the Rosters again (review R-3).
+    fn relay_refused_rosters(&mut self, known: &HashMap<NetworkId, u64>) {
+        self.relay_rosters = known.clone();
+    }
+
     /// Decrypts one inbound message and classifies it, recording
     /// liveness activity for any record that decrypts successfully
     /// (protocol.md 3.3: "no *authenticated* record", not "no PONG").
@@ -384,6 +392,10 @@ const TICK: Duration = Duration::from_secs(1);
 /// 10) so a genuine stall is noticed and reconnected well before the
 /// liveness mechanism would otherwise have had a chance to.
 const SEND_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How long after an `over_quota` answer to a Roster push the node sends its Rosters again
+/// (the relay's limit is a rate per tenant, so a later try may be taken).
+const ROSTER_RETRY_AFTER: Duration = Duration::from_secs(60);
 
 /// How long a stop ([`run_session_until`]) spends writing what was already admitted before it
 /// closes the connection. The carrier's own close waits as long again for the relay's answer.
@@ -1318,6 +1330,8 @@ pub async fn run_session_observed(
         // The answers to the ADVERTISE records of this attachment: a missing one ends it, a
         // refusal is tried again.
         let mut advertise_watch = shares.advertise_watch();
+        // When to send the relay the Rosters again after it refused a push as `over_quota`.
+        let mut roster_retry: Option<tokio::time::Instant> = None;
         // Whether this attachment claimed every network the node is configured for.
         let complete = session.claimed_networks().len() == config.networks.len();
         let settle = tokio::time::sleep(notes.settle_after());
@@ -1361,6 +1375,11 @@ pub async fn run_session_observed(
                                 advertise_watch.acked(tokio::time::Instant::now());
                             }
                             if let Record::Error(body) = &record {
+                                if body.code == menzil_proto::ErrorCode::OverQuota {
+                                    session.engine.relay_refused_rosters(&session.welcome.rosters);
+                                    roster_retry =
+                                        Some(tokio::time::Instant::now() + ROSTER_RETRY_AFTER);
+                                }
                                 // While an ADVERTISE is unanswered an ERROR is its answer: the
                                 // relay did not take the set (its claims stay as they were),
                                 // so the node asks again after a delay. Nothing it held can be
@@ -1461,6 +1480,26 @@ pub async fn run_session_observed(
                                 share_changes.mark_changed();
                             }
                         }
+                        Ok(Err(err)) => {
+                            tracing::warn!(error = %err, "node session ended while pushing a Roster to the relay, reconnecting");
+                            break 'attached None;
+                        }
+                        Err(_elapsed) => {
+                            tracing::warn!("pushing a Roster to the relay stalled past the write timeout, reconnecting");
+                            break 'attached None;
+                        }
+                    }
+                }
+                // The relay refused a Roster push as over its limit: send them again later.
+                () = async {
+                    match roster_retry {
+                        Some(at) => tokio::time::sleep_until(at).await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    roster_retry = None;
+                    match tokio::time::timeout(SEND_TIMEOUT, session.push_newer_rosters()).await {
+                        Ok(Ok(_)) => {}
                         Ok(Err(err)) => {
                             tracing::warn!(error = %err, "node session ended while pushing a Roster to the relay, reconnecting");
                             break 'attached None;
@@ -2142,6 +2181,35 @@ mod tests {
             .set(&signed_roster(&owner, network_id, 3))
             .unwrap();
         assert_eq!(roster_seqs_in(engine.catch_up_records()), vec![3]);
+    }
+
+    /// A Roster push the relay refused as `over_quota` is sent again by the next catch up
+    /// (review R-3); without the reset the figure stays raised and the relay never gets it.
+    #[test]
+    fn a_refused_roster_push_is_sent_again() {
+        let (node_transport, _relay_transport) = two_live_transports();
+        let roster_store = Arc::new(RosterStore::new());
+        let owner = SigningKey::generate(&mut rand::rng());
+        let network_id = NetworkId::from(owner.verifying_key().to_bytes());
+        let mut engine = Engine::new(
+            node_transport,
+            Instant::now(),
+            Arc::clone(&roster_store),
+            vec![network_id],
+        );
+        let welcome = HashMap::from([(network_id, 1u64)]);
+        engine.relay_rosters = welcome.clone();
+        roster_store
+            .set(&signed_roster(&owner, network_id, 2))
+            .unwrap();
+        assert_eq!(roster_seqs_in(engine.catch_up_records()), vec![2]);
+        assert!(engine.catch_up_records().is_empty(), "sent once");
+        engine.relay_refused_rosters(&welcome);
+        assert_eq!(
+            roster_seqs_in(engine.catch_up_records()),
+            vec![2],
+            "sent again"
+        );
     }
 
     #[test]

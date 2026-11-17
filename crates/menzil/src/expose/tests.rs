@@ -1310,3 +1310,38 @@ fn an_edit_that_parses_but_is_not_the_change_asked_for_is_refused() {
     let same = Config::parse(&doc.text()).unwrap();
     assert_eq!(verify(&doc, &same).unwrap(), same);
 }
+
+/// `expose --replace` that moves a share to another mode drops the old service from the running
+/// node as well as from the file (review R-4).
+#[tokio::test]
+async fn replacing_the_mode_of_a_share_drops_the_old_service_from_the_running_node() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = Home::new(dir.path().join("home"));
+    plain_config(&home, dir.path(), "");
+    let first = expose(&home, &spec("myapp", 8443), None).unwrap();
+    assert!(first.changed);
+    let config = Config::load(&home).unwrap();
+    let services = config.local_services().unwrap();
+    let shares = ShareBook::new();
+    shares.set_shares(config.shares().unwrap()).unwrap();
+    let old: ServiceId = "tls:myapp".parse().unwrap();
+    assert!(
+        services.target(&old).is_some(),
+        "the node serves the blind share"
+    );
+
+    let mut moved = spec("myapp", 9000);
+    moved.mode = ExposeMode::Tcp;
+    moved.replace = true;
+    let runtime = Runtime {
+        services: &services,
+        shares: &shares,
+    };
+    expose(&home, &moved, Some(&runtime)).unwrap();
+    assert!(
+        services.target(&old).is_none(),
+        "the old service must be gone from the running node"
+    );
+    let new: ServiceId = "tcp:myapp".parse().unwrap();
+    assert!(services.target(&new).is_some());
+}

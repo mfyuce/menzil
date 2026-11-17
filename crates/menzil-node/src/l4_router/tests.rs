@@ -440,8 +440,37 @@ async fn node_limited(
     inbound_budget: Option<usize>,
     inbound_ceiling: Option<usize>,
 ) -> TestNode {
+    node_inner(
+        net,
+        party,
+        stores,
+        table,
+        shares,
+        inbound_budget,
+        inbound_ceiling,
+        None,
+    )
+    .await
+}
+
+/// [`node_limited`]; `slow_wire` is an outbound channel of that capacity whose wire takes one
+/// request per permit of the semaphore (none to begin with), so a test decides when the L3
+/// loop drains `outbound`.
+#[allow(clippy::too_many_arguments)]
+async fn node_inner(
+    net: &Net,
+    party: &Party,
+    stores: &Stores,
+    table: TableConfig,
+    shares: ShareBook,
+    inbound_budget: Option<usize>,
+    inbound_ceiling: Option<usize>,
+    slow_wire: Option<(usize, Arc<tokio::sync::Semaphore>)>,
+) -> TestNode {
     let (events_tx, events_rx) = mpsc::channel(1024);
-    let (outbound_tx, mut outbound_rx) = mpsc::channel::<OutboundSend>(1024);
+    let capacity = slow_wire.as_ref().map_or(1024, |(cap, _)| *cap);
+    let wire_gate = slow_wire.map(|(_, gate)| gate);
+    let (outbound_tx, mut outbound_rx) = mpsc::channel::<OutboundSend>(capacity);
     net.inner.lock().unwrap().links.insert(
         party.id,
         Link {
@@ -473,7 +502,13 @@ async fn node_limited(
     let wire_net = net.clone();
     let src = party.id;
     let wire = tokio::spawn(async move {
-        while let Some(request) = outbound_rx.recv().await {
+        loop {
+            if let Some(gate) = &wire_gate {
+                gate.acquire().await.unwrap().forget();
+            }
+            let Some(request) = outbound_rx.recv().await else {
+                break;
+            };
             let kind = match E2eFrame::decode(&request.payload) {
                 Ok(E2eFrame::Init { .. }) => "init",
                 Ok(E2eFrame::Resp { .. }) => "resp",
@@ -689,6 +724,53 @@ async fn a_session_comes_up_between_two_nodes_and_carries_bytes_both_ways() {
 
     assert_eq!(net.count_from(&a.id, "init"), 1);
     assert_eq!(net.count_from(&b.id, "resp"), 1);
+}
+
+/// The `resp` of a responder session waits in the router's `unsent` while the shared `outbound`
+/// is full; the session task writes to `outbound` itself, so its first record must not overtake
+/// the `resp` (review medium R-5): the initiator would see data before its `resp`.
+#[tokio::test(start_paused = true)]
+async fn a_responders_first_data_does_not_overtake_its_resp_held_back_by_a_full_outbound() {
+    let w = world();
+    let (b, m1, m2) = (party(), party(), party());
+    let stores = w.stores(&[&b, &m1, &m2], vec![w.grant(&m1, &b), w.grant(&m2, &b)]);
+    let net = Net::new();
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    let mut nb = node_inner(
+        &net,
+        &b,
+        &stores,
+        TableConfig::default(),
+        ShareBook::new(),
+        None,
+        None,
+        Some((1, gate.clone())),
+    )
+    .await;
+    let mut manual1 = Manual::new(&net, m1);
+    let mut manual2 = Manual::new(&net, m2);
+
+    // The first resp takes the only place of `outbound` (the wire waits for a permit).
+    let (_hs1, init1) = manual1.init(&b, w.network, 1);
+    net.inject(manual1.party.id, b.id, &init1);
+    let _ready1 = nb.next_ready().await;
+    // The second resp finds it full and is held back by the router.
+    let (_hs2, init2) = manual2.init(&b, w.network, 2);
+    net.inject(manual2.party.id, b.id, &init2);
+    let ready2 = nb.next_ready().await;
+    // B's session towards manual2 writes its first record at once.
+    let opener = tokio::spawn(async move { ready2.handle.open_stream().await.map(|_| ()) });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // The L3 loop drains one request at a time; manual2 must see its resp first.
+    gate.add_permits(1000);
+    let (_, first) = manual2.next_frame().await;
+    assert!(
+        matches!(first, E2eFrame::Resp { .. }),
+        "the first frame a responder sends must be its resp, got {first:?}"
+    );
+    let _ = manual1.next_frame().await;
+    opener.abort();
 }
 
 #[tokio::test(start_paused = true)]
@@ -2035,7 +2117,7 @@ async fn held_back_frames_keep_their_order_are_bounded_and_die_with_their_attach
         d.engine.send(dst, Epoch::first(), vec![i as u8]);
     }
     assert_eq!(d.engine.unsent.len(), MAX_UNSENT);
-    let oldest_kept = d.engine.unsent.front().unwrap().payload[0];
+    let oldest_kept = d.engine.unsent.front().unwrap().0.payload[0];
     assert_eq!(oldest_kept as usize, total + 1 - MAX_UNSENT);
 
     // Draining the channel and ticking releases them in order.

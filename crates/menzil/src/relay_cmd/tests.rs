@@ -2783,6 +2783,39 @@ async fn a_suspended_tenants_networks_are_dropped_at_reload_and_resume_restores_
     running.stop();
 }
 
+/// Suspending a tenant stops serving its networks but does not release their names: after
+/// resume they are still held (review medium R-2), not new names against the weekly quota.
+#[tokio::test]
+async fn a_suspended_tenants_names_are_kept_not_released() {
+    let (net_a, token_a) = labeled_network(&[("myapp", 1)]);
+    let (dir, relay) = relay_machine();
+    add_network_to(&relay, &token_a, clock(), Some("ali")).unwrap();
+    let running = running_on(dir.path(), &relay).await;
+    let t0 = unix_now();
+    let ack = advertise_now(&running, &net_a, 1, &["myapp"], t0);
+    assert_eq!(ack.names.len(), 1, "{ack:?}");
+    // The session that held the name is gone (a held name is never released at once).
+    running
+        .relay
+        .labels()
+        .clear_for(&NodeId::from([1u8; 32]), t0);
+    let before = running.relay.labels().state();
+    assert_eq!(before.names.len(), 1);
+
+    set_suspended(&relay, "ali", true).unwrap();
+    reload_once(&running.relay, &relay, &mut Vec::new());
+    assert_eq!(running.roster_seq(&net_a), None, "not served");
+    let during = running.relay.labels().state();
+    assert_eq!(during.names, before.names, "the names are kept");
+    assert!(during.quarantine.is_empty());
+
+    set_suspended(&relay, "ali", false).unwrap();
+    reload_once(&running.relay, &relay, &mut Vec::new());
+    assert_eq!(running.roster_seq(&net_a), Some(1));
+    assert_eq!(running.relay.labels().state().names, before.names);
+    running.stop();
+}
+
 #[test]
 fn a_suspended_tenant_keeps_its_networks_out_of_the_default_tenant_and_takes_no_new_one() {
     let (_a, _oa, id_a, token_a) = another_network();
