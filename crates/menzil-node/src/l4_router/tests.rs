@@ -3816,19 +3816,67 @@ async fn a_droppable_recv_is_routed_by_counter_class() {
         Some(&b"unflagged"[..])
     );
 
-    // And a reliable record the relay flagged droppable is still a reliable record: if it
-    // were dropped on the flag the next one would leave a counter gap and end the session.
+    // A reliable record flagged droppable is a protocol violation and is dropped (protocol.md
+    // 4.2, TBD 72): the next reliable record then leaves a counter gap, which ends the session
+    // as it always does. The router itself does not end it on the flag.
     let keep0 = data_frame(&mut rig.transport, rig.index, &E2eDataBody::Keep);
     rig.deliver(Epoch::first(), 0x01, &keep0);
-    let keep1 = data_frame(&mut rig.transport, rig.index, &E2eDataBody::Keep);
-    rig.deliver(Epoch::first(), 0x00, &keep1);
     assert!(
         timeout(Duration::from_millis(300), rig.ready.acceptor.closed())
             .await
             .is_err(),
-        "the flagged reliable record was dropped on its flag"
+        "the flagged reliable record ended the session by itself"
     );
     assert!(rig.d.engine.table.get(7).is_some());
+    let keep1 = data_frame(&mut rig.transport, rig.index, &E2eDataBody::Keep);
+    rig.deliver(Epoch::first(), 0x00, &keep1);
+    timeout(Duration::from_secs(5), rig.ready.acceptor.closed())
+        .await
+        .expect("the gap left by the dropped record must end the session");
+}
+
+/// An `init` flagged droppable is dropped before it costs anything; the same `init` unflagged
+/// brings the session up (TBD 72).
+#[tokio::test]
+async fn a_droppable_flagged_init_is_dropped() {
+    let w = world();
+    let (b, m) = (party(), party());
+    let stores = w.stores(&[&b, &m], vec![w.grant(&m, &b)]);
+    let mut d = driven(&b, &stores, NodeId::from([0xAA; 32]), 7);
+    let manual = Manual::new(&Net::new(), m);
+    d.engine.on_attached(Epoch::first(), LIMITS, relay_static());
+    let (_hs, init) = manual.init(&b, w.network, 1);
+    assert!(
+        d.engine
+            .on_record(
+                Epoch::first(),
+                recv_record(manual.party.id, 0x01, &init),
+                Now::capture()
+            )
+            .is_none()
+    );
+    assert!(
+        d.outbound.try_recv().is_err(),
+        "a flagged init was answered"
+    );
+    assert!(
+        d._ready.try_recv().is_err(),
+        "a flagged init made a session"
+    );
+    assert!(d.engine.table.get(7).is_none());
+    assert!(
+        d.engine
+            .on_record(
+                Epoch::first(),
+                recv_record(manual.party.id, 0, &init),
+                Now::capture()
+            )
+            .is_none()
+    );
+    assert!(
+        d.outbound.try_recv().is_ok(),
+        "the unflagged init gets its resp"
+    );
 }
 
 #[tokio::test]

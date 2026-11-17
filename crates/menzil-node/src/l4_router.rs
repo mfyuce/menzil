@@ -20,8 +20,9 @@
 //!
 //! * Anything that is not `e2e_proto` 0x01 is not ours and is passed on
 //!   untouched ([`RouterParts::passthrough`]); a 0x01 record with the
-//!   droppable flag set is still read: the L3 flag is ignored on purpose and the class comes
-//!   from the counter (datagram class, `crate::channels`);
+//!   droppable flag set is read only if its counter is datagram class (`crate::channels`): the
+//!   class comes from the counter, and the flag on an `init`, a `resp` or a reliable `data` is
+//!   a protocol violation that drops the record (protocol.md 4.2);
 //!   anything that does not decode as an `E2eFrame` is dropped.
 //! * `init`: first, an `init` that repeats byte for byte the one that
 //!   created the slot's candidate or current session is dropped (a peer
@@ -135,7 +136,8 @@ use menzil_e2e::{
     TableConfig,
 };
 use menzil_proto::{
-    E2eFrame, ErrorCode, Limits, NetworkId, NodeId, ProtoError, Record, X25519PublicKey,
+    E2eFrame, ErrorCode, Limits, NetworkId, NodeId, ProtoError, Record, RecordClass,
+    X25519PublicKey,
 };
 use menzil_stream::Mode;
 use tokio::sync::{mpsc, oneshot, watch};
@@ -906,9 +908,8 @@ impl Engine {
         }
         // The L3 `flags` droppable bit is the relay's hint, written by the relay and open to
         // being flipped by it: the class of a record is its counter's top bit (protocol.md
-        // 5.2), which `feed_inbound` reads. A reliable record with the bit set is still a
-        // reliable record (the relay could drop it anyway), and a datagram without it is
-        // still a datagram.
+        // 5.2), which `feed_inbound` reads. A datagram without the bit is still a datagram;
+        // the bit on a record that is not one is checked below.
         if self.stopping {
             // Nothing is answered or routed any more: the sessions are closed
             // and a new `init` would only start one that is never served.
@@ -923,6 +924,21 @@ impl Engine {
             tracing::debug!(%src, "dropped an L4 record that is not an E2eFrame");
             return None;
         };
+        // A droppable flag on a record that is not datagram class is a protocol violation
+        // (protocol.md 4.2, TBD 72): the record is dropped. The session is not ended here; a
+        // dropped reliable `data` leaves a counter gap that ends it at the next record. A
+        // datagram counter without the flag is still a datagram.
+        if flags & 0x01 != 0 {
+            let datagram = matches!(
+                &frame,
+                E2eFrame::Data { counter, .. }
+                    if RecordClass::of_counter(*counter) == RecordClass::Datagram
+            );
+            if !datagram {
+                tracing::debug!(%src, "dropped a non datagram L4 record flagged droppable");
+                return None;
+            }
+        }
         match frame {
             E2eFrame::Init {
                 sender_index,
