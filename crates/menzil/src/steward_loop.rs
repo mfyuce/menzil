@@ -8,7 +8,8 @@
 //! [`run`] is the thin task that calls it and starts the push to the members.
 //!
 //! What the loop renews from is the newer of what the node holds in memory (documents that
-//! came over the relay or from a peer are not written to disk) and what is on disk (the
+//! came over the relay or from a peer are written to disk too, `keep_adopted_documents`) and
+//! what is on disk (the
 //! documents `menzil admit` or `menzil join` wrote), so it never signs a lower `seq` than the
 //! network already has.
 

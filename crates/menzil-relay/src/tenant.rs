@@ -777,8 +777,10 @@ pub(crate) struct TenantUsage {
 pub(crate) const FAILED_VERIFICATIONS_PER_HOUR: u32 = 12;
 /// Roster transfers that fail verification a NodeId may send back to back.
 pub(crate) const FAILED_VERIFICATION_BURST: u32 = 3;
-/// The most NodeIds the failed verification table remembers; when it is full of NodeIds that are
-/// still being limited, a further one is refused verification until one has recovered.
+/// The most NodeIds the failed verification table remembers. When it is full of NodeIds that are
+/// still being limited, a further NodeId is NOT remembered and so not limited per NodeId (the
+/// session's own transfer rate and the tenant figures still apply); this bounds memory, it is
+/// not a refusal (review medium R-13).
 const MAX_FAILED_SUBMITTERS: usize = 4_096;
 
 impl TenantUsage {

@@ -141,6 +141,15 @@ fn host_matches_no_proxy(host: &str, pattern: &str) -> bool {
 
 fn parse_proxy_url(raw: &str) -> Result<ProxyTarget, String> {
     let url = Url::parse(raw).map_err(|e| format!("invalid proxy URL: {e}"))?;
+    // The dial side speaks plain HTTP CONNECT over TCP whatever the scheme says: `socks5://` (a
+    // common `ALL_PROXY`) would get an HTTP request on a SOCKS port and fail obscurely, for ever
+    // (review medium R-10). Say so instead.
+    if !matches!(url.scheme(), "http" | "https") {
+        return Err(format!(
+            "unsupported proxy scheme {:?}: only an HTTP proxy (CONNECT) is supported",
+            url.scheme()
+        ));
+    }
     let host = url
         .host_str()
         .ok_or_else(|| "proxy URL missing host".to_string())?
@@ -377,5 +386,16 @@ mod tests {
             "{shown}"
         );
         assert!(!shown.contains("hunter2"), "{shown}");
+    }
+
+    #[test]
+    fn a_socks_or_other_scheme_is_refused_not_spoken_to_in_http() {
+        let env = |k: &str, v: &str| HashMap::from([(k.to_string(), v.to_string())]);
+        for raw in ["socks5://127.0.0.1:1080", "socks4://p:1", "ftp://p:21"] {
+            let err = resolve("relay.example", &env("ALL_PROXY", raw), None).unwrap_err();
+            assert!(err.contains("unsupported proxy scheme"), "{raw}: {err}");
+        }
+        assert!(resolve("relay.example", &env("ALL_PROXY", "http://p:3128"), None).is_ok());
+        assert!(resolve("relay.example", &env("HTTPS_PROXY", "https://p:3128"), None).is_ok());
     }
 }

@@ -250,17 +250,30 @@ async fn garbage_and_a_short_stream_are_passed_on_whole_and_never_answered() {
     assert_eq!(served, Served::PassOn(part.to_vec()));
 }
 
+/// A well formed handshake record that claims a ClientHello of 16380 bytes (record length 16384,
+/// which rustls accepts, then a handshake header of 0x003ffc): rustls keeps asking for more, so
+/// the peek really reaches the cap (the earlier garbage prefix was refused by rustls on the first
+/// read and never got there; review high R-4).
+fn long_hello_prefix(total: usize) -> Vec<u8> {
+    let mut bytes = vec![0x16, 0x03, 0x01, 0x40, 0x00, 0x01, 0x00, 0x3f, 0xfc];
+    bytes.resize(total, 0x41);
+    bytes
+}
+
 #[tokio::test]
 async fn a_hello_over_sixteen_kib_is_passed_on_and_not_buffered_further() {
     let book = ChallengeBook::new();
     let _order = book.begin(DOMAIN, "k.a").unwrap();
-    // A handshake record header that claims 20 KiB and then enough bytes to pass the cap.
-    let mut bytes = vec![0x16, 0x03, 0x01, 0x50, 0x00, 0x01, 0x00, 0x4f, 0xf0];
-    bytes.resize(MAX_HELLO_BYTES + 100, 0x41);
+    let bytes = long_hello_prefix(MAX_HELLO_BYTES + 5000);
     let mut input = bytes.as_slice();
     let served = answer_or_pass(&mut ReadOnly(&mut input), DOMAIN, &book).await;
     match served {
-        Served::PassOn(read) => assert!(read.len() <= MAX_HELLO_BYTES, "{}", read.len()),
+        Served::PassOn(read) => {
+            // Past the cap, by the one read that crossed it and no more; nothing lost.
+            assert!(read.len() > MAX_HELLO_BYTES, "{}", read.len());
+            assert!(read.len() <= MAX_HELLO_BYTES + 4096, "{}", read.len());
+            assert_eq!(&read[..], &bytes[..read.len()]);
+        }
         other => panic!("{other:?}"),
     }
 }
@@ -1315,16 +1328,17 @@ fn failures_have_fixed_words_and_sentences_that_carry_no_ca_text() {
     }
 }
 
-/// A stream that is not a ClientHello and is longer than the cap: what was read is handed back
-/// whole, including the read that crossed the cap (review R-5), so the caller can pass it on.
+/// A stream that is longer than the cap and still looks like the start of a ClientHello: what was
+/// read is handed back whole, including the read that crossed the cap (review R-5), so the caller
+/// can pass it on.
 #[tokio::test]
 async fn a_stream_over_the_hello_cap_is_returned_whole_not_clipped() {
-    let data = vec![0x41u8; MAX_HELLO_BYTES + 100];
+    let data = long_hello_prefix(MAX_HELLO_BYTES + 100);
     let mut io = std::io::Cursor::new(data.clone());
-    // A cursor reads garbage: the peek ends at the first chunk that rustls refuses, or at the cap.
     let peeked = peek_client_hello(&mut io).await.unwrap();
     assert!(peeked.hello.is_none());
     let read = io.position() as usize;
+    assert!(read > MAX_HELLO_BYTES, "the cap was not reached: {read}");
     assert_eq!(
         peeked.buf.len(),
         read,

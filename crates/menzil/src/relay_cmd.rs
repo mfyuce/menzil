@@ -781,8 +781,8 @@ pub(crate) async fn start_tuned(
             .adopt(&stored.roster, stored.base.as_ref(), unix_now())
         {
             Ok(_) => networks.push(network_id),
-            // A Roster that ran out on disk (the relay does not write the ones it takes over
-            // DOC, so the file is as old as the last `add-network`) or is not valid yet is
+            // A Roster that ran out on disk (the keeper writes the ones it takes over DOC, but
+            // a write that failed or has not run yet leaves the file as old as the last `add-network`) or is not valid yet is
             // still held, judged at its own `issued` (every other rule of protocol.md 2.3
             // still applies), so that a member's newer Roster over DOC can replace it
             // (`accept_roster_chunk` refuses a network the store does not hold). Holding it

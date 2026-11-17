@@ -17,7 +17,8 @@
 //!   one is answered `unknown_service`. `egress:*` is the exception that is not a table
 //!   entry: with an [`EgressExecutor`] ([`LocalServices::with_egress`]) a counted peer OPEN
 //!   for it is dialled by the executor's own rules (protocol.md 8, `crate::egress`), with
-//!   the same slots and pipe; the relay principal's path, and a node without an enabled
+//!   its own slot pool ([`LocalServices::with_egress_limits`]), not the services'; the
+//!   relay principal's path, and a node without an enabled
 //!   executor, answer it `unknown_service`.
 //! * **A rate before the counts.** Each counted OPEN of a peer is first counted in that peer's
 //!   minute ([`ServeLimits::opens_per_peer_per_minute`], refused ones too); past it the OPEN is
@@ -66,8 +67,8 @@
 //!   one side half closed, the pipe is reset all the same once the other direction has been
 //!   silent for the idle time. Egress streams have their own, always on, timeout
 //!   ([`EgressLimits`]).
-//! * **Not bounded here.** A service has no limit of its own (the
-//!   TODO.md line); the streams a session may hold are bounded by `menzil-stream`'s live
+//! * **Not bounded here.** Beyond the per service count above, a service has no further limit;
+//!   the streams a session may hold are bounded by `menzil-stream`'s live
 //!   stream limit and the OPEN admission control of [`crate::accept_loop`]. A target that
 //!   stalls forever holds its stream and its slot until the peer ends it.
 

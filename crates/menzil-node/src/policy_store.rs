@@ -22,13 +22,13 @@
 //! reading it) found that without this, a Roster revocation that has not
 //! yet been matched by a corresponding Policy update (the normal
 //! revocation window: the Roster arrives by relay DOC, protocol.md 4.3,
-//! while the Policy only ever travels end to end, 5.5, and nothing
-//! implements that push yet, TODO.md L4j) would leave a stale grant
+//! while the Policy only ever travels end to end, 5.5; the push is the
+//! `menzil:docs` stream since L4j) would leave a stale grant
 //! usable, contradicting 7.3 ("peers close its L4 sessions on receipt
 //! and refuse new ones").
 //!
 //! Deliberately NOT built here: section 8's egress allow/deny evaluation
-//! (its own separate, not-yet-started TODO line); live re-evaluation
+//! (`crate::egress`, and the node's `EgressRule` in `PolicyAuthorizer`); live re-evaluation
 //! when a Policy or Roster changes mid-session, or when a grant's own
 //! `expires` passes while a stream is already open (protocol.md 5.3's
 //! last sentence; TODO.md L4k) — these functions only ever answer "right

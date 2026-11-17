@@ -4,9 +4,8 @@
 //! verifies." Policy is out of scope here (end to end only, protocol.md
 //! 4.3, 5.5) — this only ever holds Rosters.
 //!
-//! Persists only for this process's lifetime (no on-disk store exists
-//! yet, the same flagged gap `menzil-node`'s identity and replay-defense
-//! state already carry). Meant to be owned by the caller across
+//! Persists only for this process's lifetime: the store itself writes nothing. The CLI writes
+//! the adopted pairs to disk (`menzil::node_cmd`, `keep_adopted_documents`). Meant to be owned by the caller across
 //! reconnects, unlike a [`crate::Session`] (rebuilt on every reconnect
 //! attempt): what this node already holds should survive a dropped link,
 //! not be forgotten and relearned every time.

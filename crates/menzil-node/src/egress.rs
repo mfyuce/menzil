@@ -1,8 +1,9 @@
 //! The exit side of `egress:*` streams (protocol.md section 8, slice 1a): [`EgressExecutor`]
 //! decides whether a target a member asked for may be dialled and, if so, dials it.
 //!
-//! What this is not: no SOCKS listener, no agent request, no config file key and no owner
-//! command; those are later slices. [`crate::LocalServices::with_egress`] is where the executor
+//! What this is not (as written for slice 1a; the SOCKS/HTTP listener, the agent request and
+//! the `[egress]` config keys exist since, in `crates/menzil`): the executor itself.
+//! [`crate::LocalServices::with_egress`] is where the executor
 //! is plugged in, and only a counted peer OPEN reaches it (the relay principal's path refuses an
 //! `egress:*` open before the executor is asked).
 //!

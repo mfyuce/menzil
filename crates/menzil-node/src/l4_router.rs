@@ -20,7 +20,8 @@
 //!
 //! * Anything that is not `e2e_proto` 0x01 is not ours and is passed on
 //!   untouched ([`RouterParts::passthrough`]); a 0x01 record with the
-//!   droppable flag set is dropped (the datagram class is phase 2);
+//!   droppable flag set is still read: the L3 flag is ignored on purpose and the class comes
+//!   from the counter (datagram class, `crate::channels`);
 //!   anything that does not decode as an `E2eFrame` is dropped.
 //! * `init`: first, an `init` that repeats byte for byte the one that
 //!   created the slot's candidate or current session is dropped (a peer

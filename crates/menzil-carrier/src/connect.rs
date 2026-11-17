@@ -78,7 +78,8 @@ async fn connect_tunnel(
         return tunnel_opened(&leftover);
     }
     if resp.status != 407 {
-        drain_body(stream, resp.content_length, leftover.len()).await?;
+        // The connection is thrown away: no body is drained, so a body the proxy frames badly
+        // or cuts short cannot hide the status (review high R-3).
         return Err(CarrierError::Connect(format!(
             "proxy CONNECT failed with status {}",
             resp.status
@@ -100,7 +101,6 @@ async fn connect_tunnel(
     if resp2.status == 200 {
         tunnel_opened(&leftover2)
     } else {
-        drain_body(stream, resp2.content_length, leftover2.len()).await?;
         Err(CarrierError::Connect(format!(
             "proxy authentication failed (status {})",
             resp2.status
@@ -410,6 +410,28 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, CarrierError::Connect(_)));
+        server.await.unwrap();
+    }
+
+    /// A failed CONNECT names its status even when the body cannot be drained (review high R-3):
+    /// a body with no `Content-Length` used to turn the error into "trailing bytes".
+    #[tokio::test]
+    async fn a_refusal_with_a_bad_body_still_reports_its_status() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 4096];
+            let _ = sock.read(&mut buf).await.unwrap();
+            sock.write_all(b"HTTP/1.1 403 Forbidden\r\n\r\nnot allowed here")
+                .await
+                .unwrap();
+        });
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        let err = connect_tunnel(&mut stream, "relay.example", 443, None)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("403"), "{err}");
         server.await.unwrap();
     }
 }
