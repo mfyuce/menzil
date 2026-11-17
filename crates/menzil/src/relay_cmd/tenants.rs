@@ -348,6 +348,39 @@ impl FlatNames {
     }
 }
 
+/// The audit file of this process (`docs/spec/audit-format.md`): the tenant commands append
+/// to it when it is set. `menzil relay` sets it from `MENZIL_RELAY_AUDIT_FILE`, the admin agent
+/// from `--audit-file`; both may point at the file the running relay writes (lines are appended
+/// whole with `O_APPEND`).
+static AUDIT: std::sync::OnceLock<menzil_audit::AuditLog> = std::sync::OnceLock::new();
+
+/// Sets the audit log of this process; the first call wins.
+pub fn set_audit(log: menzil_audit::AuditLog) {
+    let _ = AUDIT.set(log);
+}
+
+/// Opens `path` as the relay's audit file for the tenant commands of this process.
+pub fn set_audit_file(path: &std::path::Path) -> Result<()> {
+    let log = menzil_audit::AuditLog::open(path, menzil_audit::Source::Relay, false)
+        .with_context(|| format!("opening the audit file {}", path.display()))?;
+    set_audit(log);
+    Ok(())
+}
+
+/// [`set_audit_file`] with the path of `MENZIL_RELAY_AUDIT_FILE`, when that is set and not empty.
+pub fn set_audit_from_env() -> Result<()> {
+    match std::env::var_os("MENZIL_RELAY_AUDIT_FILE") {
+        Some(path) if !path.is_empty() => set_audit_file(std::path::Path::new(&path)),
+        _ => Ok(()),
+    }
+}
+
+fn audit(ev: &str, fields: &[(&str, menzil_audit::Field)]) {
+    if let Some(log) = AUDIT.get() {
+        log.record(ev, fields);
+    }
+}
+
 /// What `add-network` did.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Added {
@@ -379,6 +412,25 @@ pub fn add_network_to(home: &Home, token: &str, now: u64, tenant: Option<&str>) 
 /// a `friend` first (review low R-9: the second write of a two step creation could fail and leave
 /// the first behind).
 pub fn add_network_to_as(
+    home: &Home,
+    token: &str,
+    now: u64,
+    tenant: Option<&str>,
+    new_class: Class,
+) -> Result<Added> {
+    let added = add_network_inner(home, token, now, tenant, new_class)?;
+    let mut fields = vec![
+        ("network", added.network_id.to_string().into()),
+        ("seq", added.seq.into()),
+    ];
+    if let Some(tenant) = &added.tenant {
+        fields.push(("tenant", tenant.as_str().into()));
+    }
+    audit("network_added", &fields);
+    Ok(added)
+}
+
+fn add_network_inner(
     home: &Home,
     token: &str,
     now: u64,
@@ -694,6 +746,16 @@ fn remove_if_there(path: &std::path::Path) -> Result<bool> {
 /// network at its next reload, ends the sessions that claimed it (`not_member`), and its keeper
 /// never writes the file again (it only updates files that are there).
 pub fn remove_network(home: &Home, network: &str) -> Result<Removed> {
+    let removed = remove_network_inner(home, network)?;
+    let mut fields = vec![("network", removed.network_id.to_string().into())];
+    if let Some(tenant) = &removed.tenant {
+        fields.push(("tenant", tenant.as_str().into()));
+    }
+    audit("network_removed", &fields);
+    Ok(removed)
+}
+
+fn remove_network_inner(home: &Home, network: &str) -> Result<Removed> {
     let id = parse_hex32(network.trim())
         .map(NetworkId::from)
         .ok_or_else(|| anyhow!("{network:?} is not a network id (64 hex digits)"))?;
@@ -798,6 +860,20 @@ pub fn remove_tenant(home: &Home, slug: &str, now: u64) -> Result<Vec<NetworkId>
     }
     names_state::quarantine_slug_locked(home, slug.as_str(), now)?;
     remove_if_there(&path)?;
+    audit(
+        "tenant_removed",
+        &[
+            ("tenant", slug.as_str().into()),
+            (
+                "networks",
+                networks
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .into(),
+            ),
+        ],
+    );
     Ok(networks)
 }
 
@@ -1054,6 +1130,14 @@ pub fn set_suspended(home: &Home, slug: &str, suspend: bool) -> Result<TenantInf
         file.suspended = suspend;
         home.write_public(&path, file.render().as_bytes())
             .map_err(|e| TenantError::io(&e))?;
+        audit(
+            if suspend {
+                "tenant_suspended"
+            } else {
+                "tenant_resumed"
+            },
+            &[("tenant", slug.as_str().into())],
+        );
     }
     drop(lock);
     get_tenant(home, slug.as_str())
@@ -1115,6 +1199,13 @@ pub fn update_tenant(
     }
     home.write_public(&path, file.render().as_bytes())
         .map_err(|e| TenantError::io(&e))?;
+    audit(
+        "tenant_updated",
+        &[
+            ("tenant", slug.as_str().into()),
+            ("class", class.as_str().into()),
+        ],
+    );
     drop(lock);
     get_tenant(home, slug.as_str())
 }

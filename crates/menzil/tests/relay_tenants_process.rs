@@ -14,7 +14,16 @@ struct Output {
 
 /// Runs `menzil --home <home> <args>`, with `stdin` given to it when there is any.
 fn menzil(home: &Path, args: &[&str], stdin: Option<&str>) -> Output {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_menzil"))
+    menzil_env(home, args, stdin, None)
+}
+
+/// [`menzil`] with `MENZIL_RELAY_AUDIT_FILE` set to `audit` when given.
+fn menzil_env(home: &Path, args: &[&str], stdin: Option<&str>, audit: Option<&Path>) -> Output {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_menzil"));
+    if let Some(audit) = audit {
+        command.env("MENZIL_RELAY_AUDIT_FILE", audit);
+    }
+    let mut child = command
         .arg("--home")
         .arg(home)
         .args(args)
@@ -132,4 +141,45 @@ fn tenants_are_added_listed_and_removed_from_the_command_line() {
         "{gone}"
     );
     assert!(!menzil(&relay, &["relay", "remove-tenant", "ali"], None).ok);
+}
+
+/// With `MENZIL_RELAY_AUDIT_FILE` the tenant commands append their events to that file.
+#[test]
+fn tenant_commands_write_audit_events() {
+    let dir = tempfile::tempdir().unwrap();
+    let relay = dir.path().join("relay");
+    let audit = dir.path().join("audit.jsonl");
+    ok(menzil(&relay, &["init"], None));
+    let (token, id) = network(dir.path(), "owner-a");
+    let run = |args: &[&str], stdin: Option<&str>| {
+        ok(menzil_env(&relay, args, stdin, Some(&audit)));
+    };
+    run(
+        &["relay", "add-network", "-", "--tenant", "ali"],
+        Some(&token),
+    );
+    run(&["relay", "suspend-tenant", "ali"], None);
+    run(&["relay", "suspend-tenant", "ali"], None);
+    run(&["relay", "resume-tenant", "ali"], None);
+    run(&["relay", "remove-tenant", "ali"], None);
+    let lines: Vec<serde_json::Value> = std::fs::read_to_string(&audit)
+        .unwrap()
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    let evs: Vec<&str> = lines.iter().map(|l| l["ev"].as_str().unwrap()).collect();
+    // The second suspend changed nothing and writes nothing.
+    assert_eq!(
+        evs,
+        [
+            "network_added",
+            "tenant_suspended",
+            "tenant_resumed",
+            "tenant_removed"
+        ]
+    );
+    assert_eq!(lines[0]["network"], id);
+    assert_eq!(lines[0]["tenant"], "ali");
+    assert_eq!(lines[0]["by"], "relay");
+    assert_eq!(lines[3]["networks"], serde_json::json!([id]));
 }

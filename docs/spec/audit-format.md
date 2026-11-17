@@ -30,6 +30,7 @@ Relay (`by` = `relay`):
 - `session_evicted`: `node_id`, `session`, `reason` (the protocol.md 4.2 name of the ERROR code sent to the node, such as `not_member`). An eviction can also happen before any attach (a session that is refused while it attaches), so a `session_evicted` line may have no `session_attach` before it.
 - `share_accepted`: `node_id`, `session`, `name`: the relay accepted this name from an ADVERTISE (one line per name, every ADVERTISE).
 - `share_rejected`: `node_id`, `session`, `name`, `reason` (the relay's free text, as sent in ADVERTISE_ACK).
+- Tenant changes, written by the process that makes them (`menzil relay <command>` with `MENZIL_RELAY_AUDIT_FILE` set, or `menzil-relay-admin --audit-file`), which may append to the same file as the running relay, with `by` = `relay`: `network_added` (`network`, `seq`, `tenant` unless the default tenant), `network_removed` (`network`, `tenant` if one listed it), `tenant_removed` (`tenant`, `networks` list), `tenant_suspended` and `tenant_resumed` (`tenant`; nothing is written when the state did not change), `tenant_updated` (`tenant`, `class` now in force). A line is written after the change succeeded; lines of several processes interleave whole, each ending in a newline.
 
 Node (`by` = `node`):
 

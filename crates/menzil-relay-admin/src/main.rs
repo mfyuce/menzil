@@ -39,6 +39,11 @@ struct Cli {
     /// The CA that signs client certificates (PEM): the only trust anchor.
     #[arg(long)]
     client_ca: Option<PathBuf>,
+    /// Append tenant changes (network added or removed, tenant removed, suspended, resumed,
+    /// updated) to this audit file (docs/spec/audit-format.md); it may be the file the relay
+    /// itself writes.
+    #[arg(long, value_name = "FILE")]
+    audit_file: Option<PathBuf>,
 }
 
 #[derive(Subcommand)]
@@ -98,6 +103,9 @@ async fn main() -> Result<()> {
         Some(root) => Home::new(root),
         None => Home::locate()?,
     };
+    if let Some(path) = &cli.audit_file {
+        menzil_cli::relay_cmd::tenants::set_audit_file(path)?;
+    }
     let config = server_config(&TlsFiles {
         cert,
         key,

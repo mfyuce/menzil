@@ -979,6 +979,7 @@ async fn run(cli: Cli) -> Result<()> {
         Command::Relay {
             command: RelayCommand::AddNetwork { token, tenant },
         } => {
+            relay_cmd::tenants::set_audit_from_env()?;
             let added = relay_cmd::tenants::add_network_to(
                 &home()?,
                 &token_argument(token)?,
@@ -1002,6 +1003,7 @@ async fn run(cli: Cli) -> Result<()> {
         Command::Relay {
             command: RelayCommand::RemoveNetwork { network },
         } => {
+            relay_cmd::tenants::set_audit_from_env()?;
             let removed = relay_cmd::tenants::remove_network(&home()?, &network)?;
             println!("this relay no longer serves network {}", removed.network_id);
             for warning in &removed.warnings {
@@ -1012,6 +1014,7 @@ async fn run(cli: Cli) -> Result<()> {
         Command::Relay {
             command: RelayCommand::RemoveTenant { name },
         } => {
+            relay_cmd::tenants::set_audit_from_env()?;
             let networks = relay_cmd::tenants::remove_tenant(&home()?, &name, now())?;
             println!(
                 "removed tenant {name} and its {} network(s); the name is kept back for 180 days",
@@ -1022,6 +1025,7 @@ async fn run(cli: Cli) -> Result<()> {
         Command::Relay {
             command: RelayCommand::SuspendTenant { name },
         } => {
+            relay_cmd::tenants::set_audit_from_env()?;
             let info = relay_cmd::tenants::set_suspended(&home()?, &name, true)?;
             println!(
                 "suspended tenant {name}: its {} network(s) are not served",
@@ -1032,6 +1036,7 @@ async fn run(cli: Cli) -> Result<()> {
         Command::Relay {
             command: RelayCommand::ResumeTenant { name },
         } => {
+            relay_cmd::tenants::set_audit_from_env()?;
             let info = relay_cmd::tenants::set_suspended(&home()?, &name, false)?;
             println!(
                 "resumed tenant {name}: its {} network(s) are served again",
