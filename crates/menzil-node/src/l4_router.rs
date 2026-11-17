@@ -673,6 +673,24 @@ enum Origin {
     },
 }
 
+/// The session that gives way when the node wide ceiling is crossed: the one holding the most
+/// unread data (ties to the lower index), among the sessions of `own_network` (the arriving
+/// session's) when any of them holds something, else among all (TBD 76 b). `None` when nothing
+/// holds anything.
+fn pick_victim(
+    sessions: &[(SessionIndex, NetworkId, usize)],
+    own_network: Option<NetworkId>,
+) -> Option<SessionIndex> {
+    let largest = |scope: Option<NetworkId>| {
+        sessions
+            .iter()
+            .filter(|(_, network, held)| *held > 0 && scope.is_none_or(|n| *network == n))
+            .max_by_key(|&&(index, _, held)| (held, std::cmp::Reverse(index)))
+            .map(|&(index, ..)| index)
+    };
+    largest(own_network).or_else(|| largest(None))
+}
+
 /// The smallest node wide ceiling that is honoured: the per session floor `l4_session` raises
 /// every session's budget to, `2 x (max_record + 128)` with `max_record` at its largest
 /// (Noise's 65,535 byte message). A lower ceiling would be raised again per session, so a lone
@@ -984,7 +1002,8 @@ impl Engine {
 
     /// The node wide ceiling refused the record `(counter, ciphertext)` that arrived for
     /// session `arriving` (TBD 75): the session holding the most unread inbound data gives way,
-    /// the arriving one included (ties go to the lower index; when nothing holds anything the
+    /// preferring the arriving session's own network and taking the largest of all networks only
+    /// when that network holds nothing (TBD 76 b); the arriving one included (ties go to the lower index; when nothing holds anything the
     /// arriving one, since ending another frees nothing). If the victim is another session it
     /// is ended first, which takes its charges out of the node counter
     /// ([`L4SessionHandle::detach_inbound`]), and then the record is charged without the
@@ -992,13 +1011,16 @@ impl Engine {
     /// again; during the scan it can only grow back up to what was just released (one record per driver). If the victim is the arriving session the record is dropped
     /// with it (its counter has a gap anyway).
     fn make_room(&mut self, arriving: SessionIndex, counter: u64, ciphertext: Vec<u8>, now: Now) {
-        let victim = self
+        let held: Vec<(SessionIndex, NetworkId, usize)> = self
             .table
             .sessions()
-            .map(|(index, entry)| (entry.handle.inbound_in_use(), index))
-            .filter(|&(held, _)| held > 0)
-            .max_by_key(|&(held, index)| (held, std::cmp::Reverse(index)))
-            .map_or(arriving, |(_, index)| index);
+            .map(|(index, entry)| (index, entry.network, entry.handle.inbound_in_use()))
+            .collect();
+        let own_network = held
+            .iter()
+            .find(|(index, ..)| *index == arriving)
+            .map(|&(_, network, _)| network);
+        let victim = pick_victim(&held, own_network).unwrap_or(arriving);
         self.end_session_for(victim, now, true);
         if victim == arriving {
             return;

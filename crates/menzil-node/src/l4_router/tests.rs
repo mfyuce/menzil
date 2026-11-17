@@ -2507,6 +2507,30 @@ async fn the_session_holding_the_most_gives_way_when_the_node_ceiling_is_crossed
     closed_rate_limited(&mut t.ready[0]).await;
 }
 
+/// TBD 76 (b): the victim is taken from the arriving session's own network when that network
+/// holds anything, so a session of another network cannot push an honest network's session out;
+/// only an empty own network falls back to the largest of all.
+#[test]
+fn the_victim_is_taken_from_the_arriving_sessions_own_network_first() {
+    let (a, b) = (NetworkId::from([1u8; 32]), NetworkId::from([2u8; 32]));
+    let sessions = [(7, a, 900), (8, b, 100), (9, b, 50)];
+    // A session of network b arrives: network a's larger session is not touched.
+    assert_eq!(pick_victim(&sessions, Some(b)), Some(8));
+    assert_eq!(pick_victim(&sessions, Some(a)), Some(7));
+    // Its own network holds nothing: the global largest gives way.
+    let empty_own = [(7, a, 900), (8, b, 0), (9, b, 0)];
+    assert_eq!(pick_victim(&empty_own, Some(b)), Some(7));
+    // Ties go to the lower index, inside the scope.
+    assert_eq!(
+        pick_victim(&[(9, b, 5), (8, b, 5), (7, a, 5)], Some(b)),
+        Some(8)
+    );
+    // Nothing held anywhere: no victim (the arriving session is taken by the caller).
+    assert_eq!(pick_victim(&[(7, a, 0)], Some(a)), None);
+    // An unknown arriving session (own network unknown): the global rule.
+    assert_eq!(pick_victim(&sessions, None), Some(7));
+}
+
 /// T2: the arriving session holds the most, so it is the one that ends.
 #[tokio::test]
 async fn the_arriving_session_ends_when_it_holds_the_most() {
