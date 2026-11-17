@@ -423,6 +423,35 @@ fn an_issued_certificate_must_name_the_domain_carry_the_key_and_be_valid() {
     assert!(check_issued("", DOMAIN, key.public_key_raw()).is_err());
 }
 
+/// A chain that cannot be written does not leave the new key beside the old chain (review low
+/// R-10): the old key is put back.
+#[test]
+fn a_failed_chain_write_puts_the_old_key_back() {
+    let scratch = Scratch::new();
+    let store = CertStore::new(&scratch.0);
+    let make = || {
+        let key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
+        Issued {
+            chain_pem: issue_leaf(DOMAIN, key.public_key_raw()),
+            key_pem: key.serialize_pem(),
+            not_before: 0,
+            not_after: 0,
+        }
+    };
+    let (old, new) = (make(), make());
+    store.save(DOMAIN, &old).unwrap();
+    let (chain, key_path) = store.paths(DOMAIN).unwrap();
+    // A directory in the chain's place: the rename onto it fails.
+    std::fs::remove_file(&chain).unwrap();
+    std::fs::create_dir(&chain).unwrap();
+    assert!(store.save(DOMAIN, &new).is_err());
+    assert_eq!(
+        std::fs::read_to_string(&key_path).unwrap(),
+        old.key_pem,
+        "the key must be the old one again"
+    );
+}
+
 #[test]
 fn the_store_keeps_the_key_private_replaces_atomically_and_refuses_odd_names() {
     let scratch = Scratch::new();

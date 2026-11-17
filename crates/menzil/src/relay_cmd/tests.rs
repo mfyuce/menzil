@@ -3024,6 +3024,33 @@ fn update_tenant_round_trips_through_the_file_and_replaces_the_override_set() {
     );
 }
 
+/// A tenant made as `personal` is `personal` from the first write (review low R-9), and an
+/// existing tenant keeps its class.
+#[test]
+fn a_tenant_is_made_with_its_class_in_one_write() {
+    let (_a, _oa, _ida, token_a) = another_network();
+    let (_b, _ob, _idb, token_b) = another_network();
+    let (_d, relay) = relay_machine();
+    super::tenants::add_network_to_as(&relay, &token_a, clock(), Some("ali"), Class::Personal)
+        .unwrap();
+    assert_eq!(
+        super::tenants::get_tenant(&relay, "ali").unwrap().class,
+        Class::Personal
+    );
+    // A tenant that exists keeps its class; the argument only names the class of a new one.
+    super::tenants::add_network_to_as(&relay, &token_a, clock() + 1, Some("ali"), Class::Friend)
+        .unwrap();
+    assert_eq!(
+        super::tenants::get_tenant(&relay, "ali").unwrap().class,
+        Class::Personal
+    );
+    add_network_to(&relay, &token_b, clock(), Some("veli")).unwrap();
+    assert_eq!(
+        super::tenants::get_tenant(&relay, "veli").unwrap().class,
+        Class::Friend
+    );
+}
+
 #[test]
 fn update_tenant_refuses_a_personal_tenant_with_overrides_in_either_order() {
     let (_a, _oa, _id, token_a) = another_network();

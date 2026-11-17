@@ -137,6 +137,10 @@ pub(crate) fn accept_completed(
     // Not newer than the held one: held, before any signature is checked (a forged old
     // Roster costs a map lookup, not an Ed25519 verify).
     if store.seq(&network_id).is_some_and(|held| body.seq <= held) {
+        // The base the relay sent ahead of this Roster is used up all the same: left pending it
+        // would take one of the 8 places for the whole session (review R-8). The relay sends a
+        // base again before every steward signed Roster, so nothing later needs this one.
+        pending.discard_through(&network_id, body.seq);
         return L3DocOutcome::Held(network_id, body.seq);
     }
     // An owner signed Roster needs no base and discards the bases at or below its seq; a
@@ -293,6 +297,21 @@ mod tests {
             })
         );
         assert_eq!(pending.len(), 0);
+    }
+
+    /// A steward Roster this node holds already (taken over L4, say) uses up the base sent ahead
+    /// of it (review R-8): the pending places do not fill with bases of Rosters long held.
+    #[test]
+    fn a_base_sent_ahead_of_a_roster_already_held_is_not_left_pending() {
+        let fix = Fix::new(NOW);
+        let (store, mut pending) = (RosterStore::new(), PendingBases::new());
+        let r = fix.steward_roster(11);
+        let first = base_then_roster(&fix, &store, &mut pending, &r);
+        assert!(matches!(first, L3DocOutcome::Adopted(_, 11)), "{first:?}");
+        // The relay sends the same pair again: the base is kept, then the Roster is Held.
+        let again = base_then_roster(&fix, &store, &mut pending, &r);
+        assert!(matches!(again, L3DocOutcome::Held(_, 11)), "{again:?}");
+        assert_eq!(pending.len(), 0, "the base must not stay pending");
     }
 
     #[test]

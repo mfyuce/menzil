@@ -412,25 +412,15 @@ impl TenantAdmin for Admin {
                     ))?;
                 }
                 Err(TenantError::NotFound) => {
-                    command(tenants::add_network_to(
+                    // The class is written with the tenant, in the one command (a second write
+                    // could fail and leave a `friend` that the repeat of this call refuses).
+                    command(tenants::add_network_to_as(
                         home,
                         &req.tokens[0],
                         now(),
                         Some(slug.as_str()),
+                        class,
                     ))?;
-                    if class == Class::Personal {
-                        lib(
-                            home,
-                            tenants::update_tenant(
-                                home,
-                                slug.as_str(),
-                                UpdateTenant {
-                                    class: Some(class),
-                                    ..UpdateTenant::default()
-                                },
-                            ),
-                        )?;
-                    }
                 }
                 Err(other) => return Err(status_of(&other, home)),
             }

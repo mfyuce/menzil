@@ -371,6 +371,20 @@ const PSL_WARNING: &str = "this relay now has more than one tenant: until the re
 /// when `tenant` is `None` (a newer token renews it), and cannot be moved by `tenant`: remove
 /// it first.
 pub fn add_network_to(home: &Home, token: &str, now: u64, tenant: Option<&str>) -> Result<Added> {
+    add_network_to_as(home, token, now, tenant, Class::Friend)
+}
+
+/// [`add_network_to`] with the class a tenant made by this call gets (an existing tenant keeps
+/// its own). One write under one lock: a tenant of another class than `friend` is never seen as
+/// a `friend` first (review low R-9: the second write of a two step creation could fail and leave
+/// the first behind).
+pub fn add_network_to_as(
+    home: &Home,
+    token: &str,
+    now: u64,
+    tenant: Option<&str>,
+    new_class: Class,
+) -> Result<Added> {
     let (roster, base) = decode_roster(token)?;
     let network_id = roster.decode()?.network_id;
     let _lock = home.lock_relay()?;
@@ -430,7 +444,7 @@ pub fn add_network_to(home: &Home, token: &str, now: u64, tenant: Option<&str>) 
                 specs.push(TenantSpec {
                     slug: slug.clone(),
                     networks: Vec::new(),
-                    class: Class::Friend,
+                    class: new_class,
                     overrides: BTreeMap::new(),
                     terminated: false,
                     extra_names: Vec::new(),

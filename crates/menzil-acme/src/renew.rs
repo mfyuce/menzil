@@ -245,8 +245,18 @@ impl CertStore {
     /// Keeps `issued` for `domain`: the key (0600) and the chain, each replaced atomically.
     pub fn save(&self, domain: &str, issued: &Issued) -> Result<(), AcmeError> {
         let (chain, key) = self.paths(domain)?;
+        let old_key = std::fs::read(&key).ok();
         write_private(&key, issued.key_pem.as_bytes())?;
-        write_private(&chain, issued.chain_pem.as_bytes())
+        if let Err(error) = write_private(&chain, issued.chain_pem.as_bytes()) {
+            // The new key with the old chain would break TLS for as long as the old certificate
+            // lives: put the old key back (review low R-10). A crash between the two writes
+            // still leaves that pair; the window is the one rename.
+            if let Some(old_key) = old_key {
+                let _ = write_private(&key, &old_key);
+            }
+            return Err(error);
+        }
+        Ok(())
     }
 
     /// The validity of the chain kept for `domain`, if there is one that parses.
