@@ -228,7 +228,7 @@ impl Node {
         H: ServiceHandler<Stream> + Send + Sync + 'static,
         H::Handling: Send + 'static,
     {
-        Self::start_inner(config, handler, sync_config, RelayLimits::new())
+        Self::start_inner(config, handler, sync_config, RelayLimits::new(), None)
     }
 
     /// [`Self::start`] with other limits for the streams the relay principal holds on this node
@@ -242,7 +242,29 @@ impl Node {
         H: ServiceHandler<Stream> + Send + Sync + 'static,
         H::Handling: Send + 'static,
     {
-        Self::start_inner(config, handler, SyncConfig::default(), relay_limits)
+        Self::start_inner(config, handler, SyncConfig::default(), relay_limits, None)
+    }
+
+    /// [`Self::start_with_relay_limits`] with a node wide inbound ceiling in bytes
+    /// (`[limits] inbound_ceiling_mib` of config.toml); `None` keeps
+    /// [`crate::L4_INBOUND_CEILING_PER_NODE`]. A figure below the router's own floor is raised.
+    pub fn start_with_limits<H>(
+        config: NodeConfig,
+        handler: H,
+        relay_limits: Arc<RelayLimits>,
+        inbound_ceiling: Option<usize>,
+    ) -> Result<Self, StartError>
+    where
+        H: ServiceHandler<Stream> + Send + Sync + 'static,
+        H::Handling: Send + 'static,
+    {
+        Self::start_inner(
+            config,
+            handler,
+            SyncConfig::default(),
+            relay_limits,
+            inbound_ceiling,
+        )
     }
 
     fn start_inner<H>(
@@ -250,6 +272,7 @@ impl Node {
         handler: H,
         sync_config: SyncConfig,
         relay_limits: Arc<RelayLimits>,
+        inbound_ceiling: Option<usize>,
     ) -> Result<Self, StartError>
     where
         H: ServiceHandler<Stream> + Send + Sync + 'static,
@@ -278,6 +301,10 @@ impl Node {
             SendBudgets::new(),
         )?
         .with_shares(shares.clone());
+        let router_config = match inbound_ceiling {
+            Some(bytes) => router_config.with_inbound_ceiling(bytes),
+            None => router_config,
+        };
 
         let (events_tx, events_rx) = mpsc::channel(L3_CHANNEL_CAPACITY);
         let (outbound_tx, outbound_rx) = mpsc::channel(L3_CHANNEL_CAPACITY);

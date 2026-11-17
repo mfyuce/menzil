@@ -1039,13 +1039,15 @@ where
     // shared with the renewal tasks.
     let challenges = acme.as_ref().map(|_| ChallengeBook::new());
     let relay_limits = config.relay_limits()?;
+    let inbound_ceiling = config.inbound_ceiling()?;
     let started = match &challenges {
-        Some(book) => Node::start_with_relay_limits(
+        Some(book) => Node::start_with_limits(
             node_config,
             AcmeHandler::new(services, book.clone()),
             relay_limits,
+            inbound_ceiling,
         ),
-        None => Node::start_with_relay_limits(node_config, services, relay_limits),
+        None => Node::start_with_limits(node_config, services, relay_limits, inbound_ceiling),
     };
     let node = Arc::new(started.map_err(|e| anyhow!("{e}"))?);
     node.shares()

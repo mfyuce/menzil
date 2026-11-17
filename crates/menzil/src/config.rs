@@ -27,6 +27,10 @@
 //! # idle_secs = 300               # off unless set: reset a served tcp:/http:/tls: stream with no
 //! #                               # byte in either direction this long (10 to 86400)
 //!
+//! # Optional: the node wide ceiling on unread inbound data of all L4 sessions together.
+//! # [limits]
+//! # inbound_ceiling_mib = 1024    # 64 to 65536; absent is 1 GiB (TBD 75)
+//!
 //! # Optional: make this node an egress exit (protocol.md 8). Off by default; the Policy must also
 //! # give it an `egress` entry and a member an `egress:*` grant. Read at start: a change needs a
 //! # restart.
@@ -111,6 +115,9 @@ pub struct Config {
     /// Whether this node is an egress exit: `[egress]` (protocol.md 8). Off without it.
     #[serde(default)]
     pub egress: EgressSettings,
+    /// Node wide limits: `[limits]`.
+    #[serde(default)]
+    pub limits: LimitsSettings,
     /// Public names to advertise to the relay: `[[share]]`.
     #[serde(default)]
     pub share: Vec<ShareSettings>,
@@ -322,6 +329,37 @@ pub struct ServeSettings {
     /// Streams the relay principal may hold open on this node in all (default 256, 1 to
     /// [`MAX_RELAY_STREAMS_SETTING`]).
     pub max_relay_streams: Option<usize>,
+}
+
+/// The `[limits]` table: node wide figures. A key that is left out keeps the library's default.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct LimitsSettings {
+    /// Unread inbound data of all L4 sessions together, in MiB (64 to 65536). Past it the
+    /// session holding the most gives way (protocol.md 5.2, TBD 75). Absent: 1 GiB.
+    pub inbound_ceiling_mib: Option<u64>,
+}
+
+/// The smallest and largest `[limits] inbound_ceiling_mib`.
+pub const MIN_INBOUND_CEILING_MIB: u64 = 64;
+/// See [`MIN_INBOUND_CEILING_MIB`].
+pub const MAX_INBOUND_CEILING_MIB: u64 = 65_536;
+
+impl LimitsSettings {
+    /// The ceiling in bytes, `None` for the default; a figure outside the range is refused.
+    pub fn inbound_ceiling(&self) -> Result<Option<usize>> {
+        let Some(mib) = self.inbound_ceiling_mib else {
+            return Ok(None);
+        };
+        if !(MIN_INBOUND_CEILING_MIB..=MAX_INBOUND_CEILING_MIB).contains(&mib) {
+            bail!(
+                "inbound_ceiling_mib in [limits] of config.toml is {mib}: it must be from {MIN_INBOUND_CEILING_MIB} to {MAX_INBOUND_CEILING_MIB} (leave the key out for the default of 1024)"
+            );
+        }
+        usize::try_from(mib << 20).map(Some).map_err(|_| {
+            anyhow!("inbound_ceiling_mib in [limits] of config.toml does not fit this platform")
+        })
+    }
 }
 
 /// The largest `[serve] max_relay_streams`.
@@ -632,6 +670,11 @@ impl Config {
         self.serve.relay_limits()
     }
 
+    /// The node wide inbound ceiling in bytes `[limits]` asks for, validated; `None` is the default.
+    pub fn inbound_ceiling(&self) -> Result<Option<usize>> {
+        self.limits.inbound_ceiling()
+    }
+
     /// The relay's share domain in lowercase, if one is configured: a host name of at least two
     /// labels (letters, digits and hyphens, no trailing dot, at most 253 characters). A value
     /// that is not one is an error here, since it would be printed as part of a URL.
@@ -701,6 +744,35 @@ mod tests {
             "menzil://relay.example.org:443/_menzil/v1?id={}",
             "ab".repeat(32)
         )
+    }
+
+    /// `[limits] inbound_ceiling_mib` (TBD 75 addendum): absent is the default, the range edges
+    /// are taken as bytes, and anything outside is refused with the range in the message.
+    #[test]
+    fn the_inbound_ceiling_key_is_validated_and_converted_to_bytes() {
+        let text = |body: &str| format!("{body}\n[services]\n\"tcp:ssh\" = \"127.0.0.1:22\"\n");
+        let ceiling = |body: &str| Config::parse(&text(body)).unwrap().inbound_ceiling();
+        assert_eq!(ceiling("").unwrap(), None);
+        assert_eq!(ceiling("[limits]").unwrap(), None);
+        assert_eq!(
+            ceiling("[limits]\ninbound_ceiling_mib = 64").unwrap(),
+            Some(64 << 20)
+        );
+        assert_eq!(
+            ceiling("[limits]\ninbound_ceiling_mib = 2048").unwrap(),
+            Some(2048 << 20)
+        );
+        assert_eq!(
+            ceiling("[limits]\ninbound_ceiling_mib = 65536").unwrap(),
+            Some(65_536 << 20)
+        );
+        for bad in [0u64, 63, 65_537] {
+            let err = ceiling(&format!("[limits]\ninbound_ceiling_mib = {bad}"))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("from 64 to 65536"), "{err}");
+        }
+        assert!(Config::parse(&text("[limits]\nunknown_key = 1")).is_err());
     }
 
     /// The fourth red-team round, N2: the derived `Debug` of the settings printed the proxy URL
