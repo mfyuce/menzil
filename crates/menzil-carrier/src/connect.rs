@@ -52,6 +52,21 @@ struct ConnectResponse {
     content_length: Option<usize>,
 }
 
+/// A 2xx answer to CONNECT opens the tunnel: whatever follows the head is tunnel data, never
+/// a body (RFC 9110 9.3.6), so a `Content-Length` there means nothing and bytes already read
+/// past the head are not ours to drop quietly (review R-12). A proxy that speaks first on a
+/// tunnel this client opened for TLS or a WebSocket is broken: refuse instead of losing bytes.
+fn tunnel_opened(leftover: &[u8]) -> Result<(), CarrierError> {
+    if leftover.is_empty() {
+        Ok(())
+    } else {
+        Err(CarrierError::Connect(format!(
+            "the proxy sent {} bytes after its 200 answer before the tunnel was used",
+            leftover.len()
+        )))
+    }
+}
+
 async fn connect_tunnel(
     stream: &mut TcpStream,
     target_host: &str,
@@ -60,8 +75,7 @@ async fn connect_tunnel(
 ) -> Result<(), CarrierError> {
     let (resp, leftover) = send_connect(stream, target_host, target_port, None).await?;
     if resp.status == 200 {
-        drain_body(stream, resp.content_length, leftover.len()).await?;
-        return Ok(());
+        return tunnel_opened(&leftover);
     }
     if resp.status != 407 {
         drain_body(stream, resp.content_length, leftover.len()).await?;
@@ -83,10 +97,10 @@ async fn connect_tunnel(
     };
 
     let (resp2, leftover2) = send_connect(stream, target_host, target_port, Some(creds)).await?;
-    drain_body(stream, resp2.content_length, leftover2.len()).await?;
     if resp2.status == 200 {
-        Ok(())
+        tunnel_opened(&leftover2)
     } else {
+        drain_body(stream, resp2.content_length, leftover2.len()).await?;
         Err(CarrierError::Connect(format!(
             "proxy authentication failed (status {})",
             resp2.status
@@ -100,9 +114,11 @@ async fn send_connect(
     target_port: u16,
     creds: Option<&ProxyCredentials>,
 ) -> Result<(ConnectResponse, Vec<u8>), CarrierError> {
-    let mut request = format!(
-        "CONNECT {target_host}:{target_port} HTTP/1.1\r\nHost: {target_host}:{target_port}\r\n"
+    let authority = format!(
+        "{}:{target_port}",
+        crate::connection_info::authority_host(target_host)
     );
+    let mut request = format!("CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\n");
     if let Some(c) = creds {
         let token = base64::engine::general_purpose::STANDARD
             .encode(format!("{}:{}", c.username, c.password));
@@ -368,6 +384,27 @@ mod tests {
                 .unwrap();
         });
 
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        let err = connect_tunnel(&mut stream, "relay.example", 443, None)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, CarrierError::Connect(_)));
+        server.await.unwrap();
+    }
+    /// A `Content-Length` on a 200 answer to CONNECT is not a body (review R-12): the bytes after
+    /// the head are tunnel data and are never silently taken for it.
+    #[tokio::test]
+    async fn a_content_length_on_a_200_does_not_hide_tunnel_bytes() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 4096];
+            let _ = sock.read(&mut buf).await.unwrap();
+            sock.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello")
+                .await
+                .unwrap();
+        });
         let mut stream = TcpStream::connect(addr).await.unwrap();
         let err = connect_tunnel(&mut stream, "relay.example", 443, None)
             .await

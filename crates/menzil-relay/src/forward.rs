@@ -161,11 +161,9 @@
 //! [`ForwardTable::forward`]'s own doc comment) — the same
 //! already-accepted class of race `SessionRegistry::attach`'s and
 //! `crate::advertise`'s own doc comments describe elsewhere in this
-//! crate, not a new one introduced here; a member's NodeCert serial is
-//! validated only at HELLO time, not re-checked against `NodeHistory`'s
-//! current high-water mark on every SEND, so a Roster update raising
-//! `min_serial` for an already-attached session's NodeId does not cut off
-//! its forwarding immediately, only on its next HELLO.
+//! crate, not a new one introduced here. (A Roster update raising `min_serial` above an
+//! attached session's cert serial is not a gap: the session is judged again and ended
+//! `stale_serial`, module `session`.)
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};

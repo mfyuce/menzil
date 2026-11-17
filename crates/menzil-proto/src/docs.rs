@@ -4,7 +4,7 @@
 //! This module only describes bytes: it has no I/O. The rules that must run before anything is
 //! allocated or read are here as pure functions the I/O layer calls in the right place:
 //! [`check_frame_len`] bounds a length prefix before a buffer exists for it, and
-//! [`MessageCounter`] refuses the seventh message of a stream before its header is read.
+//! [`MessageCounter`] refuses the eighth message of a stream before its header is read.
 //!
 //! The CBOR is strict as in section 2.1: definite lengths and no trailing bytes
 //! ([`crate::strict`]), no unknown keys and no duplicate keys (serde), and every key present, a
@@ -369,7 +369,7 @@ pub fn check_frame_len(prefix: u32) -> Result<usize, DocsError> {
     Ok(len)
 }
 
-/// Counts the messages received on one stream; the seventh is refused.
+/// Counts the messages received on one stream; the eighth is refused.
 #[derive(Debug, Default)]
 pub struct MessageCounter {
     seen: usize,

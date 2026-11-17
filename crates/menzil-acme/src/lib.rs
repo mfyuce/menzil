@@ -497,7 +497,8 @@ pub struct Peeked {
     pub hello: Option<Accepted>,
 }
 
-/// Reads from `io` until rustls has a whole ClientHello, at most [`MAX_HELLO_BYTES`]. Garbage,
+/// Reads from `io` until rustls has a whole ClientHello, at most [`MAX_HELLO_BYTES`] (the
+/// buffer returned for a too long hello holds one more read, so that nothing is lost). Garbage,
 /// too long a hello and an early end of stream give `hello: None` with what was read, so that
 /// the caller can pass it on; only an I/O error is an `Err`.
 pub async fn peek_client_hello<S>(io: &mut S) -> io::Result<Peeked>
@@ -510,6 +511,9 @@ where
     loop {
         let n = io.read(&mut chunk).await?;
         if n == 0 || buf.len() + n > MAX_HELLO_BYTES {
+            // The chunk just read is part of the stream too: the caller passes `buf` on whole
+            // (review R-5), so it may run one chunk past the cap, never lose bytes.
+            buf.extend_from_slice(&chunk[..n]);
             return Ok(Peeked { buf, hello: None });
         }
         buf.extend_from_slice(&chunk[..n]);

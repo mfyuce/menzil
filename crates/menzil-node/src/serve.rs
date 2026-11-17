@@ -426,8 +426,8 @@ impl LocalServices {
 
     /// Serves `egress:*` through `executor` (protocol.md 8), for counted peer OPENs only: the
     /// relay principal's path refuses it. An executor that is not [`EgressExecutor::enabled`]
-    /// serves nothing, like none. It takes its places from the same [`ServeLimits`] as the
-    /// local services. A local service table never maps egress ([`Self::set_target`] refuses it).
+    /// serves nothing, like none. It takes its places from a pool of its own
+    /// ([`Self::with_egress_limits`]), apart from the [`ServeLimits`] of the local services. A local service table never maps egress ([`Self::set_target`] refuses it).
     pub fn with_egress(mut self, executor: EgressExecutor) -> Self {
         self.egress = Some(Arc::new(executor));
         self

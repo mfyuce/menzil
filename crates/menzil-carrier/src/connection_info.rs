@@ -31,6 +31,15 @@ pub struct ConnectionInfo {
     pub relay_x25519: Option<X25519PublicKey>,
 }
 
+/// `host` as it is written in a URL authority or a `Host:` header: an IPv6 literal in brackets.
+pub(crate) fn authority_host(host: &str) -> String {
+    if host.contains(':') {
+        format!("[{host}]")
+    } else {
+        host.to_string()
+    }
+}
+
 impl ConnectionInfo {
     /// Parses a `menzil://...` connection string.
     pub fn parse(raw: &str) -> Result<Self, CarrierError> {
@@ -44,6 +53,10 @@ impl ConnectionInfo {
         let host = url
             .host_str()
             .ok_or_else(|| CarrierError::ConnectionInfo("missing host".to_string()))?
+            // An IPv6 literal comes back bracketed; the dial, the TLS name and the resolver
+            // want it bare (review R-11), and [`authority_host`] brackets it again for text.
+            .trim_start_matches('[')
+            .trim_end_matches(']')
             .to_string();
         let port = url.port().unwrap_or(443);
         let path = match url.path() {
@@ -124,6 +137,17 @@ mod tests {
         assert_eq!(info.path, "/_menzil/v1");
         assert_eq!(info.relay_node_id, NodeId::from([0x11u8; 32]));
         assert_eq!(info.relay_x25519, Some(X25519PublicKey::from([0x22u8; 32])));
+    }
+
+    #[test]
+    fn an_ipv6_literal_host_is_kept_bare_and_bracketed_for_text() {
+        let id = hex32(0x11);
+        let raw = format!("menzil://[2001:db8::1]:8443/_menzil/v1?id={id}");
+        let info = ConnectionInfo::parse(&raw).unwrap();
+        assert_eq!(info.host, "2001:db8::1");
+        assert_eq!(info.port, 8443);
+        assert_eq!(authority_host(&info.host), "[2001:db8::1]");
+        assert_eq!(authority_host("relay.example"), "relay.example");
     }
 
     #[test]

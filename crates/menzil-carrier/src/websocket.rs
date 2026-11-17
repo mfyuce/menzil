@@ -36,9 +36,12 @@ pub async fn upgrade<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let mut request = format!("wss://{host}{path}")
-        .into_client_request()
-        .map_err(CarrierError::WebSocket)?;
+    let mut request = format!(
+        "wss://{}{path}",
+        crate::connection_info::authority_host(host)
+    )
+    .into_client_request()
+    .map_err(CarrierError::WebSocket)?;
     request.headers_mut().insert(
         "Sec-WebSocket-Protocol",
         SUBPROTOCOL

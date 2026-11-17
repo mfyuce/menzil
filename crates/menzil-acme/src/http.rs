@@ -311,7 +311,7 @@ fn decode_chunked(mut rest: &[u8]) -> Result<Option<Vec<u8>>, AcmeError> {
                 }
             }
         }
-        if body.len() + size > MAX_RESPONSE_BYTES {
+        if size > MAX_RESPONSE_BYTES || body.len() + size > MAX_RESPONSE_BYTES {
             return Err(bad("too long"));
         }
         if rest.len() < size + 2 {
@@ -322,5 +322,24 @@ fn decode_chunked(mut rest: &[u8]) -> Result<Option<Vec<u8>>, AcmeError> {
             return Err(bad("a chunk is not followed by a line break"));
         }
         rest = &rest[size + 2..];
+    }
+}
+
+#[cfg(test)]
+mod chunked_tests {
+    use super::*;
+
+    /// A chunk size of the largest `usize` must be refused, not overflow the length arithmetic
+    /// (review R-1).
+    #[test]
+    fn a_huge_chunk_size_is_an_error_not_a_panic() {
+        assert!(decode_chunked(b"ffffffffffffffff\r\nabc").is_err());
+        assert!(decode_chunked(b"7fffffffffffffff\r\nabc").is_err());
+    }
+
+    #[test]
+    fn an_ordinary_chunked_body_decodes() {
+        let got = decode_chunked(b"3\r\nabc\r\n2\r\nde\r\n0\r\n\r\n").unwrap();
+        assert_eq!(got, Some(b"abcde".to_vec()));
     }
 }

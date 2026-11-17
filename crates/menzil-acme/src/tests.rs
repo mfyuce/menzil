@@ -1314,3 +1314,21 @@ fn failures_have_fixed_words_and_sentences_that_carry_no_ca_text() {
         assert!(!kind.text().contains("secret"));
     }
 }
+
+/// A stream that is not a ClientHello and is longer than the cap: what was read is handed back
+/// whole, including the read that crossed the cap (review R-5), so the caller can pass it on.
+#[tokio::test]
+async fn a_stream_over_the_hello_cap_is_returned_whole_not_clipped() {
+    let data = vec![0x41u8; MAX_HELLO_BYTES + 100];
+    let mut io = std::io::Cursor::new(data.clone());
+    // A cursor reads garbage: the peek ends at the first chunk that rustls refuses, or at the cap.
+    let peeked = peek_client_hello(&mut io).await.unwrap();
+    assert!(peeked.hello.is_none());
+    let read = io.position() as usize;
+    assert_eq!(
+        peeked.buf.len(),
+        read,
+        "every byte read must be in the buffer"
+    );
+    assert_eq!(&peeked.buf[..], &data[..read]);
+}

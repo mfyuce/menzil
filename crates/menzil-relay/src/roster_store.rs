@@ -36,6 +36,9 @@ pub(crate) const CHANGE_BACKLOG: usize = 1024;
 /// (protocol.md 2.1), never re-encoding them.
 pub struct RosterStore {
     by_network: RwLock<HashMap<NetworkId, Held>>,
+    /// Raised, under the write lock, by every [`Self::remove`] that dropped a Roster: an
+    /// adoption whose verdict was reached before one does not put the network back.
+    removals: std::sync::atomic::AtomicU64,
     /// Called after [`Self::adopt`] has stored a Roster (see [`Self::set_on_adopted`]).
     on_adopted: RwLock<Option<AdoptedHook>>,
     /// Says which network got a newer Roster (see [`Self::subscribe`]).
@@ -54,6 +57,7 @@ impl Default for RosterStore {
     fn default() -> Self {
         Self {
             by_network: RwLock::default(),
+            removals: std::sync::atomic::AtomicU64::new(0),
             on_adopted: RwLock::default(),
             changes: broadcast::channel(CHANGE_BACKLOG).0,
             #[cfg(test)]
@@ -278,6 +282,7 @@ impl RosterStore {
         // takes a successful adoption of this same network by someone else each time, so it
         // ends, and the cheap path of `check_bundle` makes a newer-or-equal Roster cost nothing.
         loop {
+            let removals_before = self.removals.load(std::sync::atomic::Ordering::SeqCst);
             let seen = self
                 .by_network
                 .read()
@@ -321,6 +326,11 @@ impl RosterStore {
             let entry = Held::new(roster.clone(), body, held_base.cloned(), new_view, counted);
 
             let mut guard = self.by_network.write().unwrap();
+            if self.removals.load(std::sync::atomic::Ordering::SeqCst) != removals_before {
+                // The operator removed a network meanwhile: this adoption began before that and
+                // must not bring the network back.
+                return Ok(false);
+            }
             if guard.get(&network_id).map(|held| held.body.seq) != seen_seq {
                 drop(guard);
                 continue;
@@ -351,12 +361,15 @@ impl RosterStore {
     /// remove-network` and `remove-tenant`). Whether a Roster was held. The `on_adopted` hook is
     /// not called: what the relay keeps on disk is the operator's to delete.
     pub fn remove(&self, network_id: &NetworkId) -> bool {
-        let removed = self
-            .by_network
-            .write()
-            .unwrap()
-            .remove(network_id)
-            .is_some();
+        let removed = {
+            let mut guard = self.by_network.write().unwrap();
+            let removed = guard.remove(network_id).is_some();
+            if removed {
+                self.removals
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+            removed
+        };
         if removed {
             let _ = self.changes.send(*network_id);
         }
@@ -1781,6 +1794,54 @@ mod tests {
         );
         assert!(adopter.join().unwrap().unwrap());
         assert_eq!(store.seq_of(&network_id), Some(2));
+    }
+
+    /// An adoption that was verifying while the operator removed the network must not put it
+    /// back (review R-2); an adoption begun after the removal still may.
+    #[test]
+    fn an_adoption_overtaken_by_a_removal_does_not_bring_the_network_back() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let owner = SigningKey::generate(&mut rand::rng());
+        let network_id = NetworkId::from(owner.verifying_key().to_bytes());
+        let store = Arc::new(RosterStore::new());
+        assert!(
+            store
+                .adopt(&two_members(&owner, network_id, 1), None, NOW)
+                .unwrap()
+        );
+        let (in_verify_tx, in_verify_rx) = mpsc::channel::<()>();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let release_rx = std::sync::Mutex::new(release_rx);
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        store.set_verify_hook(move || {
+            if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                in_verify_tx.send(()).unwrap();
+                let _ = release_rx
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(30));
+            }
+        });
+        let adopter = {
+            let store = Arc::clone(&store);
+            let newer = two_members(&owner, network_id, 2);
+            std::thread::spawn(move || store.adopt(&newer, None, NOW))
+        };
+        in_verify_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the adoption never reached its verification");
+        assert!(store.remove(&network_id));
+        release_tx.send(()).unwrap();
+        assert!(!adopter.join().unwrap().unwrap(), "nothing was stored");
+        assert!(!store.serves(&network_id), "the removed network came back");
+        // A later adoption is the operator's own reload and works.
+        assert!(
+            store
+                .adopt(&two_members(&owner, network_id, 3), None, NOW)
+                .unwrap()
+        );
     }
 
     /// While a slow adoption of seq 2 verifies, seq 3 is adopted. The slow one must notice
