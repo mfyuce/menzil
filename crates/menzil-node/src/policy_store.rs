@@ -57,7 +57,7 @@
 //! TODO.md line rather than silently assumed covered by this one.
 
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock, RwLockWriteGuard};
+use std::sync::{Arc, OnceLock, RwLock, RwLockWriteGuard};
 
 use ed25519_dalek::VerifyingKey;
 use menzil_proto::trust::Signer;
@@ -80,6 +80,9 @@ pub struct PolicyStore {
     /// (L4k: grants are re evaluated on it, protocol.md 5.3), like
     /// [`RosterStore::subscribe`] does for Rosters.
     changes: broadcast::Sender<NetworkId>,
+    /// The node's audit file (`docs/spec/audit-format.md`). It rides on the store because every
+    /// session's authorizer and the document adoption already hold it; unset means no audit.
+    audit: OnceLock<menzil_audit::AuditLog>,
 }
 
 impl Default for PolicyStore {
@@ -87,6 +90,7 @@ impl Default for PolicyStore {
         Self {
             by_network: RwLock::default(),
             changes: broadcast::channel(CHANGE_BACKLOG).0,
+            audit: OnceLock::new(),
         }
     }
 }
@@ -151,6 +155,17 @@ impl PolicyStore {
     /// An empty store, holding nothing yet.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Sets the node's audit log (the first call wins): inbound OPEN decisions and document
+    /// adoptions are written to it.
+    pub fn set_audit(&self, log: menzil_audit::AuditLog) {
+        let _ = self.audit.set(log);
+    }
+
+    /// The node's audit log, if one was set.
+    pub fn audit(&self) -> Option<&menzil_audit::AuditLog> {
+        self.audit.get()
     }
 
     /// Verifies `policy`'s signature against its own claimed

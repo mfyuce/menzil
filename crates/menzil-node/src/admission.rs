@@ -950,6 +950,25 @@ impl Authorizer for PolicyAuthorizer {
         }
         OpenDecision::Allow
     }
+
+    fn decided(&self, request: &OpenRequest, decision: &OpenDecision) {
+        let Some(audit) = self.policies.audit() else {
+            return;
+        };
+        let service = request.service.to_string();
+        let mut fields = vec![
+            ("network", request.network_id.to_string().into()),
+            ("peer", request.initiator.to_string().into()),
+            ("service", service.into()),
+        ];
+        match decision {
+            OpenDecision::Allow => audit.record("stream_allowed", &fields),
+            OpenDecision::Deny(refusal) => {
+                fields.push(("reason", refusal.code.name().into()));
+                audit.record("stream_refused", &fields);
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1750,6 +1769,44 @@ mod tests {
                 assert!(!refusal.msg.is_empty());
             }
             OpenDecision::Allow => panic!("grant is for tcp:web, not tcp:ssh; must be a denial"),
+        }
+    }
+
+    /// `decided` writes `stream_allowed` and `stream_refused` lines with the peer and the
+    /// service, and never a target.
+    #[test]
+    fn decided_writes_the_audit_lines_of_an_allow_and_a_refusal() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        let log = menzil_audit::AuditLog::open(&path, menzil_audit::Source::Node, false).unwrap();
+        let f = fixture(vec![]);
+        f.policies.set_audit(log.clone());
+        let ids = &f.ids;
+        let request = open_request(ids);
+        let authorizer = PolicyAuthorizer::new(
+            Arc::new(f.policies),
+            Arc::new(f.rosters),
+            f.ids.network_id,
+            f.ids.responder_node_id,
+            f.ids.responder_cert_serial,
+            f.ids.responder_x25519,
+        );
+        authorizer.decided(&request, &OpenDecision::Allow);
+        authorizer.decided(&request, &PolicyAuthorizer::no_grant());
+        log.flush();
+        let lines: Vec<serde_json::Value> = std::fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(lines[0]["ev"], "stream_allowed");
+        assert_eq!(lines[1]["ev"], "stream_refused");
+        assert_eq!(lines[1]["reason"], "no_grant");
+        for line in &lines {
+            assert_eq!(line["peer"], request.initiator.to_string());
+            assert_eq!(line["service"], "tcp:ssh");
+            assert_eq!(line["network"], request.network_id.to_string());
+            assert_eq!(line["by"], "node");
         }
     }
 

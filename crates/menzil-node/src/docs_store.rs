@@ -73,6 +73,37 @@ impl<'a> DocStore<'a> {
     /// is [`NodeError::DocumentRejected`]. A document over [`MAX_DOC_BYTES`] is refused before
     /// anything is judged.
     pub fn adopt(&self, bundle: &Bundle, now: u64) -> Result<Adopted, NodeError> {
+        let result = self.adopt_inner(bundle, now);
+        if let Some(audit) = self.policies.audit()
+            && let Ok(Some(network_id)) = network_of(bundle)
+        {
+            let network = network_id.to_string();
+            match &result {
+                Ok(adopted) if adopted.roster || adopted.policy => audit.record(
+                    "document_adopted",
+                    &[
+                        ("network", network.into()),
+                        ("roster", adopted.roster.into()),
+                        ("policy", adopted.policy.into()),
+                    ],
+                ),
+                Ok(_) => {}
+                Err(error) => {
+                    let reason = match error {
+                        NodeError::DocumentRejected(reason) => format!("{reason:?}"),
+                        _ => "Invalid".to_owned(),
+                    };
+                    audit.record(
+                        "document_refused",
+                        &[("network", network.into()), ("reason", reason.into())],
+                    );
+                }
+            }
+        }
+        result
+    }
+
+    fn adopt_inner(&self, bundle: &Bundle, now: u64) -> Result<Adopted, NodeError> {
         let Some(network_id) = network_of(bundle)? else {
             return Ok(Adopted::default());
         };
@@ -373,6 +404,37 @@ mod tests {
         assert_eq!(rosters.signer(&net.network_id), Some(Signer::Owner));
         assert!(rosters.base(&net.network_id).is_none());
         assert!(policies.base(&net.network_id).is_none());
+    }
+
+    /// The audit file records an adoption, says nothing for a bundle that changes nothing, and
+    /// records a refusal with the reason.
+    #[test]
+    fn adoptions_and_refusals_reach_the_audit_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        let log = menzil_audit::AuditLog::open(&path, menzil_audit::Source::Node, false).unwrap();
+        let net = Net::new();
+        let (rosters, policies) = (RosterStore::new(), PolicyStore::new());
+        policies.set_audit(log.clone());
+        let docs = DocStore::new(&rosters, &policies);
+        docs.adopt(&net.base_bundle(), NOW).unwrap();
+        // The same bundle again is held: nothing stored, nothing written.
+        docs.adopt(&net.base_bundle(), NOW).unwrap();
+        // A steward signed renewal without its bases is refused.
+        let refusal = docs.adopt(&net.renewal(&net.steward, 11, false), NOW);
+        assert!(refusal.is_err(), "{refusal:?}");
+        log.flush();
+        let lines: Vec<serde_json::Value> = std::fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        let evs: Vec<&str> = lines.iter().map(|l| l["ev"].as_str().unwrap()).collect();
+        assert_eq!(evs, ["document_adopted", "document_refused"], "{lines:?}");
+        assert_eq!(lines[0]["network"], net.network_id.to_string());
+        assert_eq!(lines[0]["roster"], true);
+        assert_eq!(lines[0]["by"], "node");
+        assert!(!lines[1]["reason"].as_str().unwrap().is_empty());
     }
 
     /// Round 6, L2: a node that pushes a steward signed Roster to a relay sends the base first,

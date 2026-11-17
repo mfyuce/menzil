@@ -799,6 +799,7 @@ pub(crate) async fn start_tuned(
     if let Some(path) = &options.audit_file {
         let audit = menzil_audit::AuditLog::open(path, menzil_audit::Source::Relay, false)
             .with_context(|| format!("opening the audit file {}", path.display()))?;
+        crate::signals::reopen_audit_on_usr1(&audit);
         relay = relay.with_audit(audit);
     }
     if let Some(config) = front_door {

@@ -34,10 +34,14 @@ Relay (`by` = `relay`):
 
 Node (`by` = `node`):
 
+- `stream_allowed` and `stream_refused`: one line for every inbound OPEN a member sent to this node (not for a later re check of a served stream, and not for the relay principal's opens): `network`, `peer` (initiator NodeId, hex), `service` (such as `tcp:ssh`; never an egress target, which `egress_stream` carries), and for a refusal `reason` (the protocol.md 4.2 name of the ERROR code, such as `no_grant`).
+- `document_adopted`: a Roster and/or Policy was stored through the document acceptance (`menzil:docs`, steward renewals): `network`, `roster`, `policy` (booleans). A bundle that changes nothing writes nothing. A Roster the relay sends over L3 is not recorded yet.
+- `document_refused`: `network`, `reason` (the name of the refusal, such as `WrongNetwork`, or `Invalid`).
 - `egress_stream`: one line for every egress stream this node served as an exit, when it ended:
   `peer` (initiator NodeId, hex), `host` (an address literal is written as `<ip>` unless `include_ips` is on), `port`, `outcome` (the close line's outcome word),
   `up` and `down` (bytes toward and from the target), `secs` (duration, number),
   `ip` (the target address, only with `include_ips`).
 
-There is no session end event: the absence of a `session_superseded` or `session_evicted` line does not mean a session is still attached. A relay's `session_attach` lines are a persistent record of when each NodeId was online in each network (metadata the relay sees by design, threat-model.md); keep the file as private as the relay's own state. `include_ips` without `file` does nothing. The file must be on a local disk (a write blocks the writing task), is a regular file (anything else is refused), and is opened append only with mode 0600 when it is created (an existing file keeps its mode, with a warning if group or others can reach it). A write error is logged and counted, never fatal.
-There is no rotation: rotate by stopping the process, moving the file, starting it again.
+There is no session end event: the absence of a `session_superseded` or `session_evicted` line does not mean a session is still attached. A relay's `session_attach` lines are a persistent record of when each NodeId was online in each network (metadata the relay sees by design, threat-model.md); keep the file as private as the relay's own state. `include_ips` without `file` does nothing. The file should be on a local disk, is a regular file (anything else is refused), and is opened append only with mode 0600 when it is created (an existing file keeps its mode, with a warning if group or others can reach it). A write error is logged and counted, never fatal.
+Rotation: move the file away, then send the process SIGUSR1 (`kill -USR1`): it opens the path again (a new file, mode 0600) and lines written before the signal stay in the moved file. SIGHUP is not used, it stops these processes. A stopped process may also be rotated as before.
+Lines are queued to a writer thread (at most 4096 waiting); a line that finds the queue full is dropped and counted, so a slow disk never stalls a session.

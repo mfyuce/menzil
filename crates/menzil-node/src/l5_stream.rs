@@ -371,6 +371,10 @@ impl<A: Authorizer> Authorizer for MemberAuthorizer<A> {
     fn authorize(&self, request: &OpenRequest) -> OpenDecision {
         self.0.authorize(&prepared(request, self.1))
     }
+
+    fn decided(&self, request: &OpenRequest, decision: &OpenDecision) {
+        self.0.decided(&prepared(request, self.1), decision);
+    }
 }
 
 /// Wraps a [`ServiceHandler`] the same way [`MemberAuthorizer`] wraps an
@@ -561,6 +565,7 @@ impl<A: Authorizer> Authorizer for TrackingAuthorizer<'_, A> {
     fn authorize(&self, request: &OpenRequest) -> OpenDecision {
         let generation = self.streams.generation();
         let decision = self.inner.authorize(request);
+        self.inner.decided(request, &decision);
         *self.seen.lock().unwrap_or_else(PoisonError::into_inner) =
             Some((generation, prepared(request, self.inner.1)));
         decision
@@ -1413,6 +1418,56 @@ mod tests {
             ],
             "a member-sent meta must be scrubbed before every one of them sees it"
         );
+        accept_task.abort();
+    }
+
+    /// Allows everything and counts the calls of [`Authorizer::decided`].
+    #[derive(Clone, Default)]
+    struct DecidedCounter(Arc<AtomicUsize>);
+    impl Authorizer for DecidedCounter {
+        fn authorize(&self, _request: &OpenRequest) -> OpenDecision {
+            OpenDecision::Allow
+        }
+        fn decided(&self, _request: &OpenRequest, decision: &OpenDecision) {
+            assert!(matches!(decision, OpenDecision::Allow));
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    /// `decided` is the audit hook: once per inbound OPEN, and not again for a recheck.
+    #[tokio::test]
+    async fn decided_is_called_once_per_open_and_not_by_a_recheck() {
+        let TwoSessions {
+            a,
+            a_acceptor: _a_acceptor,
+            mut b,
+            b_handle: _b_handle,
+            _pump_a_to_b,
+            _pump_b_to_a,
+            _task_a,
+            _task_b,
+            _a_epoch_ended_tx,
+            _b_epoch_ended_tx,
+        } = two_sessions();
+        let counter = DecidedCounter::default();
+        let streams = AcceptedStreams::new();
+        let accept_task = {
+            let (counter, streams) = (counter.clone(), streams.clone());
+            tokio::spawn(async move {
+                accept_loop_tracked(&mut b, counter, MetaRecordingGate::default(), streams).await;
+            })
+        };
+        let mut stream = a.open_stream().await.unwrap();
+        stream.write_all(&open_header(ssh())).await.unwrap();
+        stream.flush().await.unwrap();
+        let ack = tokio::time::timeout(Duration::from_secs(5), read_ack(&mut stream))
+            .await
+            .expect("no OPEN_ACK arrived");
+        assert!(ack.ok);
+        assert_eq!(counter.0.load(Ordering::SeqCst), 1);
+        streams.recheck(&counter);
+        streams.recheck(&counter);
+        assert_eq!(counter.0.load(Ordering::SeqCst), 1);
         accept_task.abort();
     }
 

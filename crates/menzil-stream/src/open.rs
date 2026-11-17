@@ -198,6 +198,11 @@ pub enum OpenDecision {
 pub trait Authorizer {
     /// Decides `request`.
     fn authorize(&self, request: &OpenRequest) -> OpenDecision;
+
+    /// Called once for every inbound OPEN with the decision [`Self::authorize`] just gave it
+    /// (never for a later re check of a served stream), so an implementation can keep an audit
+    /// trail. Does nothing by default.
+    fn decided(&self, _request: &OpenRequest, _decision: &OpenDecision) {}
 }
 
 /// Takes over an OPEN that the [`Authorizer`] has already approved, and

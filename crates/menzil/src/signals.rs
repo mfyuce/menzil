@@ -64,3 +64,30 @@ impl Shutdown {
 pub async fn shutdown() -> io::Result<&'static str> {
     Shutdown::catch()?.wait().await
 }
+
+/// Makes `log` open its file again on every SIGUSR1: the signal for log rotation (move the file
+/// away, then `kill -USR1`). SIGHUP is not used: here it stops the process. Must be called
+/// inside the runtime; does nothing for a disabled log or off Unix.
+pub fn reopen_audit_on_usr1(log: &menzil_audit::AuditLog) {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        if !log.enabled() {
+            return;
+        }
+        let Ok(mut usr1) = signal(SignalKind::user_defined1()) else {
+            tracing::warn!("cannot catch SIGUSR1: the audit file is not reopened on rotation");
+            return;
+        };
+        let log = log.clone();
+        tokio::spawn(async move {
+            while usr1.recv().await.is_some() {
+                if !log.reopen() {
+                    tracing::warn!("the audit queue is full: SIGUSR1 reopen not queued");
+                }
+            }
+        });
+    }
+    #[cfg(not(unix))]
+    let _ = log;
+}

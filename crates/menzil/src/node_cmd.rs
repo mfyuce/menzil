@@ -1005,6 +1005,8 @@ where
         }
         None => menzil_audit::AuditLog::disabled(menzil_audit::Source::Node),
     };
+    crate::signals::reopen_audit_on_usr1(&audit);
+    policies.set_audit(audit.clone());
     let services = match config.egress_enabled() {
         // The limits are in `services` already (`Config::local_services`); the node's own
         // extra deny list narrows what the Policy allows.
