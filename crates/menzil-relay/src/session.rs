@@ -622,12 +622,13 @@ async fn dispatch(
                     }
                 }
             } else if relay.registry.is_current(node_id, session_id) {
-                let outcome = relay.forwarding.forward(
+                let outcome = relay.forwarding.forward_in_session(
                     &relay.rosters,
                     &relay.registry,
                     &relay.labels,
                     &relay.limits,
                     node_id,
+                    session_id,
                     claimed_networks,
                     &dst,
                     e2e_proto,

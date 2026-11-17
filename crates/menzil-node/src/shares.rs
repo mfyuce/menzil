@@ -239,6 +239,9 @@ struct Inner {
     /// How long the relay has to answer an ADVERTISE and how long a refusal is waited out; the
     /// two figures of [`AdvertiseWatch`], settable for tests.
     timing: Mutex<(Duration, Duration)>,
+    /// How long after an `over_quota` answer to a Roster push the Rosters are sent again;
+    /// settable for tests.
+    roster_retry_after: Mutex<Duration>,
 }
 
 /// The configured shares and the relay's answer. See the module docs.
@@ -273,6 +276,7 @@ impl ShareBook {
                 state: Mutex::new(State::default()),
                 accepted_changes,
                 timing: Mutex::new((ADVERTISE_ACK_TIMEOUT, ADVERTISE_RETRY_DELAY)),
+                roster_retry_after: Mutex::new(crate::session::ROSTER_RETRY_AFTER),
             }),
         }
     }
@@ -310,6 +314,25 @@ impl ShareBook {
             .timing
             .lock()
             .unwrap_or_else(PoisonError::into_inner) = (ack_timeout, retry_delay);
+    }
+
+    /// Another delay than the 60 s before the Rosters are sent again after an `over_quota`
+    /// answer, for tests that cannot wait that long; takes effect at the next attachment.
+    #[doc(hidden)]
+    pub fn set_roster_retry_after(&self, after: Duration) {
+        *self
+            .inner
+            .roster_retry_after
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = after;
+    }
+
+    pub(crate) fn roster_retry_after(&self) -> Duration {
+        *self
+            .inner
+            .roster_retry_after
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Stores `ack` as the relay's answer to an ADVERTISE of `shares`, as the session does when

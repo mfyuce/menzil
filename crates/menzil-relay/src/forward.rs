@@ -673,14 +673,20 @@ impl ForwardTable {
     /// `CreditViolation` is deliberately exempt: it ends `src`'s session
     /// (the caller's job, once this returns), and there is no reason to
     /// reimburse a session about to close.
+    ///
+    /// `src_session_id` is the id of the session that received the SEND, which the caller has
+    /// just found current: it is not read again from the registry here, because a supersede
+    /// between the caller's check and this call would stamp the stale session's record with the
+    /// new session's id and owe the new session the CREDIT (review R-6).
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn forward(
+    pub(crate) fn forward_in_session(
         &self,
         rosters: &RosterStore,
         registry: &SessionRegistry,
         labels: &LabelRegistry,
         limits: &Limits,
         src: &NodeId,
+        src_session_id: u32,
         src_claimed: &[NetworkId],
         dst: &NodeId,
         e2e_proto: u8,
@@ -751,15 +757,6 @@ impl ForwardTable {
             .iter()
             .find(|network| target.claimed_networks.contains(network))
             .unwrap_or(&authorizing[0]);
-
-        // `src` is necessarily attached right now — this call is
-        // processing a SEND it just sent — so `None` here would mean it
-        // detached in the instant between; using a sentinel rather than
-        // panicking, `is_current` then correctly reports `false` for it
-        // regardless (no registration at all is no more "current" than a
-        // mismatched id), which is the same fail-safe direction
-        // `ForwardTable::drained` already needs for a genuine reconnect.
-        let src_session_id = registry.attached_session_id(src).unwrap_or(u32::MAX);
 
         let book = self.book();
         let admitted = self.admit(
@@ -1441,6 +1438,43 @@ impl ForwardTable {
     #[cfg(test)]
     pub(crate) fn shaper_of(&self, tenant: &TenantId) -> Option<crate::shaping::Shaper> {
         self.shapers.get(tenant)
+    }
+}
+
+#[cfg(test)]
+impl ForwardTable {
+    /// [`Self::forward_in_session`] with the sender's current session id read from the registry,
+    /// for tests that have no session of their own.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn forward(
+        &self,
+        rosters: &RosterStore,
+        registry: &SessionRegistry,
+        labels: &LabelRegistry,
+        limits: &Limits,
+        src: &NodeId,
+        src_claimed: &[NetworkId],
+        dst: &NodeId,
+        e2e_proto: u8,
+        flags: u8,
+        payload: Vec<u8>,
+        now_unix: u64,
+    ) -> ForwardOutcome {
+        let src_session_id = registry.attached_session_id(src).unwrap_or(u32::MAX);
+        self.forward_in_session(
+            rosters,
+            registry,
+            labels,
+            limits,
+            src,
+            src_session_id,
+            src_claimed,
+            dst,
+            e2e_proto,
+            flags,
+            payload,
+            now_unix,
+        )
     }
 }
 
@@ -2274,6 +2308,40 @@ mod tests {
         );
         let after_drain = table.remaining_credit(&f.src, &f.dst).unwrap();
         assert_eq!(after_drain, test_limits().credit);
+    }
+
+    /// The session id the caller found current is the one the queued record carries, not a fresh
+    /// registry read (review R-6): a sender superseded between the caller's check and `forward`
+    /// would otherwise stamp the new session's id and owe it the CREDIT.
+    #[test]
+    fn forward_stamps_the_record_with_the_callers_session_id() {
+        let mut f = fixture(4_000_000_000);
+        let table = ForwardTable::new();
+        let current = f.registry.attached_session_id(&f.src).unwrap();
+        let callers = current.wrapping_add(1000);
+        let (e2e, flags, payload) = reliable_send(500);
+        let outcome = table.forward_in_session(
+            &f.rosters,
+            &f.registry,
+            &f.labels,
+            &test_limits(),
+            &f.src,
+            callers,
+            &[f.network_id],
+            &f.dst,
+            e2e,
+            flags,
+            payload,
+            1_000,
+        );
+        assert!(matches!(outcome, ForwardOutcome::Queued));
+        match f._dst_handles.2.try_recv() {
+            Ok(ForwardItem::Recv { src_session_id, .. }) => {
+                assert_eq!(src_session_id, callers);
+                assert_ne!(src_session_id, current);
+            }
+            _ => panic!("expected the queued Recv item"),
+        }
     }
 
     #[test]

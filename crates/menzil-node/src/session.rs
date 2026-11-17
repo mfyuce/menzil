@@ -395,7 +395,7 @@ const SEND_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// How long after an `over_quota` answer to a Roster push the node sends its Rosters again
 /// (the relay's limit is a rate per tenant, so a later try may be taken).
-const ROSTER_RETRY_AFTER: Duration = Duration::from_secs(60);
+pub(crate) const ROSTER_RETRY_AFTER: Duration = Duration::from_secs(60);
 
 /// How long a stop ([`run_session_until`]) spends writing what was already admitted before it
 /// closes the connection. The carrier's own close waits as long again for the relay's answer.
@@ -1332,6 +1332,7 @@ pub async fn run_session_observed(
         let mut advertise_watch = shares.advertise_watch();
         // When to send the relay the Rosters again after it refused a push as `over_quota`.
         let mut roster_retry: Option<tokio::time::Instant> = None;
+        let roster_retry_after = shares.roster_retry_after();
         // Whether this attachment claimed every network the node is configured for.
         let complete = session.claimed_networks().len() == config.networks.len();
         let settle = tokio::time::sleep(notes.settle_after());
@@ -1378,7 +1379,7 @@ pub async fn run_session_observed(
                                 if body.code == menzil_proto::ErrorCode::OverQuota {
                                     session.engine.relay_refused_rosters(&session.welcome.rosters);
                                     roster_retry =
-                                        Some(tokio::time::Instant::now() + ROSTER_RETRY_AFTER);
+                                        Some(tokio::time::Instant::now() + roster_retry_after);
                                 }
                                 // While an ADVERTISE is unanswered an ERROR is its answer: the
                                 // relay did not take the set (its claims stay as they were),
