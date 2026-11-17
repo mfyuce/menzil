@@ -263,6 +263,7 @@ async fn a_relay_starts_with_its_networks_and_says_how_to_reach_it() {
         reload_every: Duration::from_millis(100),
         fallback_page: None,
         admission: None,
+        audit_file: None,
     };
 
     // No network yet: a relay that would refuse everyone does not start.
@@ -366,6 +367,7 @@ async fn one_damaged_roster_file_does_not_stop_the_reload_of_the_others() {
             reload_every: Duration::from_millis(50),
             fallback_page: None,
             admission: None,
+            audit_file: None,
         },
     )
     .await
@@ -414,6 +416,7 @@ async fn a_running_relay_picks_up_a_newer_roster_added_to_its_directory() {
             reload_every: Duration::from_millis(50),
             fallback_page: None,
             admission: None,
+            audit_file: None,
         },
     )
     .await
@@ -466,6 +469,7 @@ async fn an_expired_roster_on_disk_is_held_but_forwards_nothing() {
         reload_every: Duration::from_millis(100),
         fallback_page: None,
         admission: None,
+        audit_file: None,
     };
     let running = start(&relay_home, &options)
         .await
@@ -692,6 +696,7 @@ async fn a_relay_starts_and_reloads_with_a_steward_signed_roster() {
         reload_every: Duration::from_millis(100),
         fallback_page: None,
         admission: None,
+        audit_file: None,
     };
     // The relay got the owner's Roster first; the steward's, made from it, is added later.
     add_network(&relay_home, &relay_token(&owner), clock()).unwrap();
@@ -731,6 +736,7 @@ fn run_options(dir: &Path) -> RunOptions {
         reload_every: Duration::from_secs(3600),
         fallback_page: None,
         admission: None,
+        audit_file: None,
     }
 }
 

@@ -19,6 +19,7 @@ ed25519-dalek.workspace = true
 fastrand.workspace = true
 futures-util = { workspace = true, features = ["io"] }
 httparse.workspace = true
+menzil-audit = { path = "../menzil-audit" }
 menzil-acme = { path = "../menzil-acme", default-features = false }
 menzil-carrier = { path = "../menzil-carrier" }
 menzil-e2e = { path = "../menzil-e2e" }
@@ -37,6 +38,8 @@ zeroize = "1"
 # the in process CA of the ACME tests.
 menzil-acme = { path = "../menzil-acme", default-features = false, features = ["testing"] }
 rand = "0.10.3"
+tempfile = "3"
+serde_json = "1"
 rcgen = "0.14.10"
 snow = "0.10.0"
 tokio = { workspace = true, features = ["test-util"] }

@@ -357,6 +357,8 @@ pub struct RunOptions {
     /// (`menzil_relay::AdmissionLimits`). A relay behind a reverse proxy or serving many users
     /// behind one address raises them.
     pub admission: Option<menzil_relay::AdmissionLimits>,
+    /// The audit file to append to (`docs/spec/audit-format.md`), or `None` for none.
+    pub audit_file: Option<PathBuf>,
 }
 
 /// The admission limits the `--connections-per-ip-per-minute`, `--handshakes-per-ip` and
@@ -793,6 +795,11 @@ pub(crate) async fn start_tuned(
     let mut relay = Relay::new(identity, LIMITS);
     if let Some(limits) = options.admission {
         relay = relay.with_admission_limits(limits);
+    }
+    if let Some(path) = &options.audit_file {
+        let audit = menzil_audit::AuditLog::open(path, menzil_audit::Source::Relay, false)
+            .with_context(|| format!("opening the audit file {}", path.display()))?;
+        relay = relay.with_audit(audit);
     }
     if let Some(config) = front_door {
         raise_nofile_for(&config, http.is_some());

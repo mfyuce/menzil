@@ -3259,6 +3259,52 @@ mod tests {
             assert!(!line.contains("hello"), "{line}");
         }
 
+        /// Every finished egress stream is a line of the audit file, with no address unless the
+        /// operator asked for it, and none of them is left out by the log line's throttle.
+        #[tokio::test]
+        async fn every_egress_stream_is_an_audit_line_and_the_address_only_when_asked() {
+            for include_ips in [false, true] {
+                let dir = tempfile::tempdir().unwrap();
+                let path = dir.path().join("audit.jsonl");
+                let audit =
+                    menzil_audit::AuditLog::open(&path, menzil_audit::Source::Node, include_ips)
+                        .unwrap();
+                let listener = listener().await;
+                let port = listener.local_addr().unwrap().port();
+                let services = LocalServices::new()
+                    .with_egress(executor(&["127.0.0.0/8"], true).with_audit(audit));
+                for _ in 0..3 {
+                    drop(services.open(&egress_request(port)).await.unwrap());
+                }
+                for _ in 0..200 {
+                    if std::fs::read_to_string(&path).is_ok_and(|t| t.lines().count() >= 3) {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                let lines: Vec<serde_json::Value> = std::fs::read_to_string(&path)
+                    .unwrap()
+                    .lines()
+                    .map(|l| serde_json::from_str(l).unwrap())
+                    .collect();
+                assert_eq!(lines.len(), 3, "{lines:?}");
+                for line in &lines {
+                    assert_eq!(
+                        (line["by"].as_str(), line["ev"].as_str()),
+                        (Some("node"), Some("egress_stream"))
+                    );
+                    assert_eq!(line["port"], u64::from(port));
+                    assert_eq!(line["outcome"], "not started");
+                    assert_eq!(
+                        (line["up"].as_u64(), line["down"].as_u64()),
+                        (Some(0), Some(0))
+                    );
+                    assert_eq!(line.get("ip").is_some(), include_ips, "{line}");
+                }
+            }
+        }
+
         #[tokio::test]
         async fn a_refused_egress_target_is_answered_in_the_ack_and_costs_no_slot() {
             let listener = listener().await;

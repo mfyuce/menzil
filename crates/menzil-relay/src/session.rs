@@ -749,6 +749,14 @@ async fn send_eviction(
         reason = %rejection.message,
         "relay session ended, the node is out of standing in a claimed network"
     );
+    relay.audit.record(
+        "session_evicted",
+        &[
+            ("node_id", node_id.to_string().into()),
+            ("session", session_id.into()),
+            ("reason", format!("{:?}", rejection.code).into()),
+        ],
+    );
 
     if let Some(network_id) = rejection.network
         && let Some(records) = doc::roster_doc_records(&relay.rosters, &network_id)
@@ -934,6 +942,22 @@ async fn run_attached_loop(
     drop(ip_slot);
 
     tracing::info!(session_id, node_id = %node_id, "relay session attached");
+    relay.audit.record(
+        "session_attach",
+        &[
+            ("node_id", node_id.to_string().into()),
+            ("session", session_id.into()),
+            (
+                "networks",
+                claimed_networks
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(",")
+                    .into(),
+            ),
+        ],
+    );
     let (mut supersede_rx, mut outbound_rx, mut forward_rx) = relay.registry.attach_counted(
         node_id,
         session_id,
@@ -994,6 +1018,10 @@ async fn run_attached_loop(
                 });
                 let _ = send_record(&mut conn, &mut transport, goaway).await;
                 tracing::info!(session_id, node_id = %node_id, "relay session superseded");
+                relay.audit.record(
+                    "session_superseded",
+                    &[("node_id", node_id.to_string().into()), ("session", session_id.into())],
+                );
                 break;
             }
             () = watch.changed(&claimed_networks) => {

@@ -31,6 +31,11 @@
 //! # [limits]
 //! # inbound_ceiling_mib = 1024    # 64 to 65536; absent is 1 GiB (TBD 75)
 //!
+//! # Optional: append an audit line for every egress stream this node serves (JSON lines).
+//! # [audit]
+//! # file = "/var/lib/menzil/audit.jsonl"
+//! # include_ips = false           # true also writes the address a stream reached
+//!
 //! # Optional: make this node an egress exit (protocol.md 8). Off by default; the Policy must also
 //! # give it an `egress` entry and a member an `egress:*` grant. Read at start: a change needs a
 //! # restart.
@@ -118,6 +123,9 @@ pub struct Config {
     /// Node wide limits: `[limits]`.
     #[serde(default)]
     pub limits: LimitsSettings,
+    /// The audit file: `[audit]` (docs/spec/audit-format.md). Off without it.
+    #[serde(default)]
+    pub audit: AuditSettings,
     /// Public names to advertise to the relay: `[[share]]`.
     #[serde(default)]
     pub share: Vec<ShareSettings>,
@@ -338,6 +346,18 @@ pub struct LimitsSettings {
     /// Unread inbound data of all L4 sessions together, in MiB (64 to 65536). Past it the
     /// session holding the most gives way (protocol.md 5.2, TBD 75). Absent: 1 GiB.
     pub inbound_ceiling_mib: Option<u64>,
+}
+
+/// The `[audit]` table: a file this node appends JSON lines to (format:
+/// docs/spec/audit-format.md). Every egress stream this node serves as an exit is a line.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AuditSettings {
+    /// The file to append to (created with mode 0600). No `[audit]` file, no audit.
+    pub file: Option<PathBuf>,
+    /// Also write the address a stream reached (default false: names and ports only).
+    #[serde(default)]
+    pub include_ips: bool,
 }
 
 /// The smallest and largest `[limits] inbound_ceiling_mib`.
@@ -744,6 +764,24 @@ mod tests {
             "menzil://relay.example.org:443/_menzil/v1?id={}",
             "ab".repeat(32)
         )
+    }
+
+    #[test]
+    fn the_audit_table_names_a_file_and_defaults_to_no_addresses() {
+        let text = |body: &str| format!("{body}\n[services]\n\"tcp:ssh\" = \"127.0.0.1:22\"\n");
+        let none = Config::parse(&text("")).unwrap();
+        assert_eq!(none.audit, AuditSettings::default());
+        assert!(none.audit.file.is_none() && !none.audit.include_ips);
+        let on = Config::parse(&text(
+            "[audit]\nfile = \"/tmp/a.jsonl\"\ninclude_ips = true",
+        ))
+        .unwrap();
+        assert_eq!(
+            on.audit.file.as_deref(),
+            Some(std::path::Path::new("/tmp/a.jsonl"))
+        );
+        assert!(on.audit.include_ips);
+        assert!(Config::parse(&text("[audit]\nfle = \"x\"")).is_err());
     }
 
     /// `[limits] inbound_ceiling_mib` (TBD 75 addendum): absent is the default, the range edges

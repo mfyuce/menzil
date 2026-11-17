@@ -180,6 +180,7 @@ async fn start_relay(root: &Path, tls: &Tls, owner_home: &Home) -> relay_cmd::Ru
             reload_every: relay_cmd::DEFAULT_RELOAD_EVERY,
             fallback_page: None,
             admission: None,
+            audit_file: None,
         },
     )
     .await

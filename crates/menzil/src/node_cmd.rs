@@ -998,6 +998,13 @@ where
     // (`load_identity` checked that the certificate is the keys' own, so this is the node id.)
     let own_node_id = keys.node_id();
     let services = config.local_services()?;
+    let audit = match &config.audit.file {
+        Some(path) => {
+            menzil_audit::AuditLog::open(path, menzil_audit::Source::Node, config.audit.include_ips)
+                .with_context(|| format!("opening the audit file {}", path.display()))?
+        }
+        None => menzil_audit::AuditLog::disabled(menzil_audit::Source::Node),
+    };
     let services = match config.egress_enabled() {
         // The limits are in `services` already (`Config::local_services`); the node's own
         // extra deny list narrows what the Policy allows.
@@ -1006,7 +1013,8 @@ where
                 true,
                 Arc::new(PolicyEgressRules::new(policies.clone(), own_node_id)),
             )
-            .with_local_deny(config.egress_checked()?.deny),
+            .with_local_deny(config.egress_checked()?.deny)
+            .with_audit(audit),
         ),
         false => services,
     };

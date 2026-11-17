@@ -1339,6 +1339,7 @@ dependencies = [
  "futures-util",
  "menzil-acme",
  "menzil-admin",
+ "menzil-audit",
  "menzil-carrier",
  "menzil-node",
  "menzil-proto",
@@ -1396,6 +1397,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "menzil-audit"
+version = "0.0.1"
+dependencies = [
+ "serde_json",
+ "tempfile",
+ "tracing",
+]
+
+[[package]]
 name = "menzil-carrier"
 version = "0.0.1"
 dependencies = [
@@ -1434,6 +1444,7 @@ dependencies = [
  "fastrand",
  "futures-util",
  "menzil-acme",
+ "menzil-audit",
  "menzil-carrier",
  "menzil-e2e",
  "menzil-proto",
@@ -1444,8 +1455,10 @@ dependencies = [
  "rcgen",
  "ring",
  "rustls",
+ "serde_json",
  "snow",
  "socket2",
+ "tempfile",
  "thiserror",
  "tokio",
  "tokio-rustls",
@@ -1477,6 +1490,7 @@ dependencies = [
  "futures-util",
  "httparse",
  "menzil-acme",
+ "menzil-audit",
  "menzil-carrier",
  "menzil-e2e",
  "menzil-proto",
@@ -1485,7 +1499,9 @@ dependencies = [
  "rand",
  "rcgen",
  "rustls",
+ "serde_json",
  "snow",
+ "tempfile",
  "thiserror",
  "tokio",
  "tokio-rustls",

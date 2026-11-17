@@ -132,6 +132,8 @@ pub struct Relay {
     front_door: Option<Arc<FrontDoorConfig>>,
     /// The relay's own ACME (`crate::acme`); `None` answers no validation and orders nothing.
     acme: Option<RelayAcme>,
+    /// The audit file (`menzil-audit`); disabled unless [`Relay::with_audit`] was called.
+    pub(crate) audit: menzil_audit::AuditLog,
     /// Called once per session between the HELLO judgement and the attached loop (tests: adopt
     /// a Roster inside that window).
     #[cfg(test)]
@@ -214,6 +216,7 @@ impl Relay {
             principal: PrincipalConfig::default(),
             front_door: None,
             acme: None,
+            audit: menzil_audit::AuditLog::disabled(menzil_audit::Source::Relay),
             #[cfg(test)]
             before_loop: Arc::new(std::sync::Mutex::new(None)),
         }
@@ -318,6 +321,14 @@ impl Relay {
     #[must_use]
     pub fn with_front_door(mut self, config: FrontDoorConfig) -> Self {
         self.front_door = Some(Arc::new(config));
+        self
+    }
+
+    /// This relay writing its audit events (`docs/spec/audit-format.md`) to `audit`. Call it
+    /// before [`Relay::serve`] and before cloning the relay.
+    #[must_use]
+    pub fn with_audit(mut self, audit: menzil_audit::AuditLog) -> Self {
+        self.audit = audit.with_source(menzil_audit::Source::Relay);
         self
     }
 

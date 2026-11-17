@@ -439,6 +439,62 @@ async fn a_second_attach_supersedes_the_first() {
     }
 }
 
+/// The audit file records an attach and the supersede that follows it, with the NodeId, the
+/// session and the claimed network, and nothing else of the traffic.
+#[tokio::test]
+async fn the_audit_file_records_an_attach_and_a_supersede() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("audit.jsonl");
+    let (relay, listener, cert, relay_x25519) = bind_test_relay().await;
+    let relay = relay.with_audit(
+        menzil_audit::AuditLog::open(&path, menzil_audit::Source::Relay, false).unwrap(),
+    );
+    let addr = listener.local_addr().unwrap();
+    let serve_relay = relay.clone();
+    tokio::spawn(async move { serve_relay.serve(&listener).await });
+    let id = generate_identity();
+    let (networks, seq) = seed_network(&relay, &[&id]);
+    let net_hex = networks[0].to_string();
+    let mut client1 = attach_to(
+        addr,
+        cert.clone(),
+        relay_x25519,
+        &id,
+        &(networks.clone(), seq.clone()),
+    )
+    .await;
+    let (mut client2, _) =
+        TestClient::connect(addr, cert, &id, relay_x25519, networks, seq, 1, 20).await;
+    client2.send(Record::Attach).await;
+    ping_pong(&mut client2, [2; 8]).await;
+    assert!(matches!(client1.recv().await, Some(Record::Goaway(_))));
+    eventually("both attaches and the supersede in the audit file", || {
+        std::fs::read_to_string(&path).is_ok_and(|text| text.lines().count() >= 3)
+    })
+    .await;
+    let lines: Vec<serde_json::Value> = std::fs::read_to_string(&path)
+        .unwrap()
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    let evs: Vec<&str> = lines.iter().map(|l| l["ev"].as_str().unwrap()).collect();
+    assert_eq!(
+        evs.iter().filter(|e| **e == "session_attach").count(),
+        2,
+        "{evs:?}"
+    );
+    assert_eq!(
+        evs.iter().filter(|e| **e == "session_superseded").count(),
+        1,
+        "{evs:?}"
+    );
+    let attach = &lines[evs.iter().position(|e| *e == "session_attach").unwrap()];
+    assert_eq!(attach["by"], "relay");
+    assert_eq!(attach["node_id"], id.node_id.to_string());
+    assert_eq!(attach["networks"], net_hex);
+    assert!(attach.get("peer_ip").is_none());
+}
+
 #[tokio::test]
 async fn an_unserved_claimed_network_gets_not_member_then_the_connection_ends() {
     let (relay, listener, cert, relay_x25519) = bind_test_relay().await;

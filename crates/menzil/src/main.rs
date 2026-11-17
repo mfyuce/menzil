@@ -461,6 +461,12 @@ enum RelayCommand {
         /// Sessions one source address may have unattached (default 32).
         #[arg(long, value_name = "N", value_parser = clap::value_parser!(u32).range(1..=100_000))]
         unattached_per_ip: Option<u32>,
+        /// Append an audit line for every session attach, supersede and eviction to this file
+        /// (JSON lines, format in docs/spec/audit-format.md; created with mode 0600). No
+        /// payload and no client address. Off unless given; there is no rotation: stop, move
+        /// the file, start again.
+        #[arg(long, value_name = "FILE")]
+        audit_file: Option<PathBuf>,
     },
 }
 
@@ -1063,6 +1069,7 @@ async fn run(cli: Cli) -> Result<()> {
                     connections_per_ip_per_minute,
                     handshakes_per_ip,
                     unattached_per_ip,
+                    audit_file,
                 },
         } => {
             let admission = relay_cmd::admission_limits(
@@ -1089,6 +1096,7 @@ async fn run(cli: Cli) -> Result<()> {
                     reload_every: relay_cmd::DEFAULT_RELOAD_EVERY,
                     fallback_page,
                     admission,
+                    audit_file,
                 },
                 front.as_ref(),
             )

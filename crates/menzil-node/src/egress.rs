@@ -889,6 +889,8 @@ pub struct EgressExecutor {
     local_deny: Vec<Pattern>,
     /// Set only by `narrowed_floor_for_tests`; always false in a build without tests.
     loopback_ok: bool,
+    /// The audit file: one `egress_stream` line for every stream, unthrottled.
+    audit: menzil_audit::AuditLog,
     #[cfg(test)]
     log_lines: std::sync::Mutex<Vec<String>>,
 }
@@ -922,9 +924,19 @@ impl EgressExecutor {
             own_cache: AsyncMutex::new(None),
             local_deny: Vec::new(),
             loopback_ok: false,
+            audit: menzil_audit::AuditLog::disabled(menzil_audit::Source::Node),
             #[cfg(test)]
             log_lines: std::sync::Mutex::new(Vec::new()),
         }
+    }
+
+    /// Writes an `egress_stream` line (`docs/spec/audit-format.md`) for every finished stream to
+    /// `audit`, whatever the throttle of the log line says. The target address is part of it
+    /// only when the log was opened with `include_ips`.
+    #[must_use]
+    pub fn with_audit(mut self, audit: menzil_audit::AuditLog) -> Self {
+        self.audit = audit.with_source(menzil_audit::Source::Node);
+        self
     }
 
     /// Resolves names with `resolve` instead of the system's resolver. Blocking, run on a
@@ -1239,6 +1251,21 @@ impl EgressExecutor {
             live.initiator,
             live.target.port()
         ));
+        if self.audit.enabled() {
+            let mut fields = vec![
+                ("peer", live.initiator.to_string().into()),
+                ("host", live.target_host().into()),
+                ("port", u32::from(live.target.port()).into()),
+                ("outcome", outcome.into()),
+                ("up", up.into()),
+                ("down", down.into()),
+                ("secs", elapsed.as_secs_f64().into()),
+            ];
+            if self.audit.include_ips() {
+                fields.push(("ip", ip.to_string().into()));
+            }
+            self.audit.record("egress_stream", &fields);
+        }
         if let Some(left_out) = self.close_log.permit(Instant::now()) {
             tracing::info!(
                 peer = %live.initiator,

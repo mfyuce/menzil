@@ -156,6 +156,7 @@ async fn a_phone_reaches_a_service_on_a_laptop_through_a_relay() {
             reload_every: relay_cmd::DEFAULT_RELOAD_EVERY,
             fallback_page: None,
             admission: None,
+            audit_file: None,
         },
     )
     .await

@@ -8,6 +8,7 @@ members = [
     "crates/menzil-stream",
     "crates/menzil-admin",
     "crates/menzil-acme",
+    "crates/menzil-audit",
     "crates/menzil-relay",
     "crates/menzil-node",
     "crates/menzil",

@@ -1,0 +1,15 @@
+[package]
+name = "menzil-audit"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Append only JSON lines audit file of menzil (format: docs/spec/audit-format.md)"
+
+[dependencies]
+serde_json = "1"
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

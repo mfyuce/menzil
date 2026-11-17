@@ -20,6 +20,7 @@ base64 = { workspace = true }
 clap = { workspace = true }
 ed25519-dalek = { workspace = true }
 menzil-admin = { path = "../menzil-admin" }
+menzil-audit = { path = "../menzil-audit" }
 menzil-carrier = { path = "../menzil-carrier" }
 menzil-node = { path = "../menzil-node" }
 menzil-relay = { path = "../menzil-relay" }

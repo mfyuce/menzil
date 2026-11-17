@@ -228,6 +228,7 @@ async fn the_proxy_carries_a_connect_to_an_exit_and_the_exit_refuses_what_it_mus
             reload_every: relay_cmd::DEFAULT_RELOAD_EVERY,
             fallback_page: None,
             admission: None,
+            audit_file: None,
         },
     )
     .await
