@@ -330,10 +330,9 @@ impl SessionRegistry {
     }
 
     /// Whether `node_id` currently has an attached session, and if so,
-    /// its session id. Used by `crate::forward::ForwardTable::forward` to
-    /// capture `src`'s own session id at admission time (TODO.md L4b's
-    /// own second review round), independently of tests, which also use
-    /// it (crate-visible so the live end-to-end suite can too).
+    /// its session id. Tests only: the relay session passes its own id to
+    /// `crate::forward::ForwardTable::forward_in_session` (review R-6).
+    #[cfg(test)]
     pub(crate) fn attached_session_id(&self, node_id: &NodeId) -> Option<u32> {
         self.by_node
             .read()
