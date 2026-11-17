@@ -3301,6 +3301,12 @@ mod tests {
                         (Some(0), Some(0))
                     );
                     assert_eq!(line.get("ip").is_some(), include_ips, "{line}");
+                    // The target was an address literal: it is not the host field either, unless asked.
+                    assert_eq!(
+                        line["host"],
+                        if include_ips { "127.0.0.1" } else { "<ip>" },
+                        "{line}"
+                    );
                 }
             }
         }

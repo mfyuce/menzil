@@ -754,7 +754,7 @@ async fn send_eviction(
         &[
             ("node_id", node_id.to_string().into()),
             ("session", session_id.into()),
-            ("reason", format!("{:?}", rejection.code).into()),
+            ("reason", rejection.code.name().into()),
         ],
     );
 
@@ -953,7 +953,6 @@ async fn run_attached_loop(
                     .iter()
                     .map(ToString::to_string)
                     .collect::<Vec<_>>()
-                    .join(",")
                     .into(),
             ),
         ],

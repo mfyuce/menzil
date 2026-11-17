@@ -20,6 +20,9 @@ use serde_json::{Map, Value};
 /// The format version written as `v`.
 pub const FORMAT_VERSION: u64 = 1;
 
+/// The most items of a list field.
+pub const MAX_LIST_ITEMS: usize = 64;
+
 /// The longest string field, in characters.
 pub const MAX_FIELD_CHARS: usize = 255;
 
@@ -52,6 +55,8 @@ pub enum Field {
     F64(f64),
     /// A flag.
     Bool(bool),
+    /// A list of strings (each cut like a string field, at most [`MAX_LIST_ITEMS`] items).
+    List(Vec<String>),
 }
 
 impl From<&str> for Field {
@@ -79,6 +84,11 @@ impl From<f64> for Field {
         Self::F64(n)
     }
 }
+impl From<Vec<String>> for Field {
+    fn from(items: Vec<String>) -> Self {
+        Self::List(items)
+    }
+}
 impl From<bool> for Field {
     fn from(b: bool) -> Self {
         Self::Bool(b)
@@ -86,7 +96,9 @@ impl From<bool> for Field {
 }
 
 struct Sink {
-    file: Mutex<std::fs::File>,
+    /// The file, and whether the last write failed (a fragment without a newline may be at its
+    /// end: the next line starts on a fresh one).
+    file: Mutex<(std::fs::File, bool)>,
     errors: AtomicU64,
     last_warned: Mutex<Option<Instant>>,
 }
@@ -131,9 +143,23 @@ impl AuditLog {
             options.mode(0o600);
         }
         let file = options.open(path)?;
+        let meta = file.metadata()?;
+        if !meta.is_file() {
+            return Err(std::io::Error::other(format!(
+                "{} is not a regular file",
+                path.display()
+            )));
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if meta.permissions().mode() & 0o077 != 0 {
+                tracing::warn!(path = %path.display(), "the audit file is readable or writable by group or others (mode {:o}); a new file is created 0600", meta.permissions().mode() & 0o777);
+            }
+        }
         Ok(Self {
             sink: Some(Arc::new(Sink {
-                file: Mutex::new(file),
+                file: Mutex::new((file, false)),
                 errors: AtomicU64::new(0),
                 last_warned: Mutex::new(None),
             })),
@@ -178,8 +204,16 @@ impl AuditLog {
             .map_or(0, |d| d.as_secs());
         let line = render(self.source, now, ev, fields);
         let result = {
-            let mut file = sink.file.lock().unwrap_or_else(PoisonError::into_inner);
-            file.write_all(line.as_bytes())
+            let mut guard = sink.file.lock().unwrap_or_else(PoisonError::into_inner);
+            let (file, dirty) = &mut *guard;
+            let mut out = String::with_capacity(line.len() + 1);
+            if *dirty {
+                out.push('\n');
+            }
+            out.push_str(&line);
+            let result = file.write_all(out.as_bytes());
+            *dirty = result.is_err();
+            result
         };
         if let Err(error) = result {
             sink.errors.fetch_add(1, Ordering::Relaxed);
@@ -214,6 +248,13 @@ fn render(source: Source, ts: u64, ev: &str, fields: &[(&str, Field)]) -> String
             Field::U64(n) => (*n).into(),
             Field::F64(n) => serde_json::Number::from_f64(*n).map_or(Value::Null, Value::Number),
             Field::Bool(b) => Value::Bool(*b),
+            Field::List(items) => Value::Array(
+                items
+                    .iter()
+                    .take(MAX_LIST_ITEMS)
+                    .map(|item| Value::String(cut(item)))
+                    .collect(),
+            ),
         };
         map.insert(cut(key), value);
     }
@@ -307,6 +348,30 @@ mod tests {
         assert!(line["nan"].is_null());
     }
 
+    #[test]
+    fn a_list_is_an_array_with_every_id_whole_and_a_failed_write_is_not_glued_to_the_next_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        let log = AuditLog::open(&path, Source::Relay, false).unwrap();
+        let ids: Vec<String> = (0..32).map(|i| format!("{i:02x}").repeat(32)).collect();
+        log.record("e", &[("networks", ids.clone().into())]);
+        assert_eq!(lines(&path)[0]["networks"], serde_json::json!(ids));
+        // A write that failed may have left a fragment: the next line starts on a fresh one.
+        log.sink.as_ref().unwrap().file.lock().unwrap().1 = true;
+        log.record("after", &[]);
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let last: Vec<&str> = raw.lines().collect();
+        assert_eq!(last.len(), 3, "{raw}");
+        assert_eq!(last[1], "");
+        assert!(serde_json::from_str::<Value>(last[2]).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_path_that_is_not_a_regular_file_is_refused() {
+        assert!(AuditLog::open(Path::new("/dev/null"), Source::Relay, false).is_err());
+    }
+
     #[cfg(unix)]
     #[test]
     fn the_file_is_created_private() {
@@ -323,9 +388,23 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn a_write_error_is_counted_and_not_fatal() {
-        let log = AuditLog::open(Path::new("/dev/full"), Source::Relay, false).unwrap();
+        // `open` refuses a device, so the sink is built by hand around /dev/full.
+        let file = OpenOptions::new().write(true).open("/dev/full").unwrap();
+        let log = AuditLog {
+            sink: Some(Arc::new(Sink {
+                file: Mutex::new((file, false)),
+                errors: AtomicU64::new(0),
+                last_warned: Mutex::new(None),
+            })),
+            source: Source::Relay,
+            include_ips: false,
+        };
         log.record("x", &[]);
         log.record("x", &[]);
         assert_eq!(log.write_errors(), 2);
+        assert!(
+            log.sink.as_ref().unwrap().file.lock().unwrap().1,
+            "a failed write must mark the file as possibly ending in a fragment"
+        );
     }
 }

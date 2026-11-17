@@ -1240,6 +1240,15 @@ impl EgressExecutor {
         .map_err(|why| Fail::Forbidden(why.to_owned()))
     }
 
+    /// The host as the audit file gets it: an address literal only with `include_ips` (else
+    /// `<ip>`), so the address of a target never reaches the file unasked.
+    fn audit_host(&self, live: &LiveStream) -> String {
+        match live.target.host() {
+            Host::Addr(_) if !self.audit.include_ips() => "<ip>".to_owned(),
+            _ => live.target_host(),
+        }
+    }
+
     /// Writes the one line a finished egress stream gets (throttled like the refusals; the host
     /// is escaped and cut, the payload is never part of it).
     fn log_close(&self, live: &LiveStream, outcome: &str, up: u64, down: u64, elapsed: Duration) {
@@ -1254,7 +1263,7 @@ impl EgressExecutor {
         if self.audit.enabled() {
             let mut fields = vec![
                 ("peer", live.initiator.to_string().into()),
-                ("host", live.target_host().into()),
+                ("host", self.audit_host(live).into()),
                 ("port", u32::from(live.target.port()).into()),
                 ("outcome", outcome.into()),
                 ("up", up.into()),

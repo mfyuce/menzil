@@ -491,7 +491,7 @@ async fn the_audit_file_records_an_attach_and_a_supersede() {
     let attach = &lines[evs.iter().position(|e| *e == "session_attach").unwrap()];
     assert_eq!(attach["by"], "relay");
     assert_eq!(attach["node_id"], id.node_id.to_string());
-    assert_eq!(attach["networks"], net_hex);
+    assert_eq!(attach["networks"], serde_json::json!([net_hex]));
     assert!(attach.get("peer_ip").is_none());
 }
 

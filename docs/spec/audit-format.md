@@ -12,7 +12,7 @@ One JSON object per line, UTF-8, `\n` terminated. Every line has:
 | `by` | string | `relay` or `node` |
 | `ev` | string | event name |
 
-and the flat fields of its event (strings, integers, booleans; no nesting). A consumer must
+and the flat fields of its event: strings (at most 255 characters), integers, numbers with a fraction, booleans, and lists of strings (at most 64 items); no nesting. A consumer must
 ignore keys and events it does not know. A new key never changes the meaning of an old one; `v`
 changes only for a breaking change.
 
@@ -25,16 +25,16 @@ a member (egress) are recorded, as they are in the exit's own close line.
 Relay (`by` = `relay`):
 
 - `session_attach`: `node_id` (hex), `session` (integer), `networks` (the claimed network ids,
-  hex, as one comma separated string). The peer address is not recorded.
+  hex, as a list). The peer address is not recorded.
 - `session_superseded`: `node_id`, `session`: a newer session of the same NodeId replaced it.
-- `session_evicted`: `node_id`, `session`, `reason` (the name of the ERROR code sent to the node, as the relay's log prints it).
+- `session_evicted`: `node_id`, `session`, `reason` (the protocol.md 4.2 name of the ERROR code sent to the node, such as `not_member`). An eviction can also happen before any attach (a session that is refused while it attaches), so a `session_evicted` line may have no `session_attach` before it.
 
 Node (`by` = `node`):
 
 - `egress_stream`: one line for every egress stream this node served as an exit, when it ended:
-  `peer` (initiator NodeId, hex), `host`, `port`, `outcome` (the close line's outcome word),
+  `peer` (initiator NodeId, hex), `host` (an address literal is written as `<ip>` unless `include_ips` is on), `port`, `outcome` (the close line's outcome word),
   `up` and `down` (bytes toward and from the target), `secs` (duration, number),
   `ip` (the target address, only with `include_ips`).
 
-The file is opened append only with mode 0600. A write error is logged and counted, never fatal.
+There is no session end event: the absence of a `session_superseded` or `session_evicted` line does not mean a session is still attached. A relay's `session_attach` lines are a persistent record of when each NodeId was online in each network (metadata the relay sees by design, threat-model.md); keep the file as private as the relay's own state. `include_ips` without `file` does nothing. The file must be on a local disk (a write blocks the writing task), is a regular file (anything else is refused), and is opened append only with mode 0600 when it is created (an existing file keeps its mode, with a warning if group or others can reach it). A write error is logged and counted, never fatal.
 There is no rotation: rotate by stopping the process, moving the file, starting it again.
