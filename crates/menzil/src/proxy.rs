@@ -449,15 +449,18 @@ fn log_target(host: &str, port: u16) -> String {
     }
 }
 
-/// `host` as the log shows it: unsafe characters written out and at most 255 bytes.
+/// `host` as the log shows it: a backslash doubled and unsafe characters written out as `\u{..}`
+/// (so a name that contains the text `\u{202e}` cannot look like an invisible character), at
+/// most 255 bytes, `...` after a cut.
 fn log_host(host: &str) -> String {
-    let mut shown = text::escaped(host);
+    let mut shown = text::escaped(&host.replace('\\', "\\\\"));
     if shown.len() > LOG_HOST_BYTES {
         let mut end = LOG_HOST_BYTES;
         while !shown.is_char_boundary(end) {
             end -= 1;
         }
         shown.truncate(end);
+        shown.push_str("...");
     }
     shown
 }
@@ -2449,10 +2452,15 @@ mod tests {
     fn the_log_shows_a_host_escaped_and_cut() {
         assert_eq!(log_host("example.org"), "example.org");
         assert!(!log_host("a\u{1b}[31mb").contains('\u{1b}'));
-        assert!(log_host(&"x".repeat(1000)).len() <= LOG_HOST_BYTES);
+        assert!(log_host(&"x".repeat(1000)).len() <= LOG_HOST_BYTES + 3);
+        assert!(log_host(&"x".repeat(1000)).ends_with("..."));
+        // N1 (round D2): a typed `\u{202e}` and the real character are told apart.
+        assert_ne!(log_host("ab\u{202e}cd"), log_host("ab\\u{202e}cd"));
+        assert_eq!(log_host("a\\b"), "a\\\\b");
         let multibyte = "é".repeat(300);
         let shown = log_host(&multibyte);
-        assert!(shown.len() <= LOG_HOST_BYTES && shown.chars().all(|c| c == 'é'));
+        let body = shown.strip_suffix("...").expect("a cut host ends in ...");
+        assert!(body.len() <= LOG_HOST_BYTES && body.chars().all(|c| c == 'é'));
     }
 
     // ---- the private Unix socket (`--unix`) ---------------------------------------------------
