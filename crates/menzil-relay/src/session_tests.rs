@@ -495,6 +495,49 @@ async fn the_audit_file_records_an_attach_and_a_supersede() {
     assert!(attach.get("peer_ip").is_none());
 }
 
+/// Every name of an ADVERTISE_ACK reaches the audit file: accepted ones as `share_accepted`,
+/// rejected ones as `share_rejected` with the relay's reason.
+#[tokio::test]
+async fn the_audit_file_records_each_share_the_relay_accepted_or_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("audit.jsonl");
+    let (relay, listener, cert, relay_x25519) = bind_test_relay().await;
+    let relay = relay.with_audit(
+        menzil_audit::AuditLog::open(&path, menzil_audit::Source::Relay, false).unwrap(),
+    );
+    let addr = listener.local_addr().unwrap();
+    let serve_relay = relay.clone();
+    tokio::spawn(async move { serve_relay.serve(&listener).await });
+    let id = generate_identity();
+    let (networks, seq) = seed_network(&relay, &[&id]);
+    let mut client = attach_to(addr, cert, relay_x25519, &id, &(networks, seq)).await;
+    client.send(advertise_one("someshare")).await;
+    let ack = match client.recv().await {
+        Some(Record::AdvertiseAck(ack)) => ack,
+        other => panic!("expected an ADVERTISE_ACK, got {other:?}"),
+    };
+    assert_eq!(ack.accepted.len() + ack.rejected.len(), 1, "{ack:?}");
+    eventually("the share line in the audit file", || {
+        std::fs::read_to_string(&path).is_ok_and(|t| t.contains("\"share_"))
+    })
+    .await;
+    let lines: Vec<serde_json::Value> = std::fs::read_to_string(&path)
+        .unwrap()
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .filter(|l: &serde_json::Value| l["ev"].as_str().unwrap().starts_with("share_"))
+        .collect();
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert_eq!(lines[0]["node_id"], id.node_id.to_string());
+    assert_eq!(lines[0]["name"], "someshare");
+    if ack.accepted.is_empty() {
+        assert_eq!(lines[0]["ev"], "share_rejected");
+        assert_eq!(lines[0]["reason"], ack.rejected[0].reason);
+    } else {
+        assert_eq!(lines[0]["ev"], "share_accepted");
+    }
+}
+
 #[tokio::test]
 async fn an_unserved_claimed_network_gets_not_member_then_the_connection_ends() {
     let (relay, listener, cert, relay_x25519) = bind_test_relay().await;

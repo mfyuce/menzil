@@ -574,6 +574,27 @@ async fn dispatch(
                 ack.share_domain = relay
                     .front_door_config()
                     .map(|front| front.share_domain().to_string());
+                for name in &ack.accepted {
+                    relay.audit.record(
+                        "share_accepted",
+                        &[
+                            ("node_id", node_id.to_string().into()),
+                            ("session", session_id.into()),
+                            ("name", name.as_str().into()),
+                        ],
+                    );
+                }
+                for rejected in &ack.rejected {
+                    relay.audit.record(
+                        "share_rejected",
+                        &[
+                            ("node_id", node_id.to_string().into()),
+                            ("session", session_id.into()),
+                            ("name", rejected.name.as_str().into()),
+                            ("reason", rejected.reason.as_str().into()),
+                        ],
+                    );
+                }
                 let _ = send_record(conn, transport, Record::AdvertiseAck(ack)).await;
             } else {
                 tracing::debug!(
