@@ -262,6 +262,7 @@ async fn a_relay_starts_with_its_networks_and_says_how_to_reach_it() {
         host: Some("localhost".to_string()),
         reload_every: Duration::from_millis(100),
         fallback_page: None,
+        admission: None,
     };
 
     // No network yet: a relay that would refuse everyone does not start.
@@ -286,6 +287,47 @@ async fn a_relay_starts_with_its_networks_and_says_how_to_reach_it() {
             .unwrap()
             .node_id
     );
+    running.stop();
+}
+
+#[test]
+fn the_admission_flags_change_only_what_they_name() {
+    assert_eq!(admission_limits(None, None, None), None);
+    let d = menzil_relay::AdmissionLimits::default();
+    let l = admission_limits(Some(500), None, None).unwrap();
+    assert_eq!(l.connections_per_ip_per_minute, 500);
+    assert_eq!(l.max_handshakes_per_ip, d.max_handshakes_per_ip);
+    assert_eq!(l.max_unattached_per_ip, d.max_unattached_per_ip);
+    let l = admission_limits(None, Some(3), Some(5)).unwrap();
+    assert_eq!(
+        (
+            l.connections_per_ip_per_minute,
+            l.max_handshakes_per_ip,
+            l.max_unattached_per_ip
+        ),
+        (d.connections_per_ip_per_minute, 3, 5)
+    );
+}
+
+/// `RunOptions::admission` reaches the relay: with one connection a minute allowed, the second
+/// connection from the same address is closed before TLS.
+#[tokio::test]
+async fn a_configured_connection_rate_is_enforced_by_the_running_relay() {
+    use tokio::io::AsyncReadExt;
+    let (_o, owner, _id, _docs_token) = token_of_a_network();
+    let (dir, relay_home) = home();
+    init(&relay_home, clock()).unwrap();
+    add_network(&relay_home, &relay_token(&owner), clock()).unwrap();
+    let mut options = run_options(dir.path());
+    options.admission = admission_limits(Some(1), None, None);
+    let running = start(&relay_home, &options).await.unwrap();
+    let _first = tokio::net::TcpStream::connect(running.addr).await.unwrap();
+    let mut second = tokio::net::TcpStream::connect(running.addr).await.unwrap();
+    let mut byte = [0u8; 1];
+    let closed = tokio::time::timeout(Duration::from_secs(5), second.read(&mut byte))
+        .await
+        .expect("the over rate connection must be closed by the relay");
+    assert!(matches!(closed, Ok(0) | Err(_)));
     running.stop();
 }
 
@@ -323,6 +365,7 @@ async fn one_damaged_roster_file_does_not_stop_the_reload_of_the_others() {
             host: None,
             reload_every: Duration::from_millis(50),
             fallback_page: None,
+            admission: None,
         },
     )
     .await
@@ -370,6 +413,7 @@ async fn a_running_relay_picks_up_a_newer_roster_added_to_its_directory() {
             host: None,
             reload_every: Duration::from_millis(50),
             fallback_page: None,
+            admission: None,
         },
     )
     .await
@@ -421,6 +465,7 @@ async fn an_expired_roster_on_disk_is_held_but_forwards_nothing() {
         host: Some("localhost".to_string()),
         reload_every: Duration::from_millis(100),
         fallback_page: None,
+        admission: None,
     };
     let running = start(&relay_home, &options)
         .await
@@ -646,6 +691,7 @@ async fn a_relay_starts_and_reloads_with_a_steward_signed_roster() {
         host: Some("localhost".to_string()),
         reload_every: Duration::from_millis(100),
         fallback_page: None,
+        admission: None,
     };
     // The relay got the owner's Roster first; the steward's, made from it, is added later.
     add_network(&relay_home, &relay_token(&owner), clock()).unwrap();
@@ -684,6 +730,7 @@ fn run_options(dir: &Path) -> RunOptions {
         host: None,
         reload_every: Duration::from_secs(3600),
         fallback_page: None,
+        admission: None,
     }
 }
 

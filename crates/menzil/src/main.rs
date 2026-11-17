@@ -451,6 +451,16 @@ enum RelayCommand {
         /// for the WebSocket upgrade are not affected.
         #[arg(long, value_name = "FILE")]
         fallback_page: Option<PathBuf>,
+        /// New connections one source address (an IPv6 /64) may open per minute, before TLS
+        /// (default 240). Raise it behind a reverse proxy or for many users behind one address.
+        #[arg(long, value_name = "N", value_parser = clap::value_parser!(u32).range(1..=1_000_000))]
+        connections_per_ip_per_minute: Option<u32>,
+        /// TLS and WebSocket handshakes one source address may have in flight (default 8).
+        #[arg(long, value_name = "N", value_parser = clap::value_parser!(u32).range(1..=100_000))]
+        handshakes_per_ip: Option<u32>,
+        /// Sessions one source address may have unattached (default 32).
+        #[arg(long, value_name = "N", value_parser = clap::value_parser!(u32).range(1..=100_000))]
+        unattached_per_ip: Option<u32>,
     },
 }
 
@@ -1050,8 +1060,16 @@ async fn run(cli: Cli) -> Result<()> {
                     acme_directory,
                     acme_contact,
                     fallback_page,
+                    connections_per_ip_per_minute,
+                    handshakes_per_ip,
+                    unattached_per_ip,
                 },
         } => {
+            let admission = relay_cmd::admission_limits(
+                connections_per_ip_per_minute,
+                handshakes_per_ip,
+                unattached_per_ip,
+            );
             let front = share_domain.map(|share_domain| relay_cmd::FrontDoorOptions {
                 share_domain,
                 http_listen,
@@ -1070,6 +1088,7 @@ async fn run(cli: Cli) -> Result<()> {
                     host,
                     reload_every: relay_cmd::DEFAULT_RELOAD_EVERY,
                     fallback_page,
+                    admission,
                 },
                 front.as_ref(),
             )

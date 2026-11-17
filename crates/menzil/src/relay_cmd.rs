@@ -353,6 +353,33 @@ pub struct RunOptions {
     /// the relay's own host name with, such as a browser opening `https://<host>/`. Without it
     /// such a request gets no answer. A WebSocket upgrade is not affected.
     pub fallback_page: Option<PathBuf>,
+    /// The per address admission figures to run with, or `None` for the defaults
+    /// (`menzil_relay::AdmissionLimits`). A relay behind a reverse proxy or serving many users
+    /// behind one address raises them.
+    pub admission: Option<menzil_relay::AdmissionLimits>,
+}
+
+/// The admission limits the `--connections-per-ip-per-minute`, `--handshakes-per-ip` and
+/// `--unattached-per-ip` flags ask for on top of the defaults; `None` when none was given.
+pub fn admission_limits(
+    connections_per_minute: Option<u32>,
+    handshakes: Option<u32>,
+    unattached: Option<u32>,
+) -> Option<menzil_relay::AdmissionLimits> {
+    if connections_per_minute.is_none() && handshakes.is_none() && unattached.is_none() {
+        return None;
+    }
+    let mut limits = menzil_relay::AdmissionLimits::default();
+    if let Some(n) = connections_per_minute {
+        limits.connections_per_ip_per_minute = n as usize;
+    }
+    if let Some(n) = handshakes {
+        limits.max_handshakes_per_ip = n as usize;
+    }
+    if let Some(n) = unattached {
+        limits.max_unattached_per_ip = n as usize;
+    }
+    Some(limits)
 }
 
 /// The blind front door of `menzil relay run` (protocol.md 6.2): off unless a share domain is
@@ -764,6 +791,9 @@ pub(crate) async fn start_tuned(
         .map(tokio::net::TcpListener::local_addr)
         .transpose()?;
     let mut relay = Relay::new(identity, LIMITS);
+    if let Some(limits) = options.admission {
+        relay = relay.with_admission_limits(limits);
+    }
     if let Some(config) = front_door {
         raise_nofile_for(&config, http.is_some());
         relay = relay.with_front_door(config);

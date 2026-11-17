@@ -136,6 +136,7 @@ async fn every_signal_that_stops_a_node_resets_the_connections_it_serves() {
             host: Some("localhost".to_string()),
             reload_every: relay_cmd::DEFAULT_RELOAD_EVERY,
             fallback_page: None,
+            admission: None,
         },
     )
     .await

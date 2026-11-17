@@ -179,6 +179,7 @@ async fn start_relay(root: &Path, tls: &Tls, owner_home: &Home) -> relay_cmd::Ru
             host: Some("localhost".to_string()),
             reload_every: relay_cmd::DEFAULT_RELOAD_EVERY,
             fallback_page: None,
+            admission: None,
         },
     )
     .await
