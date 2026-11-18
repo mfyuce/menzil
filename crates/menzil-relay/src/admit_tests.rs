@@ -1286,3 +1286,41 @@ async fn a_steward_refuses_a_request_of_its_own_invite() {
         AdmitResultBody::Refused(u16::from(ErrorCode::BadTag))
     );
 }
+
+/// A request held while no issuer of its signer is listening is replayed to that signer's
+/// registration only: a steward that registers later does not get an owner signed request, and
+/// the owner that registers afterwards does.
+#[tokio::test]
+async fn a_held_request_is_replayed_only_to_its_signers_registration() {
+    let h = start().await;
+    let (owner_dev, steward_dev) = (generate_identity(), generate_identity());
+    let (net, steward_key) = steward_net(
+        &h.relay,
+        &[&owner_dev, &steward_dev],
+        &["admit"],
+        4_000_000_000,
+    );
+    let d = generate_identity();
+    let mut c = h.redeem(&d).await;
+    let req = request(&d, &invite(&net.owner, net.id, 1));
+    c.send(Record::AdmitRequest(req.clone())).await;
+    assert_eq!(expect_result(&mut c).await, AdmitResultBody::Pending);
+    // The steward's issuer registers: the owner's request is not its business.
+    let mut st = h.member(&steward_dev, net.id, 11).await;
+    st.send(h.proof(&net, &steward_key, &steward_dev, 11)).await;
+    ping_pong(&mut st, [3; 8]).await;
+    assert!(
+        quiet(&mut st).await,
+        "the steward was replayed an owner signed request"
+    );
+    // The owner's issuer registers: it gets the held request.
+    // (By hand: `issuer` pings right after the proof and would meet the replay first.)
+    let mut owner_session = h.member(&owner_dev, net.id, 10).await;
+    owner_session
+        .send(h.proof(&net, &net.owner, &owner_dev, 10))
+        .await;
+    match recv_in_time(&mut owner_session).await {
+        Some(Record::AdmitPending(body)) => assert_eq!(body, req),
+        other => panic!("expected the held request for the owner, got {other:?}"),
+    }
+}
