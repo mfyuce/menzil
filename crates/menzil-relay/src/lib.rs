@@ -21,6 +21,7 @@
 
 mod acme;
 mod admission;
+mod admit;
 mod advertise;
 mod connection;
 mod doc;
@@ -60,6 +61,10 @@ pub use admission::{
     AdmissionLimits, CONNECTIONS_PER_IP_PER_MINUTE, MAX_ATTACHED, MAX_HANDSHAKES_PER_IP,
     MAX_HANDSHAKES_PER_V6_48, MAX_TRACKED_PEERS, MAX_UNATTACHED_PER_IP, MAX_UNATTACHED_PER_NODE,
     RATE_WINDOW,
+};
+pub use admit::{
+    HOLD_PER_ADDRESS, HOLD_PER_INVITE, HOLD_PER_NETWORK, HOLD_PER_NODE, REDEEM_MAX_WAIT,
+    RedeemLimits,
 };
 pub use advertise::{DEFAULT_RESERVED_LABELS, LabelRegistry};
 pub use connection::InboundConnection;

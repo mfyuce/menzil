@@ -197,17 +197,23 @@ fn validate_against_rosters<T>(
     cert_serial: u32,
     rosters: &RosterStore,
     history: &NodeHistory,
+    redeem: bool,
     admit: impl FnOnce(&NodeId, &[NetworkId]) -> Result<T, HelloRejection>,
 ) -> Result<T, HelloRejection> {
     // Repeats dropped and the count capped before the first look at the store: the work below
     // is then at most MAX_HELLO_NETWORKS lookups however the HELLO was padded.
     let claimed = dedup_networks(&hello.networks);
-    // Decision D6 (MT4): a HELLO that claims no network is refused. Its only legitimate use
-    // is redeeming an invitation, which is not built (phase 2), and until then it would give
-    // any key a session that lives as long as it answers PING. The code is `not_member`: the
-    // node is a member of none of the networks it named, and the answer says nothing about
-    // which networks this relay serves.
+    // A HELLO that claims no network (decision D6, MT4) is refused, unless the caller runs
+    // redeem sessions (`redeem`, protocol.md 4.1 and 7.2): then it is admitted under the same
+    // per NodeId and per address figures as any unattached session, and nothing more: no
+    // replay mark is written (the node is a stranger, so it must not fill the history), and
+    // the session `crate::admit` drives may only send ADMIT_REQUEST. Without `redeem` the code
+    // is `not_member`: the node is a member of none of the networks it named, and the answer
+    // says nothing about which networks this relay serves.
     if claimed.is_empty() {
+        if redeem {
+            return admit(&node_id, &claimed);
+        }
         return Err(reject(
             ErrorCode::NotMember,
             "a HELLO must claim at least one network",
@@ -255,8 +261,10 @@ pub fn check_hello(
     history: &NodeHistory,
     now: u64,
 ) -> Result<NodeId, HelloRejection> {
-    check_hello_admitting(hello, node_static, rosters, history, now, |_, _| Ok(()))
-        .map(|(node_id, ())| node_id)
+    check_hello_admitting(hello, node_static, rosters, history, now, false, |_, _| {
+        Ok(())
+    })
+    .map(|(node_id, ())| node_id)
 }
 
 /// [`check_hello`] with one more step: `admit` runs once the NodeId is proven and in standing
@@ -269,6 +277,7 @@ pub(crate) fn check_hello_admitting<T>(
     rosters: &RosterStore,
     history: &NodeHistory,
     now: u64,
+    redeem: bool,
     admit: impl FnOnce(&NodeId, &[NetworkId]) -> Result<T, HelloRejection>,
 ) -> Result<(NodeId, T), HelloRejection> {
     let cert_body = verify_node_cert(hello, node_static, now)?;
@@ -278,6 +287,7 @@ pub(crate) fn check_hello_admitting<T>(
         cert_body.serial,
         rosters,
         history,
+        redeem,
         admit,
     )?;
     Ok((cert_body.node_id, admitted))
@@ -404,6 +414,63 @@ mod tests {
         let retry = hello_with(&fixture, vec![network_id], 1, 10);
         let node_id = check_hello(&retry, &fixture.x25519_static, &rosters, &history, 500).unwrap();
         assert_eq!(node_id, fixture.node_id);
+    }
+
+    /// With redeem sessions on (protocol.md 4.1, 7.2) a HELLO that claims no network is admitted
+    /// through the admission step and leaves no replay mark; a certificate that fails is
+    /// refused as before.
+    #[test]
+    fn a_claim_less_hello_is_admitted_for_a_redeem_session_without_a_replay_mark() {
+        let fixture = fixture();
+        let rosters = RosterStore::new();
+        let history = NodeHistory::new();
+        let empty = hello_with(&fixture, vec![], 1, 10);
+        let (node_id, claimed) = check_hello_admitting(
+            &empty,
+            &fixture.x25519_static,
+            &rosters,
+            &history,
+            500,
+            true,
+            |_, claimed| Ok(claimed.len()),
+        )
+        .unwrap();
+        assert_eq!(node_id, fixture.node_id);
+        assert_eq!(claimed, 0);
+        assert!(history.is_empty(), "a stranger must not fill the history");
+        let wrong_key = X25519PublicKey::from([8u8; 32]);
+        assert_eq!(
+            check_hello_admitting(
+                &empty,
+                &wrong_key,
+                &rosters,
+                &history,
+                500,
+                true,
+                |_, _| Ok(())
+            )
+            .unwrap_err()
+            .code,
+            ErrorCode::BadCert
+        );
+        // A HELLO that does claim networks is judged as ever.
+        let owner = SigningKey::generate(&mut rand::rng());
+        let network_id = NetworkId::from(owner.verifying_key().to_bytes());
+        let stranger_claims = hello_with(&fixture, vec![network_id], 1, 10);
+        assert_eq!(
+            check_hello_admitting(
+                &stranger_claims,
+                &fixture.x25519_static,
+                &rosters,
+                &history,
+                500,
+                true,
+                |_, _| Ok(())
+            )
+            .unwrap_err()
+            .code,
+            ErrorCode::NotMember
+        );
     }
 
     #[test]
@@ -634,6 +701,7 @@ mod tests {
             &rosters,
             &history,
             500,
+            false,
             |_, _| Err(over_limit("full")),
         );
         assert_eq!(refused.unwrap_err().code, ErrorCode::RateLimited);
@@ -645,6 +713,7 @@ mod tests {
                 &rosters,
                 &history,
                 500,
+                false,
                 |_, _| { Ok(()) }
             )
             .is_ok(),
@@ -661,6 +730,7 @@ mod tests {
             &rosters,
             &history,
             500,
+            false,
             |_, _| {
                 asked = true;
                 Ok(())

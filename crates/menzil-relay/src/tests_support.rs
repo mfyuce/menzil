@@ -158,6 +158,25 @@ impl StewardNet {
         }
     }
 
+    /// A Roster at `seq` signed by `signer` that lists `member` besides the base's members (a
+    /// steward's admission).
+    pub(crate) fn renewal_listing(
+        &self,
+        signer: &ed25519_dalek::SigningKey,
+        seq: u64,
+        member: menzil_proto::NodeId,
+    ) -> menzil_proto::Roster {
+        let mut body = self.body.clone();
+        body.seq = seq;
+        body.issued = self.now;
+        body.expires = self.now + 7 * DAY;
+        body.members.push(menzil_proto::RosterMember {
+            node_id: member,
+            min_serial: 1,
+        });
+        menzil_proto::Roster::sign(signer, &body).unwrap()
+    }
+
     /// A renewal of the base at `seq`, signed by `signer`.
     pub(crate) fn renewal(
         &self,

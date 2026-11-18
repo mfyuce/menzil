@@ -3114,13 +3114,15 @@ async fn a_stranger_with_a_fresh_key_sees_no_networks_in_welcome() {
     let three = three_networks([&[member.node_id], &[member.node_id], &[]]).await;
     let stranger = generate_identity();
 
-    // Claims nothing: refused (D6), and nothing listed.
+    // Claims nothing: a redeem session (D3 B2), nothing listed, and anything but an
+    // ADMIT_REQUEST (here ATTACH) is refused `not_member`.
     let (mut client, welcome) = three.connect_ik(&stranger, vec![], 10).await;
     assert!(
         welcome.rosters.is_empty(),
         "a stranger enumerated {:?}",
         welcome.rosters
     );
+    client.send(Record::Attach).await;
     match client.recv().await {
         Some(Record::Error(body)) => assert_eq!(body.code, ErrorCode::NotMember),
         other => panic!("expected ERROR(not_member), got {other:?}"),
@@ -6398,3 +6400,6 @@ async fn xx_is_answered_with_the_current_key_even_while_a_previous_key_is_held()
         menzil_session::StaticUsed::Current
     );
 }
+
+#[path = "admit_tests.rs"]
+mod admit_tests;

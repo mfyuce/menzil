@@ -37,8 +37,12 @@
 //! not yet, by the rule HELLO applied (`crate::hello::roster_standing`), so a node of another
 //! network is never looked at.
 //!
-//! Everything else this build doesn't yet act on (PEER_STATE, ADMIT_*,
-//! and an ADVERTISE_ACK, CREDIT, or GOAWAY received from a node, all
+//! ADMIT_LISTEN and ADMIT_REFUSED (an issuer's registration and refusals, `crate::admit`) are
+//! handled here too; a HELLO that claims no network is a redeem session that
+//! `crate::admit::run_redeem_session` drives instead of the attached loop.
+//!
+//! Everything else this build doesn't yet act on (PEER_STATE, ADMIT_REQUEST
+//! after ATTACH, and an ADVERTISE_ACK, CREDIT, or GOAWAY received from a node, all
 //! protocol violations since those records are relay-to-node only — not
 //! specially detected as such yet, just as unhandled as the rest) is
 //! decrypted, logged, and otherwise ignored.
@@ -49,7 +53,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use menzil_proto::{
     CreditBody, DocReassembler, ErrorBody, ErrorCode, GoawayBody, HelloBody, NetworkId, NodeId,
-    Record, WelcomeBody, X25519PublicKey,
+    Record, Tai64N, WelcomeBody, X25519PublicKey,
 };
 use menzil_session::{
     HandshakePattern, Liveness, RekeySchedule, RelayHandshake, RelayHandshakeStep, StaticUsed,
@@ -58,6 +62,7 @@ use menzil_session::{
 use tokio::sync::broadcast;
 
 use crate::admission::{IpSlot, NodeSlot};
+use crate::admit;
 use crate::connection::InboundConnection;
 use crate::doc::{self, AcceptOutcome, PendingBases};
 use crate::endpoint::{EndpointCredit, EndpointOutcome};
@@ -105,7 +110,7 @@ fn detect_pattern(message1: &[u8]) -> HandshakePattern {
 
 /// How long a refused peer's connection stays open, read and discarded, after its ERROR was
 /// sent (see `run_handshake_and_validate`).
-const REJECTION_LINGER: Duration = Duration::from_secs(1);
+pub(crate) const REJECTION_LINGER: Duration = Duration::from_secs(1);
 
 /// How long a connection that finished its WebSocket upgrade has to complete the Noise
 /// handshake and have its HELLO accepted, from the first message to the end of the rejection
@@ -118,7 +123,7 @@ pub(crate) const NOISE_DEADLINE: Duration = Duration::from_secs(10);
 /// handshake; then it is closed (MT4, threat A9; protocol.md 4.1).
 pub(crate) const ATTACH_DEADLINE: Duration = Duration::from_secs(10);
 
-fn unix_now() -> u64 {
+pub(crate) fn unix_now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -301,6 +306,7 @@ async fn run_handshake_and_validate(
             &relay.rosters,
             &relay.history,
             unix_now(),
+            true,
             |node_id, claimed| admit_session(relay, node_id, claimed, answered.used()),
         )),
         _ => None,
@@ -328,6 +334,7 @@ async fn run_handshake_and_validate(
                 &relay.rosters,
                 &relay.history,
                 unix_now(),
+                true,
                 |node_id, claimed| admit_session(relay, node_id, claimed, answered.used()),
             );
             (transport, hello, checked)
@@ -383,7 +390,7 @@ async fn run_handshake_and_validate(
     }
 }
 
-async fn send_record(
+pub(crate) async fn send_record(
     conn: &mut InboundConnection,
     transport: &mut Transport,
     record: Record,
@@ -477,6 +484,7 @@ async fn dispatch(
     node_id: &NodeId,
     session_id: u32,
     claimed_networks: &[NetworkId],
+    hello_timestamp: Tai64N,
     endpoint_credit: &EndpointCredit,
     incoming: Result<Vec<u8>, RelayError>,
 ) -> Dispatch {
@@ -654,6 +662,32 @@ async fn dispatch(
                     "ignoring ADVERTISE from a session that is not (or no longer) current"
                 );
             }
+            Dispatch::Continue
+        }
+        Record::AdmitListen(body) => {
+            // An issuer registering for a network's ADMIT_PENDING (protocol.md 7.2, `crate::admit`).
+            // Silent on every failure; a session that keeps sending failing ones is ended.
+            if admit::on_listen(
+                relay,
+                node_id,
+                session_id,
+                claimed_networks,
+                hello_timestamp,
+                budget,
+                &body,
+            ) {
+                end_rate_limited(
+                    conn,
+                    transport,
+                    "sending too many unusable ADMIT_LISTEN records",
+                )
+                .await;
+                return Dispatch::End;
+            }
+            Dispatch::Continue
+        }
+        Record::AdmitRefused(body) => {
+            admit::on_refused(relay, node_id, session_id, &body);
             Dispatch::Continue
         }
         Record::Send {
@@ -848,7 +882,7 @@ async fn send_eviction(
 }
 
 #[derive(Debug, PartialEq, Eq)]
-enum TickOutcome {
+pub(crate) enum TickOutcome {
     Continue,
     Dead,
 }
@@ -856,7 +890,7 @@ enum TickOutcome {
 /// Sends this side's own PING or REKEY as [`Liveness`]/[`RekeySchedule`]
 /// come due; a dead link (protocol.md 3.3) is reported for the caller to
 /// end the session over.
-async fn on_tick(
+pub(crate) async fn on_tick(
     conn: &mut InboundConnection,
     transport: &mut Transport,
     liveness: &Liveness,
@@ -883,7 +917,7 @@ async fn on_tick(
 /// arrived; see `menzil-node`'s identical constant for why a fixed
 /// `tokio::time::Interval` (not a plain `sleep` re-armed each loop pass)
 /// matters here.
-const TICK: Duration = Duration::from_secs(1);
+pub(crate) const TICK: Duration = Duration::from_secs(1);
 
 /// Drives one handshaken connection from "not yet routable" through
 /// attachment (protocol.md 4.1) to however it ends: idle, closed, or
@@ -900,6 +934,7 @@ async fn run_attached_loop(
     cert_serial: u32,
     cert_x25519: X25519PublicKey,
     session_id: u32,
+    hello_timestamp: Tai64N,
     relay: &Relay,
     claimed_networks: Vec<NetworkId>,
     their_roster_seq: HashMap<NetworkId, u64>,
@@ -956,7 +991,7 @@ async fn run_attached_loop(
             incoming = conn.recv() => {
                 let outcome = dispatch(
                     &mut conn, &mut transport, &mut liveness, &mut doc_reassembler, &mut pending_bases, &mut budget, relay,
-                    &node_id, session_id, &claimed_networks, &endpoint_credit, incoming,
+                    &node_id, session_id, &claimed_networks, hello_timestamp, &endpoint_credit, incoming,
                 ).await;
                 match outcome {
                     Dispatch::Attach => break,
@@ -1071,7 +1106,7 @@ async fn run_attached_loop(
             incoming = conn.recv() => {
                 let outcome = dispatch(
                     &mut conn, &mut transport, &mut liveness, &mut doc_reassembler, &mut pending_bases, &mut budget, relay,
-                    &node_id, session_id, &claimed_networks, &endpoint_credit, incoming,
+                    &node_id, session_id, &claimed_networks, hello_timestamp, &endpoint_credit, incoming,
                 ).await;
                 match outcome {
                     Dispatch::Attach | Dispatch::Continue => {}
@@ -1196,6 +1231,8 @@ async fn run_attached_loop(
     // above has already settled this session's in-flight items; a
     // `drained` call from another session's queue that arrives after the
     // pair is gone finds no pair and is a no-op.
+    // An issuer registration of this session ends with it.
+    relay.admit.unlisten(&node_id, session_id);
     if relay.registry.detach_then(&node_id, session_id, || {
         relay.forwarding.clear_for(&node_id)
     }) {
@@ -1242,6 +1279,15 @@ pub(crate) async fn handle_connection(
             };
             #[cfg(test)]
             relay.run_before_loop();
+            // A HELLO that claimed no network is a redeem session (`crate::admit`), never
+            // attached.
+            if dedup_networks(&hello.networks).is_empty() {
+                admit::run_redeem_session(
+                    conn, transport, node_id, session_id, &relay, pre_attach, ip_slot,
+                )
+                .await;
+                return;
+            }
             run_attached_loop(
                 conn,
                 transport,
@@ -1249,6 +1295,7 @@ pub(crate) async fn handle_connection(
                 cert.serial,
                 cert.x25519_pub,
                 session_id,
+                hello.timestamp,
                 &relay,
                 dedup_networks(&hello.networks),
                 hello.roster_seq,

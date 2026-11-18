@@ -352,6 +352,11 @@ pub(crate) struct IpSlot {
 }
 
 impl IpSlot {
+    /// The peer this slot counts (an IPv6 address by its /64).
+    pub(crate) fn peer_key(&self) -> PeerKey {
+        self.key
+    }
+
     /// The TLS and WebSocket handshake of this connection is over (done, failed or timed out):
     /// it no longer counts against the peer's handshakes in flight, only against its unattached
     /// sessions, until the session attaches or ends. Idempotent; dropping the slot does it too.

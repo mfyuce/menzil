@@ -239,6 +239,9 @@ impl Window {
 #[derive(Debug)]
 pub(crate) struct SessionBudget {
     pub(crate) advertise: TokenBucket,
+    /// ADMIT_LISTEN records (an issuer registers once per attach; the rate of ADVERTISE bounds
+    /// the signature checks a member can cause).
+    pub(crate) listen: TokenBucket,
     pub(crate) docs: DocBuckets,
     unadopted: Window,
     over_rate: Window,
@@ -249,6 +252,7 @@ impl SessionBudget {
     pub(crate) fn new(rates: &SessionRates, claimed: usize) -> Self {
         Self {
             advertise: TokenBucket::new(rates.advertise_per_minute, rates.advertise_burst),
+            listen: TokenBucket::new(rates.advertise_per_minute, rates.advertise_burst),
             docs: DocBuckets::new(rates, claimed),
             unadopted: Window::new(rates.unadopted_docs_to_end),
             over_rate: Window::new(rates.over_rate_docs_to_end),

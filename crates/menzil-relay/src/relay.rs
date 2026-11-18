@@ -19,6 +19,7 @@ use menzil_session::StaticUsed;
 use crate::acme::RelayAcme;
 use crate::admission::IpSlot;
 use crate::admission::{Admission, AdmissionLimits};
+use crate::admit::{AdmitBook, RedeemLimits};
 use crate::advertise::LabelRegistry;
 use crate::endpoint::RelayEndpoint;
 use crate::forward::{ForwardTable, RelaySendOutcome};
@@ -111,6 +112,8 @@ pub struct Relay {
     pub(crate) history: Arc<NodeHistory>,
     pub(crate) registry: Arc<SessionRegistry>,
     pub(crate) admission: Arc<Admission>,
+    /// Held invite requests and issuer registrations (`crate::admit`).
+    pub(crate) admit: Arc<AdmitBook>,
     pub(crate) labels: Arc<LabelRegistry>,
     pub(crate) forwarding: Arc<ForwardTable>,
     pub(crate) limits: Limits,
@@ -210,6 +213,7 @@ impl Relay {
             history: Arc::new(NodeHistory::new()),
             registry: Arc::new(SessionRegistry::new()),
             admission: Arc::new(Admission::new(AdmissionLimits::default())),
+            admit: Arc::new(AdmitBook::new(RedeemLimits::default())),
             labels: Arc::new(LabelRegistry::new()),
             // The data plane judges tenants by the same book the relay swaps (MT8).
             forwarding: Arc::new(ForwardTable::with_tenants(Arc::clone(&tenants))),
@@ -325,6 +329,16 @@ impl Relay {
     #[must_use]
     pub fn with_admission_limits(mut self, limits: AdmissionLimits) -> Self {
         self.admission = Arc::new(Admission::new(limits));
+        self
+    }
+
+    /// This relay with `limits` as the figures of its redeem sessions (requests held per network,
+    /// per invite and per source address, and how long a held request waits;
+    /// [`RedeemLimits::default`] otherwise). Call it before [`Relay::serve`] and before cloning
+    /// the relay: it replaces the book, dropping anything held.
+    #[must_use]
+    pub fn with_redeem_limits(mut self, limits: RedeemLimits) -> Self {
+        self.admit = Arc::new(AdmitBook::new(limits));
         self
     }
 

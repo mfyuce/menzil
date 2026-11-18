@@ -529,6 +529,28 @@ impl RosterStore {
             .unwrap_or_default()
     }
 
+    /// The keys that may sign an invite or an `ADMIT_LISTEN` proof for `network_id` at `now`:
+    /// `None` when the network is not held, otherwise the Roster's stewards that carry `admit`
+    /// and a `not_after` ahead (the owner's key is the network id itself and is not listed
+    /// here). Nothing of the Roster is cloned beyond the keys (design B4).
+    pub(crate) fn admit_stewards(&self, network_id: &NetworkId, now: u64) -> Option<Vec<[u8; 32]>> {
+        let guard = self.by_network.read().unwrap();
+        let held = guard.get(network_id)?;
+        Some(
+            held.body
+                .stewards
+                .iter()
+                .filter_map(|steward| steward.decode().ok())
+                .filter(|steward| {
+                    steward.network_id == *network_id
+                        && steward.not_after > now
+                        && steward.may.iter().any(|may| may == "admit")
+                })
+                .map(|steward| <[u8; 32]>::from(steward.steward_pub))
+                .collect(),
+        )
+    }
+
     /// Whether any held Roster lists `node_id` as a member (revoked or not). One hash lookup per
     /// held network. `crate::node_history` uses it to decide which replay marks must survive an
     /// eviction.
