@@ -73,6 +73,7 @@ mod docs_sync;
 pub mod egress;
 mod error;
 mod identity;
+mod known_relays;
 mod l3_doc;
 mod l4_router;
 mod l4_session;
@@ -99,6 +100,7 @@ pub use docs_store::{Adopted, AdoptedDocs, DocStore};
 pub use docs_sync::{DOCS_ONLY_WAIT, POLICY_JITTER_MAX, PushReport, SyncConfig};
 pub use error::NodeError;
 pub use identity::{IdentityCell, IdentityError, LocalIdentity, OwnSerial};
+pub use known_relays::{KnownRelays, MAX_KNOWN_RELAYS, RelayFile, RelayRecordView};
 pub use l4_router::{
     EnsureError, HANDSHAKE_ATTEMPTS, RouterConfig, RouterHandle, RouterParts, SessionReady,
     new_router,

@@ -203,6 +203,7 @@ fn session_config_port(
         networks: vec![network_id],
         caps: vec![],
         e2e_protos: vec![0x01],
+        known_relays: std::sync::Arc::new(menzil_node::KnownRelays::in_memory()),
     }
 }
 

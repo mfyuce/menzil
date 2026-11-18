@@ -55,6 +55,13 @@
 //!                   "no word from the node".
 //! ```
 //!
+//! The reply may also carry up to [`MAX_KNOWN_RELAY_LINES`] lines about the relay certificates the
+//! node remembers (the rollback rule of protocol.md 4.1), most recent first:
+//!
+//! ```text
+//!                     known_relay <relay fingerprint> <serial> <key fingerprint> <not_after>
+//! ```
+//!
 //! The status reply may carry the node's certificate too (cert rotation S6):
 //!
 //! ```text
@@ -185,6 +192,12 @@ pub trait Opener: Send + Sync + 'static {
     /// the person at the other end of the socket.
     fn renew_cert(&self) -> impl Future<Output = Result<RenewedCert, String>> + Send {
         async { Err("this agent does not renew certificates".to_string()) }
+    }
+
+    /// The relay certificates the node remembers, for the `status` request. An opener that
+    /// remembers none says none.
+    fn known_relays(&self) -> impl Future<Output = Vec<KnownRelayView>> + Send {
+        async { Vec::new() }
     }
 
     /// The public shares of the node and what the relay says about each, for the `status`
@@ -332,6 +345,67 @@ pub struct NodeStatus {
     pub cert: Option<CertStatus>,
     /// Its public shares and what the relay said about each.
     pub shares: Vec<ShareView>,
+    /// The relay certificates it remembers.
+    pub known_relays: Vec<KnownRelayView>,
+}
+
+/// The most `known_relay` lines a status reply carries.
+pub const MAX_KNOWN_RELAY_LINES: usize = 8;
+
+/// One relay certificate the node remembers, as `status` shows it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KnownRelayView {
+    /// The relay's fingerprint (the first 10 bytes of its `NodeId` in hex).
+    pub relay: String,
+    /// The highest certificate serial the node has verified for it.
+    pub serial: u32,
+    /// The fingerprint of that certificate's X25519 key (10 bytes in hex).
+    pub key: String,
+    /// The end of that certificate's window, Unix seconds.
+    pub not_after: u64,
+}
+
+impl KnownRelayView {
+    fn to_line(&self) -> String {
+        format!(
+            "known_relay {} {} {} {}\n",
+            one_line(&self.relay),
+            self.serial,
+            one_line(&self.key),
+            self.not_after
+        )
+    }
+
+    fn from_line(line: &str) -> Option<Self> {
+        let rest = line.strip_prefix("known_relay ")?;
+        let mut parts = rest.split(' ');
+        let (relay, serial, key, not_after) =
+            (parts.next()?, parts.next()?, parts.next()?, parts.next()?);
+        let hex =
+            |t: &str| t.len() == 20 && t.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
+        if parts.next().is_some() || !hex(relay) || !hex(key) {
+            return None;
+        }
+        Some(Self {
+            relay: relay.to_string(),
+            serial: serial.parse().ok()?,
+            key: key.to_string(),
+            not_after: not_after.parse().ok()?,
+        })
+    }
+
+    /// The line `menzil status` prints, with the window relative to `now`.
+    pub fn render(&self, now: u64) -> String {
+        let window = if self.not_after > now {
+            format!("valid for {}", text::age(self.not_after - now))
+        } else {
+            format!("expired {} ago", text::age(now - self.not_after))
+        };
+        format!(
+            "known relay {}: serial {}, key {}, {window}\n",
+            self.relay, self.serial, self.key
+        )
+    }
 }
 
 /// What the node knows about its relay, as the `status` request carries it. Every part is
@@ -778,6 +852,14 @@ async fn handle<O: Opener>(connection: UnixStream, opener: &O) -> Result<()> {
         if let Some(cert) = opener.cert_status().await {
             reply.push_str(&cert.to_lines());
         }
+        for relay in opener
+            .known_relays()
+            .await
+            .iter()
+            .take(MAX_KNOWN_RELAY_LINES)
+        {
+            reply.push_str(&relay.to_line());
+        }
         for share in opener.shares().await.iter().take(MAX_SHARE_LINES) {
             reply.push_str(&share.to_line());
             reply.push('\n');
@@ -1142,7 +1224,7 @@ const STATUS_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// The most lines of a `status` reply a client reads: 32 for the relay and the certificate and
 /// one for each share the agent may list.
-const MAX_STATUS_LINES: usize = 32 + MAX_SHARE_LINES;
+const MAX_STATUS_LINES: usize = 32 + MAX_KNOWN_RELAY_LINES + MAX_SHARE_LINES;
 
 /// Asks the agent at `socket` how the node stands with its relay. An error means there is no
 /// agent to ask (none is listening, another user serves the socket, it did not answer, or it
@@ -1213,6 +1295,11 @@ async fn query_node_status_as(socket: &Path, uid: u32) -> Result<NodeStatus> {
                 .iter()
                 .filter_map(|line| ShareView::from_line(line))
                 .take(MAX_SHARE_LINES)
+                .collect(),
+            known_relays: lines
+                .iter()
+                .filter_map(|line| KnownRelayView::from_line(line))
+                .take(MAX_KNOWN_RELAY_LINES)
                 .collect(),
         })
     })

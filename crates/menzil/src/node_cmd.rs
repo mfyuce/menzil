@@ -25,8 +25,9 @@ use menzil_node::acme::{
 };
 use menzil_node::egress::{EgressExecutor, PolicyEgressRules};
 use menzil_node::{
-    Adopted, AdoptedDocs, DocStore, EnsureError, LocalIdentity, LocalServices, Node, NodeConfig,
-    NodeError, NodeOpenError, OpenStreamError, PolicyStore, RelayError, RosterStore, SessionConfig,
+    Adopted, AdoptedDocs, DocStore, EnsureError, KnownRelays, LocalIdentity, LocalServices, Node,
+    NodeConfig, NodeError, NodeOpenError, OpenStreamError, PolicyStore, RelayError, RelayFile,
+    RosterStore, SessionConfig,
 };
 use menzil_proto::trust::{DOC_MAX_LIFETIME, Reason};
 use menzil_proto::{ErrorCode, NetworkId, NodeId, OpenTarget, ServiceId, ServiceKind, Share};
@@ -621,6 +622,45 @@ pub struct NodeOpener {
     shares: Option<(Home, LocalServices)>,
     /// What the node's certificates stand at, when it gets them (`[acme]`).
     acme: Option<AcmeView>,
+    /// The relay certificates the node remembers, for `status`.
+    known_relays: Option<Arc<KnownRelays>>,
+}
+
+/// The known relays file of a home: [`menzil_node::RelayFile`] over `known-relays.cbor`, its lock
+/// and `Home::write_secret`.
+#[derive(Debug)]
+struct HomeRelayFile {
+    home: Home,
+}
+
+impl RelayFile for HomeRelayFile {
+    fn lock(&self) -> std::io::Result<Box<dyn Send>> {
+        self.home
+            .lock_known_relays()
+            .map(|lock| Box::new(lock) as Box<dyn Send>)
+            .map_err(std::io::Error::other)
+    }
+
+    fn read(&self) -> std::io::Result<Option<Vec<u8>>> {
+        match fs::read(self.home.known_relays_path()) {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    fn write(&self, bytes: &[u8]) -> std::io::Result<()> {
+        self.home
+            .write_secret(&self.home.known_relays_path(), bytes)
+            .map_err(std::io::Error::other)
+    }
+
+    fn set_aside(&self, unix: u64) -> std::io::Result<()> {
+        let path = self.home.known_relays_path();
+        let mut aside = path.clone().into_os_string();
+        aside.push(format!(".corrupt-{unix}"));
+        fs::rename(path, aside)
+    }
 }
 
 /// What a status display needs to say how the certificates of the shares stand: the renewal
@@ -671,7 +711,14 @@ impl NodeOpener {
             certs: None,
             shares: None,
             acme: None,
+            known_relays: None,
         }
+    }
+
+    /// Lets the agent list the relay certificates the node remembers in `status`.
+    pub fn with_known_relays(mut self, known: Arc<KnownRelays>) -> Self {
+        self.known_relays = Some(known);
+        self
     }
 
     /// Lets the agent show how the certificates of the shares stand, from `acme`.
@@ -826,6 +873,25 @@ impl Opener for NodeOpener {
         }
     }
 
+    async fn known_relays(&self) -> Vec<agent::KnownRelayView> {
+        let Some(known) = &self.known_relays else {
+            return Vec::new();
+        };
+        let fingerprint = |bytes: &[u8]| -> String {
+            bytes.iter().take(10).map(|b| format!("{b:02x}")).collect()
+        };
+        known
+            .views()
+            .into_iter()
+            .map(|view| agent::KnownRelayView {
+                relay: view.relay_id.fingerprint(),
+                serial: view.serial,
+                key: fingerprint(view.x25519.as_ref()),
+                not_after: view.not_after,
+            })
+            .collect()
+    }
+
     async fn cert_status(&self) -> Option<agent::CertStatus> {
         self.certs.as_ref()?.status(unix_now())
     }
@@ -978,6 +1044,12 @@ where
     let (keys, cert) = load_identity(home)?;
     let (policies, rosters, networks) = load_stores(home)?;
     let keeper = keep_adopted_documents(home, &rosters)?;
+    // The highest relay certificate seen per relay (protocol.md 4.1): a corrupt file is set
+    // aside and the node starts with none (it never stops the node).
+    let known_relays = Arc::new(KnownRelays::open(
+        Box::new(HomeRelayFile { home: home.clone() }),
+        unix_now(),
+    ));
     let session = SessionConfig {
         dial: DialConfig {
             connection_info: config.connection_info()?,
@@ -991,6 +1063,7 @@ where
         networks,
         caps: vec![],
         e2e_protos: vec![0x01],
+        known_relays: known_relays.clone(),
     };
     // `[egress] enabled = true` makes this node an exit (protocol.md 8): the executor reads this
     // node's own EgressRule from the same Policies the node adopts into. Without it nothing is
@@ -1101,7 +1174,8 @@ where
         _ => (None, None),
     };
     let mut opener = NodeOpener::new(node.clone(), directory.clone())
-        .with_shares(home.clone(), services_handle.clone());
+        .with_shares(home.clone(), services_handle.clone())
+        .with_known_relays(known_relays.clone());
     if let Some(view) = &acme_view {
         opener = opener.with_acme(view.clone());
     }

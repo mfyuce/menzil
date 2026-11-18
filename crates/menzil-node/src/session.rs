@@ -73,6 +73,7 @@ use menzil_session::{
 
 use crate::error::NodeError;
 use crate::identity::IdentityCell;
+use crate::known_relays::KnownRelays;
 use crate::l3_doc::{self, L3DocOutcome, PendingBases};
 use crate::outbound::{EnqueueOutcome, Epoch, MAX_QUEUED_BYTES, OutboundQueue, OutboundSend};
 use crate::relay_notes::{RelayNotes, listed_in_own_roster};
@@ -95,6 +96,9 @@ pub struct SessionConfig {
     pub caps: Vec<Capability>,
     /// `e2e_proto` tags this node supports (protocol.md 4.2, 9).
     pub e2e_protos: Vec<u8>,
+    /// What this node remembers of the relays it dialed: the highest certificate serial per
+    /// relay (the rollback rule of protocol.md 4.1), and the dial key choice.
+    pub known_relays: Arc<KnownRelays>,
 }
 
 /// The pure L3 session logic, independent of how bytes travel: decrypts
@@ -729,12 +733,12 @@ async fn run_handshake(
     roster_store: &RosterStore,
 ) -> Result<(Transport, WelcomeBody, X25519PublicKey), NodeError> {
     let info = &config.dial.connection_info;
-    // "`key` is a cache that enables the one round trip IK handshake;
-    // when it is absent or stale the node uses XX" (protocol.md 3.2).
-    // Detecting staleness (as opposed to absence) would need a record of
-    // past failed attempts that no store exists yet to hold; see this
-    // module's doc comment.
-    let pattern = if info.relay_x25519.is_some() {
+    // protocol.md 3.2, 4.1: IK with the key this node remembers for the relay, else with the
+    // configured `key`, else XX; after an IK attempt failed in the handshake itself, XX.
+    let dial_key = config
+        .known_relays
+        .dial_key(&info.relay_node_id, info.relay_x25519);
+    let pattern = if dial_key.is_some() {
         HandshakePattern::Ik
     } else {
         HandshakePattern::Xx
@@ -769,35 +773,74 @@ async fn run_handshake(
     let (node_handshake, message1) = NodeHandshake::start(
         pattern,
         &identity.x25519_private,
-        info.relay_x25519.as_ref(),
+        dial_key.as_ref(),
         &prologue_bytes,
         &hello,
     )?;
     carrier.send(message1).await?;
-    let message2 = carrier.recv().await?;
-    let (transport, welcome, relay_static, message3) = node_handshake.finish(&message2)?;
+    let ik = pattern == HandshakePattern::Ik;
+    let message2 = if ik {
+        // A relay that no longer holds the key says nothing or closes: that is the IK failure
+        // the fallback to XX is for, and it must not wait for the whole attempt deadline.
+        match tokio::time::timeout(IK_REPLY_TIMEOUT, carrier.recv()).await {
+            Ok(Ok(message)) => message,
+            Ok(Err(error)) => {
+                config.known_relays.ik_failed(&info.relay_node_id);
+                return Err(error.into());
+            }
+            Err(_) => {
+                config.known_relays.ik_failed(&info.relay_node_id);
+                return Err(NodeError::Carrier(menzil_carrier::CarrierError::Connect(
+                    "no answer to the IK handshake message".to_string(),
+                )));
+            }
+        }
+    } else {
+        carrier.recv().await?
+    };
+    let (transport, welcome, relay_static, message3) = match node_handshake.finish(&message2) {
+        Ok(done) => done,
+        Err(error) => {
+            if ik {
+                config.known_relays.ik_failed(&info.relay_node_id);
+            }
+            return Err(error.into());
+        }
+    };
     if let Some(message3) = message3 {
         carrier.send(message3).await?;
     }
 
-    verify_relay_identity(info, &welcome, &relay_static)?;
+    // The serial rule writes a risen record here, before the caller sends ATTACH.
+    verify_relay_identity(
+        info,
+        &welcome,
+        &relay_static,
+        &config.known_relays,
+        unix_now(),
+    )?;
+    config.known_relays.ik_succeeded(&info.relay_node_id);
     Ok((transport, welcome, relay_static))
 }
 
-/// protocol.md 4.1: "the node verifies `relay_cert.node_id` equals the
-/// `id` of its connection information and `relay_cert.x25519_pub` equals
-/// the relay static key of the handshake". `menzil_session` surfaces both
-/// sides of this comparison without performing it; this is where it
-/// actually happens.
-///
-/// Not done here: "remembers the highest relay serial" (protocol.md
-/// 4.1) needs state kept across reconnects, which needs a persistent
-/// identity/state store that does not exist yet (the same gap
-/// `tai64n_now`'s docs flag for HELLO's timestamp).
+/// How long an IK attempt waits for message 2 before it counts as failed in the handshake.
+const IK_REPLY_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The one hour of clock skew a certificate's `not_before` may be ahead of this node.
+const NOT_BEFORE_SKEW: u64 = 3600;
+
+/// protocol.md 4.1, in this order: the self signature under the dialed `id`; `node_id` equals
+/// `id`; the window (`not_after > now`, `not_before <= now + 3600`); `x25519_pub` equals the
+/// handshake's static key; then the serial rule against what `known` holds for this relay
+/// ([`KnownRelays::accept`]: a lower serial is [`NodeError::RelayRollback`], a higher one is
+/// written before this returns). `relay_next` (the 30 day window of a rotated key) is slice A2
+/// and not read here.
 fn verify_relay_identity(
     info: &ConnectionInfo,
     welcome: &WelcomeBody,
     relay_static: &X25519PublicKey,
+    known: &KnownRelays,
+    now: u64,
 ) -> Result<(), NodeError> {
     let verifying_key = VerifyingKey::from_bytes(&<[u8; 32]>::from(info.relay_node_id))?;
     welcome.relay_cert.verify(&verifying_key)?;
@@ -807,12 +850,24 @@ fn verify_relay_identity(
             "relay_cert.node_id does not match the dialed connection information's id",
         ));
     }
+    if cert_body.not_after <= now {
+        return Err(NodeError::RelayCertExpired {
+            not_after: cert_body.not_after,
+        });
+    }
+    if cert_body.not_before > now.saturating_add(NOT_BEFORE_SKEW) {
+        return Err(NodeError::RelayCertNotYetValid {
+            not_before: cert_body.not_before,
+        });
+    }
     if cert_body.x25519_pub != *relay_static {
         return Err(NodeError::RelayIdentityMismatch(
             "relay_cert.x25519_pub does not match the relay's negotiated Noise static key",
         ));
     }
-    Ok(())
+    known
+        .accept(&info.relay_node_id, &welcome.relay_cert, &cert_body, now)
+        .map(|_| ())
 }
 
 /// The system clock in Unix seconds, for the time rules of protocol.md 2.3.
@@ -1769,6 +1824,7 @@ mod tests {
             networks,
             caps: vec![],
             e2e_protos: vec![0x01],
+            known_relays: std::sync::Arc::new(KnownRelays::in_memory()),
         }
     }
 
@@ -2597,7 +2653,14 @@ mod tests {
         let relay_cert = NodeCert::sign(&key, &cert_body).unwrap();
         let welcome = sample_welcome(relay_cert);
         let info = sample_info(node_id, relay_static);
-        verify_relay_identity(&info, &welcome, &relay_static).unwrap();
+        verify_relay_identity(
+            &info,
+            &welcome,
+            &relay_static,
+            &KnownRelays::in_memory(),
+            500_000_000,
+        )
+        .unwrap();
     }
 
     #[test]
@@ -2619,7 +2682,14 @@ mod tests {
         let relay_cert = NodeCert::sign(&key, &cert_body).unwrap();
         let welcome = sample_welcome(relay_cert);
         let info = sample_info(dialed_id, relay_static);
-        let err = verify_relay_identity(&info, &welcome, &relay_static).unwrap_err();
+        let err = verify_relay_identity(
+            &info,
+            &welcome,
+            &relay_static,
+            &KnownRelays::in_memory(),
+            500_000_000,
+        )
+        .unwrap_err();
         assert!(matches!(err, NodeError::RelayIdentityMismatch(_)));
     }
 
@@ -2640,8 +2710,156 @@ mod tests {
         let relay_cert = NodeCert::sign(&key, &cert_body).unwrap();
         let welcome = sample_welcome(relay_cert);
         let info = sample_info(node_id, cert_x25519);
-        let err = verify_relay_identity(&info, &welcome, &negotiated_x25519).unwrap_err();
+        let err = verify_relay_identity(
+            &info,
+            &welcome,
+            &negotiated_x25519,
+            &KnownRelays::in_memory(),
+            500_000_000,
+        )
+        .unwrap_err();
         assert!(matches!(err, NodeError::RelayIdentityMismatch(_)));
+    }
+
+    const NOW: u64 = 1_800_000_000;
+
+    /// A relay certificate for `key` under `serial`, bound to the static `x25519`, with the
+    /// given window, wrapped in a WELCOME; and what the node dialed.
+    fn relay_welcome(
+        key: &SigningKey,
+        serial: u32,
+        x25519: u8,
+        not_before: u64,
+        not_after: u64,
+    ) -> (ConnectionInfo, WelcomeBody, X25519PublicKey) {
+        let node_id = NodeId::from(key.verifying_key().to_bytes());
+        let static_key = X25519PublicKey::from([x25519; 32]);
+        let body = NodeCertBody {
+            v: PROTOCOL_VERSION,
+            node_id,
+            x25519_pub: static_key,
+            serial,
+            not_before,
+            not_after,
+        };
+        let welcome = sample_welcome(NodeCert::sign(key, &body).unwrap());
+        (sample_info(node_id, static_key), welcome, static_key)
+    }
+
+    fn verify_at(
+        known: &KnownRelays,
+        key: &SigningKey,
+        serial: u32,
+        x25519: u8,
+    ) -> Result<(), NodeError> {
+        let (info, welcome, static_key) =
+            relay_welcome(key, serial, x25519, NOW - 86_400, NOW + 86_400 * 100);
+        verify_relay_identity(&info, &welcome, &static_key, known, NOW)
+    }
+
+    #[test]
+    fn a_relay_certificate_past_its_window_is_refused() {
+        let key = SigningKey::generate(&mut rand::rng());
+        let known = KnownRelays::in_memory();
+        for (not_before, not_after, expired) in [
+            // not_after == now is already expired.
+            (NOW - 10, NOW, true),
+            (NOW - 10, NOW - 1, true),
+            // not_before more than an hour ahead is refused; exactly an hour is not.
+            (NOW + 3601, NOW + 9999, false),
+        ] {
+            let (info, welcome, static_key) = relay_welcome(&key, 1, 5, not_before, not_after);
+            let err = verify_relay_identity(&info, &welcome, &static_key, &known, NOW).unwrap_err();
+            if expired {
+                assert!(matches!(err, NodeError::RelayCertExpired { .. }), "{err:?}");
+            } else {
+                assert!(
+                    matches!(err, NodeError::RelayCertNotYetValid { .. }),
+                    "{err:?}"
+                );
+            }
+        }
+        let (info, welcome, static_key) = relay_welcome(&key, 1, 5, NOW + 3600, NOW + 9999);
+        verify_relay_identity(&info, &welcome, &static_key, &known, NOW).unwrap();
+        // Nothing refused was remembered: serial 1 stored once, by the last call.
+        assert_eq!(known.views().len(), 1);
+    }
+
+    #[test]
+    fn a_refused_certificate_leaves_the_memory_alone() {
+        let key = SigningKey::generate(&mut rand::rng());
+        let known = KnownRelays::in_memory();
+        let (info, welcome, static_key) = relay_welcome(&key, 7, 5, 0, NOW - 1);
+        assert!(verify_relay_identity(&info, &welcome, &static_key, &known, NOW).is_err());
+        assert!(known.views().is_empty());
+    }
+
+    #[test]
+    fn the_serial_rule_through_verify_relay_identity() {
+        let key = SigningKey::generate(&mut rand::rng());
+        let known = KnownRelays::in_memory();
+        // No record: accepted and stored.
+        verify_at(&known, &key, 2, 7).unwrap();
+        // Lower: rollback, naming both serials.
+        let err = verify_at(&known, &key, 1, 6).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                NodeError::RelayRollback {
+                    stored: 2,
+                    presented: 1
+                }
+            ),
+            "{err:?}"
+        );
+        // Equal serial, another key: refused.
+        let err = verify_at(&known, &key, 2, 8).unwrap_err();
+        assert!(
+            matches!(err, NodeError::RelayIdentityMismatch(_)),
+            "{err:?}"
+        );
+        // Equal serial, same key: accepted.
+        verify_at(&known, &key, 2, 7).unwrap();
+        // Higher: accepted, and the old serial is now a rollback.
+        verify_at(&known, &key, 3, 9).unwrap();
+        assert!(matches!(
+            verify_at(&known, &key, 2, 7).unwrap_err(),
+            NodeError::RelayRollback {
+                stored: 3,
+                presented: 2
+            }
+        ));
+    }
+
+    #[test]
+    fn a_higher_serial_is_on_disk_when_verify_relay_identity_returns() {
+        // The caller sends ATTACH after this returns: the write must already have happened.
+        let file = crate::known_relays::tests::SharedFile::default();
+        let known = KnownRelays::open(Box::new(file.clone()), NOW);
+        let key = SigningKey::generate(&mut rand::rng());
+        verify_at(&known, &key, 4, 7).unwrap();
+        assert_eq!(*file.0.writes.lock().unwrap(), 1);
+        let reopened = KnownRelays::open(Box::new(file), NOW);
+        assert_eq!(
+            reopened
+                .stored(&NodeId::from(key.verifying_key().to_bytes()))
+                .unwrap()
+                .0,
+            4
+        );
+    }
+
+    #[test]
+    fn a_relay_certificate_signed_by_another_key_is_refused_before_the_memory_is_touched() {
+        let dialed = SigningKey::generate(&mut rand::rng());
+        let forger = SigningKey::generate(&mut rand::rng());
+        let known = KnownRelays::in_memory();
+        // The forger signs a certificate that names the dialed id.
+        let (info, mut welcome, static_key) = relay_welcome(&dialed, 1, 5, 0, NOW + 100);
+        let body = welcome.relay_cert.decode().unwrap();
+        welcome.relay_cert = NodeCert::sign(&forger, &body).unwrap();
+        assert!(verify_relay_identity(&info, &welcome, &static_key, &known, NOW).is_err());
+        assert!(known.views().is_empty());
     }
 
     #[test]

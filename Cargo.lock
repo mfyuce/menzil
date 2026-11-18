@@ -1440,6 +1440,7 @@ dependencies = [
 name = "menzil-node"
 version = "0.0.1"
 dependencies = [
+ "ciborium",
  "ed25519-dalek",
  "fastrand",
  "futures-util",

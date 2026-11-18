@@ -10,6 +10,8 @@
 //!                                         so the pair is replaced atomically)
 //! <home>/owner/<id>.key            32 secret bytes: the owner key of a network (0600)
 //! <home>/node.lock                 held by a running `menzil node`: one per home
+//! <home>/known-relays.cbor         the highest certificate verified per relay (0600; strict CBOR)
+//! <home>/known-relays.lock         held around a read, merge and write of that file
 //! <home>/config.lock               held while `menzil expose` (or the node) changes config.toml
 //! <home>/networks/<id>/.lock       held while a command changes that network's documents
 //! ```
@@ -123,6 +125,21 @@ impl Home {
     /// The secret keys of this node.
     pub fn identity_key_path(&self) -> PathBuf {
         self.root.join("identity.key")
+    }
+
+    /// The file of the relay certificates this node has verified (the highest serial per relay).
+    pub fn known_relays_path(&self) -> PathBuf {
+        self.root.join("known-relays.cbor")
+    }
+
+    /// Takes the lock every writer of [`Self::known_relays_path`] holds around its read, merge
+    /// and write, so that none lowers a record.
+    pub fn lock_known_relays(&self) -> Result<FileLock> {
+        create_private_dirs(&self.root)?;
+        lock_file(&self.root.join("known-relays.lock"), LOCK_WAIT).with_context(|| {
+            "another menzil process is changing the known relays file; try again in a moment"
+                .to_string()
+        })
     }
 
     /// This node's certificate.
@@ -522,6 +539,30 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[test]
+    fn the_known_relays_file_and_lock_live_in_the_home_and_the_lock_excludes() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home::new(dir.path());
+        assert_eq!(
+            home.known_relays_path(),
+            dir.path().join("known-relays.cbor")
+        );
+        let first = home.lock_known_relays().unwrap();
+        assert!(dir.path().join("known-relays.lock").exists());
+        assert!(
+            FileLock::try_acquire(&dir.path().join("known-relays.lock"))
+                .unwrap()
+                .is_none(),
+            "held"
+        );
+        drop(first);
+        assert!(
+            FileLock::try_acquire(&dir.path().join("known-relays.lock"))
+                .unwrap()
+                .is_some()
+        );
+    }
+
     #[test]
     fn secrets_are_created_readable_by_their_owner_only() {
         use std::os::unix::fs::PermissionsExt;

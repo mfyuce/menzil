@@ -961,6 +961,9 @@ async fn run(cli: Cli) -> Result<()> {
                 let socket = node_cmd::agent_socket_path(&home, &config);
                 if let Ok(status) = agent::query_node_status(&socket).await {
                     print!("{}", status.relay.render(now()));
+                    for relay in &status.known_relays {
+                        print!("{}", relay.render(now()));
+                    }
                     if let Some(cert) = status.cert {
                         print!("{}", cert.render(now()));
                     }

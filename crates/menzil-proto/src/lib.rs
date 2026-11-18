@@ -66,6 +66,7 @@ pub use service::{
 };
 pub use signed::{Signed, SignedBody};
 pub use stream::{OpenAckBody, OpenBody, OpenMeta, OpenTarget, OpenTransport};
+pub use strict::{StrictCborError, check_definite_lengths};
 
 /// Current wire protocol version, bumped whenever the framing format
 /// changes in a way that is not backward compatible.

@@ -195,6 +195,7 @@ pub fn session_config(relay: &TestRelay, id: &Identity, network_id: NetworkId) -
         networks: vec![network_id],
         caps: vec![],
         e2e_protos: vec![0x01],
+        known_relays: std::sync::Arc::new(menzil_node::KnownRelays::in_memory()),
     }
 }
 

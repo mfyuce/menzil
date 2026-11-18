@@ -2003,3 +2003,40 @@ mod acme_wiring {
         assert!(!socket.exists());
     }
 }
+
+/// The known relays file of a home: a record written by one node process is read by the next,
+/// the file is private, and a corrupt file is set aside (never stops the node).
+#[test]
+fn the_known_relays_file_of_a_home_is_kept_private_and_a_corrupt_one_is_set_aside() {
+    use ed25519_dalek::SigningKey;
+    use menzil_proto::{NodeCert, NodeCertBody, X25519PublicKey};
+
+    let dir = tempfile::tempdir().unwrap();
+    let home = Home::new(dir.path());
+    let open = |unix| KnownRelays::open(Box::new(HomeRelayFile { home: home.clone() }), unix);
+    let key = SigningKey::generate(&mut rand::rng());
+    let relay = NodeId::from(key.verifying_key().to_bytes());
+    let body = NodeCertBody {
+        v: menzil_proto::PROTOCOL_VERSION,
+        node_id: relay,
+        x25519_pub: X25519PublicKey::from([7; 32]),
+        serial: 3,
+        not_before: 0,
+        not_after: 4_000_000_000,
+    };
+    let cert = NodeCert::sign(&key, &body).unwrap();
+    let known = open(10);
+    assert!(known.views().is_empty());
+    known.accept(&relay, &cert, &body, 10).unwrap();
+    let path = home.known_relays_path();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+    assert_eq!(open(11).stored(&relay).unwrap().0, 3);
+    fs::write(&path, b"\xbf\xff").unwrap();
+    assert!(open(12345).views().is_empty());
+    assert!(!path.exists());
+    assert!(dir.path().join("known-relays.cbor.corrupt-12345").exists());
+}

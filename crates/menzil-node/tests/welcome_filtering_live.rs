@@ -111,6 +111,8 @@ async fn a_node_of_two_networks_on_a_relay_of_three_attaches_catches_up_and_forw
     // Noise Xx (first contact): nothing is listed, and the node still attaches.
     let mut first_contact = config.clone();
     first_contact.dial.connection_info.relay_x25519 = None;
+    // First contact means no memory of the relay either (a stored key would be dialed with IK).
+    first_contact.known_relays = Arc::new(menzil_node::KnownRelays::in_memory());
     let held = Arc::new(RosterStore::new());
     held.set(&x1).unwrap();
     held.set(&y1).unwrap();

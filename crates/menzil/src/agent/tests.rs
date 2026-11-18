@@ -2120,3 +2120,61 @@ async fn malformed_answer_lines_count_toward_the_answer_line_limit() {
     server.await.unwrap();
     assert!(lines.is_empty(), "read past the limit: {lines:?}");
 }
+
+struct KnowsRelays(Vec<KnownRelayView>);
+
+impl Opener for KnowsRelays {
+    async fn open(&self, _target: &str) -> Result<Stream, String> {
+        Err("no streams here".to_string())
+    }
+    async fn known_relays(&self) -> Vec<KnownRelayView> {
+        self.0.clone()
+    }
+}
+
+fn a_known_relay(n: u32) -> KnownRelayView {
+    KnownRelayView {
+        relay: "0a1b2c3d4e5f60718293".to_string(),
+        serial: n,
+        key: "ffeeddccbbaa99887766".to_string(),
+        not_after: 1_900_000_000 + u64::from(n),
+    }
+}
+
+#[tokio::test]
+async fn the_status_request_carries_the_known_relays_up_to_the_limit() {
+    let views: Vec<KnownRelayView> = (1..=20).map(a_known_relay).collect();
+    let got = with_agent(Arc::new(KnowsRelays(views.clone())), async |socket, uid| {
+        query_node_status_as(socket, uid).await
+    })
+    .await
+    .unwrap();
+    assert_eq!(got.known_relays.len(), MAX_KNOWN_RELAY_LINES);
+    assert_eq!(got.known_relays[0], views[0]);
+    let text = got.known_relays[0].render(1_900_000_000);
+    assert!(
+        text.contains("serial 1") && text.contains("valid for"),
+        "{text}"
+    );
+    let past = a_known_relay(1).render(1_900_100_000);
+    assert!(past.contains("expired"), "{past}");
+}
+
+#[test]
+fn a_known_relay_line_that_is_not_well_formed_is_ignored() {
+    for bad in [
+        "known_relay zz 1 ffeeddccbbaa99887766 5",
+        "known_relay 0a1b2c3d4e5f60718293 x ffeeddccbbaa99887766 5",
+        "known_relay 0a1b2c3d4e5f60718293 1 ffeeddccbbaa99887766",
+        "known_relay 0a1b2c3d4e5f60718293 1 ffeeddccbbaa99887766 5 extra",
+        "known_relay 0a1b2c3d4e5f60718293 1 FFEEDDCCBBAA99887766 5",
+        "known_relay \x1b[31m 1 ffeeddccbbaa99887766 5",
+    ] {
+        assert!(KnownRelayView::from_line(bad).is_none(), "{bad:?}");
+    }
+    let good = a_known_relay(3);
+    assert_eq!(
+        KnownRelayView::from_line(good.to_line().trim_end()),
+        Some(good)
+    );
+}

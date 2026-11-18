@@ -42,6 +42,34 @@ pub enum NodeError {
     #[error("relay identity mismatch: {0}")]
     RelayIdentityMismatch(&'static str),
 
+    /// The relay presented a certificate with a lower serial than the highest this node has
+    /// verified for it (design note A3): a stolen older key answering, or an old backup restored.
+    #[error(
+        "relay rollback: this node holds serial {stored} for the relay, it presented serial {presented}"
+    )]
+    RelayRollback {
+        /// The highest serial this node has verified for the relay.
+        stored: u32,
+        /// The serial the relay presented now.
+        presented: u32,
+    },
+
+    /// The relay's certificate is past its `not_after`.
+    #[error(
+        "the relay's certificate expired at {not_after}; its operator must run `menzil relay renew-cert`"
+    )]
+    RelayCertExpired {
+        /// The end of the certificate's window, Unix seconds.
+        not_after: u64,
+    },
+
+    /// The relay's certificate starts more than an hour from now.
+    #[error("the relay's certificate is not valid until {not_before} (this clock may be wrong)")]
+    RelayCertNotYetValid {
+        /// The start of the certificate's window, Unix seconds.
+        not_before: u64,
+    },
+
     /// The relay ended the session with GOAWAY (protocol.md 4.2); carries
     /// the `retry_after_ms` hint a reconnect loop should honor.
     #[error("relay sent GOAWAY: {reason}")]
