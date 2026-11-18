@@ -657,8 +657,19 @@ impl RelayFile for HomeRelayFile {
 
     fn set_aside(&self, unix: u64) -> std::io::Result<()> {
         let path = self.home.known_relays_path();
-        let mut aside = path.clone().into_os_string();
-        aside.push(format!(".corrupt-{unix}"));
+        // N3: a second corrupt file in the same second gets a counter, never renaming over the
+        // first one.
+        let name = |suffix: String| {
+            let mut aside = path.clone().into_os_string();
+            aside.push(suffix);
+            std::path::PathBuf::from(aside)
+        };
+        let mut aside = name(format!(".corrupt-{unix}"));
+        let mut counter = 1u32;
+        while aside.exists() && counter < 1000 {
+            aside = name(format!(".corrupt-{unix}-{counter}"));
+            counter += 1;
+        }
         fs::rename(path, aside)
     }
 }

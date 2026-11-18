@@ -58,7 +58,13 @@ struct Record {
     cert: NodeCert,
     body: NodeCertBody,
     seen: u64,
+    /// The static keys this record replaced, most recent last (at most [`MAX_SUPERSEDED`]): a
+    /// configured `key=` among them is stale connection information, not new information.
+    superseded: Vec<X25519PublicKey>,
 }
+
+/// The most replaced keys remembered per relay.
+const MAX_SUPERSEDED: usize = 8;
 
 /// What `menzil status` shows of one record.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -93,6 +99,9 @@ struct State {
     ik_failed: HashSet<NodeId>,
     /// Relays for which a config key that disagrees with the record has been logged.
     mismatch_logged: HashSet<NodeId>,
+    /// Relays whose record in memory is ahead of the file because a write failed: written again
+    /// at the next accept of that record.
+    unwritten: HashSet<NodeId>,
 }
 
 /// The relays this node remembers. Shared (`Arc`) by every connection attempt of a node.
@@ -170,10 +179,12 @@ impl KnownRelays {
         views
     }
 
-    /// The static key to dial `relay` with under IK, or `None` for XX: the stored key when a
-    /// record exists (the config key is then ignored, a mismatch is logged once), else the
-    /// config key, else none. After an IK handshake failure the answer is `None` until a
-    /// handshake succeeds ([`Self::ik_succeeded`]).
+    /// The static key to dial `relay` with under IK, or `None` for XX: the config key when one
+    /// is given and the record has not replaced it (new connection information wins over what
+    /// the node remembers: a remembered key may be the leaked one, so a certificate on it is
+    /// refused by [`Self::accept_pinned`]); a config key the record replaced is stale and the
+    /// stored key is dialed; else the stored key, else none. After an IK handshake failure the answer is `None` until
+    /// a handshake succeeds ([`Self::ik_succeeded`]).
     pub fn dial_key(
         &self,
         relay: &NodeId,
@@ -183,20 +194,23 @@ impl KnownRelays {
         if state.ik_failed.contains(relay) {
             return None;
         }
-        match state.records.get(relay).map(|r| r.body.x25519_pub) {
-            Some(stored) => {
-                if let Some(configured) = config_key
-                    && configured != stored
-                    && state.mismatch_logged.insert(*relay)
-                {
+        let record = state.records.get(relay);
+        let stored = record.map(|r| r.body.x25519_pub);
+        let stale = record.is_some_and(|r| config_key.is_some_and(|k| r.superseded.contains(&k)));
+        match (config_key, stored) {
+            // A configured key the record already replaced is old connection information.
+            (Some(_), Some(stored)) if stale => Some(stored),
+            (Some(configured), Some(stored)) => {
+                if configured != stored && state.mismatch_logged.insert(*relay) {
                     tracing::warn!(
                         relay = %relay.fingerprint(),
-                        "the configured relay key differs from the one this node remembers for the relay: the remembered key is used"
+                        "the configured relay key differs from the one this node remembers for the relay: the configured key is dialed, and a certificate on the remembered key is refused unless its serial is higher"
                     );
                 }
-                Some(stored)
+                Some(configured)
             }
-            None => config_key,
+            (Some(configured), None) => Some(configured),
+            (None, stored) => stored,
         }
     }
 
@@ -234,6 +248,23 @@ impl KnownRelays {
         body: &NodeCertBody,
         now: u64,
     ) -> Result<Accepted, NodeError> {
+        self.accept_pinned(relay, cert, body, now, None)
+    }
+
+    /// [`Self::accept`] for a dial that carried a configured `key=`. When that key differs from
+    /// the stored one, a certificate at the stored serial is refused even on the stored key
+    /// (the stored key may be the leaked one the new connection information replaces); only a
+    /// higher serial passes, which only the owner of the identity key can sign.
+    pub fn accept_pinned(
+        &self,
+        relay: &NodeId,
+        cert: &NodeCert,
+        body: &NodeCertBody,
+        now: u64,
+        configured: Option<X25519PublicKey>,
+    ) -> Result<Accepted, NodeError> {
+        let mut rewrite_same: Option<Record> = None;
+        let mut written = None;
         let accepted = {
             let mut state = self.state();
             let accepted = match state.records.get(relay) {
@@ -250,21 +281,65 @@ impl KnownRelays {
                             "the relay presented another key under a serial this node already holds",
                         ));
                     }
-                    return Ok(Accepted::Same);
+                    let pinned = configured.filter(|key| !stored.superseded.contains(key));
+                    if pinned.is_some_and(|key| key != body.x25519_pub) {
+                        return Err(NodeError::RelayIdentityMismatch(
+                            "the relay answered on a key other than the configured one, at a serial this node already holds",
+                        ));
+                    }
+                    if state.unwritten.contains(relay) {
+                        rewrite_same = Some(stored.clone());
+                    } else {
+                        return Ok(Accepted::Same);
+                    }
+                    Accepted::Same
                 }
                 Some(_) => Accepted::Raised,
             };
-            state.records.insert(
-                *relay,
-                Record {
-                    cert: cert.clone(),
-                    body: body.clone(),
-                    seen: now,
-                },
-            );
-            evict(&mut state.records);
+            if rewrite_same.is_none() {
+                let mut superseded = state
+                    .records
+                    .get(relay)
+                    .map(|old| {
+                        let mut kept = old.superseded.clone();
+                        if old.body.x25519_pub != body.x25519_pub
+                            && !kept.contains(&old.body.x25519_pub)
+                        {
+                            kept.push(old.body.x25519_pub);
+                        }
+                        kept
+                    })
+                    .unwrap_or_default();
+                // First contact (XX after a failed IK, TBD 98): the relay answered on a key
+                // other than the configured one, so the configured key counts as stale from
+                // now on instead of being dialed and pinned against the record forever.
+                if let Some(key) = configured
+                    && key != body.x25519_pub
+                    && !state.records.contains_key(relay)
+                {
+                    superseded.push(key);
+                }
+                let excess = superseded.len().saturating_sub(MAX_SUPERSEDED);
+                superseded.drain(..excess);
+                state.records.insert(
+                    *relay,
+                    Record {
+                        cert: cert.clone(),
+                        body: body.clone(),
+                        seen: now,
+                        superseded,
+                    },
+                );
+                written = state.records.get(relay).cloned();
+                evict(&mut state.records);
+            }
             accepted
         };
+        if let Some(record) = rewrite_same {
+            // N1: an earlier write failed; the same record is written again now.
+            self.persist(relay, &record, now);
+            return Ok(Accepted::Same);
+        }
         match accepted {
             Accepted::First => tracing::info!(
                 relay = %relay.fingerprint(),
@@ -277,13 +352,17 @@ impl KnownRelays {
                 "the relay presented a higher certificate serial: remembered"
             ),
         }
-        self.persist(relay, cert, body, now);
+        if let Some(record) = written {
+            self.persist(relay, &record, now);
+        }
         Ok(accepted)
     }
 
     /// Merges the record into the file under its lock; a failure is a warning.
-    fn persist(&self, relay: &NodeId, cert: &NodeCert, body: &NodeCertBody, now: u64) {
+    fn persist(&self, relay: &NodeId, record: &Record, now: u64) {
+        let body = &record.body;
         let Some(file) = &self.file else { return };
+        let mut risen_on_disk = None;
         let result = (|| -> io::Result<()> {
             let _guard = file.lock()?;
             let mut on_disk = match file.read()? {
@@ -301,24 +380,43 @@ impl KnownRelays {
             let lower = on_disk
                 .get(relay)
                 .is_some_and(|held| held.body.serial >= body.serial);
-            if !lower {
+            if lower {
+                // N4: the file holds a higher (or the same) record than this writer: memory
+                // follows it, so a later rise compares against the real highest.
+                if let Some(held) = on_disk.get(relay)
+                    && held.body.serial > body.serial
+                {
+                    risen_on_disk = Some(held.clone());
+                }
+            } else {
                 on_disk.insert(
                     *relay,
                     Record {
-                        cert: cert.clone(),
-                        body: body.clone(),
                         seen: now,
+                        ..record.clone()
                     },
                 );
             }
             evict(&mut on_disk);
             file.write(&encode_file(&on_disk))
         })();
+        let mut state = self.state();
+        if let Some(held) = risen_on_disk
+            && state
+                .records
+                .get(relay)
+                .is_none_or(|mine| mine.body.serial < held.body.serial)
+        {
+            state.records.insert(*relay, held);
+        }
         if let Err(error) = result {
+            state.unwritten.insert(*relay);
             tracing::warn!(
                 %error,
-                "could not write the known-relays file: the record is kept in memory and written at the next rise"
+                "could not write the known-relays file: the record is kept in memory and written at the next accept of it"
             );
+        } else {
+            state.unwritten.remove(relay);
         }
     }
 }
@@ -371,7 +469,7 @@ fn encode_file(records: &HashMap<NodeId, Record>) -> Vec<u8> {
     let relays = ordered
         .into_iter()
         .map(|(id, record)| {
-            Value::Map(vec![
+            let mut fields = vec![
                 (
                     Value::Text("relay_id".into()),
                     Value::Bytes(<[u8; 32]>::from(*id).to_vec()),
@@ -384,7 +482,20 @@ fn encode_file(records: &HashMap<NodeId, Record>) -> Vec<u8> {
                     Value::Text("seen".into()),
                     Value::Integer(record.seen.into()),
                 ),
-            ])
+            ];
+            if !record.superseded.is_empty() {
+                fields.push((
+                    Value::Text("old".into()),
+                    Value::Array(
+                        record
+                            .superseded
+                            .iter()
+                            .map(|key| Value::Bytes(<[u8; 32]>::from(*key).to_vec()))
+                            .collect(),
+                    ),
+                ));
+            }
+            Value::Map(fields)
         })
         .collect();
     let file = Value::Map(vec![
@@ -447,6 +558,7 @@ fn parse_record(entry: Value) -> Result<(NodeId, Record), String> {
         return Err("a record is not a map".into());
     };
     let (mut relay_id, mut cert, mut seen) = (None, None, None);
+    let mut old: Option<Vec<Value>> = None;
     for (key, value) in fields {
         match (key, value) {
             (Value::Text(k), Value::Bytes(b)) if k == "relay_id" && relay_id.is_none() => {
@@ -456,6 +568,7 @@ fn parse_record(entry: Value) -> Result<(NodeId, Record), String> {
             (Value::Text(k), Value::Integer(i)) if k == "seen" && seen.is_none() => {
                 seen = u64::try_from(i).ok()
             }
+            (Value::Text(k), Value::Array(a)) if k == "old" && old.is_none() => old = Some(a),
             _ => return Err("unknown, repeated or mistyped field".into()),
         }
     }
@@ -473,7 +586,24 @@ fn parse_record(entry: Value) -> Result<(NodeId, Record), String> {
     if body.node_id != id {
         return Err("the certificate is for another node_id".into());
     }
-    Ok((id, Record { cert, body, seen }))
+    let mut superseded = Vec::new();
+    for key in old.unwrap_or_default() {
+        let Value::Bytes(bytes) = key else {
+            return Err("an old key is not bytes".into());
+        };
+        let bytes: [u8; 32] = bytes.try_into().map_err(|_| "an old key is not 32 bytes")?;
+        superseded.push(X25519PublicKey::from(bytes));
+    }
+    superseded.truncate(MAX_SUPERSEDED);
+    Ok((
+        id,
+        Record {
+            cert,
+            body,
+            seen,
+            superseded,
+        },
+    ))
 }
 
 #[cfg(test)]
@@ -672,7 +802,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn dial_key_prefers_the_stored_key_over_the_config_key_over_xx() {
+    fn dial_key_prefers_a_new_config_key_over_the_stored_key_over_xx() {
         let known = KnownRelays::in_memory();
         let key = relay_key();
         let id = id_of(&key);
@@ -681,8 +811,14 @@ pub(crate) mod tests {
         assert_eq!(known.dial_key(&id, Some(configured)), Some(configured));
         let (c, b) = cert(&key, 1, 7);
         known.accept(&id, &c, &b, NOW).unwrap();
-        assert_eq!(known.dial_key(&id, Some(configured)), Some(b.x25519_pub));
+        // L1: a config key the record never held is new connection information.
+        assert_eq!(known.dial_key(&id, Some(configured)), Some(configured));
+        assert_eq!(known.dial_key(&id, Some(b.x25519_pub)), Some(b.x25519_pub));
         assert_eq!(known.dial_key(&id, None), Some(b.x25519_pub));
+        // A key the record replaced is stale connection information: the stored key is dialed.
+        let (c2, b2) = cert(&key, 2, 8);
+        known.accept(&id, &c2, &b2, NOW).unwrap();
+        assert_eq!(known.dial_key(&id, Some(b.x25519_pub)), Some(b2.x25519_pub));
     }
 
     #[test]
@@ -721,6 +857,7 @@ pub(crate) mod tests {
                 cert: cf.clone(),
                 body: cert(&forger, 9, 3).1,
                 seen: 1,
+                superseded: vec![],
             },
         );
         let bytes = encode_file(&records);
@@ -743,6 +880,7 @@ pub(crate) mod tests {
                 cert: good_cert,
                 body: good_body,
                 seen: 1,
+                superseded: vec![],
             },
         );
         assert_eq!(load(ok).len(), 1, "control: an honest record loads");
@@ -757,6 +895,7 @@ pub(crate) mod tests {
                 cert: forged,
                 body: body_naming_honest,
                 seen: 1,
+                superseded: vec![],
             },
         );
         assert!(load(bad_signature).is_empty(), "signature checked on load");
@@ -772,6 +911,7 @@ pub(crate) mod tests {
                 cert: signed_by_honest,
                 body: body_naming_other,
                 seen: 1,
+                superseded: vec![],
             },
         );
         assert!(load(bad_node_id).is_empty(), "node_id checked on load");
@@ -823,5 +963,88 @@ pub(crate) mod tests {
         }
         assert_eq!(known.views().len(), MAX_KNOWN_RELAYS);
         assert!(known.stored(&oldest.unwrap()).is_none());
+    }
+
+    /// Round R-A N1: a rise whose write failed is written at the next accept of the same
+    /// record, so a restart before the next rise no longer reloads the lower serial.
+    #[test]
+    fn a_rise_whose_write_failed_is_written_at_the_next_accept_of_the_same_record() {
+        let (known, file) = with_file();
+        let key = relay_key();
+        let id = id_of(&key);
+        let (c1, b1) = cert(&key, 1, 6);
+        known.accept(&id, &c1, &b1, NOW).unwrap();
+        *file.0.fail_writes.lock().unwrap() = true;
+        let (c2, b2) = cert(&key, 2, 7);
+        known.accept(&id, &c2, &b2, NOW).unwrap();
+        *file.0.fail_writes.lock().unwrap() = false;
+        assert_eq!(known.accept(&id, &c2, &b2, NOW).unwrap(), Accepted::Same);
+        let reopened = KnownRelays::open(Box::new(file.clone()), NOW);
+        assert_eq!(reopened.stored(&id).unwrap().0, 2);
+        // Written once: the next Same accept touches nothing.
+        let writes = *file.0.writes.lock().unwrap();
+        known.accept(&id, &c2, &b2, NOW).unwrap();
+        assert_eq!(*file.0.writes.lock().unwrap(), writes);
+    }
+
+    /// Round R-A N4: a writer that finds a higher record on disk follows it in memory.
+    #[test]
+    fn persist_raises_memory_to_a_higher_record_found_on_disk() {
+        let file = SharedFile::default();
+        let first = KnownRelays::open(Box::new(file.clone()), NOW);
+        let second = KnownRelays::open(Box::new(file.clone()), NOW);
+        let key = relay_key();
+        let id = id_of(&key);
+        let (c1, b1) = cert(&key, 1, 6);
+        let (c3, b3) = cert(&key, 3, 8);
+        first.accept(&id, &c3, &b3, NOW).unwrap();
+        second.accept(&id, &c1, &b1, NOW).unwrap();
+        assert_eq!(second.stored(&id).unwrap().0, 3);
+        let (c2, b2) = cert(&key, 2, 7);
+        assert!(matches!(
+            second.accept(&id, &c2, &b2, NOW),
+            Err(NodeError::RelayRollback {
+                stored: 3,
+                presented: 2
+            })
+        ));
+    }
+
+    /// Round R-A L1: the keys a record replaced survive a restart, so a stale `key=` is told
+    /// from new connection information after it.
+    #[test]
+    fn replaced_keys_are_remembered_in_the_file() {
+        let (known, file) = with_file();
+        let key = relay_key();
+        let id = id_of(&key);
+        let (c1, b1) = cert(&key, 1, 6);
+        let (c2, b2) = cert(&key, 2, 7);
+        known.accept(&id, &c1, &b1, NOW).unwrap();
+        known.accept(&id, &c2, &b2, NOW).unwrap();
+        let reopened = KnownRelays::open(Box::new(file.clone()), NOW);
+        assert_eq!(
+            reopened.dial_key(&id, Some(b1.x25519_pub)),
+            Some(b2.x25519_pub)
+        );
+        let unknown = X25519PublicKey::from([0x55; 32]);
+        assert_eq!(reopened.dial_key(&id, Some(unknown)), Some(unknown));
+    }
+
+    /// A first contact over XX on a key other than the configured one makes the configured key
+    /// stale: the node does not dial it again, and the relay's certificate at the stored serial
+    /// is not refused for differing from it (the case of a node with a stale `key=`).
+    #[test]
+    fn a_first_contact_on_another_key_than_the_configured_one_makes_that_key_stale() {
+        let known = KnownRelays::in_memory();
+        let key = relay_key();
+        let id = id_of(&key);
+        let stale = X25519PublicKey::from([0x42; 32]);
+        let (c, b) = cert(&key, 2, 7);
+        known.accept_pinned(&id, &c, &b, NOW, Some(stale)).unwrap();
+        assert_eq!(known.dial_key(&id, Some(stale)), Some(b.x25519_pub));
+        assert_eq!(
+            known.accept_pinned(&id, &c, &b, NOW, Some(stale)).unwrap(),
+            Accepted::Same
+        );
     }
 }

@@ -2040,3 +2040,24 @@ fn the_known_relays_file_of_a_home_is_kept_private_and_a_corrupt_one_is_set_asid
     assert!(!path.exists());
     assert!(dir.path().join("known-relays.cbor.corrupt-12345").exists());
 }
+
+/// Round R-A N3: two corrupt files set aside in the same second both survive.
+#[test]
+fn a_second_corrupt_known_relays_file_in_the_same_second_does_not_replace_the_first() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = Home::new(dir.path());
+    let file = HomeRelayFile { home: home.clone() };
+    let path = home.known_relays_path();
+    fs::write(&path, b"first").unwrap();
+    menzil_node::RelayFile::set_aside(&file, 77).unwrap();
+    fs::write(&path, b"second").unwrap();
+    menzil_node::RelayFile::set_aside(&file, 77).unwrap();
+    assert_eq!(
+        fs::read(dir.path().join("known-relays.cbor.corrupt-77")).unwrap(),
+        b"first"
+    );
+    assert_eq!(
+        fs::read(dir.path().join("known-relays.cbor.corrupt-77-1")).unwrap(),
+        b"second"
+    );
+}

@@ -4137,4 +4137,104 @@ mod rotation_tests {
         assert!(!rotation::forget_relay(&home, &id.to_hex(), clock()).unwrap());
         assert!(rotation::forget_relay(&home, "nonsense", clock()).is_err());
     }
+
+    /// Round R-A L2: from the interrupted-rotation state (cert and key do not match)
+    /// `renew-cert` refuses, and `rotate-key` continues from the serial of identity.cert, so the
+    /// serial never falls below what nodes may hold.
+    #[test]
+    fn commands_in_the_interrupted_rotation_state_never_restart_the_serial() {
+        let crash = |home: &Home| {
+            for i in 0..4 {
+                renew_cert(home, clock() + i).unwrap();
+            }
+            assert_eq!(serial_of(home), 5);
+            let _ = rotate_key_with(
+                home,
+                &RotateOptions {
+                    window_days: Some(0),
+                    ..RotateOptions::default()
+                },
+                clock() + 10,
+                &mut |step| {
+                    if step == Step::IdentityCert {
+                        anyhow::bail!("crash");
+                    }
+                    Ok(())
+                },
+            );
+        };
+        // renew-cert refuses and changes nothing.
+        let (_d, home) = initialised();
+        crash(&home);
+        let before = fs::read(home.identity_cert_path()).unwrap();
+        let error = renew_cert(&home, clock() + 20).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("does not load whole"),
+            "{error:#}"
+        );
+        assert_eq!(fs::read(home.identity_cert_path()).unwrap(), before);
+        // rotate-key goes on from the serial 6 that identity.cert holds.
+        let (_d, home) = initialised();
+        crash(&home);
+        let rotated = rotate_key(
+            &home,
+            &RotateOptions {
+                force: true,
+                window_days: Some(0),
+                ..RotateOptions::default()
+            },
+            clock() + 20,
+        )
+        .unwrap();
+        assert_eq!(rotated.new_serial, 7);
+        assert!(relay_identity(&home).is_ok());
+        // With no certificate that decodes, a serial must be given.
+        let (_d, home) = initialised();
+        crash(&home);
+        fs::write(home.identity_cert_path(), b"junk").unwrap();
+        let options = RotateOptions {
+            force: true,
+            window_days: Some(0),
+            ..RotateOptions::default()
+        };
+        let error = rotate_key(&home, &options, clock() + 20).unwrap_err();
+        assert!(format!("{error:#}").contains("--serial"), "{error:#}");
+        let rotated = rotate_key(
+            &home,
+            &RotateOptions {
+                serial: Some(9),
+                ..options
+            },
+            clock() + 20,
+        )
+        .unwrap();
+        assert_eq!(rotated.new_serial, 10);
+    }
+
+    /// Round R-A N2: the old identity key and a replaced previous key are overwritten with
+    /// zeros, not only renamed over (a second name for the old inode shows it).
+    #[test]
+    fn a_replaced_identity_key_and_previous_key_are_wiped() {
+        let (_d, home) = initialised();
+        let old_key_link = home.identity_key_path().with_extension("held");
+        fs::hard_link(home.identity_key_path(), &old_key_link).unwrap();
+        assert!(fs::read(&old_key_link).unwrap().iter().any(|b| *b != 0));
+        rotate_key(&home, &RotateOptions::default(), clock() + 10).unwrap();
+        assert!(fs::read(&old_key_link).unwrap().iter().all(|b| *b == 0));
+        // A second rotation with --force replaces previous.key.
+        let held = home.previous_key_path().with_extension("held");
+        fs::hard_link(home.previous_key_path(), &held).unwrap();
+        rotate_key(
+            &home,
+            &RotateOptions {
+                force: true,
+                ..RotateOptions::default()
+            },
+            clock() + 20,
+        )
+        .unwrap();
+        let wiped = fs::read(&held).unwrap();
+        assert!(!wiped.is_empty());
+        assert!(wiped.iter().all(|b| *b == 0));
+    }
 }

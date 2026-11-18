@@ -210,6 +210,22 @@ fn wipe_and_delete(path: &Path) -> Result<()> {
     }
 }
 
+/// N2: replaces a secret file atomically (the new content is renamed over it, so a crash never
+/// leaves no file) and then overwrites the old content with zeros: before the rename the old
+/// inode is kept under a second name (a hard link), which is wiped and deleted afterwards.
+fn replace_secret_wiping(home: &Home, path: &Path, bytes: &[u8]) -> Result<()> {
+    let mut old_name = path.as_os_str().to_owned();
+    old_name.push(".old");
+    let old_name = std::path::PathBuf::from(old_name);
+    wipe_and_delete(&old_name)?;
+    let linked = fs::hard_link(path, &old_name).is_ok();
+    home.write_secret(path, bytes)?;
+    if linked {
+        wipe_and_delete(&old_name)?;
+    }
+    Ok(())
+}
+
 /// Wipes and deletes `relay/previous.key` when its `retire_at` or its certificate's `not_after`
 /// has passed. Returns the key while it can still answer, `None` otherwise (including when
 /// there is none). A damaged file is left alone and is an error.
@@ -227,9 +243,12 @@ pub fn retire_previous_if_due(home: &Home, now: u64) -> Result<Option<PreviousFi
 /// The identity of the home for a rotation: the keys, and the certificate if it still belongs to
 /// them. A certificate that does not (an interrupted rotation) is `None`, so that the same
 /// command can be run again to finish the job.
-fn load_for_rotation(home: &Home) -> Result<(NodeKeys, Option<NodeCert>)> {
+fn load_for_rotation(home: &Home) -> Result<(NodeKeys, Option<NodeCert>, Option<u32>)> {
     match load_identity(home) {
-        Ok((keys, cert)) => Ok((keys, Some(cert))),
+        Ok((keys, cert)) => {
+            let serial = cert.decode().ok().map(|body| body.serial);
+            Ok((keys, Some(cert), serial))
+        }
         Err(error) => {
             // Only a certificate that does not match the key (or is unreadable) is tolerated;
             // a missing key is the usual "no identity" error.
@@ -243,7 +262,17 @@ fn load_for_rotation(home: &Home) -> Result<(NodeKeys, Option<NodeCert>)> {
             let keys = NodeKeys::from_secret_bytes(&secret)
                 .with_context(|| format!("{} is damaged", key_path.display()))?;
             tracing::warn!(error = %format!("{error:#}"), "the identity does not load whole; continuing from the key file alone");
-            Ok((keys, None))
+            // The serial still counts: the certificate that does not fit the key may be the
+            // one an interrupted rotation wrote, and nodes may already hold its serial. It is
+            // read when its signature holds under this seed (a key mismatch is ignored).
+            let serial = fs::read(home.identity_cert_path())
+                .ok()
+                .and_then(|bytes| NodeCert::decode_strict(&bytes).ok())
+                .filter(|cert| cert.verify(&keys.signing_key().verifying_key()).is_ok())
+                .and_then(|cert| cert.decode().ok())
+                .filter(|body| body.node_id == keys.node_id())
+                .map(|body| body.serial);
+            Ok((keys, None, serial))
         }
     }
 }
@@ -260,7 +289,7 @@ pub fn rotate_key_with(
         bail!("--window-days is at most {MAX_WINDOW_DAYS}");
     }
     let _running = home.lock_relay_running()?;
-    let (keys, current) = load_for_rotation(home)?;
+    let (keys, current, cert_serial) = load_for_rotation(home)?;
     // A previous key that is due is dropped first, so it is not "inside its window" below.
     let held = match retire_previous_if_due(home, now) {
         Ok(held) => held,
@@ -281,11 +310,12 @@ pub fn rotate_key_with(
             held.retire_at
         );
     }
-    let current_serial = current
-        .as_ref()
-        .map(|cert| cert.decode())
-        .transpose()?
-        .map_or(0, |body| body.serial);
+    if cert_serial.is_none() && options.serial.is_none() {
+        bail!(
+            "no certificate of this identity can be read, so the serial the nodes hold is not known: pass --serial N (the highest serial your nodes hold)"
+        );
+    }
+    let current_serial = cert_serial.unwrap_or(0);
     let held_serial = held
         .as_ref()
         .map(|held| held.cert.decode())
@@ -330,7 +360,8 @@ pub fn rotate_key_with(
         let cert = current
             .as_ref()
             .expect("keep_previous implies a certificate");
-        home.write_secret(
+        replace_secret_wiping(
+            home,
             &home.previous_key_path(),
             &encode_previous(cert, &old_private, retire_at),
         )?;
@@ -341,7 +372,11 @@ pub fn rotate_key_with(
     }
     home.write_secret(&home.identity_cert_path(), &new_cert.encode())?;
     after_write(Step::IdentityCert)?;
-    home.write_secret(&home.identity_key_path(), &new_keys.secret_bytes()[..])?;
+    replace_secret_wiping(
+        home,
+        &home.identity_key_path(),
+        &new_keys.secret_bytes()[..],
+    )?;
     after_write(Step::IdentityKey)?;
 
     let body = new_cert.decode()?;
@@ -372,12 +407,14 @@ pub fn rotate_key(home: &Home, options: &RotateOptions, now: u64) -> Result<Rota
 /// days. The previous key, if one is held, is not touched. Refused while a relay runs.
 pub fn renew_cert(home: &Home, now: u64) -> Result<Renewed> {
     let _running = home.lock_relay_running()?;
-    let (keys, current) = load_for_rotation(home)?;
-    let old_serial = current
-        .as_ref()
-        .map(|cert| cert.decode())
-        .transpose()?
-        .map_or(0, |body| body.serial);
+    let (keys, current, cert_serial) = load_for_rotation(home)?;
+    if current.is_none() {
+        bail!(
+            "the identity does not load whole (identity.cert and identity.key do not belong together, a rotation was interrupted): renewing would certify a key the serial {} may already have replaced; finish it with `menzil relay rotate-key --force --serial N` instead",
+            cert_serial.map_or_else(|| "of the nodes".to_string(), |serial| serial.to_string())
+        );
+    }
+    let old_serial = cert_serial.unwrap_or(0);
     let new_serial = old_serial
         .checked_add(1)
         .ok_or_else(|| anyhow!("the certificate serial cannot go up any more (u32 range)"))?;

@@ -23,8 +23,8 @@ mod transport;
 pub use credit::CreditLedger;
 pub use error::SessionError;
 pub use handshake::{
-    HandshakePattern, NodeHandshake, RelayHandshake, RelayHandshakeAwaitingHello,
-    RelayHandshakeStep, StaticUsed, prologue,
+    HandshakePattern, NodeHandshake, NodeHandshakeRead, RelayHandshake,
+    RelayHandshakeAwaitingHello, RelayHandshakeStep, StaticUsed, prologue,
 };
 pub use liveness::Liveness;
 pub use rekey::RekeySchedule;

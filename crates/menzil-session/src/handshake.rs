@@ -190,23 +190,47 @@ impl NodeHandshake {
     /// it does not perform it, since it has no notion of what a
     /// `NodeCert` should be checked against beyond what the Noise layer
     /// itself negotiated.
-    pub fn finish(mut self, incoming: &[u8]) -> Result<NodeFinishOutcome, SessionError> {
+    pub fn finish(self, incoming: &[u8]) -> Result<NodeFinishOutcome, SessionError> {
+        let (welcome, relay_static, pending) = self.read_welcome(incoming)?;
+        let (transport, outgoing) = pending.complete()?;
+        Ok((transport, welcome, relay_static, outgoing))
+    }
+
+    /// The first half of [`Self::finish`]: reads the relay's response and decodes WELCOME and
+    /// the negotiated static key, but writes nothing. The caller verifies the relay (protocol.md
+    /// 4.1) and only then calls [`NodeHandshakeRead::complete`], which in `Xx` produces message
+    /// 3 (HELLO): nothing reaches a relay that has not been verified.
+    pub fn read_welcome(
+        mut self,
+        incoming: &[u8],
+    ) -> Result<(WelcomeBody, X25519PublicKey, NodeHandshakeRead), SessionError> {
         let welcome_bytes = read(&mut self.hs, incoming)?;
         let welcome = WelcomeBody::decode(&welcome_bytes)?;
-        let outgoing = match self.pattern {
+        let relay_static = remote_static(&self.hs)
+            .expect("both patterns learn the responder's static key by the final message");
+        Ok((welcome, relay_static, NodeHandshakeRead(self)))
+    }
+}
+
+/// A node-side handshake that has read WELCOME and not yet written its last message.
+pub struct NodeHandshakeRead(NodeHandshake);
+
+impl NodeHandshakeRead {
+    /// Writes message 3 (`Xx`; `None` for `Ik`) and returns the finished transport.
+    pub fn complete(self) -> Result<(Transport, Option<Vec<u8>>), SessionError> {
+        let mut this = self.0;
+        let outgoing = match this.pattern {
             HandshakePattern::Ik => None,
             HandshakePattern::Xx => {
-                let hello_bytes = self
+                let hello_bytes = this
                     .pending_hello
                     .as_deref()
                     .expect("Xx always stashes hello in start()");
-                Some(write(&mut self.hs, hello_bytes)?)
+                Some(write(&mut this.hs, hello_bytes)?)
             }
         };
-        let relay_static = remote_static(&self.hs)
-            .expect("both patterns learn the responder's static key by the final message");
-        let transport = Transport::from_finished(self.hs)?;
-        Ok((transport, welcome, relay_static, outgoing))
+        let transport = Transport::from_finished(this.hs)?;
+        Ok((transport, outgoing))
     }
 }
 
@@ -513,5 +537,35 @@ mod tests {
     #[test]
     fn live_xx_handshake_completes() {
         run_live_handshake(HandshakePattern::Xx);
+    }
+
+    /// Round R-A M2: `read_welcome` writes nothing; message 3 (the HELLO in XX) exists only
+    /// after `complete`, so a caller that verifies the relay in between never sends it to an
+    /// unverified one. A completed pair still carries the HELLO.
+    #[test]
+    fn xx_read_welcome_writes_nothing_and_complete_produces_message_3() {
+        let pattern = HandshakePattern::Xx;
+        let mk = || {
+            let kp = snow::Builder::new(HandshakePattern::Xx.params_str().parse().unwrap())
+                .generate_keypair()
+                .unwrap();
+            <[u8; 32]>::try_from(kp.private).unwrap()
+        };
+        let (node_priv, relay_priv) = (mk(), mk());
+        let pro = prologue("menzil.v1", "menzil.v1", pattern);
+        let mut hello = crate::transport::tests::sample_hello();
+        hello.networks = vec![menzil_proto::NetworkId::from([0xAB; 32])];
+        let welcome = crate::transport::tests::sample_welcome();
+        let (node, m1) = NodeHandshake::start(pattern, &node_priv, None, &pro, &hello).unwrap();
+        let relay = RelayHandshake::start(pattern, &relay_priv, &pro, &m1).unwrap();
+        let (step, _, m2) = relay.write_welcome(&welcome).unwrap();
+        let (got_welcome, _static, pending) = node.read_welcome(&m2).unwrap();
+        assert_eq!(got_welcome, welcome);
+        let (_transport, m3) = pending.complete().unwrap();
+        let RelayHandshakeStep::AwaitingHello(awaiting) = step else {
+            panic!("Xx awaits the HELLO")
+        };
+        let (_, got, _) = awaiting.finish(&m3.unwrap()).unwrap();
+        assert_eq!(got, hello);
     }
 }

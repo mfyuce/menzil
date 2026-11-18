@@ -798,7 +798,7 @@ async fn run_handshake(
     } else {
         carrier.recv().await?
     };
-    let (transport, welcome, relay_static, message3) = match node_handshake.finish(&message2) {
+    let (welcome, relay_static, pending) = match node_handshake.read_welcome(&message2) {
         Ok(done) => done,
         Err(error) => {
             if ik {
@@ -807,20 +807,36 @@ async fn run_handshake(
             return Err(error.into());
         }
     };
-    if let Some(message3) = message3 {
-        carrier.send(message3).await?;
-    }
 
-    // The serial rule writes a risen record here, before the caller sends ATTACH.
-    verify_relay_identity(
+    let (transport, message3) = complete_after_verifying(
         info,
         &welcome,
         &relay_static,
         &config.known_relays,
         unix_now(),
+        || pending.complete(),
     )?;
+    if let Some(message3) = message3 {
+        carrier.send(message3).await?;
+    }
     config.known_relays.ik_succeeded(&info.relay_node_id);
     Ok((transport, welcome, relay_static))
+}
+
+/// The relay is verified BEFORE message 3 (the HELLO in XX) is written: a refusal produces
+/// nothing to send, so a path attacker that answers XX with any key and a junk certificate
+/// learns nothing about this node. The serial rule writes a risen record here, before the
+/// caller sends ATTACH.
+fn complete_after_verifying<T>(
+    info: &ConnectionInfo,
+    welcome: &WelcomeBody,
+    relay_static: &X25519PublicKey,
+    known: &KnownRelays,
+    now: u64,
+    complete: impl FnOnce() -> Result<T, menzil_session::SessionError>,
+) -> Result<T, NodeError> {
+    verify_relay_identity(info, welcome, relay_static, known, now)?;
+    Ok(complete()?)
 }
 
 /// How long an IK attempt waits for message 2 before it counts as failed in the handshake.
@@ -847,7 +863,13 @@ fn verify_relay_identity(
             "relay_cert.x25519_pub does not match the relay's negotiated Noise static key",
         ));
     }
-    known.accept(&info.relay_node_id, &welcome.relay_cert, &cert_body, now)?;
+    known.accept_pinned(
+        &info.relay_node_id,
+        &welcome.relay_cert,
+        &cert_body,
+        now,
+        info.relay_x25519,
+    )?;
     remember_relay_next(info, welcome, &cert_body, known, now);
     Ok(())
 }
@@ -3099,5 +3121,104 @@ mod tests {
 
         let records = push_records_for_newer_rosters(&[network_id], &store, &HashMap::new());
         assert!(!records.is_empty());
+    }
+
+    /// Round R-A M2: in XX the HELLO is message 3. The relay is verified first, so an attacker
+    /// that answers with any static key and a junk certificate gets no message 3 at all.
+    /// Drives `complete_after_verifying` with a real XX handshake.
+    #[test]
+    fn xx_message_3_is_not_produced_for_a_relay_that_fails_verification() {
+        use menzil_session::RelayHandshake;
+        let node_priv = <[u8; 32]>::try_from(
+            snow::Builder::new(xx_params())
+                .generate_keypair()
+                .unwrap()
+                .private,
+        )
+        .unwrap();
+        let attacker_priv = <[u8; 32]>::try_from(
+            snow::Builder::new(xx_params())
+                .generate_keypair()
+                .unwrap()
+                .private,
+        )
+        .unwrap();
+        let pattern = HandshakePattern::Xx;
+        let prologue_bytes = prologue("menzil.v1", "menzil.v1", pattern);
+        let hello = HelloBody {
+            v: PROTOCOL_VERSION,
+            node_cert: node_cert(1),
+            networks: vec![NetworkId::from([0xAB; 32])],
+            timestamp: Tai64N::from([0u8; 12]),
+            roster_seq: HashMap::new(),
+            caps: vec![],
+            e2e_protos: vec![0x01],
+        };
+        // The relay the node dialed, and a certificate signed by someone else.
+        let dialed = SigningKey::generate(&mut rand::rng());
+        let dialed_id = NodeId::from(dialed.verifying_key().to_bytes());
+        let junk_signer = SigningKey::generate(&mut rand::rng());
+        let junk_body = NodeCertBody {
+            v: PROTOCOL_VERSION,
+            node_id: dialed_id,
+            x25519_pub: X25519PublicKey::from([0x99; 32]),
+            serial: 1,
+            not_before: 0,
+            not_after: 4_000_000_000,
+        };
+        let welcome = sample_welcome(NodeCert::sign(&junk_signer, &junk_body).unwrap());
+        let (node, message1) =
+            NodeHandshake::start(pattern, &node_priv, None, &prologue_bytes, &hello).unwrap();
+        let attacker =
+            RelayHandshake::start(pattern, &attacker_priv, &prologue_bytes, &message1).unwrap();
+        let (_step, _node_static, message2) = attacker.write_welcome(&welcome).unwrap();
+        let (read_welcome, relay_static, pending) = node.read_welcome(&message2).unwrap();
+        let info = sample_info(dialed_id, relay_static);
+        let mut completed = false;
+        let result = complete_after_verifying(
+            &info,
+            &read_welcome,
+            &relay_static,
+            &KnownRelays::in_memory(),
+            NOW,
+            || {
+                completed = true;
+                pending.complete()
+            },
+        );
+        assert!(result.is_err());
+        assert!(
+            !completed,
+            "message 3 (the HELLO) was produced for an unverified relay"
+        );
+    }
+
+    fn xx_params() -> snow::params::NoiseParams {
+        "Noise_XX_25519_ChaChaPoly_BLAKE2s".parse().unwrap()
+    }
+
+    /// Round R-A L1: after `rotate-key --window-days 0` the operator hands out the new key; a
+    /// node that stored the leaked one dials the new key, and an attacker on the leaked key
+    /// with its old certificate is refused, also over XX.
+    #[test]
+    fn a_new_configured_key_beats_a_stored_leaked_one_and_the_old_certificate_is_refused() {
+        let key = SigningKey::generate(&mut rand::rng());
+        let id = NodeId::from(key.verifying_key().to_bytes());
+        let known = KnownRelays::in_memory();
+        verify_at(&known, &key, 1, 0x11).unwrap();
+        let new_key = X25519PublicKey::from([0x22; 32]);
+        assert_eq!(known.dial_key(&id, Some(new_key)), Some(new_key));
+        let (_, welcome, old_static) =
+            relay_welcome(&key, 1, 0x11, NOW - 86_400, NOW + 86_400 * 300);
+        let info = sample_info(id, new_key);
+        let result = verify_relay_identity(&info, &welcome, &old_static, &known, NOW);
+        assert!(
+            matches!(result, Err(NodeError::RelayIdentityMismatch(_))),
+            "{result:?}"
+        );
+        // The real relay on the new key at a higher serial passes and replaces the record.
+        let (_, welcome2, static2) = relay_welcome(&key, 2, 0x22, NOW - 86_400, NOW + 86_400 * 300);
+        verify_relay_identity(&info, &welcome2, &static2, &known, NOW).unwrap();
+        assert_eq!(known.stored(&id), Some((2, new_key)));
     }
 }

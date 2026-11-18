@@ -117,7 +117,7 @@ pub(crate) mod tests {
         }
     }
 
-    fn sample_welcome() -> WelcomeBody {
+    pub(crate) fn sample_welcome() -> WelcomeBody {
         WelcomeBody {
             v: menzil_proto::PROTOCOL_VERSION,
             relay_cert: node_cert(2),
