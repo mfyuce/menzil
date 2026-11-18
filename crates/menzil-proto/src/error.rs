@@ -135,6 +135,16 @@ pub enum ErrorCode {
     /// works once the tenant is below it. A peer built before this code existed reads it as
     /// [`Self::Unknown`] with the number 27 and treats it like any code it does not know.
     OverQuota,
+    /// `handover_failed` (protocol.md 5.2): the CLOSE of an L4 session whose replacement
+    /// handshake offered to continue it (CONTINUE or CONTINUE_ACK) and the two sides did not
+    /// agree: wrong `prior`, wrong `binding`, or a count of reliable records that did not
+    /// match. Streams of that session are reset. A peer built before this code existed reads
+    /// it as [`Self::Unknown`] with the number 28.
+    HandoverFailed,
+    /// `session_expired` (protocol.md 5.2): the CLOSE of an L4 session that reached its hard
+    /// age cap (24 hours and 30 minutes) before a replacement took over. A peer built before
+    /// this code existed reads it as [`Self::Unknown`] with the number 29.
+    SessionExpired,
     /// A code this build does not recognize, preserved verbatim.
     Unknown(u16),
 }
@@ -167,6 +177,8 @@ impl ErrorCode {
     const BAD_DOCUMENT: u16 = 25;
     const DOCS_ONLY: u16 = 26;
     const OVER_QUOTA: u16 = 27;
+    const HANDOVER_FAILED: u16 = 28;
+    const SESSION_EXPIRED: u16 = 29;
 
     /// The symbolic name from protocol.md, e.g. `"bad_cert"`.
     pub fn name(self) -> &'static str {
@@ -198,6 +210,8 @@ impl ErrorCode {
             Self::BadDocument => "bad_document",
             Self::DocsOnly => "docs_only",
             Self::OverQuota => "over_quota",
+            Self::HandoverFailed => "handover_failed",
+            Self::SessionExpired => "session_expired",
             Self::Unknown(_) => "unknown",
         }
     }
@@ -233,6 +247,8 @@ impl From<ErrorCode> for u16 {
             ErrorCode::BadDocument => ErrorCode::BAD_DOCUMENT,
             ErrorCode::DocsOnly => ErrorCode::DOCS_ONLY,
             ErrorCode::OverQuota => ErrorCode::OVER_QUOTA,
+            ErrorCode::HandoverFailed => ErrorCode::HANDOVER_FAILED,
+            ErrorCode::SessionExpired => ErrorCode::SESSION_EXPIRED,
             ErrorCode::Unknown(code) => code,
         }
     }
@@ -268,6 +284,8 @@ impl From<u16> for ErrorCode {
             Self::BAD_DOCUMENT => Self::BadDocument,
             Self::DOCS_ONLY => Self::DocsOnly,
             Self::OVER_QUOTA => Self::OverQuota,
+            Self::HANDOVER_FAILED => Self::HandoverFailed,
+            Self::SESSION_EXPIRED => Self::SessionExpired,
             other => Self::Unknown(other),
         }
     }
@@ -319,6 +337,8 @@ mod tests {
             ErrorCode::BadDocument,
             ErrorCode::DocsOnly,
             ErrorCode::OverQuota,
+            ErrorCode::HandoverFailed,
+            ErrorCode::SessionExpired,
         ];
         for code in codes {
             let wire: u16 = code.into();
@@ -367,8 +387,28 @@ mod tests {
         assert_eq!(wire, as_number);
         assert_eq!(u16::from(ErrorCode::Unknown(27)), 27);
         assert_eq!(ErrorCode::Unknown(27).name(), "unknown");
-        // The next number is still free: it reads as unknown here.
-        assert_eq!(ErrorCode::from(28), ErrorCode::Unknown(28));
+        // The next number after the re-handshake codes is still free: unknown here.
+        assert_eq!(ErrorCode::from(30), ErrorCode::Unknown(30));
+    }
+
+    #[test]
+    fn the_rehandshake_codes_keep_their_numbers_and_names_and_older_peers_read_them_as_unknown() {
+        assert_eq!(u16::from(ErrorCode::HandoverFailed), 28);
+        assert_eq!(ErrorCode::from(28), ErrorCode::HandoverFailed);
+        assert_eq!(ErrorCode::HandoverFailed.name(), "handover_failed");
+        assert_eq!(u16::from(ErrorCode::SessionExpired), 29);
+        assert_eq!(ErrorCode::from(29), ErrorCode::SessionExpired);
+        assert_eq!(ErrorCode::SessionExpired.name(), "session_expired");
+        for (code, number) in [
+            (ErrorCode::HandoverFailed, 28u16),
+            (ErrorCode::SessionExpired, 29),
+        ] {
+            let mut wire = Vec::new();
+            ciborium::into_writer(&code, &mut wire).unwrap();
+            let mut as_number = Vec::new();
+            ciborium::into_writer(&number, &mut as_number).unwrap();
+            assert_eq!(wire, as_number);
+        }
     }
 
     #[test]

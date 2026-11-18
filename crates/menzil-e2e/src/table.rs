@@ -66,6 +66,25 @@
 //! that has not been decided; TODO.md L4e2 adds the grace period if item 6
 //! needs one.
 //!
+//! **Replacement with continuation** (re-handshake design, slice R1; nothing in `menzil-node`
+//! uses these yet, slice R3 wires them). A replacement `init` of ours is an ordinary
+//! [`SessionTable::register_pending`] beside an existing `current` (the table has always allowed
+//! that: only a second pending or a candidate refuses). Its `resp` is taken with
+//! [`SessionTable::take_pending_for_resp`]. If the `resp` offered `held` and it matches, the
+//! caller does *not* install an initiator session (that would replace `current` and end its
+//! streams) but [`SessionTable::install_alias`]es the reserved index: a second routing label
+//! for the same handle, so frames of both the old and the new keys reach the one actor. When
+//! the handover is confirmed, [`SessionTable::commit_alias`] makes the alias the slot's
+//! `current` and hands the old entry back; if it fails, [`SessionTable::remove`] drops the alias.
+//! An alias lives at most [`TableConfig::candidate_timeout`] ([`Expired::aliases`]), and it ends
+//! with its slot's `current` (taking the current out also drops the alias, silently: the handle
+//! is the same actor's). At most one alias per slot. On the responder side the offer is
+//! [`SessionTable::held_offer`] (the index of the slot's `current`, for the caller to put in
+//! `resp` after its own epoch and static key checks), and a candidate remembers the value
+//! offered with it ([`SessionTable::install_candidate_offering`],
+//! [`SessionTable::offered_held`]) so the router can compare it with the `prior` of the
+//! CONTINUE that arrives on that candidate.
+//!
 //! **Authenticating the source.** [`SessionTable::route`] refuses a `data`
 //! frame whose RECV `src` is not the peer that session belongs to
 //! (protocol.md 5.1: dialed NodeId, RECV source and prologue must agree).
@@ -199,6 +218,23 @@ pub struct SlotState {
     pub candidate: Option<SessionIndex>,
     /// Our own `init`, awaiting a `resp`.
     pub pending: Option<SessionIndex>,
+    /// A second routing label for `current`'s handle, during a handover
+    /// ([`SessionTable::install_alias`]).
+    pub alias: Option<SessionIndex>,
+}
+
+/// Why [`SessionTable::install_alias`] refused. The index it was given is released.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum AliasError {
+    /// The index is not one this table reserved for the caller.
+    #[error("that index is not reserved")]
+    NotReserved,
+    /// The slot has no `current` session to alias.
+    #[error("no current session to alias in this slot")]
+    NoCurrent,
+    /// The slot already has an alias.
+    #[error("the slot already has an alias")]
+    AliasExists,
 }
 
 /// Why an inbound `init` is not to be answered.
@@ -307,6 +343,9 @@ pub enum Removed<H, P> {
     Reserved,
     /// A pending initiation, abandoned.
     Pending(P),
+    /// An alias ([`SessionTable::install_alias`]), dropped. Only a routing label: do not end
+    /// the session behind the handle.
+    Alias(H),
     /// A session.
     Session {
         /// The handle registered with it.
@@ -325,6 +364,9 @@ pub struct Expired<H, P> {
     pub pending: Vec<(SessionIndex, P)>,
     /// Responder-side sessions that never saw a record. End them.
     pub candidates: Vec<(SessionIndex, H)>,
+    /// Aliases that were never committed: only routing labels, so do **not** end the session
+    /// behind the handle (it is the `current` session's own).
+    pub aliases: Vec<(SessionIndex, H)>,
 }
 
 impl<H, P> Default for Expired<H, P> {
@@ -332,6 +374,7 @@ impl<H, P> Default for Expired<H, P> {
         Self {
             pending: Vec::new(),
             candidates: Vec::new(),
+            aliases: Vec::new(),
         }
     }
 }
@@ -347,11 +390,15 @@ struct Slot {
     current: Option<SessionIndex>,
     candidate: Option<SessionIndex>,
     pending: Option<SessionIndex>,
+    alias: Option<SessionIndex>,
 }
 
 impl Slot {
     fn is_empty(&self) -> bool {
-        self.current.is_none() && self.candidate.is_none() && self.pending.is_none()
+        self.current.is_none()
+            && self.candidate.is_none()
+            && self.pending.is_none()
+            && self.alias.is_none()
     }
 }
 
@@ -369,6 +416,14 @@ enum Entry<H, P> {
         key: SlotKey,
         role: Role,
         status: SessionStatus,
+        since: Instant,
+        handle: H,
+        /// For a responder candidate: the `held` offered in its `resp`, if any.
+        offered_held: Option<u32>,
+    },
+    /// A second routing label for the slot's `current` handle.
+    Alias {
+        key: SlotKey,
         since: Instant,
         handle: H,
     },
@@ -463,6 +518,7 @@ impl<H, P> SessionTable<H, P> {
                 current: slot.current,
                 candidate: slot.candidate,
                 pending: slot.pending,
+                alias: slot.alias,
             })
     }
 
@@ -608,6 +664,20 @@ impl<H, P> SessionTable<H, P> {
         handle: H,
         now: Instant,
     ) -> Result<Installed<H, P>, (RegisterError, H)> {
+        self.install_session_inner(index, peer, network, role, handle, None, now)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn install_session_inner(
+        &mut self,
+        index: SessionIndex,
+        peer: NodeId,
+        network: NetworkId,
+        role: Role,
+        handle: H,
+        offered_held: Option<u32>,
+        now: Instant,
+    ) -> Result<Installed<H, P>, (RegisterError, H)> {
         if !matches!(self.entries.get(&index), Some(Entry::Reserved { .. })) {
             return Err((RegisterError::NotReserved, handle));
         }
@@ -633,6 +703,7 @@ impl<H, P> SessionTable<H, P> {
                         status: SessionStatus::Current,
                         since: now,
                         handle,
+                        offered_held: None,
                     },
                 );
             }
@@ -655,11 +726,111 @@ impl<H, P> SessionTable<H, P> {
                         status: SessionStatus::Candidate,
                         since: now,
                         handle,
+                        offered_held,
                     },
                 );
             }
         }
         Ok(installed)
+    }
+
+    /// As [`Self::install_session`] as [`Role::Responder`], remembering the `held` value the
+    /// responder offered in this session's `resp` (see [`Self::held_offer`]).
+    pub fn install_candidate_offering(
+        &mut self,
+        index: SessionIndex,
+        peer: NodeId,
+        network: NetworkId,
+        handle: H,
+        held: Option<u32>,
+        now: Instant,
+    ) -> Result<Installed<H, P>, (RegisterError, H)> {
+        self.install_session_inner(index, peer, network, Role::Responder, handle, held, now)
+    }
+
+    /// The `held` value offered with candidate (or session) `index`, if any.
+    pub fn offered_held(&self, index: SessionIndex) -> Option<u32> {
+        match self.entries.get(&index) {
+            Some(Entry::Session { offered_held, .. }) => *offered_held,
+            _ => None,
+        }
+    }
+
+    /// What a responder would offer as `held` in a `resp` to `peer` in `network`: the index of
+    /// the slot's `current` session. The caller still has to check that this session is on the
+    /// L3 attachment the `init` arrived on and that its peer static key is the `init`'s.
+    pub fn held_offer(&self, peer: &NodeId, network: &NetworkId) -> Option<SessionIndex> {
+        self.slot(peer, network).current
+    }
+
+    /// Turns a reserved index into a second routing label for the slot's `current` handle
+    /// (see the module docs). The slot's `current` is untouched. On refusal the index is
+    /// released and `handle` handed back.
+    pub fn install_alias(
+        &mut self,
+        index: SessionIndex,
+        peer: NodeId,
+        network: NetworkId,
+        handle: H,
+        now: Instant,
+    ) -> Result<(), (AliasError, H)> {
+        if !matches!(self.entries.get(&index), Some(Entry::Reserved { .. })) {
+            return Err((AliasError::NotReserved, handle));
+        }
+        let key = SlotKey { peer, network };
+        let refusal = match self.slots.get(&key) {
+            Some(slot) if slot.current.is_none() => Some(AliasError::NoCurrent),
+            Some(slot) if slot.alias.is_some() => Some(AliasError::AliasExists),
+            Some(_) => None,
+            None => Some(AliasError::NoCurrent),
+        };
+        if let Some(error) = refusal {
+            self.entries.remove(&index);
+            return Err((error, handle));
+        }
+        self.slots.get_mut(&key).expect("checked above").alias = Some(index);
+        self.entries.insert(
+            index,
+            Entry::Alias {
+                key,
+                since: now,
+                handle,
+            },
+        );
+        Ok(())
+    }
+
+    /// The handover was confirmed: alias `index` becomes the slot's `current` session (its
+    /// role is the old one's) and the old `current` entry is handed back. `None` when `index`
+    /// is not an alias.
+    pub fn commit_alias(&mut self, index: SessionIndex) -> Option<(SessionIndex, H)> {
+        let key = match self.entries.get(&index) {
+            Some(Entry::Alias { key, .. }) => *key,
+            _ => return None,
+        };
+        let slot = self.slots.get_mut(&key)?;
+        let old_index = slot.current.replace(index)?;
+        slot.alias = None;
+        let Some(Entry::Alias { handle, since, .. }) = self.entries.remove(&index) else {
+            unreachable!("just seen to be an alias");
+        };
+        let old = self.entries.remove(&old_index);
+        let (role, old_handle) = match old {
+            Some(Entry::Session { role, handle, .. }) => (role, handle),
+            _ => unreachable!("a slot's current is always a session"),
+        };
+        self.entries.insert(
+            index,
+            Entry::Session {
+                key,
+                role,
+                status: SessionStatus::Current,
+                since,
+                handle,
+                offered_held: None,
+            },
+        );
+        Some((old_index, old_handle))
     }
 
     /// Routes an incoming `data` frame: `receiver_index` is the frame's,
@@ -677,6 +848,17 @@ impl<H, P> SessionTable<H, P> {
                         index: receiver_index,
                         handle,
                         status: *status,
+                    }
+                } else {
+                    Route::WrongSource
+                }
+            }
+            Some(Entry::Alias { key, handle, .. }) => {
+                if key.peer == *src {
+                    Route::Session {
+                        index: receiver_index,
+                        handle,
+                        status: SessionStatus::Current,
                     }
                 } else {
                     Route::WrongSource
@@ -723,6 +905,10 @@ impl<H, P> SessionTable<H, P> {
                 self.clear_slot_pending(&key, index);
                 Some(Removed::Pending(state))
             }
+            Entry::Alias { key, handle, .. } => {
+                self.clear_slot_alias(&key, index);
+                Some(Removed::Alias(handle))
+            }
             Entry::Session {
                 key,
                 role,
@@ -762,7 +948,7 @@ impl<H, P> SessionTable<H, P> {
     /// The handle registered for session `index`, if `index` is a session.
     pub fn get(&self, index: SessionIndex) -> Option<&H> {
         match self.entries.get(&index) {
-            Some(Entry::Session { handle, .. }) => Some(handle),
+            Some(Entry::Session { handle, .. } | Entry::Alias { handle, .. }) => Some(handle),
             _ => None,
         }
     }
@@ -812,6 +998,7 @@ impl<H, P> SessionTable<H, P> {
         let mut reserved = Vec::new();
         let mut pending = Vec::new();
         let mut candidates = Vec::new();
+        let mut aliases = Vec::new();
         for (&index, entry) in &self.entries {
             let (since, timeout, bucket) = match entry {
                 Entry::Reserved { since } => (*since, self.config.reservation_timeout, 0),
@@ -821,13 +1008,15 @@ impl<H, P> SessionTable<H, P> {
                     status: SessionStatus::Candidate,
                     ..
                 } => (*since, self.config.candidate_timeout, 2),
+                Entry::Alias { since, .. } => (*since, self.config.candidate_timeout, 3),
                 Entry::Session { .. } => continue,
             };
             if now.saturating_duration_since(since) >= timeout {
                 match bucket {
                     0 => reserved.push(index),
                     1 => pending.push(index),
-                    _ => candidates.push(index),
+                    2 => candidates.push(index),
+                    _ => aliases.push(index),
                 }
             }
         }
@@ -843,6 +1032,11 @@ impl<H, P> SessionTable<H, P> {
         for index in candidates {
             if let Some(session) = self.take_session(index) {
                 expired.candidates.push(session);
+            }
+        }
+        for index in aliases {
+            if let Some(Removed::Alias(handle)) = self.remove(index) {
+                expired.aliases.push((index, handle));
             }
         }
         expired
@@ -893,9 +1087,24 @@ impl<H, P> SessionTable<H, P> {
         if let Some(slot) = self.slots.get_mut(key) {
             if slot.current == Some(index) {
                 slot.current = None;
+                // An alias is a second label for the current's handle: it ends with it.
+                if let Some(alias) = slot.alias.take() {
+                    self.entries.remove(&alias);
+                }
             }
             if slot.candidate == Some(index) {
                 slot.candidate = None;
+            }
+            if slot.is_empty() {
+                self.slots.remove(key);
+            }
+        }
+    }
+
+    fn clear_slot_alias(&mut self, key: &SlotKey, index: SessionIndex) {
+        if let Some(slot) = self.slots.get_mut(key) {
+            if slot.alias == Some(index) {
+                slot.alias = None;
             }
             if slot.is_empty() {
                 self.slots.remove(key);
@@ -971,12 +1180,22 @@ mod tests {
                     other => panic!("slot.pending {i} points at {other:?}"),
                 }
             }
+            if let Some(i) = slot.alias {
+                assert!(slot.current.is_some(), "an alias without a current");
+                match t.entries.get(&i) {
+                    Some(Entry::Alias { key: k, .. }) => assert_eq!(k, key),
+                    other => panic!("slot.alias {i} points at {other:?}"),
+                }
+            }
         }
         for (&i, entry) in &t.entries {
             match entry {
                 Entry::Reserved { .. } => {}
                 Entry::Pending { key, .. } => {
                     assert_eq!(t.slots.get(key).and_then(|s| s.pending), Some(i));
+                }
+                Entry::Alias { key, .. } => {
+                    assert_eq!(t.slots.get(key).and_then(|s| s.alias), Some(i));
                 }
                 Entry::Session { key, status, .. } => {
                     let slot = t.slots.get(key).expect("a session has its slot");
@@ -1811,5 +2030,201 @@ mod tests {
             }
             assert!(t.is_empty(), "seed {seed}: {t:?}");
         }
+    }
+
+    // --- replacement with continuation (re-handshake design R1) ---------------
+
+    /// Reserves an index and installs it as an alias of the slot's current.
+    fn alias(
+        t: &mut Table,
+        peer: NodeId,
+        network: NetworkId,
+        handle: u32,
+        now: Instant,
+    ) -> Result<SessionIndex, AliasError> {
+        let index = t.reserve_index(now).unwrap();
+        t.install_alias(index, peer, network, handle, now)
+            .map(|()| index)
+            .map_err(|(e, _)| e)
+    }
+
+    #[test]
+    fn a_replacement_pending_sits_beside_current_and_its_resp_does_not_touch_current() {
+        let mut t = table();
+        let now = Instant::now();
+        let (old, _) = session(&mut t, id(2), net(9), Role::Initiator, 1, now);
+        let replacement = pending(&mut t, id(2), net(9), now);
+        check_invariants(&t);
+        let slot = t.slot(&id(2), &net(9));
+        assert_eq!(slot.current, Some(old));
+        assert_eq!(slot.pending, Some(replacement));
+        assert_eq!(t.held_offer(&id(2), &net(9)), Some(old));
+        // One replacement at a time.
+        let again = t.reserve_index(now).unwrap();
+        let err = t
+            .register_pending(again, id(2), net(9), "x", now)
+            .unwrap_err();
+        assert_eq!(err.0, RegisterError::AlreadyPending);
+        // Taking the resp leaves the old session current and routable.
+        match t.take_pending_for_resp(replacement, &id(2), now) {
+            RespLookup::Matched { index, .. } => assert_eq!(index, replacement),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(t.slot(&id(2), &net(9)).current, Some(old));
+        assert!(matches!(t.route(old, &id(2)), Route::Session { .. }));
+        check_invariants(&t);
+    }
+
+    #[test]
+    fn an_alias_routes_to_the_same_handle_and_commit_makes_it_current() {
+        let mut t = table();
+        let now = Instant::now();
+        let (old, _) = session(&mut t, id(2), net(9), Role::Initiator, 7, now);
+        let new = alias(&mut t, id(2), net(9), 7, now).unwrap();
+        check_invariants(&t);
+        let slot = t.slot(&id(2), &net(9));
+        assert_eq!((slot.current, slot.alias), (Some(old), Some(new)));
+        // Both labels route, to the same handle, as current; the wrong source is refused.
+        for index in [old, new] {
+            match t.route(index, &id(2)) {
+                Route::Session { handle, status, .. } => {
+                    assert_eq!(*handle, 7);
+                    assert_eq!(status, SessionStatus::Current);
+                }
+                other => panic!("{other:?}"),
+            }
+            assert!(matches!(t.route(index, &id(3)), Route::WrongSource));
+        }
+        // `sessions()` lists real sessions only.
+        assert_eq!(t.sessions().count(), 1);
+        // Commit: the old entry comes back, the alias is the session now.
+        assert_eq!(t.commit_alias(new), Some((old, 7)));
+        check_invariants(&t);
+        let slot = t.slot(&id(2), &net(9));
+        assert_eq!((slot.current, slot.alias), (Some(new), None));
+        assert!(matches!(t.route(old, &id(2)), Route::Unknown));
+        assert_eq!(t.current(&id(2), &net(9)), Some((new, &7)));
+        assert_eq!(t.len(), 1);
+        // Not an alias any more: a second commit and a commit of a session do nothing.
+        assert_eq!(t.commit_alias(new), None);
+        assert_eq!(t.commit_alias(old), None);
+    }
+
+    #[test]
+    fn an_alias_needs_a_current_a_reserved_index_and_is_one_per_slot() {
+        let mut t = table();
+        let now = Instant::now();
+        // No current in the slot.
+        assert_eq!(
+            alias(&mut t, id(2), net(9), 1, now),
+            Err(AliasError::NoCurrent)
+        );
+        assert_eq!(t.len(), 0, "the refused index was released");
+        // Not reserved.
+        session(&mut t, id(2), net(9), Role::Initiator, 1, now);
+        let err = t.install_alias(999, id(2), net(9), 1, now).unwrap_err();
+        assert_eq!(err, (AliasError::NotReserved, 1));
+        // Another network's slot has no current.
+        assert_eq!(
+            alias(&mut t, id(2), net(8), 1, now),
+            Err(AliasError::NoCurrent)
+        );
+        // A slot that exists but holds only our pending initiation has no current either.
+        pending(&mut t, id(5), net(9), now);
+        assert_eq!(
+            alias(&mut t, id(5), net(9), 1, now),
+            Err(AliasError::NoCurrent)
+        );
+        check_invariants(&t);
+        // One per slot.
+        alias(&mut t, id(2), net(9), 1, now).unwrap();
+        assert_eq!(
+            alias(&mut t, id(2), net(9), 1, now),
+            Err(AliasError::AliasExists)
+        );
+        assert_eq!(
+            t.len(),
+            3,
+            "current, its alias and the other slot's pending"
+        );
+        check_invariants(&t);
+    }
+
+    #[test]
+    fn removing_the_current_or_the_alias_cleans_up_the_other_correctly() {
+        let mut t = table();
+        let now = Instant::now();
+        let (old, _) = session(&mut t, id(2), net(9), Role::Initiator, 1, now);
+        let new = alias(&mut t, id(2), net(9), 1, now).unwrap();
+        // Dropping only the alias leaves the current.
+        assert!(matches!(t.remove(new), Some(Removed::Alias(1))));
+        check_invariants(&t);
+        assert_eq!(t.slot(&id(2), &net(9)).current, Some(old));
+        assert_eq!(t.slot(&id(2), &net(9)).alias, None);
+        // Dropping the current takes its alias with it.
+        let new = alias(&mut t, id(2), net(9), 1, now).unwrap();
+        assert!(matches!(t.remove(old), Some(Removed::Session { .. })));
+        assert!(matches!(t.route(new, &id(2)), Route::Unknown));
+        assert!(t.is_empty());
+        // Same through `remove_where`.
+        session(&mut t, id(2), net(9), Role::Initiator, 5, now);
+        let new = alias(&mut t, id(2), net(9), 5, now).unwrap();
+        let gone = t.remove_where(|h| *h == 5);
+        assert_eq!(gone.len(), 1);
+        assert!(matches!(t.route(new, &id(2)), Route::Unknown));
+        assert!(t.is_empty());
+    }
+
+    #[test]
+    fn an_uncommitted_alias_expires_with_the_candidate_timeout_and_the_current_stays() {
+        let mut t = table();
+        let t0 = Instant::now();
+        let (old, _) = session(&mut t, id(2), net(9), Role::Initiator, 1, t0);
+        let new = alias(&mut t, id(2), net(9), 1, t0).unwrap();
+        let early = t.expire(t0 + Duration::from_secs(29));
+        assert!(early.aliases.is_empty());
+        let late = t.expire(t0 + Duration::from_secs(30));
+        assert_eq!(late.aliases, vec![(new, 1)]);
+        assert!(
+            late.candidates.is_empty(),
+            "an alias is not a candidate to end"
+        );
+        assert_eq!(t.slot(&id(2), &net(9)).current, Some(old));
+        check_invariants(&t);
+    }
+
+    #[test]
+    fn a_candidate_remembers_the_held_value_offered_with_it() {
+        let mut t = table();
+        let now = Instant::now();
+        let (old, _) = session(&mut t, id(2), net(9), Role::Initiator, 1, now);
+        let offer = t.held_offer(&id(2), &net(9));
+        assert_eq!(offer, Some(old));
+        let index = t.reserve_index(now).unwrap();
+        t.install_candidate_offering(index, id(2), net(9), 2, offer, now)
+            .map_err(|(e, _)| e)
+            .unwrap();
+        assert_eq!(t.offered_held(index), Some(old));
+        assert_eq!(t.slot(&id(2), &net(9)).candidate, Some(index));
+        // Without an offer (no current at the time), none is remembered.
+        let index2 = t.reserve_index(now).unwrap();
+        t.install_candidate_offering(index2, id(3), net(9), 3, None, now)
+            .map_err(|(e, _)| e)
+            .unwrap();
+        assert_eq!(t.offered_held(index2), None);
+        // A plain install offers nothing; unknown indices have none.
+        let (plain, _) = session(&mut t, id(4), net(9), Role::Responder, 4, now);
+        assert_eq!(t.offered_held(plain), None);
+        assert_eq!(t.offered_held(424242), None);
+        // Promotion keeps the old behaviour: the old current is retired.
+        let promoted = t.promote(index).unwrap();
+        assert_eq!(promoted.retired, Some((old, 1)));
+        check_invariants(&t);
+    }
+
+    #[test]
+    fn nothing_is_offered_without_a_current_session() {
+        let t = table();
+        assert_eq!(t.held_offer(&id(2), &net(9)), None);
     }
 }

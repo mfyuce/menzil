@@ -130,6 +130,9 @@ const RELIABLE_COUNTER_CEILING: u64 = 1 << 63;
 #[derive(Debug)]
 pub struct E2eTransport {
     inner: snow::StatelessTransportState,
+    /// The Noise handshake hash `h` of the finished handshake: public transcript data, the
+    /// unambiguous name of this session (`menzil_proto::continue_binding` hashes it).
+    handshake_hash: [u8; 32],
     /// The index this side must stamp as `receiver_index` on every
     /// outgoing `data` frame: the peer's own local index for this
     /// session (protocol.md 5.1 — the initiator's `sender_index` in
@@ -160,8 +163,12 @@ impl E2eTransport {
         peer_index: u32,
         max_record: u32,
     ) -> Result<Self, E2eError> {
+        // BLAKE2s: the hash is 32 bytes, so the copy cannot truncate.
+        let handshake_hash = <[u8; 32]>::try_from(hs.get_handshake_hash())
+            .expect("Noise_IK_25519_ChaChaPoly_BLAKE2s has a 32 byte handshake hash");
         Ok(Self {
             inner: hs.into_stateless_transport_mode()?,
+            handshake_hash,
             peer_index,
             max_plaintext: menzil_proto::max_e2e_data_plaintext(max_record),
             send_reliable_next: 0,
@@ -175,6 +182,24 @@ impl E2eTransport {
     /// comment.
     pub fn peer_index(&self) -> u32 {
         self.peer_index
+    }
+
+    /// The Noise handshake hash `h` of this session (protocol.md 5.2, CONTINUE `binding`).
+    /// Both sides of one session read the same 32 bytes; it is not a secret.
+    pub fn handshake_hash(&self) -> &[u8; 32] {
+        &self.handshake_hash
+    }
+
+    /// How many reliable class records this side has sent: the next class 0 counter it would
+    /// use. Datagrams are not counted. This is the `sent` of CONTINUE and CONTINUE_ACK.
+    pub fn reliable_sent(&self) -> u64 {
+        self.send_reliable_next
+    }
+
+    /// How many reliable class records this side has received and accepted (contiguous, so
+    /// also the next class 0 counter it expects). Datagrams are not counted.
+    pub fn reliable_received(&self) -> u64 {
+        self.recv_reliable_next
     }
 
     /// Encrypts `body` as the next reliable-class `data` frame,
@@ -1313,5 +1338,48 @@ pub(crate) mod tests {
         let err = responder.decrypt_dgram(counter, &ct).unwrap_err();
         assert!(matches!(err, E2eError::Proto(_)), "{err:?}");
         assert_eq!(responder.recv_dgram_window.top(), None);
+    }
+
+    #[test]
+    fn reliable_counts_follow_reliable_records_only_and_datagrams_are_not_counted() {
+        let (mut a, mut b) = run_live_handshake();
+        assert_eq!((a.reliable_sent(), a.reliable_received()), (0, 0));
+        assert_eq!((b.reliable_sent(), b.reliable_received()), (0, 0));
+        for body in [
+            E2eDataBody::Keep,
+            E2eDataBody::Mux(vec![1, 2, 3]),
+            E2eDataBody::Keep,
+        ] {
+            let (counter, ct) = frame_parts(a.encrypt_data(&body).unwrap());
+            b.decrypt_data(counter, &ct).unwrap();
+        }
+        assert_eq!((a.reliable_sent(), a.reliable_received()), (3, 0));
+        assert_eq!((b.reliable_sent(), b.reliable_received()), (0, 3));
+        // Datagrams, in both directions, change neither count.
+        for _ in 0..4 {
+            let (counter, ct) = dgram(&mut a, 1, b"x");
+            b.decrypt_dgram(counter, &ct).unwrap();
+        }
+        let (counter, ct) = dgram(&mut b, 1, b"y");
+        a.decrypt_dgram(counter, &ct).unwrap();
+        assert_eq!((a.reliable_sent(), a.reliable_received()), (3, 0));
+        assert_eq!((b.reliable_sent(), b.reliable_received()), (0, 3));
+        // A refused record (bad counter) does not count as received.
+        let (counter, ct) = frame_parts(a.encrypt_data(&E2eDataBody::Keep).unwrap());
+        assert!(b.decrypt_data(counter + 1, &ct).is_err());
+        assert_eq!(b.reliable_received(), 3);
+        b.decrypt_data(counter, &ct).unwrap();
+        assert_eq!((a.reliable_sent(), b.reliable_received()), (4, 4));
+    }
+
+    fn frame_parts(frame: E2eFrame) -> (u64, Vec<u8>) {
+        match frame {
+            E2eFrame::Data {
+                counter,
+                ciphertext,
+                ..
+            } => (counter, ciphertext),
+            other => panic!("not data: {other:?}"),
+        }
     }
 }

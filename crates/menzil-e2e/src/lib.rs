@@ -105,6 +105,7 @@ mod handshake;
 mod limiter;
 mod liveness;
 mod rekey;
+mod replace;
 mod replay;
 mod table;
 mod transport;
@@ -117,9 +118,11 @@ pub use limiter::{
 };
 pub use liveness::Liveness;
 pub use rekey::RekeySchedule;
+pub use replace::{Poll, ReplaceDurations, ReplaceSchedule};
 pub use replay::{REPLAY_WINDOW_SIZE, ReplayWindow};
 pub use table::{
-    Expired, IgnoreReason, InitDecision, Installed, Promoted, RegisterError, Removed, RespLookup,
-    Role, Route, SessionIndex, SessionStatus, SessionTable, SlotState, TableConfig, TableError,
+    AliasError, Expired, IgnoreReason, InitDecision, Installed, Promoted, RegisterError, Removed,
+    RespLookup, Role, Route, SessionIndex, SessionStatus, SessionTable, SlotState, TableConfig,
+    TableError,
 };
 pub use transport::{E2eTransport, MAX_DGRAM_SEQUENCE};

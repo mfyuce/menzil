@@ -367,6 +367,7 @@ impl E2eResponderHandshake {
             policy_seq,
             e2e_protos,
             false,
+            None,
             own_index,
             max_record,
         )
@@ -390,6 +391,33 @@ impl E2eResponderHandshake {
             policy_seq,
             e2e_protos,
             true,
+            None,
+            own_index,
+            max_record,
+        )
+    }
+
+    /// As [`Self::finish`], offering `held` in the payload (protocol.md 5.1, 5.2): the
+    /// responder's own index of the full session it holds as current with this initiator in
+    /// this network. Never combined with `docs_only` (there is no such constructor).
+    #[allow(clippy::too_many_arguments)]
+    pub fn finish_offering_held(
+        self,
+        responder_node_cert: NodeCert,
+        roster_seq: u64,
+        policy_seq: u64,
+        e2e_protos: Vec<u8>,
+        held: u32,
+        own_index: u32,
+        max_record: u32,
+    ) -> Result<(E2eTransport, E2eFrame), E2eError> {
+        self.finish_with(
+            responder_node_cert,
+            roster_seq,
+            policy_seq,
+            e2e_protos,
+            false,
+            Some(held),
             own_index,
             max_record,
         )
@@ -403,6 +431,7 @@ impl E2eResponderHandshake {
         policy_seq: u64,
         e2e_protos: Vec<u8>,
         docs_only: bool,
+        held: Option<u32>,
         own_index: u32,
         max_record: u32,
     ) -> Result<(E2eTransport, E2eFrame), E2eError> {
@@ -413,6 +442,7 @@ impl E2eResponderHandshake {
             policy_seq,
             e2e_protos,
             docs_only,
+            held,
         };
         let noise_msg2 = write(&mut self.hs, &payload.encode()?)?;
         let frame = E2eFrame::Resp {
@@ -899,5 +929,69 @@ mod tests {
             not_after: 1_000_000_000,
         };
         NodeCert::sign(&key, &body).unwrap()
+    }
+
+    /// Runs a live handshake where the responder finishes with `finish`, returning the
+    /// initiator's view of the payload and both transports.
+    fn live_with(
+        finish: impl FnOnce(E2eResponderHandshake) -> (E2eTransport, E2eFrame),
+    ) -> (E2eHandshakePayload, E2eTransport, E2eTransport) {
+        let (responder_priv, responder_pub) = fresh_keypair();
+        let (mut initiator_hs, init_frame) = E2eInitiatorHandshake::start(
+            &fresh_private_key(),
+            &responder_pub,
+            NetworkId::from([1u8; 32]),
+            NodeId::from([2u8; 32]),
+            NodeId::from([3u8; 32]),
+            42,
+        )
+        .unwrap();
+        let responder_hs = E2eResponderHandshake::start(
+            &responder_priv,
+            NodeId::from([2u8; 32]),
+            NodeId::from([3u8; 32]),
+            &init_frame,
+        )
+        .unwrap();
+        let (responder_transport, resp_frame) = finish(responder_hs);
+        let (initiator_transport, payload, _) = initiator_hs.finish(&resp_frame, 65_535).unwrap();
+        (payload, initiator_transport, responder_transport)
+    }
+
+    #[test]
+    fn held_reaches_the_initiator_only_when_offered_and_never_with_docs_only() {
+        let (payload, _, _) = live_with(|hs| {
+            hs.finish_offering_held(sample_cert(), 1, 2, vec![0x01], 0xDEAD, 99, 65_535)
+                .unwrap()
+        });
+        assert_eq!(payload.held, Some(0xDEAD));
+        assert!(!payload.docs_only);
+        let (payload, _, _) = live_with(|hs| {
+            hs.finish(sample_cert(), 1, 2, vec![0x01], 99, 65_535)
+                .unwrap()
+        });
+        assert_eq!(payload.held, None);
+        let (payload, _, _) = live_with(|hs| {
+            hs.finish_docs_only(sample_cert(), 1, 2, vec![0x01], 99, 65_535)
+                .unwrap()
+        });
+        assert_eq!(payload.held, None);
+        assert!(payload.docs_only);
+    }
+
+    #[test]
+    fn both_sides_of_a_session_read_the_same_handshake_hash_and_sessions_differ() {
+        let (_, init_a, resp_a) = live_with(|hs| {
+            hs.finish(sample_cert(), 1, 2, vec![0x01], 99, 65_535)
+                .unwrap()
+        });
+        assert_eq!(init_a.handshake_hash(), resp_a.handshake_hash());
+        assert_ne!(init_a.handshake_hash(), &[0u8; 32]);
+        let (_, init_b, _) = live_with(|hs| {
+            hs.finish(sample_cert(), 1, 2, vec![0x01], 99, 65_535)
+                .unwrap()
+        });
+        // Fresh ephemerals: another session, another hash.
+        assert_ne!(init_a.handshake_hash(), init_b.handshake_hash());
     }
 }

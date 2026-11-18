@@ -260,6 +260,14 @@ pub struct E2eHandshakePayload {
     /// on the wire: absent means `false`, and `false` is never written.
     #[serde(default, skip_serializing_if = "is_false")]
     pub docs_only: bool,
+    /// The responder's own index (its `sender_index`) of the full session it holds as current
+    /// with this initiator in this network (protocol.md 5.1, 5.2; slice R1 of the re-handshake
+    /// design). Optional on the wire: absent means "none", and `None` is never written. An
+    /// older decoder ignores the key; an older responder never sends it. Never present
+    /// together with `docs_only: true`: [`Self::encode`] and [`Self::decode`] both refuse that
+    /// combination.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub held: Option<u32>,
 }
 
 fn is_false(value: &bool) -> bool {
@@ -269,15 +277,162 @@ fn is_false(value: &bool) -> bool {
 impl E2eHandshakePayload {
     /// Encodes this payload for embedding as `resp`'s Noise message 2
     /// payload.
+    ///
+    /// Refuses a payload with both `held` and `docs_only` set.
     pub fn encode(&self) -> Result<Vec<u8>, ProtoError> {
+        self.check_held_rule()
+            .map_err(|e| ProtoError::Encode(e.to_string()))?;
         encode_body(self)
     }
 
     /// Strictly decodes a handshake payload out of a Noise message,
     /// tolerating unknown keys; see [`crate::handshake::HelloBody::decode`]'s
-    /// docs for the same contract.
+    /// docs for the same contract. Refuses a payload with both `held` and
+    /// `docs_only: true` (a docs only session holds nothing to continue).
     pub fn decode(bytes: &[u8]) -> Result<Self, ProtoError> {
-        decode_body(bytes)
+        let payload: Self = decode_body(bytes)?;
+        payload.check_held_rule()?;
+        Ok(payload)
+    }
+
+    fn check_held_rule(&self) -> Result<(), ProtoError> {
+        if self.held.is_some() && self.docs_only {
+            return Err(ProtoError::MalformedRecord(
+                "handshake payload carries `held` together with `docs_only`".to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// The data record kind byte of CONTINUE (protocol.md 5.2, reliable class). Not an
+/// [`E2eDataKind`] variant yet: [`E2eDataBody::decode`] still refuses it as unknown, so a node
+/// that does not carry the handover (everything before slice R2/R3) behaves as before. The
+/// handover code decodes it through [`ContinueBody::decode`] before calling the general decoder.
+pub const CONTINUE_KIND: u8 = 0x06;
+/// The data record kind byte of CONTINUE_ACK; see [`CONTINUE_KIND`].
+pub const CONTINUE_ACK_KIND: u8 = 0x07;
+
+/// Domain separation label of [`continue_binding`].
+const CONTINUE_BINDING_LABEL: &[u8] = b"menzil.v1.e2e.continue";
+
+/// `binding` of a CONTINUE: `BLAKE2s-256("menzil.v1.e2e.continue" || h_old)`, where `h_old` is
+/// the Noise handshake hash of the session being continued. `h_old` is public transcript data;
+/// the binding is an unambiguous name of the old session, not a secret.
+pub fn continue_binding(h_old: &[u8; 32]) -> [u8; 32] {
+    use blake2::{Blake2s256, Digest};
+    let mut hasher = Blake2s256::new();
+    hasher.update(CONTINUE_BINDING_LABEL);
+    hasher.update(h_old);
+    hasher.finalize().into()
+}
+
+/// Length of a CONTINUE body: `u32 prior | u64 sent | bytes32 binding`.
+pub const CONTINUE_BODY_LEN: usize = 4 + 8 + 32;
+/// Length of a CONTINUE_ACK body: `u64 sent`.
+pub const CONTINUE_ACK_BODY_LEN: usize = 8;
+
+/// CONTINUE (`0x06`): the first reliable record of the initiator on a replacement session
+/// whose `resp` offered `held`. Fixed binary, big endian, exactly [`CONTINUE_BODY_LEN`] bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ContinueBody {
+    /// The `held` value the initiator received.
+    pub prior: u32,
+    /// Reliable records the sender sent on the old session.
+    pub sent: u64,
+    /// [`continue_binding`] of the old session's handshake hash.
+    pub binding: [u8; 32],
+}
+
+impl ContinueBody {
+    /// The record plaintext: `0x06 | prior | sent | binding`.
+    pub fn encode(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(1 + CONTINUE_BODY_LEN);
+        buf.push(CONTINUE_KIND);
+        buf.extend_from_slice(&self.prior.to_be_bytes());
+        buf.extend_from_slice(&self.sent.to_be_bytes());
+        buf.extend_from_slice(&self.binding);
+        buf
+    }
+
+    /// Decodes a record plaintext (`kind byte | body`). Any kind other than `0x06` or any body
+    /// length other than exactly [`CONTINUE_BODY_LEN`] is an error.
+    pub fn decode(plaintext: &[u8]) -> Result<Self, ProtoError> {
+        match plaintext.split_first() {
+            Some((&CONTINUE_KIND, body)) => Self::decode_body(body),
+            Some((&other, _)) => Err(ProtoError::UnknownE2eDataKind(other)),
+            None => Err(ProtoError::MalformedRecord(
+                "empty L4 data record".to_string(),
+            )),
+        }
+    }
+
+    /// Decodes the body alone (without the kind byte).
+    pub fn decode_body(body: &[u8]) -> Result<Self, ProtoError> {
+        if body.len() != CONTINUE_BODY_LEN {
+            return Err(ProtoError::MalformedRecord(format!(
+                "CONTINUE body is {} bytes, not {CONTINUE_BODY_LEN}",
+                body.len()
+            )));
+        }
+        let mut prior = [0u8; 4];
+        prior.copy_from_slice(&body[..4]);
+        let mut sent = [0u8; 8];
+        sent.copy_from_slice(&body[4..12]);
+        let mut binding = [0u8; 32];
+        binding.copy_from_slice(&body[12..]);
+        Ok(Self {
+            prior: u32::from_be_bytes(prior),
+            sent: u64::from_be_bytes(sent),
+            binding,
+        })
+    }
+
+    /// Whether `binding` is the one [`continue_binding`] gives for `h_old`.
+    pub fn binding_matches(&self, h_old: &[u8; 32]) -> bool {
+        self.binding == continue_binding(h_old)
+    }
+}
+
+/// CONTINUE_ACK (`0x07`): the responder's first reliable record on the replacement session.
+/// Fixed binary, exactly [`CONTINUE_ACK_BODY_LEN`] bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ContinueAckBody {
+    /// Reliable records the sender sent on the old session.
+    pub sent: u64,
+}
+
+impl ContinueAckBody {
+    /// The record plaintext: `0x07 | sent`.
+    pub fn encode(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(1 + CONTINUE_ACK_BODY_LEN);
+        buf.push(CONTINUE_ACK_KIND);
+        buf.extend_from_slice(&self.sent.to_be_bytes());
+        buf
+    }
+
+    /// Decodes a record plaintext (`kind byte | body`); see [`ContinueBody::decode`].
+    pub fn decode(plaintext: &[u8]) -> Result<Self, ProtoError> {
+        match plaintext.split_first() {
+            Some((&CONTINUE_ACK_KIND, body)) => Self::decode_body(body),
+            Some((&other, _)) => Err(ProtoError::UnknownE2eDataKind(other)),
+            None => Err(ProtoError::MalformedRecord(
+                "empty L4 data record".to_string(),
+            )),
+        }
+    }
+
+    /// Decodes the body alone (without the kind byte).
+    pub fn decode_body(body: &[u8]) -> Result<Self, ProtoError> {
+        let bytes: [u8; CONTINUE_ACK_BODY_LEN] = body.try_into().map_err(|_| {
+            ProtoError::MalformedRecord(format!(
+                "CONTINUE_ACK body is {} bytes, not {CONTINUE_ACK_BODY_LEN}",
+                body.len()
+            ))
+        })?;
+        Ok(Self {
+            sent: u64::from_be_bytes(bytes),
+        })
     }
 }
 
@@ -633,6 +788,7 @@ mod tests {
             policy_seq: 7,
             e2e_protos: vec![0x01],
             docs_only: false,
+            held: None,
         };
         let encoded = payload.encode().unwrap();
         assert_eq!(E2eHandshakePayload::decode(&encoded).unwrap(), payload);
@@ -647,6 +803,7 @@ mod tests {
             policy_seq: 7,
             e2e_protos: vec![0x01],
             docs_only: false,
+            held: None,
         };
         let plain = payload.encode().unwrap();
         payload.docs_only = true;
@@ -780,5 +937,174 @@ mod tests {
         assert_eq!(body.encode().unwrap().len(), max_e2e_data_plaintext(65_535));
         assert_eq!(max_dgram_payload(0), 0);
         assert_eq!(max_dgram_payload(10), 0);
+    }
+
+    /// What every build before the `held` key decodes into: the same struct without it.
+    #[derive(Debug, Serialize, Deserialize, PartialEq)]
+    struct OldPayload {
+        v: u16,
+        node_cert: NodeCert,
+        roster_seq: u64,
+        policy_seq: u64,
+        e2e_protos: Vec<u8>,
+        #[serde(default, skip_serializing_if = "is_false")]
+        docs_only: bool,
+    }
+
+    fn payload_with(held: Option<u32>, docs_only: bool) -> E2eHandshakePayload {
+        E2eHandshakePayload {
+            v: crate::PROTOCOL_VERSION,
+            node_cert: sample_cert(),
+            roster_seq: 3,
+            policy_seq: 7,
+            e2e_protos: vec![0x01],
+            docs_only,
+            held,
+        }
+    }
+
+    #[test]
+    fn an_old_payload_without_held_decodes_with_held_none() {
+        let payload = payload_with(None, false);
+        let old = OldPayload {
+            v: payload.v,
+            node_cert: payload.node_cert.clone(),
+            roster_seq: 3,
+            policy_seq: 7,
+            e2e_protos: vec![0x01],
+            docs_only: false,
+        };
+        let mut old_bytes = Vec::new();
+        ciborium::into_writer(&old, &mut old_bytes).unwrap();
+        let decoded = E2eHandshakePayload::decode(&old_bytes).unwrap();
+        assert_eq!(decoded, payload);
+        assert_eq!(decoded.held, None);
+        // `None` is never written: the new encoder emits the old bytes exactly.
+        assert_eq!(payload.encode().unwrap(), old_bytes);
+    }
+
+    #[test]
+    fn a_payload_with_held_round_trips_and_writes_the_key_last() {
+        let payload = payload_with(Some(0x0102), false);
+        let bytes = payload.encode().unwrap();
+        assert_eq!(E2eHandshakePayload::decode(&bytes).unwrap(), payload);
+        // CBOR text "held" (0x64) then the unsigned 0x0102 (0x19 0x01 0x02), last in the map.
+        assert_eq!(
+            &bytes[bytes.len() - 8..],
+            &[0x64, b'h', b'e', b'l', b'd', 0x19, 0x01, 0x02]
+        );
+    }
+
+    #[test]
+    fn an_old_style_decoder_reads_the_new_bytes_and_ignores_held() {
+        let payload = payload_with(Some(77), false);
+        let bytes = payload.encode().unwrap();
+        let old: OldPayload = ciborium::from_reader(bytes.as_slice()).unwrap();
+        assert_eq!(old.roster_seq, 3);
+        assert_eq!(old.policy_seq, 7);
+        assert!(!old.docs_only);
+    }
+
+    #[test]
+    fn held_together_with_docs_only_is_refused_both_ways() {
+        let bad = payload_with(Some(5), true);
+        assert!(bad.encode().is_err());
+        // Bytes made by a peer that ignored the rule: refused on decode.
+        let mut wire = Vec::new();
+        ciborium::into_writer(&bad, &mut wire).unwrap();
+        assert!(E2eHandshakePayload::decode(&wire).is_err());
+        // Each alone is fine.
+        assert!(payload_with(Some(5), false).encode().is_ok());
+        assert!(payload_with(None, true).encode().is_ok());
+    }
+
+    fn sample_continue() -> ContinueBody {
+        ContinueBody {
+            prior: 0x0102_0304,
+            sent: 0x0a0b_0c0d_0e0f_1011,
+            binding: [0xab; 32],
+        }
+    }
+
+    #[test]
+    fn continue_has_a_fixed_big_endian_layout() {
+        let bytes = sample_continue().encode();
+        assert_eq!(bytes.len(), 45);
+        assert_eq!(bytes[0], 0x06);
+        assert_eq!(&bytes[1..5], &[1, 2, 3, 4]);
+        assert_eq!(
+            &bytes[5..13],
+            &[0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10, 0x11]
+        );
+        assert_eq!(&bytes[13..], &[0xab; 32]);
+        assert_eq!(ContinueBody::decode(&bytes).unwrap(), sample_continue());
+    }
+
+    #[test]
+    fn continue_refuses_every_length_but_44() {
+        let body = sample_continue().encode();
+        let body = &body[1..];
+        assert_eq!(body.len(), 44);
+        assert!(ContinueBody::decode_body(body).is_ok());
+        assert!(ContinueBody::decode_body(&body[..43]).is_err());
+        let mut long = body.to_vec();
+        long.push(0);
+        assert!(ContinueBody::decode_body(&long).is_err());
+        assert!(ContinueBody::decode_body(&[]).is_err());
+        assert!(ContinueBody::decode(&[]).is_err());
+        assert!(ContinueBody::decode(&[0x06]).is_err());
+        // The kind byte must be CONTINUE's.
+        let mut wrong = sample_continue().encode();
+        wrong[0] = 0x07;
+        assert!(ContinueBody::decode(&wrong).is_err());
+    }
+
+    #[test]
+    fn continue_ack_has_a_fixed_layout_and_refuses_every_length_but_8() {
+        let ack = ContinueAckBody {
+            sent: 0x0102_0304_0506_0708,
+        };
+        let bytes = ack.encode();
+        assert_eq!(bytes, vec![0x07, 1, 2, 3, 4, 5, 6, 7, 8]);
+        assert_eq!(ContinueAckBody::decode(&bytes).unwrap(), ack);
+        let body = &bytes[1..];
+        assert!(ContinueAckBody::decode_body(&body[..7]).is_err());
+        let mut long = body.to_vec();
+        long.push(0);
+        assert!(ContinueAckBody::decode_body(&long).is_err());
+        assert!(ContinueAckBody::decode_body(&[]).is_err());
+        assert!(ContinueAckBody::decode(&[]).is_err());
+        assert!(ContinueAckBody::decode(&[0x07]).is_err());
+        let mut wrong = bytes.clone();
+        wrong[0] = 0x06;
+        assert!(ContinueAckBody::decode(&wrong).is_err());
+    }
+
+    #[test]
+    fn the_general_decoder_still_refuses_the_new_kinds_until_they_are_wired() {
+        for kind in [CONTINUE_KIND, CONTINUE_ACK_KIND] {
+            let err = E2eDataBody::decode(&[kind, 0, 0]).unwrap_err();
+            assert!(matches!(err, ProtoError::UnknownE2eDataKind(k) if k == kind));
+        }
+    }
+
+    #[test]
+    fn the_binding_is_blake2s_of_the_label_and_h_old_and_changes_with_it() {
+        use blake2::{Blake2s256, Digest};
+        let h_old = [7u8; 32];
+        let mut input = b"menzil.v1.e2e.continue".to_vec();
+        input.extend_from_slice(&h_old);
+        let expected: [u8; 32] = Blake2s256::digest(&input).into();
+        assert_eq!(continue_binding(&h_old), expected);
+        let mut other = h_old;
+        other[31] ^= 1;
+        assert_ne!(continue_binding(&other), continue_binding(&h_old));
+        let cont = ContinueBody {
+            prior: 1,
+            sent: 2,
+            binding: continue_binding(&h_old),
+        };
+        assert!(cont.binding_matches(&h_old));
+        assert!(!cont.binding_matches(&other));
     }
 }
