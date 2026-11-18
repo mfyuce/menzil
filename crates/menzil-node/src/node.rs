@@ -89,7 +89,7 @@ use crate::docs_access::{DocsGate, DocsLimits, SessionHandler};
 use crate::docs_sync::{DocsSync, PushReport, SyncConfig};
 use crate::identity::{IdentityCell, IdentityError, OwnSerial};
 use crate::l4_router::{
-    EnsureError, RouterConfig, RouterHandle, RouterParts, SessionReady, new_router,
+    EnsureError, ReplaceConfig, RouterConfig, RouterHandle, RouterParts, SessionReady, new_router,
 };
 use crate::l4_session::{CloseReason, E2E_PROTO_TAG, L4SessionHandle};
 use crate::l5_stream::{
@@ -228,7 +228,36 @@ impl Node {
         H: ServiceHandler<Stream> + Send + Sync + 'static,
         H::Handling: Send + 'static,
     {
-        Self::start_inner(config, handler, sync_config, RelayLimits::new(), None)
+        Self::start_inner(config, handler, sync_config, RelayLimits::new(), None, None)
+    }
+
+    /// [`Self::start`] with other figures for the 24 hour replacement of full sessions
+    /// (protocol.md 5.2) and, with `continuation` false, a node that behaves like a build that
+    /// predates the continuation of streams across it (no `held` offered or used). **For tests**,
+    /// which cannot wait a day; the protocol's own figures are `ReplaceDurations::default()`.
+    pub fn start_with_replace<H>(
+        config: NodeConfig,
+        handler: H,
+        durations: menzil_e2e::ReplaceDurations,
+        continuation: bool,
+    ) -> Result<Self, StartError>
+    where
+        H: ServiceHandler<Stream> + Send + Sync + 'static,
+        H::Handling: Send + 'static,
+    {
+        let replace = ReplaceConfig {
+            durations,
+            continuation,
+            ..ReplaceConfig::default()
+        };
+        Self::start_inner(
+            config,
+            handler,
+            SyncConfig::default(),
+            RelayLimits::new(),
+            None,
+            Some(replace),
+        )
     }
 
     /// [`Self::start`] with other limits for the streams the relay principal holds on this node
@@ -242,7 +271,14 @@ impl Node {
         H: ServiceHandler<Stream> + Send + Sync + 'static,
         H::Handling: Send + 'static,
     {
-        Self::start_inner(config, handler, SyncConfig::default(), relay_limits, None)
+        Self::start_inner(
+            config,
+            handler,
+            SyncConfig::default(),
+            relay_limits,
+            None,
+            None,
+        )
     }
 
     /// [`Self::start_with_relay_limits`] with a node wide inbound ceiling in bytes
@@ -264,6 +300,7 @@ impl Node {
             SyncConfig::default(),
             relay_limits,
             inbound_ceiling,
+            None,
         )
     }
 
@@ -273,6 +310,7 @@ impl Node {
         sync_config: SyncConfig,
         relay_limits: Arc<RelayLimits>,
         inbound_ceiling: Option<usize>,
+        replace: Option<ReplaceConfig>,
     ) -> Result<Self, StartError>
     where
         H: ServiceHandler<Stream> + Send + Sync + 'static,
@@ -303,6 +341,10 @@ impl Node {
         .with_shares(shares.clone());
         let router_config = match inbound_ceiling {
             Some(bytes) => router_config.with_inbound_ceiling(bytes),
+            None => router_config,
+        };
+        let router_config = match replace {
+            Some(replace) => router_config.with_replace(replace),
             None => router_config,
         };
 

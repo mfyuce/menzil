@@ -282,7 +282,7 @@ Handshake payload: `CBOR{ v: 1, node_cert: NodeCert, roster_seq: u64, policy_seq
 
 `held` is optional and is the responder's own index of the full session it holds as current with the initiator in `network_id`, on the relay attachment the `init` arrived on, whose peer static key is the static key of this `init`; it is absent otherwise and never sent with `docs_only`. A receiver ignores keys of the handshake payload it does not know.
 
-*Specified, not wired in the node until slice R3 of the re-handshake design: the `held` key, the codes `handover_failed` (28) and `session_expired` (29) and the record kinds of 5.2 exist in `menzil-proto` and `menzil-e2e` and are tested, but no node offers `held`, sends CONTINUE or ends a session at the age cap yet; today every full session runs until it ends for another reason and a replacement resets the streams of the old one.*
+*Built in the node (slice R3 of the re-handshake design): a node offers `held` for a full session its peer started, and ends a session at the age cap. See the note after 5.2's record bodies for what the code does differently from the text.*
 
 Checks. The initiator verifies the responder's `node_cert.node_id` equals the NodeId it dialed and `x25519_pub` equals the handshake static key. The initiator also checks the payload certificate's self signature and window, and that it names no other key than the one it dialed, and then its own standing: the responder must be an unrevoked member of `network_id`, with the serial of the certificate its own Policy lists for the negotiated key (never the serial the payload claims) not below `min_serial`. The responder takes the initiator's `node_id` from the RECV `src` (it is in the prologue, so a wrong one fails the handshake) and its static key from message 1, and verifies that both are unrevoked members of `network_id` in an unexpired Roster and Policy, and that the serial of the initiator's certificate in its Policy for that key is not below `min_serial`. The responder checks that the RECV `src` is an unrevoked member in its Roster before any Diffie Hellman, and stays silent otherwise. A member with no grant on this node is admitted like any other; what it may open is decided per stream (section 5.3). If the initiator is an unrevoked member in the responder's Roster but cannot be admitted, because the certificate that counts for it in the responder's Policy (section 2.2) is missing or not for the handshake key, it is not in that Policy, or the responder's documents have expired, the responder completes the handshake with `docs_only: true` in its payload and accepts only a `menzil:docs` push on that session (section 5.5). Every other failed check is answered with silence.
 Handshakes are rate limited per peer (10 per minute) because each costs four Diffie Hellman operations and two signature checks.
@@ -314,7 +314,7 @@ Rekey: every 2^20 records (of both classes) or every hour a sender emits REKEY (
 
 CONTINUE and CONTINUE_ACK have fixed binary bodies, big endian, of exactly 44 and 8 bytes; any other length is authenticated misbehavior and ends the session. `sent` is the number of reliable records the sender sent on the old session (datagrams are not counted). `binding` is `BLAKE2s-256("menzil.v1.e2e.continue" || h_old)`, where `h_old` is the Noise handshake hash of the old session; it is public transcript data and names the old session unambiguously, and the authenticity of the record comes from the new session's keys.
 
-*Specified, not wired in the node until slice R3: only the wire forms (`held`, the two record bodies, `continue_binding`, the codes), the table support and the sans-IO replacement schedule are built (slice R1). The node still has no 24 hour limit; a replacement handshake is accepted as before, the old session stays valid until the first data record of the new one is received, and the streams of the old one reset.*
+*Built in the node (slice R3), with two differences from the text above. (1) A datagram that arrives first on an ordinary candidate (one the router does not hold itself, that is, one without a current session beside it) still counts as that session's first record; only a router held candidate drops it. (2) A router held candidate whose first record is exactly as long as a CONTINUE but is not one cannot be handed to a new session (the router has already read it), so it is refused with CLOSE `handover_failed` instead of replacing the old session; a first record of any other length replaces the old session as before. Timing: the replacement schedule is checked once a second, the router holds a candidate for 30 s, and a replacement `init` counts against the peer's 10 per minute handshake allowance like any other.*
 
 Plaintext of a data record:
 
@@ -325,8 +325,8 @@ u8 kind | body
 0x03 CLOSE   CBOR{ code: u16, msg: str }
 0x04 KEEP    empty, every 20 s when idle
 0x05 REKEY   empty
-0x06 CONTINUE      u32 prior | u64 sent | bytes32 binding   (exactly 44 bytes, reliable class, specified not wired until R3)
-0x07 CONTINUE_ACK  u64 sent                                 (exactly 8 bytes, reliable class, specified not wired until R3)
+0x06 CONTINUE      u32 prior | u64 sent | bytes32 binding   (exactly 44 bytes, reliable class)
+0x07 CONTINUE_ACK  u64 sent                                 (exactly 8 bytes, reliable class)
 ```
 
 When an L4 session ends abnormally, the node closes the local sockets of its streams with a reset where the platform allows, never with a clean end of file, so that truncation is visible to applications.

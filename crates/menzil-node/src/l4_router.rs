@@ -128,16 +128,17 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use menzil_e2e::{
-    E2eInitiatorHandshake, E2eResponderHandshake, IgnoreReason, InitDecision, Promoted,
-    RegisterError, Removed, RespLookup, Role, Route, SessionIndex, SessionTable, SlotState,
-    TableConfig,
+    E2eError, E2eInitiatorHandshake, E2eResponderHandshake, IgnoreReason, InitDecision, Poll,
+    Promoted, RegisterError, Removed, ReplaceDurations, ReplaceSchedule, RespLookup, Role, Route,
+    SessionIndex, SessionTable, SlotState, TableConfig,
 };
 use menzil_proto::{
-    E2eFrame, ErrorCode, Limits, NetworkId, NodeId, ProtoError, Record, RecordClass,
-    X25519PublicKey,
+    ContinueBody, E2eDataBody, E2eFrame, ErrorCode, L4_AEAD_TAG_LEN, Limits, NetworkId, NodeId,
+    ProtoError, Record, RecordClass, X25519PublicKey, continue_binding,
 };
 use menzil_stream::Mode;
 use tokio::sync::{mpsc, oneshot, watch};
@@ -149,9 +150,9 @@ use crate::admission::{
 };
 use crate::identity::IdentityCell;
 use crate::l4_session::{
-    CloseReason, E2E_PROTO_TAG, FeedRefused, L4_INBOUND_BUDGET_PER_SESSION,
-    L4_INBOUND_CEILING_PER_NODE, L4SessionAcceptor, L4SessionConfig, L4SessionHandle, NodeInbound,
-    SessionNotice, SessionObserver, new as new_l4_session,
+    CloseReason, E2E_PROTO_TAG, FIRST_GENERATION, FeedRefused, Generation, HandoverRole,
+    L4_INBOUND_BUDGET_PER_SESSION, L4_INBOUND_CEILING_PER_NODE, L4SessionAcceptor, L4SessionConfig,
+    L4SessionHandle, NodeInbound, SessionNotice, SessionObserver, new as new_l4_session,
     new_with_datagrams as new_l4_session_with_datagrams,
 };
 use crate::outbound::{Epoch, OutboundSend, SendBudgets};
@@ -353,6 +354,39 @@ impl std::fmt::Debug for SessionReady {
     }
 }
 
+/// How long a router-held candidate waits for its first reliable record before it is dropped
+/// (protocol.md 5.2, re-handshake design section 3). The session table keeps the candidate's
+/// index reserved at most for its own `reservation_timeout`; the engine raises that to this.
+pub const HELD_CANDIDATE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// The 24 hour replacement of full sessions (protocol.md 5.2) and the continuation of the
+/// streams across it (re-handshake design, slice R3). The defaults are the protocol's; the
+/// fields are overridable for tests only (a live test cannot wait a day).
+#[derive(Debug, Clone)]
+pub struct ReplaceConfig {
+    /// The schedule of the chain initiator's replacement `init`s and of the hard age cap both
+    /// sides enforce ([`ReplaceDurations::default`]: due at 24 h minus up to 30 min, cap 24 h
+    /// 30 min).
+    pub durations: ReplaceDurations,
+    /// Offer `held` in a `resp` and answer a matching one with CONTINUE. `false` behaves like a
+    /// build that predates the continuation: no `held` is offered, a `held` is ignored, the
+    /// replacement starts afresh and the streams reset. Test flag.
+    pub continuation: bool,
+    /// How long a router-held candidate waits for its first reliable record
+    /// ([`HELD_CANDIDATE_TIMEOUT`]).
+    pub held_timeout: Duration,
+}
+
+impl Default for ReplaceConfig {
+    fn default() -> Self {
+        Self {
+            durations: ReplaceDurations::default(),
+            continuation: true,
+            held_timeout: HELD_CANDIDATE_TIMEOUT,
+        }
+    }
+}
+
 /// What a [`Router`](RouterParts) needs from its owner.
 pub struct RouterConfig {
     identity: IdentityCell,
@@ -366,6 +400,7 @@ pub struct RouterConfig {
     inbound_budget: usize,
     inbound_ceiling: usize,
     shares: ShareBook,
+    replace: ReplaceConfig,
 }
 
 impl RouterConfig {
@@ -399,7 +434,15 @@ impl RouterConfig {
             inbound_budget: L4_INBOUND_BUDGET_PER_SESSION,
             inbound_ceiling: L4_INBOUND_CEILING_PER_NODE,
             shares: ShareBook::new(),
+            replace: ReplaceConfig::default(),
         })
+    }
+
+    /// Replaces the figures of the 24 hour replacement and the continuation switch (the
+    /// default is [`ReplaceConfig::default`]); for tests, which cannot wait a day.
+    pub fn with_replace(mut self, replace: ReplaceConfig) -> Self {
+        self.replace = replace;
+        self
     }
 
     /// The node's [`ShareBook`], which the relay principal's `init`s are judged against (expose
@@ -707,6 +750,11 @@ fn clamp_ceiling(bytes: usize) -> usize {
 /// what it still holds must not count against others, nor make `make_room` pick an innocent
 /// victim). Idempotent.
 fn release_inbound(entry: &Entry) {
+    if entry.is_label() {
+        // A routing label of a session that lives on under another entry: the charges are
+        // that session's.
+        return;
+    }
     entry.handle.detach_inbound();
 }
 
@@ -728,9 +776,41 @@ struct Entry {
     /// A docs only session: installed under [`docs_only_slot`], tracked in
     /// [`Engine::docs_only`], never offered for sending or promoted.
     docs_only: bool,
-    /// Dropped with the entry, which is what ends the actor as
-    /// `EpochEnded` (the actor treats a closed sender like a message).
-    _epoch_ended: oneshot::Sender<()>,
+    /// What the session is for.
+    kind: SessionKind,
+    /// Which side of the handshake this node was for the session now routed under this entry
+    /// (the chain initiator, who starts the replacements, is the [`Role::Initiator`]).
+    role: Role,
+    /// The `receiver_index` this node stamps on frames to the peer for this session: what the
+    /// responder's `resp` said as `sender_index`, which a later `held` offer is compared with.
+    peer_index: u32,
+    /// The Noise handshake hash of the session routed under this entry: CONTINUE's `binding`
+    /// is computed from it.
+    handshake_hash: [u8; 32],
+    /// The tag the actor's notices carry: constant for the actor's whole life, while
+    /// the table index it is routed under changes at every continued replacement
+    /// ([`Age::index`]).
+    tag: u64,
+    /// Which of the actor's transports frames routed under this entry belong to
+    /// ([`L4SessionHandle::feed_inbound_gen`]).
+    transport_gen: Generation,
+    /// A second routing label for an actor that another entry holds: it routes the frames of
+    /// a replacement transport during a cutover, and becomes the session's entry when the
+    /// cutover is confirmed ([`SessionTable::commit_alias`]). Its charges are the actor's, and
+    /// ending it ends nothing. Cleared when the alias becomes the session's entry
+    /// ([`Engine::commit_cutover`]), hence the atomic: the table hands out `&Entry` only.
+    alias: AtomicBool,
+    /// Dropped with the last entry of the actor, which is what ends it as
+    /// `EpochEnded` (the actor treats a closed sender like a message). Shared by an actor's
+    /// aliases, so that the entry a commit retires cannot end the actor that lives on.
+    _epoch_ended: Arc<oneshot::Sender<()>>,
+}
+
+impl Entry {
+    /// Whether this entry is only a routing label of an actor another entry holds.
+    fn is_label(&self) -> bool {
+        self.alias.load(Ordering::Relaxed)
+    }
 }
 
 /// What an `init` of ours that is out keeps for when its `resp` comes, or
@@ -744,6 +824,70 @@ struct Pending {
     /// The dial's purpose is `menzil:docs`: the expiry of the held documents is not held
     /// against it.
     docs: bool,
+    /// An `init` that replaces the full session whose actor carries this tag (the 24 hour
+    /// replacement, [`Engine::begin_replacement`]); nobody waits for it.
+    replaces: Option<u64>,
+}
+
+/// What the engine keeps about a full member session beside its table entry: its age. Both
+/// sides end a session at the hard cap ([`ReplaceDurations::hard_cap`]); the chain initiator
+/// also starts its replacement from a schedule.
+struct Age {
+    /// The table index the session is routed under now (it changes at every continued
+    /// replacement, the tag does not).
+    index: SessionIndex,
+    peer: NodeId,
+    network: NetworkId,
+    /// When the keys the session sends and receives on now were agreed.
+    started: Instant,
+    hard_cap_at: Instant,
+    /// The chain initiator's replacement schedule; `None` for the responder, and for an
+    /// initiator while a cutover runs.
+    schedule: Option<ReplaceSchedule>,
+    /// A continued replacement waiting for CONTINUE_ACK (the initiator's side only: the
+    /// responder switches at once).
+    cutover: Option<Cutover>,
+}
+
+/// An initiator's continued replacement between its CONTINUE and the peer's CONTINUE_ACK.
+struct Cutover {
+    /// The alias in the table that routes the replacement transport's frames.
+    alias: SessionIndex,
+    /// What [`L4SessionHandle::hand_over`] numbered the replacement transport; the cutover is
+    /// over when [`L4SessionHandle::settled_generation`] reaches it.
+    generation: Generation,
+    /// When the replacement's `resp` arrived: the new session's age starts here.
+    since: Instant,
+}
+
+/// A responder side candidate the router holds itself because a session of the slot stays
+/// current until the candidate's first reliable record says whether it continues it (CONTINUE)
+/// or replaces it (anything else). It has no actor and sends nothing; its index stays reserved
+/// in the table.
+struct Held {
+    transport: menzil_e2e::E2eTransport,
+    peer: NodeId,
+    network: NetworkId,
+    peer_static: X25519PublicKey,
+    epoch: Epoch,
+    /// The `held` value offered in its `resp`: the table index of the slot's current session.
+    offered: SessionIndex,
+    /// The `init` that created it, to tell a repeat of it from a new one.
+    init: (u32, Vec<u8>),
+    created: Instant,
+}
+
+/// The ciphertext length of a CONTINUE record: its plaintext (kind byte and the fixed body) and
+/// the AEAD tag. A first record of any other length cannot be CONTINUE.
+fn continue_ciphertext_len() -> usize {
+    ContinueBody {
+        prior: 0,
+        sent: 0,
+        binding: [0; 32],
+    }
+    .encode()
+    .len()
+        + L4_AEAD_TAG_LEN
 }
 
 fn tag_of(generation: u32, index: SessionIndex) -> u64 {
@@ -795,6 +939,14 @@ struct Engine {
     closing: HashSet<u64>,
     /// The docs only sessions in the table, by index.
     docs_only: HashMap<SessionIndex, DocsOnly>,
+    /// The 24 hour replacement and the continuation (test overridable).
+    replace: ReplaceConfig,
+    /// The age of every full member session, by the tag of its actor.
+    ages: HashMap<u64, Age>,
+    /// The candidates the router holds itself (see [`Held`]), by their reserved index.
+    held: HashMap<SessionIndex, Held>,
+    /// The router-held candidate of each slot (at most one), by slot.
+    held_slot: HashMap<(NodeId, NetworkId), SessionIndex>,
     /// How many responder handshakes got as far as the Noise work (the Diffie
     /// Hellmans), for the test that pins that a stranger costs none.
     #[cfg(test)]
@@ -827,6 +979,12 @@ impl Engine {
         index_source: impl FnMut() -> u32 + Send + 'static,
     ) -> Self {
         let waiter_timeout = config.table.pending_timeout * HANDSHAKE_ATTEMPTS;
+        // A router-held candidate keeps its index only reserved; the reservation must outlast
+        // the candidate's own timeout.
+        let mut table_config = config.table;
+        table_config.reservation_timeout = table_config
+            .reservation_timeout
+            .max(config.replace.held_timeout);
         Self {
             identity: config.identity,
             local_node_id: config.local_node_id,
@@ -840,7 +998,7 @@ impl Engine {
                 .inbound_budget
                 .min(clamp_ceiling(config.inbound_ceiling)),
             node_inbound: Arc::new(NodeInbound::new(clamp_ceiling(config.inbound_ceiling))),
-            table: SessionTable::new(config.local_node_id, config.table, index_source),
+            table: SessionTable::new(config.local_node_id, table_config, index_source),
             waiters: HashMap::new(),
             waiter_timeout,
             attached: None,
@@ -855,6 +1013,10 @@ impl Engine {
             stopping: false,
             closing: HashSet::new(),
             docs_only: HashMap::new(),
+            replace: config.replace,
+            ages: HashMap::new(),
+            held: HashMap::new(),
+            held_slot: HashMap::new(),
             #[cfg(test)]
             handshakes_started: 0,
         }
@@ -894,6 +1056,16 @@ impl Engine {
             self.table
                 .remove_pending_where(|pending| pending.epoch == epoch),
         );
+        // The router-held candidates of that epoch: nothing carries over to the next one.
+        let gone: Vec<SessionIndex> = self
+            .held
+            .iter()
+            .filter(|(_, held)| held.epoch == epoch)
+            .map(|(&index, _)| index)
+            .collect();
+        for index in gone {
+            self.drop_held(index);
+        }
         self.unsent.retain(|(request, _)| request.epoch != epoch);
         // Nothing of that epoch is left to wait for.
         if current {
@@ -969,19 +1141,40 @@ impl Engine {
                 counter,
                 ciphertext,
             } => {
-                let refused = match self.table.route(receiver_index, &src) {
-                    Route::Session { handle, .. } => {
-                        handle.handle.feed_inbound(counter, ciphertext).err()
-                    }
-                    Route::Unknown | Route::WrongSource => None,
+                if self.held.contains_key(&receiver_index) {
+                    // A candidate of a replacement the router holds itself.
+                    self.on_held_record(receiver_index, src, counter, ciphertext, now);
+                    return None;
+                }
+                // The frame goes to the transport of the generation its index belongs to
+                // (a continued replacement has two indices for one actor for a while).
+                let (refused, generation, label_of) = match self.table.route(receiver_index, &src) {
+                    Route::Session { handle, .. } => (
+                        handle
+                            .handle
+                            .feed_inbound_gen(handle.transport_gen, counter, ciphertext)
+                            .err(),
+                        handle.transport_gen,
+                        handle.is_label().then_some((handle.peer, handle.network)),
+                    ),
+                    Route::Unknown | Route::WrongSource => (None, FIRST_GENERATION, None),
+                };
+                // An alias is a label: the session that must end is the slot's current.
+                let owner = match label_of {
+                    Some((peer, network)) => self
+                        .table
+                        .slot(&peer, &network)
+                        .current
+                        .unwrap_or(receiver_index),
+                    None => receiver_index,
                 };
                 match refused {
                     None => {}
-                    Some(FeedRefused::Session(_)) => self.end_overflowed(receiver_index, now),
+                    Some(FeedRefused::Session(_)) => self.end_overflowed(owner, now),
                     Some(FeedRefused::Node {
                         counter,
                         ciphertext,
-                    }) => self.make_room(receiver_index, counter, ciphertext, now),
+                    }) => self.make_room(owner, generation, counter, ciphertext, now),
                 }
             }
         }
@@ -1010,7 +1203,14 @@ impl Engine {
     /// ceiling check, which may leave the node one record over it; the next refusal evicts
     /// again; during the scan it can only grow back up to what was just released (one record per driver). If the victim is the arriving session the record is dropped
     /// with it (its counter has a gap anyway).
-    fn make_room(&mut self, arriving: SessionIndex, counter: u64, ciphertext: Vec<u8>, now: Now) {
+    fn make_room(
+        &mut self,
+        arriving: SessionIndex,
+        generation: Generation,
+        counter: u64,
+        ciphertext: Vec<u8>,
+        now: Now,
+    ) {
         let held: Vec<(SessionIndex, NetworkId, usize)> = self
             .table
             .sessions()
@@ -1028,7 +1228,7 @@ impl Engine {
         let refused = match self.table.get(arriving) {
             Some(entry) => entry
                 .handle
-                .feed_inbound_over_ceiling(counter, ciphertext)
+                .feed_inbound_over_ceiling_gen(generation, counter, ciphertext)
                 .is_err(),
             None => false,
         };
@@ -1197,17 +1397,56 @@ impl Engine {
         let Ok(index) = self.table.reserve_index(now.instant) else {
             return;
         };
-        let Ok((transport, resp)) = hs.finish(
-            self.identity.get().node_cert.clone(),
-            roster_seq,
-            policy_seq,
-            vec![E2E_PROTO_TAG],
-            index,
-            attached.limits.max_record,
-        ) else {
+        // A full session of this peer that this peer started stays current while a candidate
+        // proves itself: offer it as `held`, so that a peer that still holds its half can
+        // continue the streams (protocol.md 5.2).
+        let offer = self.held_offer_for(&src, &network_id, &peer_static, attached.epoch);
+        let cert = self.identity.get().node_cert.clone();
+        let finished = match offer {
+            Some(held) => hs.finish_offering_held(
+                cert,
+                roster_seq,
+                policy_seq,
+                vec![E2E_PROTO_TAG],
+                held,
+                index,
+                attached.limits.max_record,
+            ),
+            None => hs.finish(
+                cert,
+                roster_seq,
+                policy_seq,
+                vec![E2E_PROTO_TAG],
+                index,
+                attached.limits.max_record,
+            ),
+        };
+        let Ok((transport, resp)) = finished else {
             self.table.release_index(index);
             return;
         };
+        if let Some(offered) = offer {
+            self.install_held(
+                attached,
+                index,
+                Held {
+                    transport,
+                    peer: src,
+                    network: network_id,
+                    peer_static,
+                    epoch: attached.epoch,
+                    offered,
+                    init: (sender_index, msg1_copy),
+                    created: now.instant,
+                },
+                resp,
+            );
+            return;
+        }
+        // An ordinary candidate supersedes whatever the router held for this slot.
+        if let Some(stale) = self.held_slot.get(&(src, network_id)).copied() {
+            self.drop_held(stale);
+        }
 
         // A member with no grant is admitted like any other (protocol.md 5.1):
         // what it may open is decided per stream, and `menzil:docs` needs no
@@ -1589,7 +1828,12 @@ impl Engine {
     ) -> bool {
         let real = self.table.slot(src, network);
         let aside = self.table.slot(src, &docs_only_slot());
-        [real.candidate, real.current, aside.candidate]
+        let held = self
+            .held_slot
+            .get(&(*src, *network))
+            .and_then(|index| self.held.get(index))
+            .is_some_and(|held| held.init.0 == sender_index && held.init.1 == noise_msg1);
+        held || [real.candidate, real.current, aside.candidate]
             .into_iter()
             .flatten()
             .filter_map(|index| self.table.get(index))
@@ -1599,6 +1843,469 @@ impl Engine {
                     .as_ref()
                     .is_some_and(|(index, msg1)| *index == sender_index && msg1 == noise_msg1)
             })
+    }
+
+    // ------------------------------------------------------------------
+    // Responder: a replacement of a session this peer started (protocol.md 5.2)
+    // ------------------------------------------------------------------
+
+    /// What to offer as `held` in the `resp` to an `init` of `src`: the table index of the
+    /// slot's current session, when that is a full member session **this peer started** (we
+    /// answered it: the roles never swap, so only the chain initiator's replacements can
+    /// continue it), on the attachment the `init` arrived on, with the static key of this
+    /// `init`, and nothing else is in flight for the slot (no unproven candidate, no cutover).
+    /// `None` also when the continuation is switched off.
+    fn held_offer_for(
+        &self,
+        src: &NodeId,
+        network: &NetworkId,
+        peer_static: &X25519PublicKey,
+        epoch: Epoch,
+    ) -> Option<SessionIndex> {
+        if !self.replace.continuation {
+            return None;
+        }
+        let slot = self.table.slot(src, network);
+        if slot.candidate.is_some() || slot.alias.is_some() {
+            return None;
+        }
+        let current = slot.current?;
+        let entry = self.table.get(current)?;
+        (entry.kind == SessionKind::Member
+            && !entry.docs_only
+            && !entry.is_label()
+            && entry.role == Role::Responder
+            && entry.epoch == epoch
+            && entry.peer_static == *peer_static)
+            .then_some(current)
+    }
+
+    /// Keeps `held` as the slot's router-held candidate (a newer one for the slot replaces it)
+    /// and answers its `init` with `resp`. No actor, nothing is sent on it, and nobody is told
+    /// of a new session: the current one carries on until the first reliable record.
+    fn install_held(
+        &mut self,
+        attached: Attached,
+        index: SessionIndex,
+        held: Held,
+        resp: E2eFrame,
+    ) {
+        let key = (held.peer, held.network);
+        if let Some(stale) = self.held_slot.insert(key, index) {
+            self.drop_held(stale);
+            self.held_slot.insert(key, index);
+        }
+        let peer = held.peer;
+        self.held.insert(index, held);
+        self.send(peer, attached.epoch, resp.encode());
+    }
+
+    /// Takes a router-held candidate out (its index stays reserved in the table).
+    fn take_held(&mut self, index: SessionIndex) -> Option<Held> {
+        let held = self.held.remove(&index)?;
+        if self.held_slot.get(&(held.peer, held.network)) == Some(&index) {
+            self.held_slot.remove(&(held.peer, held.network));
+        }
+        Some(held)
+    }
+
+    /// Forgets a router-held candidate and gives its index back.
+    fn drop_held(&mut self, index: SessionIndex) {
+        if self.take_held(index).is_some() {
+            self.table.release_index(index);
+        }
+    }
+
+    /// A `data` record for a router-held candidate. **A candidate is proved by its first
+    /// reliable record** (protocol.md 5.2): a datagram before it is dropped, a record that does
+    /// not authenticate is dropped and the candidate waits on, and the first reliable record
+    /// that does decides, by what it is:
+    ///
+    /// * a CONTINUE: judged by [`Self::continue_verdict`], then the candidate's transport goes
+    ///   to the current session's actor ([`Self::commit_continue`]) or the candidate is refused;
+    /// * anything else (the peer does not continue: it restarted, or predates the
+    ///   continuation): today's replacement, a new actor with this transport that gets the
+    ///   record ([`Self::replace_from_held`]).
+    fn on_held_record(
+        &mut self,
+        index: SessionIndex,
+        src: NodeId,
+        counter: u64,
+        ciphertext: Vec<u8>,
+        now: Now,
+    ) {
+        let Some(held) = self.held.get(&index) else {
+            return;
+        };
+        if held.peer != src {
+            // Data is accepted only from the session's own peer (protocol.md 5.1).
+            return;
+        }
+        if RecordClass::of_counter(counter) == RecordClass::Datagram {
+            return;
+        }
+        let epoch = held.epoch;
+        if !self.attached.is_some_and(|a| a.epoch == epoch) {
+            self.drop_held(index);
+            return;
+        }
+        let Some(mut held) = self.take_held(index) else {
+            return;
+        };
+        if ciphertext.len() != continue_ciphertext_len() {
+            // Cannot be CONTINUE: the transport has not read it, so the new actor does.
+            self.replace_from_held(held, index, counter, ciphertext, now);
+            return;
+        }
+        let plaintext = match held.transport.decrypt_raw(counter, &ciphertext) {
+            Ok(plaintext) => plaintext,
+            Err(E2eError::UnauthenticatedDatagramCounter | E2eError::Noise(_)) => {
+                // Junk, or a record of another session: not proof of anything. Keep waiting.
+                self.held_slot.insert((held.peer, held.network), index);
+                self.held.insert(index, held);
+                return;
+            }
+            Err(error) => {
+                tracing::debug!(%src, %error, "dropped a replacement candidate: its first record is out of order");
+                self.table.release_index(index);
+                return;
+            }
+        };
+        match ContinueBody::decode(&plaintext) {
+            Ok(body) => self.judge_continue(held, index, body, now),
+            Err(_) => {
+                // The record of the right length was no CONTINUE, and reading it used the
+                // transport's first counter, so it cannot be handed on to a new actor: the
+                // candidate is refused (its peer sees the CLOSE and starts over). Only a
+                // first record of exactly a CONTINUE's length reaches this.
+                let close = handover_failed_close("the first record is not a valid CONTINUE");
+                self.refuse_held(held, index, &close);
+            }
+        }
+    }
+
+    /// Whether a CONTINUE that arrived on candidate `held` may take over the slot's current
+    /// session; the table index of that session if so (protocol.md 5.2): the slot's current is
+    /// still the one that was offered, `prior` names it, `binding` is its handshake's, it is a
+    /// full member session this peer started on the candidate's attachment with the
+    /// candidate's static key, no other handover is under way, and **both ends are in good
+    /// standing right now** (the check the Revalidator's next pass would make, made
+    /// synchronously at the commit).
+    fn continue_verdict(
+        &self,
+        held: &Held,
+        body: &ContinueBody,
+        now: Now,
+    ) -> Result<SessionIndex, ContinueRefusal> {
+        let slot = self.table.slot(&held.peer, &held.network);
+        let current = slot
+            .current
+            .ok_or(ContinueRefusal::Mismatch("no current session to continue"))?;
+        if current != held.offered {
+            return Err(ContinueRefusal::Mismatch(
+                "the current session is not the one that was offered",
+            ));
+        }
+        if body.prior != held.offered {
+            return Err(ContinueRefusal::Mismatch(
+                "CONTINUE names a session that is not the current one",
+            ));
+        }
+        let entry = self
+            .table
+            .get(current)
+            .ok_or(ContinueRefusal::Mismatch("no current session to continue"))?;
+        if entry.kind != SessionKind::Member
+            || entry.docs_only
+            || entry.is_label()
+            || entry.role != Role::Responder
+            || entry.epoch != held.epoch
+            || entry.peer_static != held.peer_static
+            || slot.alias.is_some()
+        {
+            return Err(ContinueRefusal::Mismatch(
+                "the current session is not this peer's full session on this attachment",
+            ));
+        }
+        if body.binding != continue_binding(&entry.handshake_hash) {
+            return Err(ContinueRefusal::Mismatch(
+                "CONTINUE's binding is not the current session's",
+            ));
+        }
+        session_standing(
+            &self.policies,
+            &self.rosters,
+            &held.network,
+            &held.peer,
+            &entry.peer_static,
+            &self.local_node_id,
+            self.identity.serial(),
+            &self.local_static,
+            now.unix,
+        )
+        .map_err(|_| ContinueRefusal::Standing)?;
+        Ok(current)
+    }
+
+    /// Acts on a CONTINUE read on candidate `held`: hands the candidate's transport to the
+    /// current session's actor, or refuses (CLOSE `handover_failed` on the candidate; when
+    /// `prior` named this slot's current session, that session ends too, because the peer has
+    /// already moved its yamux state; a session of another slot is never touched).
+    fn judge_continue(&mut self, held: Held, index: SessionIndex, body: ContinueBody, now: Now) {
+        match self.continue_verdict(&held, &body, now) {
+            Ok(current) => self.commit_continue(held, index, current, &body, now),
+            Err(refusal) => {
+                let (peer, network) = (held.peer, held.network);
+                let close = match refusal {
+                    ContinueRefusal::Mismatch(why) => {
+                        tracing::info!(%peer, why, "refused a CONTINUE");
+                        handover_failed_close(why)
+                    }
+                    ContinueRefusal::Standing => {
+                        tracing::info!(%peer, "refused a CONTINUE: a party is not in good standing");
+                        grant_removed_close()
+                    }
+                };
+                self.refuse_held(held, index, &close);
+                if let Some(current) = self
+                    .table
+                    .slot(&peer, &network)
+                    .current
+                    .filter(|current| *current == body.prior)
+                {
+                    self.end_session(current, close);
+                }
+            }
+        }
+    }
+
+    /// The CONTINUE passed: `held`'s transport becomes the current session's replacement
+    /// transport (the actor answers CONTINUE_ACK and switches when it reaches the item behind
+    /// the old records already queued), and the candidate's index becomes the session's entry
+    /// in place of the old one at once: the peer sent every old record before its CONTINUE and
+    /// the relay keeps the order, so nothing more is due on the old index.
+    fn commit_continue(
+        &mut self,
+        held: Held,
+        index: SessionIndex,
+        current: SessionIndex,
+        body: &ContinueBody,
+        now: Now,
+    ) {
+        let Held {
+            transport,
+            peer,
+            network,
+            peer_static,
+            epoch,
+            init,
+            ..
+        } = held;
+        let Some(old) = self.table.get(current) else {
+            self.table.release_index(index);
+            return;
+        };
+        let (handle, tag, generation, epoch_ended) = (
+            old.handle.clone(),
+            old.tag,
+            old.generation,
+            Arc::clone(&old._epoch_ended),
+        );
+        let (peer_index, handshake_hash) = (transport.peer_index(), *transport.handshake_hash());
+        let replacement = handle.hand_over(
+            transport,
+            HandoverRole::Responder {
+                continue_sent: body.sent,
+            },
+        );
+        let label = Entry {
+            handle,
+            peer,
+            network,
+            peer_static,
+            epoch,
+            generation,
+            init: Some(init),
+            docs_only: false,
+            kind: SessionKind::Member,
+            role: Role::Responder,
+            peer_index,
+            handshake_hash,
+            tag,
+            transport_gen: replacement,
+            alias: AtomicBool::new(true),
+            _epoch_ended: epoch_ended,
+        };
+        if let Err((error, label)) =
+            self.table
+                .install_alias(index, peer, network, label, now.instant)
+        {
+            // Not reachable (the verdict looked at the slot a moment ago), but the actor has
+            // the replacement transport: end the session rather than leave it half switched.
+            tracing::warn!(%peer, ?error, "could not install the alias of a continued session");
+            label.handle.close(Some(handover_failed_close(
+                "the replacement could not be routed",
+            )));
+            self.end_session(
+                current,
+                handover_failed_close("the replacement could not be routed"),
+            );
+            return;
+        }
+        self.commit_cutover(index, tag, now.instant, false);
+        tracing::info!(%peer, "replaced an L4 session: its streams continue (responder)");
+    }
+
+    /// Makes alias `index` the entry of the actor `tag`: the table hands the old entry back (it
+    /// is only dropped: the actor lives on under the alias and the old entry's end-of-epoch
+    /// guard is shared) and the session's age starts again from `since`.
+    fn commit_cutover(&mut self, index: SessionIndex, tag: u64, since: Instant, initiator: bool) {
+        if let Some((_, old)) = self.table.commit_alias(index) {
+            drop(old);
+        }
+        if let Some(entry) = self.table.get(index) {
+            entry.alias.store(false, Ordering::Relaxed);
+        }
+        if let Some(age) = self.ages.get_mut(&tag) {
+            age.index = index;
+            age.started = since;
+            age.hard_cap_at = since + self.replace.durations.hard_cap;
+            age.cutover = None;
+            // Only the chain initiator starts replacements, from the new session's own age.
+            age.schedule = initiator.then(|| {
+                let max = self.replace.durations.max_jitter;
+                ReplaceSchedule::with_durations(
+                    since,
+                    Duration::from_secs_f64(fastrand::f64() * max.as_secs_f64()),
+                    self.replace.durations.clone(),
+                )
+            });
+        }
+    }
+
+    /// Refuses a candidate: CLOSE on its transport (its first record, which the peer, waiting
+    /// for CONTINUE_ACK, reads) and its index back.
+    fn refuse_held(&mut self, mut held: Held, index: SessionIndex, close: &CloseReason) {
+        if let Ok(frame) = held.transport.encrypt_data(&E2eDataBody::Close {
+            code: close.code,
+            msg: close.msg.clone(),
+        }) {
+            self.send(held.peer, held.epoch, frame.encode());
+        }
+        self.table.release_index(index);
+    }
+
+    /// The candidate's first record is not a CONTINUE (a peer that restarted or predates the
+    /// continuation): today's replacement (protocol.md 5.1). A new actor takes the candidate's
+    /// transport and the record, and the old current session is retired when that first record
+    /// authenticates ([`SessionNotice::FirstRecord`]).
+    fn replace_from_held(
+        &mut self,
+        held: Held,
+        index: SessionIndex,
+        counter: u64,
+        ciphertext: Vec<u8>,
+        now: Now,
+    ) {
+        let Some(attached) = self.attached.filter(|a| a.epoch == held.epoch) else {
+            self.table.release_index(index);
+            return;
+        };
+        // The candidate waited for its first record, in which time the documents may have
+        // changed: a peer or a node that no longer stands gets no session out of it (the same
+        // check a handed out session passes, protocol.md 5.3).
+        if session_standing(
+            &self.policies,
+            &self.rosters,
+            &held.network,
+            &held.peer,
+            &held.peer_static,
+            &self.local_node_id,
+            self.identity.serial(),
+            &self.local_static,
+            now.unix,
+        )
+        .is_err()
+        {
+            tracing::info!(peer = %held.peer, "refused a replacement candidate: a party is not in good standing");
+            self.refuse_held(held, index, &grant_removed_close());
+            return;
+        }
+        let Held {
+            transport,
+            peer,
+            network,
+            peer_static,
+            init,
+            ..
+        } = held;
+        let (entry, acceptor, task) = self.make_session(
+            index,
+            peer,
+            network,
+            peer_static,
+            Origin::Answered {
+                sender_index: init.0,
+                noise_msg1: init.1,
+            },
+            transport,
+            attached,
+            SessionKind::Member,
+        );
+        let handle = entry.handle.clone();
+        match self
+            .table
+            .install_session(index, peer, network, Role::Responder, entry, now.instant)
+        {
+            Ok(installed) => {
+                drop(installed.abandoned);
+                if let Some((_, superseded)) = installed.superseded_candidate {
+                    release_inbound(&superseded);
+                    superseded.handle.close(None);
+                }
+            }
+            Err((error, _)) => {
+                tracing::warn!(%peer, ?error, "could not install a replacement session");
+                return;
+            }
+        }
+        tokio::spawn(task);
+        let _ = self.ready.send(SessionReady {
+            peer,
+            network_id: network,
+            peer_static,
+            role: Role::Responder,
+            epoch: attached.epoch,
+            handle: handle.clone(),
+            acceptor,
+            peer_roster_seq: None,
+            peer_policy_seq: None,
+            docs_only: false,
+            relay_principal: false,
+        });
+        match handle.feed_inbound(counter, ciphertext) {
+            Ok(()) => {}
+            Err(FeedRefused::Session(_)) => self.end_overflowed(index, now),
+            Err(FeedRefused::Node {
+                counter,
+                ciphertext,
+            }) => self.make_room(index, FIRST_GENERATION, counter, ciphertext, now),
+        }
+    }
+
+    /// Removes the session at `index` from the table and ends it with `reason` as its CLOSE,
+    /// like every router initiated end: removed at once, so that the next request dials afresh.
+    fn end_session(&mut self, index: SessionIndex, reason: CloseReason) {
+        let Some(Removed::Session { handle: entry, .. }) = self.table.remove(index) else {
+            return;
+        };
+        release_inbound(&entry);
+        let key = (entry.peer, entry.network);
+        // The CLOSE goes before the entry is dropped: dropping it ends the actor as
+        // `EpochEnded`, which the CLOSE must outrank.
+        entry.handle.close(Some(reason));
+        drop(entry);
+        self.fail_orphans(&key);
     }
 
     // ------------------------------------------------------------------
@@ -1709,7 +2416,7 @@ impl Engine {
         }
         if slot.pending.is_none()
             && slot.candidate.is_none()
-            && let Err(error) = self.begin_initiation(peer, network, 1, docs, now)
+            && let Err(error) = self.begin_initiation(peer, network, 1, docs, None, now)
         {
             let _ = reply.send(Err(error));
             return;
@@ -1731,6 +2438,7 @@ impl Engine {
         network: NetworkId,
         attempt: u32,
         docs: bool,
+        replaces: Option<u64>,
         now: Now,
     ) -> Result<(), EnsureError> {
         let attached = self.attached.ok_or(EnsureError::NotAttached)?;
@@ -1804,6 +2512,7 @@ impl Engine {
             attempt,
             epoch: attached.epoch,
             docs,
+            replaces,
         };
         match self
             .table
@@ -1837,13 +2546,19 @@ impl Engine {
             return;
         };
         let key = (peer, network);
+        // A replacement of a session that is still there (the 24 hour re-handshake): nobody
+        // waits for it, and a failure of it goes to its schedule, not to a caller. One whose
+        // session has gone meanwhile is an ordinary dial.
+        let replacing = state
+            .replaces
+            .filter(|_| self.table.slot(&peer, &network).current.is_some());
         let (transport, payload, responder_static) =
             match state.hs.finish(&resp, attached.limits.max_record) {
                 Ok(finished) => finished,
                 Err(error) => {
                     tracing::debug!(%peer, %error, "an L4 resp did not complete the handshake");
                     self.table.release_index(index);
-                    self.fail_waiters(&key, EnsureError::Refused);
+                    self.resp_failed(&key, replacing, EnsureError::Refused, now);
                     return;
                 }
             };
@@ -1852,7 +2567,7 @@ impl Engine {
         if !payload.e2e_protos.contains(&E2E_PROTO_TAG) {
             tracing::debug!(%peer, "the peer does not speak our L4 protocol");
             self.table.release_index(index);
-            self.fail_waiters(&key, EnsureError::Refused);
+            self.resp_failed(&key, replacing, EnsureError::Refused, now);
             return;
         }
         let decide = if state.docs {
@@ -1871,7 +2586,7 @@ impl Engine {
         ) {
             tracing::debug!(%peer, ?reason, "refused an L4 resp");
             self.table.release_index(index);
-            self.fail_waiters(&key, EnsureError::Refused);
+            self.resp_failed(&key, replacing, EnsureError::Refused, now);
             return;
         }
         if payload.docs_only {
@@ -1888,8 +2603,32 @@ impl Engine {
                 (payload.roster_seq, payload.policy_seq),
                 now,
             );
-            self.fail_waiters(&key, EnsureError::DocsOnly);
+            // For a replacement: no replacement now. The old session carries on (until its
+            // documents or the hard cap end it) and the schedule retries.
+            self.resp_failed(&key, replacing, EnsureError::DocsOnly, now);
             return;
+        }
+        // The peer holds the session this one replaces, and says so: continue its streams.
+        let transport = match (replacing, payload.held) {
+            (Some(tag), Some(held)) if self.replace.continuation => {
+                match self.continue_replacement(
+                    attached,
+                    tag,
+                    held,
+                    index,
+                    (peer, network),
+                    responder_static,
+                    transport,
+                    now,
+                ) {
+                    Ok(()) => return,
+                    Err(transport) => *transport,
+                }
+            }
+            _ => transport,
+        };
+        if replacing.is_some() {
+            tracing::info!(%peer, "replaced an L4 session afresh: its streams are reset (initiator)");
         }
         let (entry, acceptor, task) = self.make_session(
             index,
@@ -1933,6 +2672,142 @@ impl Engine {
             relay_principal: false,
         });
         self.resolve_waiters(&key, &handle);
+    }
+
+    /// A `resp` that did not lead to a session: a caller waiting for the dial is told, a
+    /// replacement goes back to its schedule.
+    fn resp_failed(
+        &mut self,
+        key: &(NodeId, NetworkId),
+        replacing: Option<u64>,
+        error: EnsureError,
+        now: Now,
+    ) {
+        match replacing {
+            Some(tag) => self.replacement_failed(tag, now),
+            None => self.fail_waiters(key, error),
+        }
+    }
+
+    /// The attempt in flight of the replacement of the session of actor `tag` failed: retry by
+    /// the schedule.
+    fn replacement_failed(&mut self, tag: u64, now: Now) {
+        if let Some(schedule) = self
+            .ages
+            .get_mut(&tag)
+            .and_then(|age| age.schedule.as_mut())
+        {
+            schedule.attempt_failed(now.instant);
+        }
+    }
+
+    /// The `resp` of a replacement `init` of ours offered `held` (protocol.md 5.2). If it names
+    /// the session this node holds as the peer's index for its old session, on this attachment
+    /// and with the same static key, and nothing else is under way, **the new transport goes to
+    /// the old session's actor** (it sends CONTINUE as the first record on it) and the new index
+    /// is installed as an alias that routes the replacement's frames to that actor; the cutover
+    /// ends when the actor has accepted CONTINUE_ACK ([`Self::replace_tick`]). Anything else
+    /// gives the transport back: the caller starts the replacement afresh, as before.
+    #[allow(clippy::too_many_arguments)]
+    fn continue_replacement(
+        &mut self,
+        attached: Attached,
+        tag: u64,
+        held: u32,
+        index: SessionIndex,
+        (peer, network): (NodeId, NetworkId),
+        responder_static: X25519PublicKey,
+        transport: menzil_e2e::E2eTransport,
+        now: Now,
+    ) -> Result<(), Box<menzil_e2e::E2eTransport>> {
+        let Some(age) = self.ages.get(&tag) else {
+            return Err(Box::new(transport));
+        };
+        let current = age.index;
+        let slot = self.table.slot(&peer, &network);
+        if age.cutover.is_some() || slot.current != Some(current) || slot.alias.is_some() {
+            return Err(Box::new(transport));
+        }
+        let Some(entry) = self.table.get(current) else {
+            return Err(Box::new(transport));
+        };
+        if entry.tag != tag
+            || entry.kind != SessionKind::Member
+            || entry.is_label()
+            || entry.role != Role::Initiator
+            || entry.epoch != attached.epoch
+            || entry.peer_static != responder_static
+            || entry.peer_index != held
+        {
+            return Err(Box::new(transport));
+        }
+        // The old session must be one the documents held now still stand behind.
+        if session_standing(
+            &self.policies,
+            &self.rosters,
+            &network,
+            &peer,
+            &entry.peer_static,
+            &self.local_node_id,
+            self.identity.serial(),
+            &self.local_static,
+            now.unix,
+        )
+        .is_err()
+        {
+            return Err(Box::new(transport));
+        }
+        let (handle, generation, epoch_ended) = (
+            entry.handle.clone(),
+            entry.generation,
+            Arc::clone(&entry._epoch_ended),
+        );
+        let (peer_index, handshake_hash) = (transport.peer_index(), *transport.handshake_hash());
+        let replacement = handle.hand_over(transport, HandoverRole::Initiator { prior: held });
+        let label = Entry {
+            handle,
+            peer,
+            network,
+            peer_static: responder_static,
+            epoch: attached.epoch,
+            generation,
+            init: None,
+            docs_only: false,
+            kind: SessionKind::Member,
+            role: Role::Initiator,
+            peer_index,
+            handshake_hash,
+            tag,
+            transport_gen: replacement,
+            alias: AtomicBool::new(true),
+            _epoch_ended: epoch_ended,
+        };
+        if let Err((error, label)) =
+            self.table
+                .install_alias(index, peer, network, label, now.instant)
+        {
+            // Not reachable (looked at a moment ago); the actor has the transport, so end it.
+            tracing::warn!(%peer, ?error, "could not install the alias of a continued session");
+            label.handle.close(Some(handover_failed_close(
+                "the replacement could not be routed",
+            )));
+            self.end_session(
+                current,
+                handover_failed_close("the replacement could not be routed"),
+            );
+            return Ok(());
+        }
+        if let Some(age) = self.ages.get_mut(&tag) {
+            age.cutover = Some(Cutover {
+                alias: index,
+                generation: replacement,
+                since: now.instant,
+            });
+            if let Some(schedule) = age.schedule.as_mut() {
+                schedule.succeeded();
+            }
+        }
+        Ok(())
     }
 
     /// Installs the initiator side of a docs only session under
@@ -2022,8 +2897,12 @@ impl Engine {
         drop(self.table.remove_pending_where(|_| true));
         self.unsent.clear();
         self.docs_only.clear();
-        for (index, entry) in self.table.remove_where(|_| true) {
-            self.closing.insert(tag_of(entry.generation, index));
+        for index in self.held.keys().copied().collect::<Vec<_>>() {
+            self.drop_held(index);
+        }
+        self.ages.clear();
+        for (_, entry) in self.table.remove_where(|_| true) {
+            self.closing.insert(entry.tag);
             release_inbound(&entry);
             entry.handle.close(Some(reason.clone()));
         }
@@ -2038,7 +2917,10 @@ impl Engine {
             // A session `on_stop` closed: it is out of the table already.
             return;
         }
-        let (generation, index) = untag(tag);
+        let (generation, first_index) = untag(tag);
+        // A continued replacement moves the actor to another table index; its notices keep the
+        // tag of the first one.
+        let index = self.ages.get(&tag).map_or(first_index, |age| age.index);
         let Some(entry) = self.table.get(index) else {
             return;
         };
@@ -2062,6 +2944,7 @@ impl Engine {
                 let handle = entry.handle.clone();
                 if let Some(Promoted { retired }) = self.table.promote(index) {
                     if let Some((_, old)) = retired {
+                        tracing::info!(peer = %key.0, "replaced an L4 session afresh: its streams are reset (responder)");
                         release_inbound(&old);
                         old.handle.close(None);
                     }
@@ -2069,6 +2952,7 @@ impl Engine {
                 }
             }
             SessionNotice::Ended => {
+                self.ages.remove(&tag);
                 if let Some(Removed::Session { handle, .. }) = self.table.remove(index) {
                     release_inbound(&handle);
                     self.fail_orphans(&key);
@@ -2080,8 +2964,22 @@ impl Engine {
     fn on_tick(&mut self, now: Now) {
         self.flush_unsent();
         self.end_docs_only_sessions(now.instant);
+        // Before the table's own expiry: a cutover that has just settled must become the
+        // session's entry before its alias can time out.
+        self.replace_tick(now);
         let expired = self.table.expire(now.instant);
         for (_, pending) in expired.pending {
+            if let Some(tag) = pending.replaces
+                && self
+                    .table
+                    .slot(&pending.peer, &pending.network)
+                    .current
+                    .is_some()
+            {
+                // A replacement `init` nobody answered: the schedule retries it.
+                self.replacement_failed(tag, now);
+                continue;
+            }
             let key = (pending.peer, pending.network);
             // A caller that stopped listening does not count: it must not
             // keep an initiation going.
@@ -2098,6 +2996,7 @@ impl Engine {
                         pending.network,
                         pending.attempt + 1,
                         pending.docs,
+                        None,
                         now,
                     ) {
                         Ok(()) => continue,
@@ -2113,6 +3012,23 @@ impl Engine {
             }
             self.fail_waiters(&key, EnsureError::Timeout);
         }
+        for (alias, _) in expired.aliases {
+            // A cutover that did not settle in time: its replacement index no longer routes,
+            // so the session cannot go on (the actor would wait for an ACK that cannot reach
+            // it).
+            let stuck = self
+                .ages
+                .iter()
+                .find(|(_, age)| age.cutover.as_ref().is_some_and(|c| c.alias == alias))
+                .map(|(_, age)| age.index);
+            if let Some(index) = stuck {
+                tracing::info!("a continued replacement did not settle in time: the session ends");
+                self.end_session(
+                    index,
+                    handover_failed_close("the replacement did not settle in time"),
+                );
+            }
+        }
         for (index, candidate) in expired.candidates {
             release_inbound(&candidate);
             let key = (candidate.peer, candidate.network);
@@ -2126,6 +3042,122 @@ impl Engine {
         // Last, so that when a caller's time is up in the same tick as the
         // thing it waited on, the more telling answer (`SessionEnded`) wins.
         self.expire_waiters(now.instant);
+    }
+
+    /// The clock's part of the 24 hour replacement (protocol.md 5.2), once a tick:
+    ///
+    /// * forgets the ages of sessions that are gone and the router-held candidates whose time
+    ///   is up (their indices go back to the table);
+    /// * ends a session at the hard cap with CLOSE `session_expired` (either side);
+    /// * for the chain initiator, confirms a cutover whose CONTINUE_ACK the actor accepted
+    ///   ([`L4SessionHandle::settled_generation`]): the replacement's alias becomes the session's
+    ///   entry and its age starts again;
+    /// * for the chain initiator, sends the replacement `init` when the schedule says so.
+    fn replace_tick(&mut self, now: Now) {
+        let timeout = self.replace.held_timeout;
+        let stale: Vec<SessionIndex> = self
+            .held
+            .iter()
+            .filter(|(_, held)| now.instant.saturating_duration_since(held.created) >= timeout)
+            .map(|(&index, _)| index)
+            .collect();
+        for index in stale {
+            tracing::debug!("dropped a replacement candidate that saw no first record in time");
+            self.drop_held(index);
+        }
+        let tags: Vec<u64> = self.ages.keys().copied().collect();
+        for tag in tags {
+            let Some(age) = self.ages.get(&tag) else {
+                continue;
+            };
+            let (index, peer, network, hard_cap_at) =
+                (age.index, age.peer, age.network, age.hard_cap_at);
+            let live = self
+                .table
+                .get(index)
+                .is_some_and(|entry| entry.tag == tag && !entry.is_label());
+            if !live {
+                self.ages.remove(&tag);
+                continue;
+            }
+            if now.instant >= hard_cap_at {
+                tracing::info!(%peer, "an L4 session reached its age cap and ends");
+                self.ages.remove(&tag);
+                if let Some(Removed::Session { handle: entry, .. }) = self.table.remove(index) {
+                    release_inbound(&entry);
+                    entry.handle.expire();
+                    drop(entry);
+                    self.fail_orphans(&(peer, network));
+                }
+                continue;
+            }
+            // A cutover whose ACK the actor accepted.
+            let settled = age.cutover.as_ref().and_then(|cutover| {
+                let handle = &self.table.get(index)?.handle;
+                (handle.settled_generation() == cutover.generation)
+                    .then_some((cutover.alias, cutover.since))
+            });
+            if let Some((alias, since)) = settled {
+                self.commit_cutover(alias, tag, since, true);
+                tracing::info!(%peer, "replaced an L4 session: its streams continue (initiator)");
+                continue;
+            }
+            // The replacement `init`, from the schedule.
+            let age = self.ages.get_mut(&tag).expect("looked up above");
+            if age.cutover.is_some() {
+                continue;
+            }
+            let Some(schedule) = age.schedule.as_mut() else {
+                continue;
+            };
+            if schedule.poll(now.instant) == Poll::Start {
+                schedule.begin_attempt(now.instant);
+                if !self.begin_replacement(tag, now)
+                    && let Some(schedule) = self
+                        .ages
+                        .get_mut(&tag)
+                        .and_then(|age| age.schedule.as_mut())
+                {
+                    schedule.attempt_failed(now.instant);
+                }
+            }
+        }
+    }
+
+    /// Sends the `init` that replaces the full session of actor `tag`, on the attachment the
+    /// session belongs to. `false` when nothing was sent (the slot is not in the plain state
+    /// a replacement needs, the attachment changed, a standing check failed), which the caller
+    /// counts as a failed attempt.
+    fn begin_replacement(&mut self, tag: u64, now: Now) -> bool {
+        if self.stopping {
+            return false;
+        }
+        let Some(age) = self.ages.get(&tag) else {
+            return false;
+        };
+        let (peer, network, index) = (age.peer, age.network, age.index);
+        let slot = self.table.slot(&peer, &network);
+        if slot.current != Some(index)
+            || slot.pending.is_some()
+            || slot.candidate.is_some()
+            || slot.alias.is_some()
+        {
+            return false;
+        }
+        let epoch = match self.table.get(index) {
+            Some(entry) => entry.epoch,
+            None => return false,
+        };
+        if !self.attached.is_some_and(|a| a.epoch == epoch) {
+            return false;
+        }
+        match self.begin_initiation(peer, network, 1, false, Some(tag), now) {
+            Ok(()) => true,
+            Err(error) => {
+                tracing::debug!(%peer, %error, "not replacing an L4 session now");
+                false
+            }
+        }
     }
 
     /// Ends the docs only sessions whose time is up with CLOSE `docs_only`
@@ -2166,13 +3198,19 @@ impl Engine {
         kind: SessionKind,
     ) -> (Entry, L4SessionAcceptor, SessionTask) {
         let docs_only = kind == SessionKind::DocsOnly;
-        let (mode, init) = match origin {
-            Origin::Initiated => (Mode::Client, None),
+        let (mode, init, role) = match origin {
+            Origin::Initiated => (Mode::Client, None, Role::Initiator),
             Origin::Answered {
                 sender_index,
                 noise_msg1,
-            } => (Mode::Server, Some((sender_index, noise_msg1))),
+            } => (
+                Mode::Server,
+                Some((sender_index, noise_msg1)),
+                Role::Responder,
+            ),
         };
+        let peer_index = transport.peer_index();
+        let handshake_hash = *transport.handshake_hash();
         let generation = self.next_generation;
         self.next_generation = self.next_generation.wrapping_add(1);
         let (epoch_ended_tx, epoch_ended_rx) = oneshot::channel();
@@ -2205,6 +3243,33 @@ impl Engine {
                 (h, a, Box::pin(t))
             }
         };
+        let tag = tag_of(generation, index);
+        if kind == SessionKind::Member {
+            // Both sides end a full member session at the hard cap; the chain initiator also
+            // replaces it from a schedule (protocol.md 5.2). A docs only session ends after
+            // thirty seconds, the relay principal's with its attachment (slice R4).
+            let started = Now::capture().instant;
+            let schedule = (role == Role::Initiator).then(|| {
+                let max = self.replace.durations.max_jitter;
+                ReplaceSchedule::with_durations(
+                    started,
+                    Duration::from_secs_f64(fastrand::f64() * max.as_secs_f64()),
+                    self.replace.durations.clone(),
+                )
+            });
+            self.ages.insert(
+                tag,
+                Age {
+                    index,
+                    peer,
+                    network,
+                    started,
+                    hard_cap_at: started + self.replace.durations.hard_cap,
+                    schedule,
+                    cutover: None,
+                },
+            );
+        }
         (
             Entry {
                 handle,
@@ -2215,7 +3280,14 @@ impl Engine {
                 generation,
                 init,
                 docs_only,
-                _epoch_ended: epoch_ended_tx,
+                kind,
+                role,
+                peer_index,
+                handshake_hash,
+                tag,
+                transport_gen: FIRST_GENERATION,
+                alias: AtomicBool::new(false),
+                _epoch_ended: Arc::new(epoch_ended_tx),
             },
             acceptor,
             task,
@@ -2421,6 +3493,22 @@ async fn run_router(
         if !events_open && !commands_open {
             break;
         }
+    }
+}
+
+/// Why a CONTINUE was refused ([`Engine::continue_verdict`]).
+enum ContinueRefusal {
+    /// A check of the CONTINUE against the slot failed; the text says which.
+    Mismatch(&'static str),
+    /// A party is not in good standing by the documents held now.
+    Standing,
+}
+
+/// The CLOSE of a handover that did not match (protocol.md 5.2, `handover_failed`).
+fn handover_failed_close(why: &str) -> CloseReason {
+    CloseReason {
+        code: ErrorCode::HandoverFailed,
+        msg: why.to_string(),
     }
 }
 

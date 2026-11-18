@@ -449,6 +449,7 @@ async fn node_limited(
         inbound_budget,
         inbound_ceiling,
         None,
+        None,
     )
     .await
 }
@@ -466,6 +467,7 @@ async fn node_inner(
     inbound_budget: Option<usize>,
     inbound_ceiling: Option<usize>,
     slow_wire: Option<(usize, Arc<tokio::sync::Semaphore>)>,
+    replace: Option<ReplaceConfig>,
 ) -> TestNode {
     let (events_tx, events_rx) = mpsc::channel(1024);
     let capacity = slow_wire.as_ref().map_or(1024, |(cap, _)| *cap);
@@ -495,6 +497,9 @@ async fn node_inner(
     }
     if let Some(bytes) = inbound_ceiling {
         config = config.with_inbound_ceiling(bytes);
+    }
+    if let Some(replace) = replace {
+        config = config.with_replace(replace);
     }
     let parts = new_router(config, outbound_tx, events_rx);
     let task = tokio::spawn(parts.task);
@@ -745,6 +750,7 @@ async fn a_responders_first_data_does_not_overtake_its_resp_held_back_by_a_full_
         None,
         None,
         Some((1, gate.clone())),
+        None,
     )
     .await;
     let mut manual1 = Manual::new(&net, m1);
@@ -3601,6 +3607,7 @@ async fn a_forged_docs_only_init_does_not_abandon_our_own_initiation_to_that_pee
 // The triggers of protocol.md 5.5 (TODO.md L4j S6), over these routers.
 mod docs_places;
 mod relay_principal;
+mod replace;
 mod revalidate;
 mod sync;
 
@@ -4117,6 +4124,9 @@ async fn a_retired_current_session_leaves_the_node_counter_at_once() {
     let (b, m, n) = (party(), party(), party());
     let stores = w.stores(&[&b, &m, &n], vec![w.grant(&m, &b), w.grant(&n, &b)]);
     let mut t = rel_rig(w, b, &stores, NodeId::from([0xAA; 32]), relay_static());
+    // The continuation would hold the second candidate in the router instead (see replace.rs):
+    // this test is about the table's own promotion.
+    t.d.engine.replace.continuation = false;
     t.init(&m, 1);
     t.init(&n, 1);
     t.notice(7, SessionNotice::FirstRecord);
