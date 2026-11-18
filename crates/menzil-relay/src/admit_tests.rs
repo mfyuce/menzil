@@ -462,11 +462,7 @@ async fn nothing_but_an_admit_request_is_taken_on_a_redeem_session() {
         let mut client = h.redeem(&who).await;
         client.send(record).await;
         assert_eq!(expect_error(&mut client).await.code, ErrorCode::NotMember);
-        assert_eq!(
-            recv_skipping_pings(&mut client).await,
-            None,
-            "the session ends"
-        );
+        assert_eq!(recv_in_time(&mut client).await, None, "the session ends");
         assert_eq!(h.relay.registry.attached_session_id(&who.node_id), None);
     }
     assert!(!h.relay.admit.has_listener(&net.id));
@@ -482,7 +478,7 @@ async fn nothing_but_an_admit_request_is_taken_on_a_redeem_session() {
         .send(Record::AdmitRequest(request(&who, &held)))
         .await;
     assert_eq!(expect_error(&mut client).await.code, ErrorCode::NotMember);
-    assert_eq!(recv_skipping_pings(&mut client).await, None);
+    assert_eq!(recv_in_time(&mut client).await, None);
     held_count(&h.relay, 0).await;
 }
 
@@ -787,7 +783,7 @@ async fn a_request_is_delivered_to_the_newest_registered_issuer() {
     let mut dev = h.redeem(&device).await;
     dev.send(Record::AdmitRequest(req.clone())).await;
     // Delivered, so the device is not told `pending`.
-    match recv_skipping_pings(&mut one).await {
+    match recv_in_time(&mut one).await {
         Some(Record::AdmitPending(body)) => assert_eq!(body, req),
         other => panic!("expected ADMIT_PENDING, got {other:?}"),
     }
@@ -795,7 +791,7 @@ async fn a_request_is_delivered_to_the_newest_registered_issuer() {
     // A newer registration receives the held request, and the next ones.
     let mut two = h.member(&second, net.id, 12).await;
     two.send(h.proof(&net, &net.owner, &second, 12)).await;
-    match recv_skipping_pings(&mut two).await {
+    match recv_in_time(&mut two).await {
         Some(Record::AdmitPending(body)) => assert_eq!(body, req),
         other => panic!("expected the held request, got {other:?}"),
     }
@@ -803,7 +799,7 @@ async fn a_request_is_delivered_to_the_newest_registered_issuer() {
     let req2 = request(&device2, &invite(&net.owner, net.id, 2));
     let mut dev2 = h.redeem(&device2).await;
     dev2.send(Record::AdmitRequest(req2.clone())).await;
-    match recv_skipping_pings(&mut two).await {
+    match recv_in_time(&mut two).await {
         Some(Record::AdmitPending(body)) => assert_eq!(body, req2),
         other => panic!("expected ADMIT_PENDING, got {other:?}"),
     }
@@ -825,7 +821,7 @@ async fn a_refusal_counts_only_from_the_registered_session() {
     let mut dev = h.redeem(&device).await;
     dev.send(Record::AdmitRequest(request(&device, &inv))).await;
     assert!(matches!(
-        recv_skipping_pings(&mut registered).await,
+        recv_in_time(&mut registered).await,
         Some(Record::AdmitPending(_))
     ));
     let refusal = |code| {
@@ -858,7 +854,7 @@ async fn a_refusal_counts_only_from_the_registered_session() {
         expect_result(&mut dev).await,
         AdmitResultBody::Refused(u16::from(ErrorCode::NameTaken))
     );
-    assert_eq!(recv_skipping_pings(&mut dev).await, None);
+    assert_eq!(recv_in_time(&mut dev).await, None);
     held_count(&h.relay, 0).await;
 }
 
@@ -883,11 +879,7 @@ async fn adopting_a_roster_that_lists_the_device_answers_it() {
             base_roster: None
         }
     );
-    assert_eq!(
-        recv_skipping_pings(&mut dev).await,
-        None,
-        "the session ends"
-    );
+    assert_eq!(recv_in_time(&mut dev).await, None, "the session ends");
     // The bystander is not listed: still waiting.
     assert!(quiet(&mut other).await);
     held_count(&h.relay, 1).await;
