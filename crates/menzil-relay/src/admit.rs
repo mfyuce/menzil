@@ -13,7 +13,9 @@
 //! is ahead, the request's `node_cert` names the session's own NodeId, the network is served and
 //! its Roster names the invite's signer as the owner (the network id is the owner's key) or as a
 //! steward with `admit` and a `not_after` ahead, and the signature verifies. The invite carries
-//! no signer field, so the relay tries the owner key and every eligible steward key. Every
+//! no signer field, so the relay tries the owner key and the eligible steward key (a Roster lists
+//! at most one steward, protocol.md 2.3; `STEWARD_SLOTS` is 1), and remembers which key
+//! verified: that is the invite's signer. Every
 //! failure, an unserved network included, gets the same ERROR `bad_invite` with the same message
 //! (isolation rule I2): the signature work is the same whatever the Roster holds (the owner key
 //! and one steward slot are always verified, a dummy key filling the slot when the network has
@@ -29,13 +31,16 @@
 //!
 //! Issuers register with ADMIT_LISTEN on an *attached* session of the network: the proof must
 //! verify over (this relay's NodeId, the session's NodeId, the session's HELLO timestamp) by the
-//! owner key or a steward with `admit` (`on_listen`). The newest registration of a network
-//! receives its ADMIT_PENDING records, the held ones at registration and each new one as it is
-//! held; a registration whose signer has since lost its right (the Roster no longer names it) is
+//! owner key or a steward with `admit` (`on_listen`). Registrations are kept per (network,
+//! signer): the owner's issuer and a steward's issuer are both registered, and a request goes to
+//! the registration of the key that signed its invite (the newest registration of one signer
+//! wins; a session's end removes only its own). That registration receives its ADMIT_PENDING
+//! records, the held ones at registration and each new one as it is held; a registration whose signer has since lost its right (the Roster no longer names it) is
 //! dropped at the next delivery. With no registration the device is answered
 //! ADMIT_RESULT `{ pending: true }` and its request stays held. ADMIT_REFUSED from the
-//! registered session becomes ADMIT_RESULT `{ refused: code }` for the matching request (from
-//! any other session it is ignored). Success needs no record: the redeem session listens to
+//! registered session of the request's signer, while that signer is still current (else the
+//! registration is dropped), becomes ADMIT_RESULT `{ refused: code }` for the matching request
+//! (from any other session it is ignored). Success needs no record: the redeem session listens to
 //! Roster changes (`RosterStore::subscribe`, whichever path stored the Roster) and, when the held
 //! Roster lists its NodeId unrevoked, sends ADMIT_RESULT `{ roster, base_roster? }` and ends.
 //!
@@ -106,10 +111,12 @@ struct Entry {
     invite_id: InviteId,
     peer: PeerKey,
     request: Arc<AdmitRequestBody>,
+    /// The key that signed the request's invite (the owner's or a steward's).
+    signer: [u8; 32],
     answer: mpsc::Sender<u16>,
 }
 
-/// The registered issuer session of a network.
+/// A registered issuer session of a network (one per (network, signer)).
 #[derive(Clone, Copy)]
 struct Listener {
     node_id: NodeId,
@@ -124,7 +131,7 @@ struct Inner {
     per_network: HashMap<NetworkId, usize>,
     per_invite: HashMap<(NetworkId, InviteId), usize>,
     per_peer: HashMap<PeerKey, usize>,
-    listeners: HashMap<NetworkId, Listener>,
+    listeners: HashMap<(NetworkId, [u8; 32]), Listener>,
 }
 
 /// The relay's held requests and issuer registrations (memory only).
@@ -169,6 +176,7 @@ impl AdmitBook {
         node_id: NodeId,
         peer: PeerKey,
         request: Arc<AdmitRequestBody>,
+        signer: [u8; 32],
     ) -> Result<(Held, mpsc::Receiver<u16>), ()> {
         let mut inner = self.inner.lock().unwrap();
         let limits = &self.limits;
@@ -204,6 +212,7 @@ impl AdmitBook {
                 invite_id,
                 peer,
                 request,
+                signer,
                 answer,
             },
         );
@@ -234,10 +243,11 @@ impl AdmitBook {
         }
     }
 
-    /// Registers `node_id`'s session as the issuer of `network` (the newest wins).
+    /// Registers `node_id`'s session as the issuer of `network` for invites signed by `signer`
+    /// (the newest registration of the same signer wins; other signers keep theirs).
     fn register(&self, network: NetworkId, node_id: NodeId, session_id: u32, signer: [u8; 32]) {
         self.inner.lock().unwrap().listeners.insert(
-            network,
+            (network, signer),
             Listener {
                 node_id,
                 session_id,
@@ -255,46 +265,59 @@ impl AdmitBook {
             .retain(|_, l| !(l.node_id == *node_id && l.session_id == session_id));
     }
 
-    fn listener_of(&self, network: &NetworkId) -> Option<Listener> {
-        self.inner.lock().unwrap().listeners.get(network).copied()
+    fn listener_of(&self, network: &NetworkId, signer: &[u8; 32]) -> Option<Listener> {
+        self.inner
+            .lock()
+            .unwrap()
+            .listeners
+            .get(&(*network, *signer))
+            .copied()
     }
 
     fn drop_listener(&self, network: &NetworkId, gone: &Listener) {
         let mut inner = self.inner.lock().unwrap();
-        if inner.listeners.get(network).is_some_and(|l| {
-            l.node_id == gone.node_id && l.session_id == gone.session_id && l.signer == gone.signer
-        }) {
-            inner.listeners.remove(network);
+        let key = (*network, gone.signer);
+        if inner
+            .listeners
+            .get(&key)
+            .is_some_and(|l| l.node_id == gone.node_id && l.session_id == gone.session_id)
+        {
+            inner.listeners.remove(&key);
         }
     }
 
-    /// The requests held for `network`.
-    fn pending_of(&self, network: &NetworkId) -> Vec<Arc<AdmitRequestBody>> {
+    /// The requests held for `network` whose invite `signer` signed.
+    fn pending_of(&self, network: &NetworkId, signer: &[u8; 32]) -> Vec<Arc<AdmitRequestBody>> {
         self.inner
             .lock()
             .unwrap()
             .by_node
             .values()
-            .filter(|entry| entry.network == *network)
+            .filter(|entry| entry.network == *network && entry.signer == *signer)
             .map(|entry| Arc::clone(&entry.request))
             .collect()
     }
 
-    /// An ADMIT_REFUSED from session (`node_id`, `session_id`): forwarded to the matching held
-    /// request only when that session is the registered issuer of the request's network.
-    fn refuse(&self, node_id: &NodeId, session_id: u32, body: &AdmitRefusedBody) -> bool {
+    /// The answer channel of the held request an ADMIT_REFUSED from session (`node_id`,
+    /// `session_id`) is about, with the network and the registration it came through: only when
+    /// that session is the registered issuer for the key that signed the request's invite.
+    fn refusal_target(
+        &self,
+        node_id: &NodeId,
+        session_id: u32,
+        body: &AdmitRefusedBody,
+    ) -> Option<(mpsc::Sender<u16>, NetworkId, Listener)> {
         let inner = self.inner.lock().unwrap();
-        let Some(entry) = inner.by_node.get(&body.node_id) else {
-            return false;
-        };
+        let entry = inner.by_node.get(&body.node_id)?;
         if entry.invite_id != body.invite_id {
-            return false;
+            return None;
         }
-        let registered = inner
+        let listener = inner
             .listeners
-            .get(&entry.network)
-            .is_some_and(|l| l.node_id == *node_id && l.session_id == session_id);
-        registered && entry.answer.try_send(u16::from(body.code)).is_ok()
+            .get(&(entry.network, entry.signer))
+            .copied()
+            .filter(|l| l.node_id == *node_id && l.session_id == session_id)?;
+        Some((entry.answer.clone(), entry.network, listener))
     }
 
     /// How many requests are held in all (tests).
@@ -303,10 +326,21 @@ impl AdmitBook {
         self.inner.lock().unwrap().by_node.len()
     }
 
-    /// Whether `network` has a registered issuer (tests).
+    /// Whether `network` has a registered issuer of any signer (tests).
     #[cfg(test)]
     pub(crate) fn has_listener(&self, network: &NetworkId) -> bool {
-        self.inner.lock().unwrap().listeners.contains_key(network)
+        self.inner
+            .lock()
+            .unwrap()
+            .listeners
+            .keys()
+            .any(|(net, _)| net == network)
+    }
+
+    /// Whether `signer` has a registered issuer on `network` (tests).
+    #[cfg(test)]
+    pub(crate) fn has_listener_of(&self, network: &NetworkId, signer: &[u8; 32]) -> bool {
+        self.listener_of(network, signer).is_some()
     }
 
     #[cfg(test)]
@@ -358,7 +392,7 @@ fn check_request(
     node_id: &NodeId,
     body: &AdmitRequestBody,
     now: u64,
-) -> Option<(NetworkId, InviteId)> {
+) -> Option<(NetworkId, InviteId, [u8; 32])> {
     let invite = body.invite.decode().ok()?;
     invite.check_roles_empty().ok()?;
     if invite.expires <= now {
@@ -379,23 +413,33 @@ fn check_request(
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         VerifyingKey::from_bytes(key).is_ok_and(|key| body.invite.verify(&key).is_ok())
     };
-    // The owner key and at least one steward slot are always verified: a served network with
-    // no eligible steward and an unserved one do the same work.
-    let owner_ok = verify(&<[u8; 32]>::from(network));
+    // The owner key and exactly STEWARD_SLOTS steward slots are always verified, a dummy key
+    // filling a slot the network cannot fill (no eligible steward, or not served): the signature
+    // work is the same for every Roster. A Roster lists at most one steward (protocol.md 2.3),
+    // so one slot covers every legal Roster; of a Roster that lists more (only a relay that
+    // holds a malformed one) the first eligible steward is the one a request can be held for.
+    let owner_key = <[u8; 32]>::from(network);
+    let owner_ok = verify(&owner_key);
     let stewards = relay.rosters.admit_stewards(&network, now);
     let served = stewards.is_some();
-    let mut steward_ok = false;
-    let mut done = 0usize;
-    for key in stewards.iter().flatten() {
-        steward_ok |= verify(key);
-        done += 1;
+    let mut signer = None;
+    let eligible = stewards.unwrap_or_default();
+    for slot in 0..STEWARD_SLOTS {
+        let key = eligible.get(slot).unwrap_or(&DUMMY_KEY);
+        let ok = verify(key);
+        if ok && signer.is_none() && eligible.get(slot).is_some() {
+            signer = Some(*key);
+        }
     }
-    while done < 1 {
-        steward_ok |= verify(&DUMMY_KEY);
-        done += 1;
+    let signer = if owner_ok { Some(owner_key) } else { signer };
+    match (served, signer) {
+        (true, Some(signer)) => Some((network, invite.invite_id, signer)),
+        _ => None,
     }
-    (served & (owner_ok | steward_ok)).then_some((network, invite.invite_id))
 }
+
+/// How many steward keys `check_request` verifies against, whatever the Roster holds.
+const STEWARD_SLOTS: usize = 1;
 
 /// Whether `signer` may speak for `network` now: its owner key, or a steward with `admit`.
 fn signer_current(relay: &Relay, network: &NetworkId, signer: &[u8; 32], now: u64) -> bool {
@@ -410,8 +454,13 @@ fn signer_current(relay: &Relay, network: &NetworkId, signer: &[u8; 32], now: u6
 
 /// Sends `request` to the registered issuer of `network`, if there is one that may still speak
 /// for it. True when it was handed to the issuer's session.
-fn deliver_pending(relay: &Relay, network: &NetworkId, request: &Arc<AdmitRequestBody>) -> bool {
-    let Some(listener) = relay.admit.listener_of(network) else {
+fn deliver_pending(
+    relay: &Relay,
+    network: &NetworkId,
+    signer: &[u8; 32],
+    request: &Arc<AdmitRequestBody>,
+) -> bool {
+    let Some(listener) = relay.admit.listener_of(network, signer) else {
         return false;
     };
     if !signer_current(relay, network, &listener.signer, unix_now()) {
@@ -449,8 +498,9 @@ pub(crate) fn on_listen(
         body,
     );
     if ok {
-        for request in relay.admit.pending_of(&body.network_id) {
-            deliver_pending(relay, &body.network_id, &request);
+        let signer = <[u8; 32]>::from(body.signer);
+        for request in relay.admit.pending_of(&body.network_id, &signer) {
+            deliver_pending(relay, &body.network_id, &signer, &request);
         }
         return false;
     }
@@ -496,9 +546,20 @@ pub(crate) fn on_refused(
     session_id: u32,
     body: &AdmitRefusedBody,
 ) {
-    if relay.registry.is_current(node_id, session_id) {
-        relay.admit.refuse(node_id, session_id, body);
+    if !relay.registry.is_current(node_id, session_id) {
+        return;
     }
+    let Some((answer, network, listener)) = relay.admit.refusal_target(node_id, session_id, body)
+    else {
+        return;
+    };
+    // The issuer must still be allowed to speak for the network (a steward removed from the
+    // Roster, or without `admit` now, is dropped).
+    if !signer_current(relay, &network, &listener.signer, unix_now()) {
+        relay.admit.drop_listener(&network, &listener);
+        return;
+    }
+    let _ = answer.try_send(u16::from(body.code));
 }
 
 /// ADMIT_RESULT `{ roster, base_roster? }` when the held Roster of `network` lists `node_id`
@@ -631,7 +692,7 @@ pub(crate) async fn run_redeem_session(
                                 deadline
                                     .as_mut()
                                     .reset(tokio::time::Instant::now() + relay.admit.limits().max_wait);
-                                let (held, rx, network, changes, request) = accepted;
+                                let (held, rx, network, changes, request, signer) = accepted;
                                 // The Roster may already list the device (a retry after an
                                 // admission whose answer was lost): answer at once.
                                 if let Some(result) = admitted_result(relay, &network, &node_id) {
@@ -639,7 +700,7 @@ pub(crate) async fn run_redeem_session(
                                     drop(held);
                                     break Finish::Linger;
                                 }
-                                if !deliver_pending(relay, &network, &request) {
+                                if !deliver_pending(relay, &network, &signer, &request) {
                                     let _ = send_record(
                                         &mut conn,
                                         &mut transport,
@@ -691,21 +752,27 @@ fn accept_request(
         NetworkId,
         StandingWatch,
         Arc<AdmitRequestBody>,
+        [u8; 32],
     ),
     ErrorBody,
 > {
-    let Some((network, invite_id)) = check_request(relay, node_id, &body, unix_now()) else {
+    let Some((network, invite_id, signer)) = check_request(relay, node_id, &body, unix_now())
+    else {
         return Err(bad_invite());
     };
     let request = Arc::new(body);
     // Listening starts before the caller's own look at the Roster, so an adoption between the
     // two is not missed.
     let watch = StandingWatch::new(relay);
-    match relay
-        .admit
-        .hold(network, invite_id, *node_id, peer, Arc::clone(&request))
-    {
-        Ok((guard, answers)) => Ok((guard, answers, network, watch, request)),
+    match relay.admit.hold(
+        network,
+        invite_id,
+        *node_id,
+        peer,
+        Arc::clone(&request),
+        signer,
+    ) {
+        Ok((guard, answers)) => Ok((guard, answers, network, watch, request, signer)),
         Err(()) => Err(error(
             ErrorCode::RateLimited,
             "too many invite requests are waiting; try again later",

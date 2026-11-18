@@ -237,6 +237,13 @@ pub fn create(home: &Home, spec: &CreateSpec, relay: &str, now: u64) -> Result<C
     }
     if let Some(name) = &spec.name {
         menzil_admin::check_name(name)?;
+        // A fixed name is unique in the network: every device after the first would be refused
+        // `name_taken`, so the invite would be a one use invite in effect (design B4).
+        if spec.uses > 1 {
+            bail!(
+                "a fixed name (--name) can be given to one device only: use --uses 1, or leave the name to each device"
+            );
+        }
     }
     menzil_carrier::ConnectionInfo::parse(relay)
         .map_err(|e| anyhow!("the relay in config.toml is not usable in a token: {e}"))?;

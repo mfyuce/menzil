@@ -302,18 +302,21 @@ pub fn process_batch(
         if batch_nodes.contains(&node_id) {
             continue;
         }
+        // A current member is answered with the Roster it already has (resend): it spends no
+        // use, is never admitted again and does not touch any redeemed list (a second invite
+        // must not burn a use or void the batch).
+        if standing == Standing::Member {
+            outcome.resend = true;
+            continue;
+        }
         // 8. The counting rule.
         let list = redeemed
             .entry(invite_id)
             .or_insert_with(|| record.redeemed.clone());
         if list.contains(&node_id) {
-            if standing == Standing::Member {
-                outcome.resend = true;
-            } else {
-                batch_nodes.insert(node_id);
-                names.push((node_id, lowered));
-                to_admit.push((request.node_cert.clone(), request.name.clone()));
-            }
+            batch_nodes.insert(node_id);
+            names.push((node_id, lowered));
+            to_admit.push((request.node_cert.clone(), request.name.clone()));
             continue;
         }
         if list.len() < usize::from(invite.uses) {

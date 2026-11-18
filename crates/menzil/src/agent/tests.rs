@@ -2239,6 +2239,25 @@ async fn invite_requests_reach_the_node_whole_and_the_answer_lines_come_back() {
     assert_eq!(opener.seen.lock().unwrap().as_slice(), ops);
 }
 
+/// Round R-B N1: an answer line over the limit is an error, never a cut (damaged) token.
+#[tokio::test]
+async fn an_invite_answer_line_over_the_limit_is_an_error_not_a_cut_line() {
+    let op = crate::invite::InviteOp::List { network: None };
+    let opener = inviter(Ok(vec![format!("token {}", "A".repeat(5000))]));
+    let error = with_agent(opener, async |socket, uid| {
+        request_invite_as(socket, &op, uid).await
+    })
+    .await
+    .unwrap_err();
+    match error {
+        AskError::Failed(e) => {
+            let shown = format!("{e:#}");
+            assert!(shown.contains("longer than 4096"), "{shown:?}");
+        }
+        AskError::NoAgent => panic!("an agent answered"),
+    }
+}
+
 #[tokio::test]
 async fn an_invite_refusal_is_one_line_and_a_bad_request_never_reaches_the_node() {
     let opener = inviter(Err("no steward key\nsecond line".to_string()));

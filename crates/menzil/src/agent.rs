@@ -154,9 +154,25 @@ const RENEW_TIMEOUT: Duration = Duration::from_secs(10);
 const EXPOSE_TIMEOUT: Duration = Duration::from_secs(15);
 /// How long the agent spends on an `invite-*` request: the wait for the network lock (ten
 /// seconds) and the write of the book.
-/// The longest answer line of an `invite-*` request (a token is about 600 characters).
-const INVITE_LINE_CHARS: usize = 1200;
 const INVITE_TIMEOUT: Duration = Duration::from_secs(15);
+/// The longest answer line of an `invite-*` request (a token is 600 to 800 characters). A line
+/// over it is an error, never cut: a cut token would be a damaged secret.
+const INVITE_LINE_CHARS: usize = 4096;
+/// The reply to a successful `invite-*` request: `ok` and the lines, each made printable, or one
+/// error when a line is longer than [`INVITE_LINE_CHARS`] (never cut).
+fn invite_reply(lines: &[String]) -> String {
+    if lines.iter().any(|l| l.chars().count() > INVITE_LINE_CHARS) {
+        return format!(
+            "error an answer line is longer than {INVITE_LINE_CHARS} characters and was not sent\n"
+        );
+    }
+    let mut reply = "ok\n".to_string();
+    for line in lines {
+        reply.push_str(&text::one_line(line, INVITE_LINE_CHARS));
+        reply.push('\n');
+    }
+    reply
+}
 /// How many connections the agent serves at once.
 const MAX_CONNECTIONS: usize = 256;
 
@@ -912,14 +928,7 @@ async fn handle<O: Opener>(connection: UnixStream, opener: &O) -> Result<()> {
         let reply = match crate::invite::InviteOp::parse_request_line(request) {
             Err(message) => format!("error {}\n", error_line(&message)),
             Ok(op) => match timeout(INVITE_TIMEOUT, opener.invite(op)).await {
-                Ok(Ok(lines)) => {
-                    let mut reply = "ok\n".to_string();
-                    for line in lines {
-                        reply.push_str(&text::one_line(&line, INVITE_LINE_CHARS));
-                        reply.push('\n');
-                    }
-                    reply
-                }
+                Ok(Ok(lines)) => invite_reply(&lines),
                 Ok(Err(message)) => format!("error {}\n", error_line(&message)),
                 Err(_) => "error the node did not finish the invite request in time\n".to_string(),
             },

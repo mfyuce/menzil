@@ -186,6 +186,73 @@ fn the_limits_of_create_are_enforced() {
     assert_eq!(body.name.as_deref(), Some("kiosk"));
 }
 
+/// Round R-B N2: a fixed name with more than one use would refuse every later device.
+#[test]
+fn a_fixed_name_with_more_than_one_use_is_refused() {
+    let fx = fixture();
+    let spec = |uses| CreateSpec {
+        uses,
+        name: Some("kiosk".to_string()),
+        ..CreateSpec::default()
+    };
+    let error = create(&fx.owner, &spec(2), &relay(), NOW).unwrap_err();
+    assert!(
+        format!("{error:#}").contains("one device only"),
+        "{error:#}"
+    );
+    assert!(create(&fx.owner, &spec(1), &relay(), NOW).is_ok());
+    // No name, several uses: fine.
+    let many = CreateSpec {
+        uses: 3,
+        ..CreateSpec::default()
+    };
+    assert!(create(&fx.owner, &many, &relay(), NOW).is_ok());
+}
+
+/// Round R-B L1: a member presenting another invite spends no use of it, does not void the
+/// batch, and is answered with the Roster it has.
+#[test]
+fn a_member_with_a_second_invite_spends_nothing_and_does_not_poison_the_batch() {
+    let fx = fixture();
+    let a = make(&fx.owner, &CreateSpec::default());
+    let b = make(
+        &fx.owner,
+        &CreateSpec {
+            uses: 2,
+            ..CreateSpec::default()
+        },
+    );
+    let member = device();
+    let out = run(
+        &fx.owner,
+        &fx.network,
+        vec![request(&a.token, &member, "member")],
+    );
+    assert_eq!(out.admitted, 1);
+    let fresh = device();
+    let out = run(
+        &fx.owner,
+        &fx.network,
+        vec![
+            request(&b.token, &member, "member"),
+            request(&b.token, &fresh, "fresh"),
+        ],
+    );
+    assert_eq!(out.admitted, 1, "{out:?}");
+    assert!(out.refused.is_empty(), "{out:?}");
+    assert!(out.resend, "{out:?}");
+    let docs = local::load_documents(&fx.owner, &fx.network).unwrap();
+    assert!(docs.is_member(&fresh.id));
+    let book = load_book(&fx.owner, &fx.network).unwrap();
+    let redeemed = &book.get(&b.invite_id).unwrap().redeemed;
+    assert_eq!(
+        redeemed.len(),
+        1,
+        "the member spent a use of the second invite"
+    );
+    assert!(!redeemed.contains(&member.id));
+}
+
 #[test]
 fn a_device_that_is_no_issuer_cannot_create() {
     let fx = fixture();

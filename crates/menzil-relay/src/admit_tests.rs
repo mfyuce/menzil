@@ -1016,8 +1016,8 @@ async fn nothing_is_persisted_a_new_relay_holds_nothing() {
     assert_eq!(restarted.admit.held(), 0);
 }
 
-/// A registration whose signer the Roster no longer names (a steward the owner removed) is
-/// dropped at the next delivery: the device is told `pending` and the old issuer hears nothing.
+/// A registration whose signer the Roster no longer names (a steward the owner removed) hears
+/// nothing: the device is told `pending`.
 #[tokio::test]
 async fn a_registration_whose_steward_was_removed_receives_nothing() {
     let h = start().await;
@@ -1044,5 +1044,245 @@ async fn a_registration_whose_steward_was_removed_receives_nothing() {
         quiet(&mut client).await,
         "a removed steward still receives requests"
     );
-    assert!(!h.relay.admit.has_listener(&net.id));
+    // Its registration is only ever reached by invites it signed, which no longer verify; it
+    // is dropped when one is delivered or when its session ends.
+}
+
+// --- round R-B regressions -----------------------------------------------------------------------
+
+/// M1: the owner's issuer and a steward's issuer are both registered; a request goes to the
+/// registration of the key that signed its invite, and the steward leaving takes only its own
+/// registration away.
+#[tokio::test]
+async fn owner_and_steward_issuers_each_get_their_own_invites() {
+    let h = start().await;
+    let (owner_dev, steward_dev) = (generate_identity(), generate_identity());
+    let (net, steward_key) = steward_net(
+        &h.relay,
+        &[&owner_dev, &steward_dev],
+        &["admit"],
+        4_000_000_000,
+    );
+    let mut owner_session = h.issuer(&owner_dev, &net, 10).await;
+    let mut st = h.member(&steward_dev, net.id, 11).await;
+    st.send(h.proof(&net, &steward_key, &steward_dev, 11)).await;
+    ping_pong(&mut st, [3; 8]).await;
+    // An owner signed invite reaches the owner's issuer, not the steward's.
+    let d1 = generate_identity();
+    let mut c1 = h.redeem(&d1).await;
+    let req1 = request(&d1, &invite(&net.owner, net.id, 1));
+    c1.send(Record::AdmitRequest(req1.clone())).await;
+    match recv_skipping_pings(&mut owner_session).await {
+        Some(Record::AdmitPending(body)) => assert_eq!(body, req1),
+        other => panic!("expected ADMIT_PENDING for the owner, got {other:?}"),
+    }
+    assert!(quiet(&mut st).await, "the steward got an owner's invite");
+    // A steward signed invite reaches the steward's issuer, not the owner's.
+    let d2 = generate_identity();
+    let mut c2 = h.redeem(&d2).await;
+    let req2 = request(&d2, &invite(&steward_key, net.id, 2));
+    c2.send(Record::AdmitRequest(req2.clone())).await;
+    match recv_skipping_pings(&mut st).await {
+        Some(Record::AdmitPending(body)) => assert_eq!(body, req2),
+        other => panic!("expected ADMIT_PENDING for the steward, got {other:?}"),
+    }
+    assert!(quiet(&mut owner_session).await);
+    // The steward leaves: the owner's registration stays.
+    drop(st);
+    for _ in 0..300 {
+        if !h
+            .relay
+            .admit
+            .has_listener_of(&net.id, &steward_key.verifying_key().to_bytes())
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let d3 = generate_identity();
+    let mut c3 = h.redeem(&d3).await;
+    let req3 = request(&d3, &invite(&net.owner, net.id, 3));
+    c3.send(Record::AdmitRequest(req3.clone())).await;
+    match recv_skipping_pings(&mut owner_session).await {
+        Some(Record::AdmitPending(body)) => assert_eq!(body, req3),
+        other => panic!("the owner's issuer was lost, got {other:?}"),
+    }
+}
+
+/// M1: a signer with no registration leaves the device answered `pending` even when another
+/// signer's issuer is attached.
+#[tokio::test]
+async fn a_request_without_an_issuer_of_its_signer_is_answered_pending() {
+    let h = start().await;
+    let (owner_dev, steward_dev) = (generate_identity(), generate_identity());
+    let (net, steward_key) = steward_net(
+        &h.relay,
+        &[&owner_dev, &steward_dev],
+        &["admit"],
+        4_000_000_000,
+    );
+    let mut owner_session = h.issuer(&owner_dev, &net, 10).await;
+    let d = generate_identity();
+    let mut c = h.redeem(&d).await;
+    c.send(Record::AdmitRequest(request(
+        &d,
+        &invite(&steward_key, net.id, 1),
+    )))
+    .await;
+    assert_eq!(expect_result(&mut c).await, AdmitResultBody::Pending);
+    assert!(quiet(&mut owner_session).await);
+}
+
+/// L2: the signature work does not depend on how many stewards a Roster lists.
+#[tokio::test]
+async fn signature_work_is_the_same_for_any_number_of_stewards() {
+    let h = start().await;
+    let issuer = generate_identity();
+    let net = new_net();
+    let stewards: Vec<Steward> = (0..5)
+        .map(|_| {
+            let key = SigningKey::generate(&mut rand::rng());
+            Steward::sign(
+                &net.owner,
+                &StewardBody {
+                    v: PROTOCOL_VERSION,
+                    network_id: net.id,
+                    steward_pub: StewardKey::from(key.verifying_key().to_bytes()),
+                    may: vec!["admit".to_string()],
+                    not_after: 4_000_000_000,
+                },
+            )
+            .unwrap()
+        })
+        .collect();
+    h.relay
+        .rosters()
+        .set(&roster_of(&net, 1, &[&issuer], &[], stewards))
+        .unwrap();
+    let unserved = new_net();
+    let stranger = SigningKey::generate(&mut rand::rng());
+    let mut counts = Vec::new();
+    for (id, n) in [(net.id, 1u8), (unserved.id, 2u8)] {
+        let who = generate_identity();
+        let mut client = h.redeem(&who).await;
+        let before = h.relay.admit.verify_count();
+        client
+            .send(Record::AdmitRequest(request(
+                &who,
+                &invite(&stranger, id, n),
+            )))
+            .await;
+        assert_eq!(expect_error(&mut client).await.code, ErrorCode::BadInvite);
+        counts.push(h.relay.admit.verify_count() - before);
+    }
+    assert_eq!(counts[0], counts[1], "served and unserved cost differently");
+}
+
+/// L3: a steward removed from the Roster cannot refuse a held request any more.
+#[tokio::test]
+async fn a_removed_steward_cannot_refuse() {
+    let h = start().await;
+    let steward_dev = generate_identity();
+    let (net, steward_key) = steward_net(&h.relay, &[&steward_dev], &["admit"], 4_000_000_000);
+    let mut st = h.member(&steward_dev, net.id, 11).await;
+    st.send(h.proof(&net, &steward_key, &steward_dev, 11)).await;
+    ping_pong(&mut st, [3; 8]).await;
+    let d = generate_identity();
+    let mut c = h.redeem(&d).await;
+    c.send(Record::AdmitRequest(request(
+        &d,
+        &invite(&steward_key, net.id, 1),
+    )))
+    .await;
+    assert!(matches!(
+        recv_skipping_pings(&mut st).await,
+        Some(Record::AdmitPending(_))
+    ));
+    h.relay
+        .rosters()
+        .set(&roster_of(&net, 2, &[&steward_dev], &[], vec![]))
+        .unwrap();
+    st.send(Record::AdmitRefused(AdmitRefusedBody {
+        invite_id: InviteId::from([1; 16]),
+        node_id: d.node_id,
+        code: ErrorCode::BadTag,
+    }))
+    .await;
+    ping_pong(&mut st, [4; 8]).await;
+    assert!(quiet(&mut c).await, "a removed steward refused a request");
+}
+
+/// L3: a steward cannot refuse a request whose invite the owner signed.
+#[tokio::test]
+async fn a_steward_cannot_refuse_an_owner_signed_request() {
+    let h = start().await;
+    let (owner_dev, steward_dev) = (generate_identity(), generate_identity());
+    let (net, steward_key) = steward_net(
+        &h.relay,
+        &[&owner_dev, &steward_dev],
+        &["admit"],
+        4_000_000_000,
+    );
+    let mut owner_session = h.issuer(&owner_dev, &net, 10).await;
+    let mut st = h.member(&steward_dev, net.id, 11).await;
+    st.send(h.proof(&net, &steward_key, &steward_dev, 11)).await;
+    ping_pong(&mut st, [3; 8]).await;
+    let d = generate_identity();
+    let mut c = h.redeem(&d).await;
+    c.send(Record::AdmitRequest(request(
+        &d,
+        &invite(&net.owner, net.id, 1),
+    )))
+    .await;
+    assert!(matches!(
+        recv_skipping_pings(&mut owner_session).await,
+        Some(Record::AdmitPending(_))
+    ));
+    st.send(Record::AdmitRefused(AdmitRefusedBody {
+        invite_id: InviteId::from([1; 16]),
+        node_id: d.node_id,
+        code: ErrorCode::BadTag,
+    }))
+    .await;
+    ping_pong(&mut st, [4; 8]).await;
+    assert!(quiet(&mut c).await, "a steward refused an owner's request");
+}
+
+/// M1/L3: a steward's refusal of a request its own invite produced reaches the device, while an
+/// owner's issuer is attached too.
+#[tokio::test]
+async fn a_steward_refuses_a_request_of_its_own_invite() {
+    let h = start().await;
+    let (owner_dev, steward_dev) = (generate_identity(), generate_identity());
+    let (net, steward_key) = steward_net(
+        &h.relay,
+        &[&owner_dev, &steward_dev],
+        &["admit"],
+        4_000_000_000,
+    );
+    let _owner_session = h.issuer(&owner_dev, &net, 10).await;
+    let mut st = h.member(&steward_dev, net.id, 11).await;
+    st.send(h.proof(&net, &steward_key, &steward_dev, 11)).await;
+    ping_pong(&mut st, [3; 8]).await;
+    let d = generate_identity();
+    let mut c = h.redeem(&d).await;
+    c.send(Record::AdmitRequest(request(
+        &d,
+        &invite(&steward_key, net.id, 1),
+    )))
+    .await;
+    assert!(matches!(
+        recv_skipping_pings(&mut st).await,
+        Some(Record::AdmitPending(_))
+    ));
+    st.send(Record::AdmitRefused(AdmitRefusedBody {
+        invite_id: InviteId::from([1; 16]),
+        node_id: d.node_id,
+        code: ErrorCode::BadTag,
+    }))
+    .await;
+    assert_eq!(
+        expect_result(&mut c).await,
+        AdmitResultBody::Refused(u16::from(ErrorCode::BadTag))
+    );
 }
