@@ -694,6 +694,9 @@ impl<H, P> SessionTable<H, P> {
         match role {
             Role::Initiator => {
                 let old = self.slots.entry(key).or_default().current.replace(index);
+                if old.is_some() {
+                    self.drop_slot_alias(&key);
+                }
                 installed.replaced = old.and_then(|old| self.take_session(old));
                 self.entries.insert(
                     index,
@@ -887,6 +890,9 @@ impl<H, P> SessionTable<H, P> {
         debug_assert_eq!(slot.candidate, Some(index));
         slot.candidate = None;
         let old = slot.current.replace(index);
+        if old.is_some() {
+            self.drop_slot_alias(&key);
+        }
         Some(Promoted {
             retired: old.and_then(|old| self.take_session(old)),
         })
@@ -1098,6 +1104,14 @@ impl<H, P> SessionTable<H, P> {
             if slot.is_empty() {
                 self.slots.remove(key);
             }
+        }
+    }
+
+    /// The slot's current was replaced: its alias (a second label for the
+    /// old handle) ends with it.
+    fn drop_slot_alias(&mut self, key: &SlotKey) {
+        if let Some(alias) = self.slots.get_mut(key).and_then(|slot| slot.alias.take()) {
+            self.entries.remove(&alias);
         }
     }
 
@@ -2226,5 +2240,33 @@ mod tests {
     fn nothing_is_offered_without_a_current_session() {
         let t = table();
         assert_eq!(t.held_offer(&id(2), &net(9)), None);
+    }
+
+    /// Round D1 L2: a candidate promoted over an aliased current takes the alias with the
+    /// retired current ("an alias ends with its slot's current").
+    #[test]
+    fn promoting_over_an_aliased_current_drops_the_alias() {
+        let mut t = table();
+        let now = Instant::now();
+        let (old, _) = session(&mut t, id(2), net(9), Role::Initiator, 1, now);
+        let a = alias(&mut t, id(2), net(9), 1, now).unwrap();
+        let (cand, _) = session(&mut t, id(2), net(9), Role::Responder, 2, now);
+        let promoted = t.promote(cand).unwrap();
+        assert_eq!(promoted.retired.map(|(i, _)| i), Some(old));
+        assert_eq!(t.slot(&id(2), &net(9)).alias, None);
+        assert!(t.get(a).is_none());
+    }
+
+    /// Round D1 L2: the same for an initiator session installed over an aliased current.
+    #[test]
+    fn installing_over_an_aliased_current_drops_the_alias() {
+        let mut t = table();
+        let now = Instant::now();
+        let (_old, _) = session(&mut t, id(2), net(9), Role::Initiator, 1, now);
+        let a = alias(&mut t, id(2), net(9), 1, now).unwrap();
+        let (_new, installed) = session(&mut t, id(2), net(9), Role::Initiator, 2, now);
+        assert!(installed.replaced.is_some());
+        assert_eq!(t.slot(&id(2), &net(9)).alias, None);
+        assert!(t.get(a).is_none());
     }
 }
