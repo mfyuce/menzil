@@ -468,6 +468,7 @@ impl Node {
         // Documents about to expire: ask for new ones (protocol.md 7.3).
         for network_id in networks {
             tasks.push(tokio::spawn(sync.clone().run_expiry(network_id)));
+            tasks.push(tokio::spawn(sync.clone().run_awaiting(network_id)));
         }
         Ok(Self {
             local_node_id,
@@ -591,6 +592,13 @@ impl Node {
     /// The relay gets a newer Roster by itself, as soon as the store takes it.
     pub async fn push_to_members(&self, network_id: NetworkId) -> PushReport {
         self.sync.push_to_members(network_id).await
+    }
+
+    /// For an issuer: notes that `node`, admitted by invite, does not hold the Policy yet; the
+    /// node tries it every 30 minutes (and each push result that shows the held Policy ends the
+    /// wait) until `deadline` (unix seconds). Bounded: 256 per network, 1024 in all.
+    pub fn await_policy(&self, network_id: NetworkId, node: NodeId, deadline: u64) {
+        self.sync.await_policy(network_id, node, deadline);
     }
 
     /// Waits up to `within` for the node to be attached to its relay and

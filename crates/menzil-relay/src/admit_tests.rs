@@ -251,15 +251,23 @@ async fn recv_skipping_pings(client: &mut TestClient) -> Option<Record> {
     }
 }
 
+/// [`recv_skipping_pings`] with a bound: a regression that leaves the answer out fails the test
+/// after a few seconds with a message, instead of hanging it.
+async fn recv_in_time(client: &mut TestClient) -> Option<Record> {
+    tokio::time::timeout(Duration::from_secs(5), recv_skipping_pings(client))
+        .await
+        .expect("no record arrived within 5 seconds (an answer that should have come is missing)")
+}
+
 async fn expect_error(client: &mut TestClient) -> ErrorBody {
-    match recv_skipping_pings(client).await {
+    match recv_in_time(client).await {
         Some(Record::Error(body)) => body,
         other => panic!("expected ERROR, got {other:?}"),
     }
 }
 
 async fn expect_result(client: &mut TestClient) -> AdmitResultBody {
-    match recv_skipping_pings(client).await {
+    match recv_in_time(client).await {
         Some(Record::AdmitResult(body)) => body,
         other => panic!("expected ADMIT_RESULT, got {other:?}"),
     }
@@ -1072,7 +1080,7 @@ async fn owner_and_steward_issuers_each_get_their_own_invites() {
     let mut c1 = h.redeem(&d1).await;
     let req1 = request(&d1, &invite(&net.owner, net.id, 1));
     c1.send(Record::AdmitRequest(req1.clone())).await;
-    match recv_skipping_pings(&mut owner_session).await {
+    match recv_in_time(&mut owner_session).await {
         Some(Record::AdmitPending(body)) => assert_eq!(body, req1),
         other => panic!("expected ADMIT_PENDING for the owner, got {other:?}"),
     }
@@ -1082,7 +1090,7 @@ async fn owner_and_steward_issuers_each_get_their_own_invites() {
     let mut c2 = h.redeem(&d2).await;
     let req2 = request(&d2, &invite(&steward_key, net.id, 2));
     c2.send(Record::AdmitRequest(req2.clone())).await;
-    match recv_skipping_pings(&mut st).await {
+    match recv_in_time(&mut st).await {
         Some(Record::AdmitPending(body)) => assert_eq!(body, req2),
         other => panic!("expected ADMIT_PENDING for the steward, got {other:?}"),
     }
@@ -1103,7 +1111,7 @@ async fn owner_and_steward_issuers_each_get_their_own_invites() {
     let mut c3 = h.redeem(&d3).await;
     let req3 = request(&d3, &invite(&net.owner, net.id, 3));
     c3.send(Record::AdmitRequest(req3.clone())).await;
-    match recv_skipping_pings(&mut owner_session).await {
+    match recv_in_time(&mut owner_session).await {
         Some(Record::AdmitPending(body)) => assert_eq!(body, req3),
         other => panic!("the owner's issuer was lost, got {other:?}"),
     }
@@ -1195,7 +1203,7 @@ async fn a_removed_steward_cannot_refuse() {
     )))
     .await;
     assert!(matches!(
-        recv_skipping_pings(&mut st).await,
+        recv_in_time(&mut st).await,
         Some(Record::AdmitPending(_))
     ));
     h.relay
@@ -1235,7 +1243,7 @@ async fn a_steward_cannot_refuse_an_owner_signed_request() {
     )))
     .await;
     assert!(matches!(
-        recv_skipping_pings(&mut owner_session).await,
+        recv_in_time(&mut owner_session).await,
         Some(Record::AdmitPending(_))
     ));
     st.send(Record::AdmitRefused(AdmitRefusedBody {
@@ -1272,7 +1280,7 @@ async fn a_steward_refuses_a_request_of_its_own_invite() {
     )))
     .await;
     assert!(matches!(
-        recv_skipping_pings(&mut st).await,
+        recv_in_time(&mut st).await,
         Some(Record::AdmitPending(_))
     ));
     st.send(Record::AdmitRefused(AdmitRefusedBody {

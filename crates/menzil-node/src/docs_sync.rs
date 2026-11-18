@@ -68,6 +68,13 @@ pub(crate) const PUSH_RETRY: [Duration; 4] = [
     Duration::from_secs(30 * 60),
     Duration::from_secs(2 * 60 * 60),
 ];
+/// The wait between two tries at a member that was admitted by invite and does not hold the
+/// Policy yet (30 minutes, plus up to a sixth of it as jitter: 5 minutes).
+pub(crate) const AWAIT_TAIL: Duration = Duration::from_secs(30 * 60);
+/// The most members awaited per network; past it the one with the oldest deadline is dropped.
+pub(crate) const AWAIT_CAP_PER_NETWORK: usize = 256;
+/// The most members awaited in all networks together.
+pub(crate) const AWAIT_CAP_TOTAL: usize = 1024;
 /// How close to its expiry a held pair has to be for the member to start asking (24 hours).
 pub(crate) const EXPIRY_WINDOW: Duration = Duration::from_secs(24 * 60 * 60);
 /// The shortest wait between two expiry rounds (30 minutes).
@@ -102,6 +109,12 @@ pub struct SyncConfig {
     /// it), in order; after the last the session is given up on until the next one. Default
     /// [`PUSH_RETRY`], the schedule of an issuer's push.
     pub cert_push_retry: [Duration; 4],
+    /// The wait between two tries at a member in the awaiting set
+    /// ([`DocsSync::await_policy`]); the jitter is a sixth of it. Default [`AWAIT_TAIL`].
+    pub await_tail: Duration,
+    /// The waits of an issuer's push ladder ([`DocsSync::push_to_members`]). Default
+    /// [`PUSH_RETRY`]; other values are for tests.
+    pub push_retry: [Duration; 4],
 }
 
 impl Default for SyncConfig {
@@ -109,6 +122,8 @@ impl Default for SyncConfig {
         Self {
             policy_jitter_max: POLICY_JITTER_MAX,
             cert_push_retry: PUSH_RETRY,
+            await_tail: AWAIT_TAIL,
+            push_retry: PUSH_RETRY,
         }
     }
 }
@@ -449,12 +464,37 @@ where
     }
 }
 
+/// Whether a member of the awaiting set that was just tried with `step` stays in it: not when
+/// it refused the documents, not once the Policy it holds (`peer_policy_seq`, from the push
+/// result, when one was read) reaches the one held here, not at its `deadline` (unix seconds).
+/// Everything else (no answer, nothing to push, a push that did not show the member's seq)
+/// stays: the next tail tries again.
+pub(crate) fn awaiting_keep(
+    step: PushStep,
+    peer_policy_seq: Option<u64>,
+    held_policy_seq: Option<u64>,
+    now: u64,
+    deadline: u64,
+) -> bool {
+    if step == PushStep::Rejected || now >= deadline {
+        return false;
+    }
+    !confirmed(peer_policy_seq, held_policy_seq)
+}
+
+/// Whether a member that reports `peer` holds at least the Policy `held` here.
+fn confirmed(peer: Option<u64>, held: Option<u64>) -> bool {
+    matches!((peer, held), (Some(p), Some(h)) if p >= h)
+}
+
 /// Whether a failed session attempt is worth another try later.
 pub(crate) fn step_for_ensure_error(error: EnsureError) -> PushStep {
     match error {
-        // The docs only session the dial produced pushes by itself ([`DocsSync::docs_only_push`]).
-        EnsureError::DocsOnly => PushStep::Done,
-        EnsureError::Timeout
+        // The docs only session the dial produced pushes by itself ([`DocsSync::docs_only_push`]),
+        // but only its end says whether the push worked: `IssuerPush` waits for that and calls
+        // this only for what it cannot tell. Nothing is done until the push is.
+        EnsureError::DocsOnly
+        | EnsureError::Timeout
         | EnsureError::NotAttached
         | EnsureError::Detached
         | EnsureError::SessionEnded
@@ -556,6 +596,13 @@ enum Verdict {
     Wait { handshaking: bool },
 }
 
+/// The member of `set` with the oldest deadline.
+fn oldest_awaited(set: &HashMap<NodeId, u64>) -> Option<(NodeId, u64)> {
+    set.iter()
+        .map(|(n, d)| (*n, *d))
+        .min_by_key(|(_, deadline)| *deadline)
+}
+
 /// The sync tasks of one node: shared by its sessions (see the module docs).
 pub struct DocsSync {
     router: RouterHandle,
@@ -588,6 +635,9 @@ pub struct DocsSync {
     /// says that another push was asked for while this one ran (round C, E1): the running push
     /// then looks again before it ends.
     cert_pushing: Mutex<HashMap<u64, bool>>,
+    /// Invite admitted members that were not seen holding the current Policy
+    /// (network, node, deadline in unix seconds).
+    awaiting: Mutex<HashMap<NetworkId, HashMap<NodeId, u64>>>,
 }
 
 /// Takes a session out of [`DocsSync::cert_pushing`] when its push ends, however it ends (also
@@ -654,7 +704,116 @@ impl DocsSync {
             #[cfg(test)]
             after_look: Mutex::default(),
             cert_pushing: Mutex::default(),
+            awaiting: Mutex::default(),
         })
+    }
+
+    /// For an issuer: notes that `node`, admitted by invite, does not hold the Policy of
+    /// `network_id` yet, until `deadline` (unix seconds). [`Self::run_awaiting`] tries it every
+    /// [`SyncConfig::await_tail`]; a push result that shows it holds the Policy ends the wait.
+    /// Bounded by [`AWAIT_CAP_PER_NETWORK`] and [`AWAIT_CAP_TOTAL`]: past either the entry with
+    /// the oldest deadline (the new one included) is dropped, and logged. Noting a member that
+    /// is held already only sets its deadline.
+    pub fn await_policy(&self, network_id: NetworkId, node: NodeId, deadline: u64) {
+        let mut awaiting = self.awaiting.lock().unwrap_or_else(|e| e.into_inner());
+        let set = awaiting.entry(network_id).or_default();
+        set.insert(node, deadline);
+        if set.len() > AWAIT_CAP_PER_NETWORK
+            && let Some(oldest) = oldest_awaited(set)
+        {
+            set.remove(&oldest.0);
+            tracing::warn!(member = %oldest.0, "the awaiting set of a network is full: dropped the oldest deadline");
+        }
+        let total: usize = awaiting.values().map(HashMap::len).sum();
+        if total > AWAIT_CAP_TOTAL {
+            let oldest = awaiting
+                .iter()
+                .filter_map(|(net, set)| oldest_awaited(set).map(|(n, d)| (*net, n, d)))
+                .min_by_key(|(_, _, d)| *d);
+            if let Some((net, member, _)) = oldest
+                && let Some(set) = awaiting.get_mut(&net)
+            {
+                set.remove(&member);
+                tracing::warn!(%member, "the awaiting sets are full: dropped the oldest deadline");
+            }
+        }
+        awaiting.retain(|_, set| !set.is_empty());
+    }
+
+    /// The members awaited in `network_id`, with their deadlines.
+    pub(crate) fn awaiting_members(&self, network_id: NetworkId) -> Vec<(NodeId, u64)> {
+        let awaiting = self.awaiting.lock().unwrap_or_else(|e| e.into_inner());
+        awaiting
+            .get(&network_id)
+            .map(|set| set.iter().map(|(n, d)| (*n, *d)).collect())
+            .unwrap_or_default()
+    }
+
+    fn stop_awaiting(&self, network_id: NetworkId, node: &NodeId) {
+        let mut awaiting = self.awaiting.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(set) = awaiting.get_mut(&network_id) {
+            set.remove(node);
+            if set.is_empty() {
+                awaiting.remove(&network_id);
+            }
+        }
+    }
+
+    /// The tail of one network: after each wait of [`SyncConfig::await_tail`] plus up to a sixth
+    /// of it as jitter, one [`Self::awaiting_round`]. Runs until the task is dropped.
+    pub(crate) async fn run_awaiting(self: Arc<Self>, network_id: NetworkId) {
+        loop {
+            let tail = self.config.await_tail;
+            tokio::time::sleep(tail + scale(tail / 6, fastrand::u64(..))).await;
+            self.awaiting_round(network_id).await;
+        }
+    }
+
+    /// One try at every member of the awaiting set of `network_id`, [`PUSH_AT_ONCE`] at a time:
+    /// one that is past its deadline or is no longer an unrevoked member of the held Roster
+    /// leaves without a dial; the rest are pushed to ([`IssuerPush`]) and leave when
+    /// [`awaiting_keep`] says so (a confirmed one has left already, in `push_over`).
+    pub(crate) async fn awaiting_round(self: &Arc<Self>, network_id: NetworkId) {
+        let now = unix_now();
+        let mut due = Vec::new();
+        for (member, deadline) in self.awaiting_members(network_id) {
+            if now >= deadline
+                || member == self.local
+                || !is_unrevoked_roster_member(&self.rosters, &network_id, &member)
+            {
+                self.stop_awaiting(network_id, &member);
+            } else {
+                due.push((member, deadline));
+            }
+        }
+        let pusher = IssuerPush {
+            sync: Arc::clone(self),
+            network_id,
+            seq: self.rosters.seq(&network_id),
+        };
+        let slots = Semaphore::new(PUSH_AT_ONCE);
+        join_all(due.into_iter().map(|(member, deadline)| {
+            let (pusher, slots) = (&pusher, &slots);
+            async move {
+                let (step, peer_seq) = {
+                    let _slot = slots
+                        .acquire()
+                        .await
+                        .expect("the semaphore is never closed");
+                    pusher.push_seen(member).await
+                };
+                if !awaiting_keep(
+                    step,
+                    peer_seq,
+                    self.policies.seq(&network_id),
+                    unix_now(),
+                    deadline,
+                ) {
+                    self.stop_awaiting(network_id, &member);
+                }
+            }
+        }))
+        .await;
     }
 
     /// The `node_cert` candidates this node judged and kept (cert rotation S5).
@@ -832,6 +991,11 @@ impl DocsSync {
                     result.roster_seq,
                     result.policy_seq,
                 );
+                // Every push (ladder, tail, docs only) that shows the member holds the Policy
+                // ends its wait. Not in `note_peer_seqs`: that one also takes a handshake claim.
+                if confirmed(result.policy_seq, self.policies.seq(&network_id)) {
+                    self.stop_awaiting(network_id, &handle.peer());
+                }
                 Ok(Some(result))
             }
             Err(error) => {
@@ -1377,7 +1541,7 @@ impl DocsSync {
             network_id,
             seq: self.rosters.seq(&network_id),
         };
-        push_to_members(&pusher, &members, PUSH_AT_ONCE, &PUSH_RETRY).await
+        push_to_members(&pusher, &members, PUSH_AT_ONCE, &self.config.push_retry).await
     }
 }
 
@@ -1418,8 +1582,11 @@ struct IssuerPush {
     seq: Option<u64>,
 }
 
-impl MemberPusher for IssuerPush {
-    async fn push(&self, member: NodeId) -> PushStep {
+impl IssuerPush {
+    /// One push to `member`, and the Policy `seq` the member's `result` showed (none when the
+    /// dial or the exchange did not get that far).
+    async fn push_seen(&self, member: NodeId) -> (PushStep, Option<u64>) {
+        let started = Instant::now();
         let handle = match self
             .sync
             .router
@@ -1427,7 +1594,24 @@ impl MemberPusher for IssuerPush {
             .await
         {
             Ok(handle) => handle,
-            Err(error) => return step_for_ensure_error(error),
+            // The dial made a docs only session that pushes by itself. Done only when that push
+            // was adopted and the fresh session came up; a push that broke is a failed try (its
+            // `push_over` has confirmed the member already when it got a result).
+            Err(EnsureError::DocsOnly) => {
+                let adopted = self
+                    .sync
+                    .wait_docs_only_push(member, self.network_id, started)
+                    .await;
+                return (
+                    if adopted {
+                        PushStep::Done
+                    } else {
+                        step_for_ensure_error(EnsureError::DocsOnly)
+                    },
+                    None,
+                );
+            }
+            Err(error) => return (step_for_ensure_error(error), None),
         };
         match self.sync.push_over(&handle, false).await {
             Ok(Some(result)) => {
@@ -1435,14 +1619,20 @@ impl MemberPusher for IssuerPush {
                 if step == PushStep::Rejected {
                     tracing::error!(%member, ?result, "a member refused the documents pushed to it");
                 }
-                step
+                (step, result.policy_seq)
             }
-            Ok(None) => PushStep::Skip,
+            Ok(None) => (PushStep::Skip, None),
             Err(error) => {
                 tracing::debug!(%member, %error, "pushing documents to a member failed");
-                PushStep::NoAnswer
+                (PushStep::NoAnswer, None)
             }
         }
+    }
+}
+
+impl MemberPusher for IssuerPush {
+    async fn push(&self, member: NodeId) -> PushStep {
+        self.push_seen(member).await.0
     }
 
     fn current(&self) -> bool {

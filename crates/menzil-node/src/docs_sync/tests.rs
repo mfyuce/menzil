@@ -490,7 +490,11 @@ async fn a_member_waiting_for_its_retry_does_not_hold_one_of_the_eight_places() 
 
 #[test]
 fn what_a_failed_session_means_for_the_issuer() {
-    assert_eq!(step_for_ensure_error(EnsureError::DocsOnly), PushStep::Done);
+    assert_eq!(
+        step_for_ensure_error(EnsureError::DocsOnly),
+        PushStep::NoAnswer,
+        "the docs only push has not run when the dial says so: nothing is done yet"
+    );
     for retry in [
         EnsureError::Timeout,
         EnsureError::NotAttached,
@@ -603,4 +607,37 @@ fn a_serial_is_unlisted_until_the_policy_lists_it_or_a_higher_one_for_that_node(
         cert_unlisted(&policy(vec![cert(&other, 5)]), &me_id, 2),
         "another node's higher serial says nothing about this node"
     );
+}
+
+// ---- the awaiting set's rule ------------------------------------------------------------
+
+#[test]
+fn a_member_that_holds_the_policy_leaves_the_awaiting_set_and_one_that_does_not_stays() {
+    let keep = |step, peer, held, now, deadline| awaiting_keep(step, peer, held, now, deadline);
+    // Equal is confirmed (the `>=`), older is not, nothing known is not.
+    assert!(!keep(PushStep::Done, Some(3), Some(3), 10, 100), "equal");
+    assert!(!keep(PushStep::Done, Some(4), Some(3), 10, 100), "newer");
+    assert!(keep(PushStep::Done, Some(2), Some(3), 10, 100), "older");
+    assert!(keep(PushStep::Done, None, Some(3), 10, 100), "unknown");
+    assert!(keep(PushStep::NoAnswer, None, Some(3), 10, 100));
+    assert!(keep(PushStep::Skip, None, Some(3), 10, 100));
+    // Nothing held here: nothing to compare with, nothing confirmed.
+    assert!(keep(PushStep::NoAnswer, Some(1), None, 10, 100));
+}
+
+#[test]
+fn a_refusal_or_the_deadline_ends_the_wait() {
+    assert!(!awaiting_keep(
+        PushStep::Rejected,
+        Some(1),
+        Some(3),
+        10,
+        100
+    ));
+    assert!(awaiting_keep(PushStep::NoAnswer, None, Some(3), 99, 100));
+    assert!(
+        !awaiting_keep(PushStep::NoAnswer, None, Some(3), 100, 100),
+        "at the deadline"
+    );
+    assert!(!awaiting_keep(PushStep::NoAnswer, None, Some(3), 101, 100));
 }

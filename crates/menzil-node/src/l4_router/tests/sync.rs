@@ -1140,3 +1140,273 @@ async fn a_push_that_ends_between_the_look_and_the_wait_wakes_the_waiter() {
         began.elapsed()
     );
 }
+
+// ---- the awaiting set: invite admitted devices that missed the issuer's push ---------------
+
+const LADDER: [Duration; 4] = [Duration::from_secs(1); 4];
+const TAIL: Duration = Duration::from_secs(60);
+
+fn sync_awaiting(node: &TestNode, party: &Party, stores: &Stores) -> Arc<DocsSync> {
+    DocsSync::new(
+        node.handle.clone(),
+        stores.rosters.clone(),
+        stores.policies.clone(),
+        party.id,
+        SyncConfig {
+            policy_jitter_max: Duration::ZERO,
+            await_tail: TAIL,
+            push_retry: LADDER,
+            ..SyncConfig::default()
+        },
+        None,
+    )
+}
+
+/// Past the tail and its jitter (a sixth) and some time for the dials.
+async fn through_a_tail() {
+    tokio::time::sleep(TAIL + TAIL / 6 + Duration::from_secs(30)).await;
+}
+
+fn awaited(sync: &DocsSync, network: NetworkId) -> Vec<NodeId> {
+    sync.awaiting_members(network)
+        .into_iter()
+        .map(|(node, _)| node)
+        .collect()
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_roster_only_device_that_attaches_after_the_ladder_gets_the_policy_from_the_tail() {
+    let w = world();
+    let (a, r) = (party(), party());
+    let (roster, policy) = w.fresh_pair(1, &[&a, &r], &[&a, &r], &[&a, &r]);
+    let (stores_a, stores_r) = (stores_from(&roster, &policy), roster_only_stores(&roster));
+    let net = Net::new();
+    let mut na = node(&net, &a, &stores_a).await;
+    let mut nr = node(&net, &r, &stores_r).await;
+    let sync_a = sync_awaiting(&na, &a, &stores_a);
+    let sync_r = sync_for(&nr, &r, &stores_r);
+    auto_serve(&mut na, &a, &stores_a, Some(&sync_a));
+    auto_serve(&mut nr, &r, &stores_r, Some(&sync_r));
+    net.set_up(&r.id, false);
+
+    sync_a.await_policy(w.network, r.id, now() + 86_400);
+    let tail = tokio::spawn(sync_a.clone().run_awaiting(w.network));
+    // The ladder, with the device away: it ends as given up.
+    let report = sync_a.push_to_members(w.network).await;
+    assert_eq!(report.gave_up, 1, "{report:?}");
+    assert_eq!(held(&stores_r, w.network), (Some(1), None));
+    assert_eq!(awaited(&sync_a, w.network), vec![r.id], "still awaited");
+
+    // The device starts, long after the ladder.
+    net.set_up(&r.id, true);
+    let inits = net.count_from(&a.id, "init");
+    through_a_tail().await;
+    assert_eq!(
+        held(&stores_r, w.network),
+        (Some(1), Some(1)),
+        "the tail pushed"
+    );
+    assert_eq!(
+        net.count_from(&a.id, "init"),
+        inits + 2,
+        "the docs only handshake and the one after the push"
+    );
+    assert!(
+        awaited(&sync_a, w.network).is_empty(),
+        "confirmed: out of the set"
+    );
+    tail.abort();
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_confirmed_member_leaves_the_set_and_is_not_tried_again() {
+    let w = world();
+    let (a, b) = (party(), party());
+    let (roster, policy) = w.fresh_pair(1, &[&a, &b], &[&a, &b], &[&a, &b]);
+    let (stores_a, stores_b) = (stores_from(&roster, &policy), stores_from(&roster, &policy));
+    let net = Net::new();
+    let mut na = node(&net, &a, &stores_a).await;
+    let mut nb = node(&net, &b, &stores_b).await;
+    let sync_a = sync_awaiting(&na, &a, &stores_a);
+    auto_serve(&mut na, &a, &stores_a, Some(&sync_a));
+    auto_serve(&mut nb, &b, &stores_b, None);
+    sync_a.await_policy(w.network, b.id, now() + 86_400);
+    let tail = tokio::spawn(sync_a.clone().run_awaiting(w.network));
+    through_a_tail().await;
+    assert!(
+        awaited(&sync_a, w.network).is_empty(),
+        "it holds the Policy"
+    );
+    let inits = net.count_from(&a.id, "init");
+    assert_eq!(inits, 1);
+    // A new session to B would show as a new init; none is made by the next tails.
+    net.set_up(&b.id, false);
+    through_a_tail().await;
+    through_a_tail().await;
+    assert_eq!(net.count_from(&a.id, "init"), inits);
+    tail.abort();
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_member_revoked_by_a_newer_roster_is_dropped_and_not_dialed() {
+    let w = world();
+    let (a, r) = (party(), party());
+    let (r1, p1) = w.fresh_pair(1, &[&a, &r], &[&a, &r], &[&a, &r]);
+    let (stores_a, stores_r) = (stores_from(&r1, &p1), roster_only_stores(&r1));
+    let net = Net::new();
+    let mut na = node(&net, &a, &stores_a).await;
+    let mut nr = node(&net, &r, &stores_r).await;
+    let sync_a = sync_awaiting(&na, &a, &stores_a);
+    auto_serve(&mut na, &a, &stores_a, Some(&sync_a));
+    auto_serve(&mut nr, &r, &stores_r, None);
+    sync_a.await_policy(w.network, r.id, now() + 86_400);
+    let tail = tokio::spawn(sync_a.clone().run_awaiting(w.network));
+    // A newer Roster revokes R before the first tail.
+    let mut body = r1.decode().unwrap();
+    body.seq = 2;
+    body.revoked = vec![menzil_proto::RevokedMember {
+        node_id: r.id,
+        since: now(),
+    }];
+    body.members.retain(|m| m.node_id != r.id);
+    stores_a
+        .rosters
+        .set(&Roster::sign(&w.owner, &body).unwrap())
+        .unwrap();
+    through_a_tail().await;
+    assert!(awaited(&sync_a, w.network).is_empty());
+    assert_eq!(
+        net.count_from(&a.id, "init"),
+        0,
+        "a revoked member costs no dial"
+    );
+    assert_eq!(held(&stores_r, w.network), (Some(1), None));
+    tail.abort();
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_member_past_its_deadline_is_dropped_and_not_dialed() {
+    let w = world();
+    let (a, r) = (party(), party());
+    let (roster, policy) = w.fresh_pair(1, &[&a, &r], &[&a, &r], &[&a, &r]);
+    let (stores_a, stores_r) = (stores_from(&roster, &policy), roster_only_stores(&roster));
+    let net = Net::new();
+    let mut na = node(&net, &a, &stores_a).await;
+    let mut nr = node(&net, &r, &stores_r).await;
+    let sync_a = sync_awaiting(&na, &a, &stores_a);
+    auto_serve(&mut na, &a, &stores_a, Some(&sync_a));
+    let sync_r = sync_for(&nr, &r, &stores_r);
+    auto_serve(&mut nr, &r, &stores_r, Some(&sync_r));
+    sync_a.await_policy(w.network, r.id, now() - 1);
+    let tail = tokio::spawn(sync_a.clone().run_awaiting(w.network));
+    through_a_tail().await;
+    assert!(awaited(&sync_a, w.network).is_empty());
+    assert_eq!(net.count_from(&a.id, "init"), 0);
+    assert_eq!(held(&stores_r, w.network), (Some(1), None));
+    tail.abort();
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_awaiting_set_is_capped_per_network_and_in_all_and_drops_the_oldest_deadline() {
+    let w = world();
+    let (a, r) = (party(), party());
+    let (roster, policy) = w.fresh_pair(1, &[&a, &r], &[&a, &r], &[&a, &r]);
+    let stores_a = stores_from(&roster, &policy);
+    let net = Net::new();
+    let na = node(&net, &a, &stores_a).await;
+    let sync_a = sync_awaiting(&na, &a, &stores_a);
+    let far = now() + 1_000_000;
+    let id = |n: u32| {
+        let mut b = [0u8; 32];
+        b[..4].copy_from_slice(&n.to_be_bytes());
+        NodeId::from(b)
+    };
+    // 256 fit; the 257th, with a later deadline than the oldest, pushes the oldest out.
+    for n in 0..256u32 {
+        sync_a.await_policy(w.network, id(n), far + u64::from(n));
+    }
+    assert_eq!(sync_a.awaiting_members(w.network).len(), 256);
+    sync_a.await_policy(w.network, id(1000), far + 5_000);
+    let kept = awaited(&sync_a, w.network);
+    assert_eq!(kept.len(), 256);
+    assert!(!kept.contains(&id(0)), "the oldest deadline went");
+    assert!(kept.contains(&id(1)) && kept.contains(&id(1000)));
+    // A deadline older than all of them does not displace anyone... it is the oldest itself.
+    sync_a.await_policy(w.network, id(2000), far - 5);
+    let kept = awaited(&sync_a, w.network);
+    assert_eq!(kept.len(), 256);
+    assert!(
+        !kept.contains(&id(2000)),
+        "the new oldest is the one dropped"
+    );
+    // Re-noting a member that is held only moves its deadline.
+    sync_a.await_policy(w.network, id(1), far + 9_000);
+    assert_eq!(sync_a.awaiting_members(w.network).len(), 256);
+    // The total over networks: 1024.
+    for k in 1..=3u8 {
+        let other = NetworkId::from([k; 32]);
+        for n in 0..256u32 {
+            sync_a.await_policy(other, id(n), far + 10_000 + u64::from(n));
+        }
+    }
+    let total = |s: &DocsSync| {
+        (0..=3u8)
+            .map(|k| {
+                let n = if k == 0 {
+                    w.network
+                } else {
+                    NetworkId::from([k; 32])
+                };
+                s.awaiting_members(n).len()
+            })
+            .sum::<usize>()
+    };
+    assert_eq!(total(&sync_a), 1024);
+    sync_a.await_policy(NetworkId::from([9; 32]), id(5), far + 100_000);
+    assert_eq!(
+        total(&sync_a),
+        1023,
+        "one in elsewhere, the oldest overall out"
+    );
+    assert!(
+        sync_a.awaiting_members(NetworkId::from([9; 32])).len() == 1,
+        "the new one is kept: it is not the oldest"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_docs_only_dial_whose_push_breaks_does_not_end_the_ladder_nor_the_wait() {
+    let w = world();
+    let (a, r) = (party(), party());
+    let (roster, policy) = w.fresh_pair(1, &[&a, &r], &[&a, &r], &[&a, &r]);
+    let (stores_a, stores_r) = (stores_from(&roster, &policy), roster_only_stores(&roster));
+    let net = Net::new();
+    let mut na = node(&net, &a, &stores_a).await;
+    let mut nr = node(&net, &r, &stores_r).await;
+    let sync_a = sync_awaiting(&na, &a, &stores_a);
+    auto_serve(&mut na, &a, &stores_a, Some(&sync_a));
+    // R answers the handshake (docs only) but nothing serves its docs stream: the push breaks.
+    let _unserved = &mut nr;
+    sync_a.await_policy(w.network, r.id, now() + 86_400);
+    let report = sync_a.push_to_members(w.network).await;
+    assert_eq!(
+        report,
+        crate::PushReport {
+            done: 0,
+            rejected: 0,
+            gave_up: 1
+        },
+        "a broken docs only push is not done"
+    );
+    assert!(
+        net.count_from(&a.id, "init") >= 2,
+        "the ladder went on: {}",
+        net.count_from(&a.id, "init")
+    );
+    assert_eq!(
+        awaited(&sync_a, w.network),
+        vec![r.id],
+        "and the wait stays"
+    );
+    assert_eq!(held(&stores_r, w.network), (Some(1), None));
+}
