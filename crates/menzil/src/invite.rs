@@ -1,6 +1,6 @@
 //! `menzil invite create | list | revoke`, the invite book and the issuer's side of the
 //! ADMIT_PENDING handler (protocol.md 7.2, design note `relay-key-and-invites-design.md` B3,
-//! slice D3 B3). The device side (`menzil join <invite>`) is not built yet (slice B4).
+//! slice D3 B3). The device side (`menzil join <invite>`) is in [`crate::join`] (slice B4).
 //!
 //! # The invite book
 //!

@@ -7,6 +7,8 @@
 //!   token (TOBEDECIDED 14: phase 1 has no invites, admission is by hand).
 //! * [`local`]: the operations on those files: `init`, `network create`, `admit`, `grant`,
 //!   `join`, `renew`, `cert` and `status`. Every one takes the clock as a parameter.
+//! * [`join`]: `menzil join <invite>`, the device side of invite redemption: the request through a
+//!   relay, the judging of the Roster that answers, and the Roster only state a node starts from.
 //! * [`expose`]: `menzil expose`, a local port under a public name: the edit of `config.toml`,
 //!   how a running node picks it up, and the text printed about it.
 //! * [`proxy`]: `menzil proxy`, a local SOCKS5 proxy (CONNECT only, loopback only) whose connections
@@ -24,6 +26,7 @@ pub mod config;
 pub mod expose;
 pub mod home;
 pub mod invite;
+pub mod join;
 pub mod local;
 pub mod node_cmd;
 pub mod persist;

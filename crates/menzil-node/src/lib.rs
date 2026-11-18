@@ -121,7 +121,7 @@ pub use node::{Node, NodeConfig, NodeOpenError, RefuseAll, StartError};
 pub use outbound::{
     EnqueueOutcome, Epoch, OutboundQueue, OutboundSend, SendBudget, SendBudgets, SendPermit,
 };
-pub use policy_store::PolicyStore;
+pub use policy_store::{PolicyStore, roster_standing};
 pub use relay_notes::{ATTACH_SETTLED, RelayError, RelayNotes, listed_in_own_roster};
 pub use relay_serve::{
     MAX_RELAY_STREAMS, MAX_RELAY_STREAMS_PER_SHARE, RelayAuthorizer, RelayHandler, RelayLimits,

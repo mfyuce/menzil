@@ -513,13 +513,42 @@ pub async fn bind_in_prepared_directory(path: &Path, kind: &SocketKind) -> Resul
 pub fn load_stores(home: &Home) -> Result<(Arc<PolicyStore>, Arc<RosterStore>, Vec<NetworkId>)> {
     let policies = Arc::new(PolicyStore::new());
     let rosters = Arc::new(RosterStore::new());
-    let networks = home.networks()?;
-    if networks.is_empty() {
+    let mut networks = home.networks()?;
+    // A device admitted by an invite holds the Roster alone until the issuer's push brings the
+    // Policy (`menzil join <invite>`); the node claims the network on that Roster and answers
+    // docs only to its members (protocol.md 5.1). A Roster only file that is not good is ignored
+    // with a warning and never grants anything.
+    let now = unix_now();
+    let roster_only = match load_identity(home) {
+        Ok((keys, cert)) => cert
+            .decode()
+            .map(|body| crate::join::load_roster_only(home, &keys.node_id(), body.serial, now))
+            .unwrap_or_else(|_| Ok(vec![]))?,
+        Err(_) => vec![],
+    };
+    if networks.is_empty() && roster_only.is_empty() {
         bail!(
             "this device is in no network: `menzil network create` or `menzil join <token>` first"
         );
     }
+    for (network_id, state) in roster_only {
+        let bundle = menzil_proto::trust::Bundle {
+            roster: Some(state.roster),
+            base_roster: state.base_roster,
+            ..Default::default()
+        };
+        match DocStore::new(&rosters, &policies).adopt(&bundle, now) {
+            Ok(_) => networks.push(network_id),
+            Err(error) => {
+                tracing::warn!(network = %network_id, %error, "the Roster only file was not adopted");
+            }
+        }
+    }
     for network_id in &networks {
+        // A Roster only network has no documents on disk (it was just adopted above).
+        if !home.documents_path(network_id).is_file() {
+            continue;
+        }
         let docs = load_documents(home, network_id)?;
         match adopt_documents(&rosters, &policies, &docs) {
             Ok(_) => {}

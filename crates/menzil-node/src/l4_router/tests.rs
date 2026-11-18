@@ -4510,3 +4510,138 @@ async fn a_reader_that_keeps_pace_is_not_evicted_and_the_counters_return_to_zero
         "never ended"
     );
 }
+
+/// Stores holding a Roster and no Policy: what a node admitted by an invite holds until the
+/// issuer's push brings the Policy (protocol.md 5.1, 7.2).
+fn roster_only_stores(roster: &Roster) -> Stores {
+    let rosters = RosterStore::new();
+    rosters.set(roster).unwrap();
+    Stores {
+        policies: Arc::new(PolicyStore::new()),
+        rosters: Arc::new(rosters),
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_node_with_a_roster_and_no_policy_answers_only_its_members_and_only_docs_only() {
+    let w = world();
+    let (r, member, revoked, stranger) = (party(), party(), party(), party());
+    let roster = w.roster_edit(&[&r, &member, &revoked], |body| {
+        body.revoked = vec![menzil_proto::RevokedMember {
+            node_id: revoked.id,
+            since: 0,
+        }];
+    });
+    let stores = roster_only_stores(&roster);
+    let net = Net::new();
+    let mut d = driven(&r, &stores, NodeId::from([0xAA; 32]), 7);
+    d.engine.on_attached(Epoch::first(), LIMITS, relay_static());
+    let send_init = |d: &mut Driven, from: &Party| {
+        let manual = Manual::new(&net, from.clone_for_test());
+        let (_hs, init) = manual.init(&r, w.network, 1);
+        let record = Record::Recv {
+            src: from.id,
+            e2e_proto: E2E_PROTO_TAG,
+            flags: 0,
+            payload: init.encode(),
+        };
+        assert!(
+            d.engine
+                .on_record(Epoch::first(), record, Now::capture())
+                .is_none()
+        );
+    };
+    send_init(&mut d, &stranger);
+    send_init(&mut d, &revoked);
+    assert_eq!(d.engine.handshakes_started, 0, "no work, no answer");
+    assert!(d.outbound.try_recv().is_err());
+
+    // The control: an unrevoked member is answered, docs only.
+    send_init(&mut d, &member);
+    assert_eq!(d.engine.handshakes_started, 1);
+    assert!(d.outbound.try_recv().is_ok());
+    assert_eq!(
+        d.engine.docs_only.len(),
+        1,
+        "a docs only session, not a full one"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_node_with_a_roster_and_no_policy_that_is_revoked_itself_answers_nobody() {
+    let w = world();
+    let (r, member) = (party(), party());
+    let roster = w.roster_edit(&[&r, &member], |body| {
+        body.revoked = vec![menzil_proto::RevokedMember {
+            node_id: r.id,
+            since: 0,
+        }];
+    });
+    let stores = roster_only_stores(&roster);
+    let net = Net::new();
+    let mut d = driven(&r, &stores, NodeId::from([0xAA; 32]), 7);
+    d.engine.on_attached(Epoch::first(), LIMITS, relay_static());
+    let manual = Manual::new(&net, member.clone_for_test());
+    let (_hs, init) = manual.init(&r, w.network, 1);
+    let record = Record::Recv {
+        src: member.id,
+        e2e_proto: E2E_PROTO_TAG,
+        flags: 0,
+        payload: init.encode(),
+    };
+    assert!(
+        d.engine
+            .on_record(Epoch::first(), record, Now::capture())
+            .is_none()
+    );
+    assert!(d.outbound.try_recv().is_err(), "a revoked node is silent");
+    assert!(d.engine.docs_only.is_empty());
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_roster_only_node_takes_one_push_of_the_policy_and_is_then_a_full_member() {
+    let w = world();
+    let (r, m) = (party(), party());
+    let (roster, policy) = w.fresh_pair(1, &[&r, &m], &[&r, &m], &[&r, &m]);
+    let stores_r = roster_only_stores(&roster);
+    let stores_m = stores_from(&roster, &policy);
+    let net = Net::new();
+    let mut nr = node(&net, &r, &stores_r).await;
+    let mut nm = node(&net, &m, &stores_m).await;
+    let gate = crate::docs_access::DocsGate::new(Default::default());
+    assert_eq!(stores_r.policies.seq(&w.network), None);
+
+    assert_eq!(
+        ensure(&nm, r.id, w.network).await.err(),
+        Some(EnsureError::DocsOnly)
+    );
+    let at_m = nm.next_ready().await;
+    let at_r = nr.next_ready().await;
+    assert!(at_m.docs_only && at_r.docs_only);
+    let handle = at_m.handle.clone();
+    serve(at_r, &stores_r, r.id, &gate);
+
+    // Anything but the push is refused on this session.
+    match crate::l5_stream::open(&handle, "tcp:ssh".parse().unwrap(), None).await {
+        Err(crate::l5_stream::OpenStreamError::Refused { code, .. }) => {
+            assert_eq!(code, ErrorCode::NoGrant);
+        }
+        other => panic!("expected no_grant, got {:?}", other.map(|_| ())),
+    }
+    let source = crate::docs::StoreDocs::new(&stores_m.rosters, &stores_m.policies, w.network);
+    let bundle = crate::docs::bundle_to_push(&source, docs_params(w.network).now);
+    let mut docs = crate::l5_stream::open(&handle, crate::docs_service(), None)
+        .await
+        .expect("a Roster member may push on a docs only session");
+    let result = crate::docs::push(&mut docs, &bundle, &docs_params(w.network))
+        .await
+        .unwrap();
+    assert_eq!(result.policy, menzil_proto::docs::Outcome::Adopted);
+    assert_eq!(stores_r.policies.seq(&w.network), Some(1));
+    assert_eq!(stores_r.rosters.seq(&w.network), Some(1));
+    docs.close().await.unwrap();
+
+    // The node is whole now: the next session is an ordinary one.
+    assert!(ensure(&nm, r.id, w.network).await.is_ok());
+    assert!(!nr.next_ready().await.docs_only);
+}

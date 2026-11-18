@@ -485,6 +485,31 @@ impl Session {
         Ok(session)
     }
 
+    /// One redeem session (protocol.md 4.1, 7.2): dial and handshake exactly as [`Self::connect`]
+    /// does, with a HELLO that claims no network, and stop there: no ATTACH is sent, so the
+    /// session is not routable. The caller sends ADMIT_REQUEST as the first transport record
+    /// ([`Self::send`]) and reads ADMIT_RESULT ([`Self::recv`]). The relay's certificate is judged
+    /// and remembered like any other (`config.known_relays`); `config.networks` is not used.
+    pub async fn connect_redeem(
+        config: &SessionConfig,
+        env: &HashMap<String, String>,
+    ) -> Result<Self, NodeError> {
+        let roster_store = Arc::new(RosterStore::new());
+        let mut carrier = Carrier::dial(&config.dial, env).await?;
+        let (transport, welcome, relay_static, hello_timestamp) =
+            run_handshake(&mut carrier, config, &[], &roster_store).await?;
+        let own_node_id = config.identity.get().node_cert.decode()?.node_id;
+        Ok(Self {
+            carrier,
+            engine: Engine::new(transport, Instant::now(), roster_store, Vec::new()),
+            welcome,
+            relay_static,
+            hello_timestamp,
+            own_node_id,
+            tick: tokio::time::interval(TICK),
+        })
+    }
+
     /// Sends the relay every Roster this node holds that it is not known to hold (protocol.md
     /// 4.3), the base first for a steward signed one. Run at attach, and again whenever the
     /// store takes a newer Roster while attached (protocol.md 5.5: a node that adopts a

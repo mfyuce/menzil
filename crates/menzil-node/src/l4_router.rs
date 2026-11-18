@@ -1310,13 +1310,14 @@ impl Engine {
         // The cheap part of the checks before the expensive one: a network
         // we hold no documents for cannot admit anyone, and finding that out
         // after the Diffie Hellmans would hand a stranger that work for free.
-        let (Some(roster_seq), Some(policy_seq)) = (
-            self.rosters.seq(&network_id),
-            self.policies.seq(&network_id),
-        ) else {
+        // A Roster alone is enough to answer (a node admitted by an invite waits for its Policy,
+        // protocol.md 5.1): the admission decision below refuses all but its Roster members, and
+        // those only docs only. `policy_seq` is 0 while there is no Policy.
+        let Some(roster_seq) = self.rosters.seq(&network_id) else {
             tracing::debug!(%src, "ignored an L4 init for a network we hold no documents for");
             return;
         };
+        let policy_seq = self.policies.seq(&network_id).unwrap_or(0);
         // Before any Diffie Hellman (protocol.md 5.1): the RECV `src` must be an
         // unrevoked member in the Roster we hold, expired or not. A stranger and a
         // revoked member alike get silence and cost nothing but their entry in the
@@ -1700,12 +1701,10 @@ impl Engine {
         hs: E2eResponderHandshake,
         now: Now,
     ) {
-        let (Some(roster_seq), Some(policy_seq)) = (
-            self.rosters.seq(&network_id),
-            self.policies.seq(&network_id),
-        ) else {
+        let Some(roster_seq) = self.rosters.seq(&network_id) else {
             return;
         };
+        let policy_seq = self.policies.seq(&network_id).unwrap_or(0);
         let peer_static = *hs.initiator_static();
         let others = self
             .docs_only

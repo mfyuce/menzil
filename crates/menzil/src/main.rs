@@ -141,11 +141,19 @@ enum Command {
         #[command(subcommand)]
         command: InviteCommand,
     },
-    /// Install the documents in a membership token an owner gave this device.
+    /// Install the documents in a membership token an owner gave this device, or redeem an invite
+    /// (`menzil1-invite:...`) to be admitted to a network.
     Join {
-        /// The token (`menzil1-docs:...`); `-` reads it from standard input, which keeps it out
-        /// of `ps` output and shell history.
+        /// The token (`menzil1-docs:...` or `menzil1-invite:...`); `-` reads it from standard
+        /// input, which keeps it out of `ps` output and shell history.
         token: String,
+        /// For an invite: the name this device takes in the network (default: the host name; an
+        /// invite may fix it).
+        #[arg(long, value_name = "NAME")]
+        name: Option<String>,
+        /// For an invite: how long to wait for the issuer's answer (for example `10m`, `90s`).
+        #[arg(long, value_name = "TIME", default_value = "10m")]
+        wait: String,
     },
     /// Print the membership token for the documents this device holds.
     Token {
@@ -627,6 +635,38 @@ fn print_new_label_documents(token: &str) {
     println!("{token}");
 }
 
+/// `menzil join <invite>`: redeems the invite through the relay in the token and tells what to do
+/// next.
+async fn join_invite(home: &Home, token: &str, name: Option<String>, wait: &str) -> Result<()> {
+    use menzil_cli::join::{JoinOptions, RelayConfig};
+    let wait = std::time::Duration::from_secs(
+        menzil_cli::invite::parse_life(wait).map_err(|e| anyhow::anyhow!("--wait: {e}"))?,
+    );
+    let options = JoinOptions {
+        name,
+        wait,
+        ..JoinOptions::default()
+    };
+    let joined =
+        menzil_cli::join::redeem(home, token, &options, &mut |line| eprintln!("{line}")).await?;
+    println!(
+        "admitted to network {} as `{}` (Roster #{})",
+        joined.network_id, joined.name, joined.roster_seq
+    );
+    match joined.relay_config {
+        RelayConfig::Written => println!("wrote `relay` into config.toml"),
+        RelayConfig::Already => {}
+        RelayConfig::Differs { configured } => println!(
+            "config.toml names another relay ({configured}); to use the invite's, set:\nrelay = \"{}\"",
+            joined.relay
+        ),
+    }
+    println!(
+        "next: start `menzil node`; the network's issuer sends it the Policy, and `menzil status` shows \"admitted, waiting for the Policy\" until then"
+    );
+    Ok(())
+}
+
 fn now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -964,22 +1004,31 @@ async fn run(cli: Cli) -> Result<()> {
                 println!("{}", issued.token);
             }
         },
-        Command::Join { token } => match local::join(&home()?, &token_argument(token)?, now())? {
-            Joined::New { network_id, seq } => {
-                println!("joined network {network_id} (documents #{seq})")
+        Command::Join { token, name, wait } => {
+            let token = token_argument(token)?;
+            if token
+                .trim_start()
+                .starts_with(menzil_cli::token::INVITE_PREFIX)
+            {
+                return join_invite(&home()?, &token, name, &wait).await;
             }
-            Joined::Updated {
-                network_id,
-                from_seq,
-                seq,
-            } => println!("updated network {network_id}: documents #{from_seq} -> #{seq}"),
-            Joined::AlreadyCurrent {
-                network_id,
-                held_seq,
-            } => println!(
-                "nothing to do: this device holds documents #{held_seq} of network {network_id} already"
-            ),
-        },
+            match local::join(&home()?, &token, now())? {
+                Joined::New { network_id, seq } => {
+                    println!("joined network {network_id} (documents #{seq})")
+                }
+                Joined::Updated {
+                    network_id,
+                    from_seq,
+                    seq,
+                } => println!("updated network {network_id}: documents #{from_seq} -> #{seq}"),
+                Joined::AlreadyCurrent {
+                    network_id,
+                    held_seq,
+                } => println!(
+                    "nothing to do: this device holds documents #{held_seq} of network {network_id} already"
+                ),
+            }
+        }
         Command::Token { network, for_relay } => {
             let home = home()?;
             println!(

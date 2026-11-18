@@ -189,6 +189,35 @@ impl Home {
             .join(format!("{}.key", network_id.to_hex()))
     }
 
+    /// `<home>/networks/<id>/roster-only.bin`: the Roster a device was admitted with by an
+    /// invite, before the Policy reached it (`menzil join <invite>`, protocol.md 5.1, 7.2).
+    pub fn roster_only_path(&self, network_id: &NetworkId) -> PathBuf {
+        self.network_dir(network_id).join("roster-only.bin")
+    }
+
+    /// The networks that have a Roster only file and no documents yet, in id order (a leftover
+    /// beside `documents.bin` is not one: the documents win).
+    pub fn roster_only_networks(&self) -> Result<Vec<NetworkId>> {
+        let dir = self.root.join("networks");
+        let entries = match fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(vec![]),
+            Err(e) => return Err(e).with_context(|| format!("reading {}", dir.display())),
+        };
+        let mut ids = Vec::new();
+        for entry in entries {
+            let entry = entry?;
+            if let Some(id) = entry.file_name().to_str().and_then(parse_hex32) {
+                let id = NetworkId::from(id);
+                if self.roster_only_path(&id).is_file() && !self.documents_path(&id).is_file() {
+                    ids.push(id);
+                }
+            }
+        }
+        ids.sort_by_key(|id| id.to_hex());
+        Ok(ids)
+    }
+
     /// The networks this node holds documents for, in id order.
     pub fn networks(&self) -> Result<Vec<NetworkId>> {
         let dir = self.root.join("networks");

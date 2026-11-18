@@ -572,10 +572,21 @@ pub fn decide_responder_admission(
     responder_cert_serial: u32,
     now: u64,
 ) -> HandshakeAdmission {
-    let (Some(roster), Some(policy)) = (rosters.body(network_id), policies.body(network_id)) else {
+    let Some(roster) = rosters.body(network_id) else {
         return HandshakeAdmission::Refuse {
             reason: ErrorCode::UnknownNetwork,
         };
+    };
+    let Some(policy) = policies.body(network_id) else {
+        // A Roster and no Policy: this node was admitted by an invite and waits for the Policy
+        // an issuer pushes (protocol.md 5.1, 7.2). It answers docs only to an initiator that is
+        // an unrevoked member of the Roster, and refuses (silence) everything else.
+        return roster_only_admission(
+            &roster,
+            initiator_node_id,
+            responder_node_id,
+            responder_cert_serial,
+        );
     };
 
     let initiator_min_serial = match roster_standing(&roster, initiator_node_id) {
@@ -650,6 +661,28 @@ pub fn decide_responder_admission(
         HandshakeAdmission::Allow
     } else {
         HandshakeAdmission::AllowNoGrant
+    }
+}
+
+/// [`decide_responder_admission`] for a node that holds a Roster and no Policy (the Roster only
+/// state of `menzil join <invite>`, protocol.md 5.1): an initiator that is an unrevoked member of
+/// the Roster gets a docs only session, provided this node is itself still an unrevoked member
+/// whose serial is not below its `min_serial`; every other initiator, and every case where this
+/// node's own standing fails, is refused.
+fn roster_only_admission(
+    roster: &RosterBody,
+    initiator: &NodeId,
+    responder: &NodeId,
+    responder_cert_serial: u32,
+) -> HandshakeAdmission {
+    if let Err(reason) = roster_standing(roster, initiator) {
+        return HandshakeAdmission::Refuse { reason };
+    }
+    if let Err(reason) = roster_own_standing(roster, responder, responder_cert_serial) {
+        return HandshakeAdmission::Refuse { reason };
+    }
+    HandshakeAdmission::DocsOnly {
+        reason: ErrorCode::UnknownNetwork,
     }
 }
 
@@ -1209,6 +1242,104 @@ mod tests {
                 1_000,
             ),
             HandshakeAdmission::AllowNoGrant
+        );
+    }
+
+    /// The fixture's Roster with no Policy: a node admitted by an invite (protocol.md 5.1).
+    fn roster_only(f: &Fixture, edit: impl FnOnce(&mut menzil_proto::RosterBody)) -> RosterStore {
+        let mut body = signed_roster(&f.ids, 1).decode().unwrap();
+        edit(&mut body);
+        let rosters = RosterStore::new();
+        rosters
+            .set(&Roster::sign(&f.ids.owner, &body).unwrap())
+            .unwrap();
+        rosters
+    }
+
+    fn decide_roster_only(f: &Fixture, rosters: &RosterStore, who: &NodeId) -> HandshakeAdmission {
+        decide_responder_admission(
+            &PolicyStore::new(),
+            rosters,
+            &f.ids.network_id,
+            who,
+            &f.ids.initiator_x25519,
+            &f.ids.responder_node_id,
+            f.ids.responder_cert_serial,
+            1_000,
+        )
+    }
+
+    #[test]
+    fn a_roster_only_responder_answers_docs_only_to_unrevoked_roster_members_and_refuses_the_rest()
+    {
+        let f = fixture(vec![]);
+        let rosters = roster_only(&f, |_| {});
+        assert!(matches!(
+            decide_roster_only(&f, &rosters, &f.ids.initiator_node_id),
+            HandshakeAdmission::DocsOnly { .. }
+        ));
+        // A stranger.
+        let stranger = NodeId::from([0x99; 32]);
+        assert_eq!(
+            decide_roster_only(&f, &rosters, &stranger),
+            HandshakeAdmission::Refuse {
+                reason: ErrorCode::NotMember
+            }
+        );
+        // A revoked member.
+        let initiator = f.ids.initiator_node_id;
+        let revoked = roster_only(&f, |body| {
+            body.revoked.push(menzil_proto::RevokedMember {
+                node_id: initiator,
+                since: 0,
+            })
+        });
+        assert_eq!(
+            decide_roster_only(&f, &revoked, &f.ids.initiator_node_id),
+            HandshakeAdmission::Refuse {
+                reason: ErrorCode::Revoked
+            }
+        );
+        // Without any Roster the network is unknown.
+        assert_eq!(
+            decide_roster_only(&f, &RosterStore::new(), &f.ids.initiator_node_id),
+            HandshakeAdmission::Refuse {
+                reason: ErrorCode::UnknownNetwork
+            }
+        );
+    }
+
+    #[test]
+    fn a_roster_only_responder_that_is_not_in_good_standing_itself_answers_nobody() {
+        let f = fixture(vec![]);
+        let me = f.ids.responder_node_id;
+        let revoked = roster_only(&f, |body| {
+            body.revoked.push(menzil_proto::RevokedMember {
+                node_id: me,
+                since: 0,
+            })
+        });
+        assert!(matches!(
+            decide_roster_only(&f, &revoked, &f.ids.initiator_node_id),
+            HandshakeAdmission::Refuse { .. }
+        ));
+        let unlisted = roster_only(&f, |body| body.members.retain(|m| m.node_id != me));
+        assert!(matches!(
+            decide_roster_only(&f, &unlisted, &f.ids.initiator_node_id),
+            HandshakeAdmission::Refuse { .. }
+        ));
+        let floor = roster_only(&f, |body| {
+            for m in &mut body.members {
+                if m.node_id == me {
+                    m.min_serial = f.ids.responder_cert_serial + 1;
+                }
+            }
+        });
+        assert_eq!(
+            decide_roster_only(&f, &floor, &f.ids.initiator_node_id),
+            HandshakeAdmission::Refuse {
+                reason: ErrorCode::StaleSerial
+            }
         );
     }
 

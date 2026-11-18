@@ -238,7 +238,10 @@ pub fn save_documents(home: &Home, docs: &Documents) -> Result<()> {
     home.write_secret(
         &home.documents_path(&docs.network_id()),
         &documents_to_bytes(docs),
-    )
+    )?;
+    // The Roster only state (`menzil join <invite>`) is over once the pair is on disk.
+    crate::join::remove_roster_only(home, &docs.network_id());
+    Ok(())
 }
 
 /// The owner key of a network, if this device owns it.
@@ -1176,7 +1179,9 @@ pub fn keep_documents(
             }
         }
         Err(_) if !home.documents_path(&network_id).exists() => {
-            if !create {
+            // A network joined by an invite has the Roster only file here: the pair its node
+            // adopted (the issuer's push) is the first documents of the device.
+            if !create && !home.roster_only_path(&network_id).is_file() {
                 return Ok(None);
             }
             save_documents(home, docs)?;
@@ -1248,6 +1253,9 @@ pub struct Status {
     pub cert_expires: Option<u64>,
     /// The networks it holds documents for.
     pub networks: Vec<NetworkStatus>,
+    /// Networks the device was admitted to by an invite whose Policy has not reached it yet
+    /// (`menzil join <invite>`): the network and the `seq` of the Roster it holds, if readable.
+    pub waiting: Vec<(NetworkId, Option<u64>)>,
 }
 
 /// Reads the state of the directory. A network whose documents cannot be read is listed with the
@@ -1308,10 +1316,25 @@ pub fn status(home: &Home) -> Result<Status> {
             },
         });
     }
+    let waiting = home
+        .roster_only_networks()?
+        .into_iter()
+        .map(|network_id| {
+            let seq = fs::read(home.roster_only_path(&network_id))
+                .ok()
+                .and_then(|bytes| {
+                    ciborium::from_reader::<crate::join::RosterOnly, _>(bytes.as_slice()).ok()
+                })
+                .and_then(|state| state.roster.decode().ok())
+                .map(|body| body.seq);
+            (network_id, seq)
+        })
+        .collect();
     Ok(Status {
         node_id: me,
         cert_expires,
         networks,
+        waiting,
     })
 }
 
@@ -1352,8 +1375,14 @@ impl Status {
             (Some(id), None) => out.push_str(&format!("this device: {id}\n")),
             _ => out.push_str("this device has no identity yet: run `menzil init`\n"),
         }
-        if self.networks.is_empty() {
+        if self.networks.is_empty() && self.waiting.is_empty() {
             out.push_str("no networks\n");
+        }
+        for (network_id, seq) in &self.waiting {
+            out.push_str(&format!(
+                "network {network_id}\n  admitted, waiting for the Policy{}: start `menzil node`; the network's issuer sends it\n",
+                seq.map_or(String::new(), |seq| format!(" (Roster #{seq} held)"))
+            ));
         }
         for network in &self.networks {
             out.push_str(&format!(
