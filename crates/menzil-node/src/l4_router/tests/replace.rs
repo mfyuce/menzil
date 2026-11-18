@@ -534,37 +534,24 @@ async fn another_first_record_replaces_the_session_as_before() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn a_first_record_of_a_continues_length_that_is_not_one_is_refused_and_the_current_stays() {
+async fn junk_of_any_length_leaves_the_held_candidate_waiting() {
     let (m, b) = (party(), party());
     let (w, stores) = world_of(&m, &b);
     let mut e = eng(&b, &stores, ReplaceConfig::default());
-    let (first, mut old) = e.establish(&m, &b, &w, 1).await;
+    let (first, _old) = e.establish(&m, &b, &w, 1).await;
     let mut second = e.handshake(&m, &b, &w, 2).await;
 
-    // 44 bytes of MUX: the same ciphertext length as CONTINUE.
-    let frame = data_frame(
-        &mut second.transport,
-        second.index,
-        &E2eDataBody::Mux(vec![0; 44]),
-    );
+    for len in [17, 61, 100, 400] {
+        e.recv(m.id, &junk_data(second.index, 0, len));
+        e.pump().await;
+        assert!(e.engine.held.contains_key(&second.index), "len {len}");
+        assert!(e.ready.try_recv().is_err(), "len {len}");
+        assert_eq!(e.slot(&m, &w).current, Some(first.index), "len {len}");
+    }
+    // The genuine CONTINUE still lands on the held candidate.
+    let frame = continue_record(&mut second.transport, first.index, 0, &first.transport);
     e.recv(m.id, &frame);
-    e.pump().await;
-    assert!(e.engine.held.is_empty());
-    assert!(e.ready.try_recv().is_err());
-    let frames = e.frames().await;
-    let close = frames.iter().find_map(|(_, f)| match f {
-        E2eFrame::Data {
-            receiver_index: 2,
-            counter,
-            ciphertext,
-        } if *counter == 0 => Some(second.transport.decrypt_data(*counter, ciphertext).unwrap()),
-        _ => None,
-    });
-    assert!(
-        matches!(close, Some(E2eDataBody::Close { code, .. }) if code == ErrorCode::HandoverFailed)
-    );
-    assert!(timeout(secs(1), old.acceptor.closed()).await.is_err());
-    assert_eq!(e.slot(&m, &w).current, Some(first.index));
+    assert_eq!(e.slot(&m, &w).current, Some(second.index));
 }
 
 #[tokio::test(start_paused = true)]
@@ -618,7 +605,7 @@ async fn a_datagram_or_junk_before_the_first_reliable_record_proves_nothing() {
     assert_eq!(RecordClass::of_counter(*counter), RecordClass::Datagram);
     e.recv(m.id, &dgram);
     // Junk of a CONTINUE's length that does not authenticate: dropped, the candidate waits.
-    e.recv(m.id, &junk_data(second.index, 0, continue_ciphertext_len()));
+    e.recv(m.id, &junk_data(second.index, 0, 61));
     assert!(e.engine.held.contains_key(&second.index));
     assert_eq!(e.slot(&m, &w).current, Some(first.index));
 

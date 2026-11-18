@@ -137,8 +137,8 @@ use menzil_e2e::{
     SessionIndex, SessionTable, SlotState, TableConfig,
 };
 use menzil_proto::{
-    ContinueBody, E2eDataBody, E2eFrame, ErrorCode, L4_AEAD_TAG_LEN, Limits, NetworkId, NodeId,
-    ProtoError, Record, RecordClass, X25519PublicKey, continue_binding,
+    ContinueBody, E2eDataBody, E2eFrame, ErrorCode, Limits, NetworkId, NodeId, ProtoError, Record,
+    RecordClass, X25519PublicKey, continue_binding,
 };
 use menzil_stream::Mode;
 use tokio::sync::{mpsc, oneshot, watch};
@@ -875,19 +875,6 @@ struct Held {
     /// The `init` that created it, to tell a repeat of it from a new one.
     init: (u32, Vec<u8>),
     created: Instant,
-}
-
-/// The ciphertext length of a CONTINUE record: its plaintext (kind byte and the fixed body) and
-/// the AEAD tag. A first record of any other length cannot be CONTINUE.
-fn continue_ciphertext_len() -> usize {
-    ContinueBody {
-        prior: 0,
-        sent: 0,
-        binding: [0; 32],
-    }
-    .encode()
-    .len()
-        + L4_AEAD_TAG_LEN
 }
 
 fn tag_of(generation: u32, index: SessionIndex) -> u64 {
@@ -1952,15 +1939,13 @@ impl Engine {
         let Some(mut held) = self.take_held(index) else {
             return;
         };
-        if ciphertext.len() != continue_ciphertext_len() {
-            // Cannot be CONTINUE: the transport has not read it, so the new actor does.
-            self.replace_from_held(held, index, counter, ciphertext, now);
-            return;
-        }
-        let plaintext = match held.transport.decrypt_raw(counter, &ciphertext) {
+        // Read the record without consuming it: a record that does not authenticate proves
+        // nothing and the candidate keeps waiting; one that does is either a CONTINUE (the
+        // transport is then consumed here) or any other first record, which the new actor
+        // reads afresh from the untouched transport (today's replacement).
+        let plaintext = match held.transport.peek_raw(counter, &ciphertext) {
             Ok(plaintext) => plaintext,
             Err(E2eError::UnauthenticatedDatagramCounter | E2eError::Noise(_)) => {
-                // Junk, or a record of another session: not proof of anything. Keep waiting.
                 self.held_slot.insert((held.peer, held.network), index);
                 self.held.insert(index, held);
                 return;
@@ -1972,15 +1957,15 @@ impl Engine {
             }
         };
         match ContinueBody::decode(&plaintext) {
-            Ok(body) => self.judge_continue(held, index, body, now),
-            Err(_) => {
-                // The record of the right length was no CONTINUE, and reading it used the
-                // transport's first counter, so it cannot be handed on to a new actor: the
-                // candidate is refused (its peer sees the CLOSE and starts over). Only a
-                // first record of exactly a CONTINUE's length reaches this.
-                let close = handover_failed_close("the first record is not a valid CONTINUE");
-                self.refuse_held(held, index, &close);
+            Ok(body) => {
+                // Consume the counter the peek left alone; it cannot fail after the peek.
+                if held.transport.decrypt_raw(counter, &ciphertext).is_err() {
+                    self.table.release_index(index);
+                    return;
+                }
+                self.judge_continue(held, index, body, now);
             }
+            Err(_) => self.replace_from_held(held, index, counter, ciphertext, now),
         }
     }
 

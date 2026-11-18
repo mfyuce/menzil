@@ -396,6 +396,15 @@ impl E2eTransport {
         })
     }
 
+    /// [`Self::decrypt_raw`] without consuming the record: the same checks, the receive counter
+    /// is not advanced and the cipher state is untouched (records are opened by explicit
+    /// counter), so the same ciphertext can be read again, by this transport or by a new owner
+    /// of it. For the router that must tell a CONTINUE from any other first record before it
+    /// decides who takes the transport.
+    pub fn peek_raw(&self, counter: u64, ciphertext: &[u8]) -> Result<Vec<u8>, E2eError> {
+        self.open_reliable(counter, ciphertext)
+    }
+
     /// Decrypts a reliable record and returns its plaintext (`kind byte | body`) undecoded:
     /// the receive side of [`Self::encrypt_raw`], for the first record of a replacement
     /// session. Applies steps 1 to 3 of [`Self::decrypt_data`] (reliable class counter, the
