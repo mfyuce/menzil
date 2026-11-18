@@ -330,10 +330,33 @@ impl Node {
         H: ServiceHandler<Stream> + Send + Sync + 'static,
         H::Handling: Send + 'static,
     {
+        Self::start_with_admit_sync(
+            config,
+            handler,
+            relay_limits,
+            inbound_ceiling,
+            admit,
+            SyncConfig::default(),
+        )
+    }
+
+    /// [`Self::start_with_admit`] with other timing for the document sync tasks.
+    pub fn start_with_admit_sync<H>(
+        config: NodeConfig,
+        handler: H,
+        relay_limits: Arc<RelayLimits>,
+        inbound_ceiling: Option<usize>,
+        admit: Option<Arc<AdmitHandler>>,
+        sync_config: SyncConfig,
+    ) -> Result<Self, StartError>
+    where
+        H: ServiceHandler<Stream> + Send + Sync + 'static,
+        H::Handling: Send + 'static,
+    {
         Self::start_inner(
             config,
             handler,
-            SyncConfig::default(),
+            sync_config,
             relay_limits,
             inbound_ceiling,
             None,

@@ -1380,7 +1380,7 @@ impl Status {
         }
         for (network_id, seq) in &self.waiting {
             out.push_str(&format!(
-                "network {network_id}\n  admitted, waiting for the Policy{}: start `menzil node`; the network's issuer sends it\n",
+                "network {network_id}\n  admitted, waiting for the Policy{}: start `menzil node`; the network's issuer sends it, and tries again every 30 minutes until it arrives\n",
                 seq.map_or(String::new(), |seq| format!(" (Roster #{seq} held)"))
             ));
         }

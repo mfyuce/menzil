@@ -1194,14 +1194,22 @@ where
         )))
     });
     let started = match &challenges {
-        Some(book) => Node::start_with_admit(
+        Some(book) => Node::start_with_admit_sync(
             node_config,
             AcmeHandler::new(services, book.clone()),
             relay_limits,
             inbound_ceiling,
             admit,
+            sync_config(),
         ),
-        None => Node::start_with_admit(node_config, services, relay_limits, inbound_ceiling, admit),
+        None => Node::start_with_admit_sync(
+            node_config,
+            services,
+            relay_limits,
+            inbound_ceiling,
+            admit,
+            sync_config(),
+        ),
     };
     let node = Arc::new(started.map_err(|e| anyhow!("{e}"))?);
     node.shares()
@@ -1332,6 +1340,19 @@ where
         keeper,
         _instance: instance,
     })
+}
+
+/// The timing of the document sync tasks: the defaults, and in a debug build the test knobs
+/// `PUSH_RETRY` (every rung of the issuer's ladder, seconds) and `AWAIT_TAIL` (seconds).
+fn sync_config() -> menzil_node::SyncConfig {
+    let mut config = menzil_node::SyncConfig::default();
+    if let Some(secs) = crate::cert_renew::test_knob("PUSH_RETRY") {
+        config.push_retry = [Duration::from_secs(secs); 4];
+    }
+    if let Some(secs) = crate::cert_renew::test_knob("AWAIT_TAIL") {
+        config.await_tail = Duration::from_secs(secs);
+    }
+    config
 }
 
 /// Tells the node which invite admitted devices to keep trying with (see

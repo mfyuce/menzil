@@ -38,7 +38,7 @@ pub const ROTATE_EVERY: u64 = 60 * 60;
 /// variable `MENZIL_TEST_<name>` in seconds, read by debug builds only (`cargo test` builds
 /// them; a release build never looks), `None` when it is not set or not a number. The names in
 /// use: `RENEW_WITHIN` (this module's [`RENEW_WITHIN`]), `CHECK_EVERY` ([`CHECK_EVERY_SECS`]),
-/// `POLL` (the steward loop's look) and `RELOAD_EVERY` (the node's reload of the documents).
+/// `POLL` (the steward loop's look), `RELOAD_EVERY` (the node's reload of the documents), `PUSH_RETRY` and `AWAIT_TAIL` (the issuer's push ladder and awaiting tail).
 /// Not part of the command line or the configuration, and not documented for users.
 pub fn test_knob(name: &str) -> Option<u64> {
     if !cfg!(debug_assertions) {
