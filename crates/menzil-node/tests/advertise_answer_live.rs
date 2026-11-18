@@ -201,6 +201,7 @@ fn run_node(config: SessionConfig, own: Arc<RosterStore>) -> Running {
     let observers = menzil_node::Observers {
         notes: menzil_node::RelayNotes::new(),
         shares: book.clone(),
+        ..Default::default()
     };
     tokio::spawn(run_session_observed(
         config,

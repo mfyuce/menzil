@@ -367,12 +367,12 @@ pub fn steward_remove(home: &Home, network: Option<&str>, now: u64) -> Result<Is
 
 /// Who signs the next documents on this device: the owner key if there is one, else a steward
 /// key, else nobody (and the error says what `admit` and `renew` need).
-enum Signing {
+pub(crate) enum Signing {
     Owner(OwnerKey),
     Steward(StewardSecret),
 }
 
-fn signing_key(home: &Home, network_id: &NetworkId) -> Result<Signing> {
+pub(crate) fn signing_key(home: &Home, network_id: &NetworkId) -> Result<Signing> {
     if !home.owner_key_path(network_id).exists() && home.steward_key_path(network_id).exists() {
         return Ok(Signing::Steward(load_steward(home, network_id)?));
     }

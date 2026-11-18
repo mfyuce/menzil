@@ -152,6 +152,11 @@ const RENEW_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long the agent spends on an `expose` or `unexpose`: the wait for the config lock (ten
 /// seconds) and the write of the file.
 const EXPOSE_TIMEOUT: Duration = Duration::from_secs(15);
+/// How long the agent spends on an `invite-*` request: the wait for the network lock (ten
+/// seconds) and the write of the book.
+/// The longest answer line of an `invite-*` request (a token is about 600 characters).
+const INVITE_LINE_CHARS: usize = 1200;
+const INVITE_TIMEOUT: Duration = Duration::from_secs(15);
 /// How many connections the agent serves at once.
 const MAX_CONNECTIONS: usize = 256;
 
@@ -211,6 +216,17 @@ pub trait Opener: Send + Sync + 'static {
     fn expose(&self, spec: ExposeSpec) -> impl Future<Output = Result<ExposeReply, String>> + Send {
         let _ = spec;
         async { Err("this agent does not manage shares".to_string()) }
+    }
+
+    /// Runs an invite operation (`invite-create`, `invite-list`, `invite-revoke`) and returns the
+    /// answer lines after `ok` ([`crate::invite::execute`]). The error is a message for the
+    /// person.
+    fn invite(
+        &self,
+        op: crate::invite::InviteOp,
+    ) -> impl Future<Output = Result<Vec<String>, String>> + Send {
+        let _ = op;
+        async { Err("this agent does not manage invites".to_string()) }
     }
 
     /// Takes a share away, for the `unexpose` request.
@@ -892,6 +908,25 @@ async fn handle<O: Opener>(connection: UnixStream, opener: &O) -> Result<()> {
         write.write_all(reply.as_bytes()).await?;
         return Ok(());
     }
+    if request.starts_with("invite-") {
+        let reply = match crate::invite::InviteOp::parse_request_line(request) {
+            Err(message) => format!("error {}\n", error_line(&message)),
+            Ok(op) => match timeout(INVITE_TIMEOUT, opener.invite(op)).await {
+                Ok(Ok(lines)) => {
+                    let mut reply = "ok\n".to_string();
+                    for line in lines {
+                        reply.push_str(&text::one_line(&line, INVITE_LINE_CHARS));
+                        reply.push('\n');
+                    }
+                    reply
+                }
+                Ok(Err(message)) => format!("error {}\n", error_line(&message)),
+                Err(_) => "error the node did not finish the invite request in time\n".to_string(),
+            },
+        };
+        write.write_all(reply.as_bytes()).await?;
+        return Ok(());
+    }
     if let Some(label) = request.strip_prefix("unexpose ") {
         let reply = match timeout(EXPOSE_TIMEOUT, opener.unexpose(label.trim().to_string())).await {
             Ok(Ok(done)) => format!("ok\n{}", done.to_lines()),
@@ -1559,6 +1594,28 @@ async fn request_unexpose_as(
     }
     let lines = ask_lines(socket, &format!("unexpose {label}"), uid).await?;
     Ok(UnexposeReply::from_lines(&lines))
+}
+
+/// Asks the node behind `socket` to run an invite operation (`menzil invite ...`); the answer
+/// lines after `ok` ([`crate::invite::execute`]). [`AskError::NoAgent`] when nothing listens.
+pub async fn request_invite(
+    socket: &Path,
+    op: &crate::invite::InviteOp,
+) -> Result<Vec<String>, AskError> {
+    let uid = current_uid()
+        .await
+        .context("finding out which user this is")
+        .map_err(AskError::Failed)?;
+    request_invite_as(socket, op, uid).await
+}
+
+/// [`request_invite`] for a client that expects the agent to run as `uid`.
+async fn request_invite_as(
+    socket: &Path,
+    op: &crate::invite::InviteOp,
+    uid: u32,
+) -> Result<Vec<String>, AskError> {
+    ask_lines(socket, &op.to_request_line(), uid).await
 }
 
 /// How the input side of [`connect_and_bridge`] ended.

@@ -85,6 +85,7 @@ use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 
 use crate::admission::PolicyAuthorizer;
+use crate::admit_handler::AdmitHandler;
 use crate::docs_access::{DocsGate, DocsLimits, SessionHandler};
 use crate::docs_sync::{DocsSync, PushReport, SyncConfig};
 use crate::identity::{IdentityCell, IdentityError, OwnSerial};
@@ -228,7 +229,15 @@ impl Node {
         H: ServiceHandler<Stream> + Send + Sync + 'static,
         H::Handling: Send + 'static,
     {
-        Self::start_inner(config, handler, sync_config, RelayLimits::new(), None, None)
+        Self::start_inner(
+            config,
+            handler,
+            sync_config,
+            RelayLimits::new(),
+            None,
+            None,
+            None,
+        )
     }
 
     /// [`Self::start`] with other figures for the 24 hour replacement of full sessions
@@ -257,6 +266,7 @@ impl Node {
             RelayLimits::new(),
             None,
             Some(replace),
+            None,
         )
     }
 
@@ -276,6 +286,7 @@ impl Node {
             handler,
             SyncConfig::default(),
             relay_limits,
+            None,
             None,
             None,
         )
@@ -301,6 +312,32 @@ impl Node {
             relay_limits,
             inbound_ceiling,
             None,
+            None,
+        )
+    }
+
+    /// [`Self::start_with_limits`] with, on a device that holds an issuer key, an `admit` handler: the relay session
+    /// registers with ADMIT_LISTEN on every attach and hands the ADMIT_PENDING requests the
+    /// relay delivers to `admit` (`crate::admit_handler`).
+    pub fn start_with_admit<H>(
+        config: NodeConfig,
+        handler: H,
+        relay_limits: Arc<RelayLimits>,
+        inbound_ceiling: Option<usize>,
+        admit: Option<Arc<AdmitHandler>>,
+    ) -> Result<Self, StartError>
+    where
+        H: ServiceHandler<Stream> + Send + Sync + 'static,
+        H::Handling: Send + 'static,
+    {
+        Self::start_inner(
+            config,
+            handler,
+            SyncConfig::default(),
+            relay_limits,
+            inbound_ceiling,
+            None,
+            admit,
         )
     }
 
@@ -311,6 +348,7 @@ impl Node {
         relay_limits: Arc<RelayLimits>,
         inbound_ceiling: Option<usize>,
         replace: Option<ReplaceConfig>,
+        admit: Option<Arc<AdmitHandler>>,
     ) -> Result<Self, StartError>
     where
         H: ServiceHandler<Stream> + Send + Sync + 'static,
@@ -387,6 +425,7 @@ impl Node {
                 let observers = Observers {
                     notes: relay_notes.clone(),
                     shares: shares.clone(),
+                    admit,
                 };
                 async move {
                     run_session_observed(

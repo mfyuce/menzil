@@ -620,6 +620,8 @@ pub struct NodeOpener {
     certs: Option<Arc<CertRenewer>>,
     /// What `expose` and `unexpose` change: the home (for `config.toml`) and the node's services.
     shares: Option<(Home, LocalServices)>,
+    /// The home the `invite-*` requests work on.
+    invites: Option<Home>,
     /// What the node's certificates stand at, when it gets them (`[acme]`).
     acme: Option<AcmeView>,
     /// The relay certificates the node remembers, for `status`.
@@ -721,9 +723,16 @@ impl NodeOpener {
             directory,
             certs: None,
             shares: None,
+            invites: None,
             acme: None,
             known_relays: None,
         }
+    }
+
+    /// Lets the agent answer the `invite-*` requests on `home`.
+    pub fn with_invites(mut self, home: Home) -> Self {
+        self.invites = Some(home);
+        self
     }
 
     /// Lets the agent list the relay certificates the node remembers in `status`.
@@ -962,6 +971,18 @@ impl Opener for NodeOpener {
         .map_err(|e| format!("the change did not finish: {e}"))?
     }
 
+    async fn invite(&self, op: crate::invite::InviteOp) -> Result<Vec<String>, String> {
+        let Some(home) = self.invites.clone() else {
+            return Err("this node does not manage invites".to_string());
+        };
+        // The network lock waits for other writers on a thread of its own.
+        tokio::task::spawn_blocking(move || {
+            crate::invite::execute(&home, &op, unix_now()).map_err(|e| format!("{e:#}"))
+        })
+        .await
+        .map_err(|e| format!("the request did not finish: {e}"))?
+    }
+
     async fn unexpose(&self, label: String) -> Result<UnexposeReply, String> {
         let Some((home, services)) = self.shares.clone() else {
             return Err("this node does not manage shares".to_string());
@@ -1134,14 +1155,24 @@ where
     let challenges = acme.as_ref().map(|_| ChallengeBook::new());
     let relay_limits = config.relay_limits()?;
     let inbound_ceiling = config.inbound_ceiling()?;
+    // A device that holds an owner or steward key registers with the relay as an issuer and
+    // admits the devices that redeem its invites (a key made after the start needs a restart).
+    let reload_wake = Arc::new(tokio::sync::Notify::new());
+    let admit = crate::invite::CliIssuer::is_needed(home).then(|| {
+        menzil_node::admit_handler::AdmitHandler::spawn(Arc::new(crate::invite::CliIssuer::new(
+            home.clone(),
+            Some(reload_wake.clone()),
+        )))
+    });
     let started = match &challenges {
-        Some(book) => Node::start_with_limits(
+        Some(book) => Node::start_with_admit(
             node_config,
             AcmeHandler::new(services, book.clone()),
             relay_limits,
             inbound_ceiling,
+            admit,
         ),
-        None => Node::start_with_limits(node_config, services, relay_limits, inbound_ceiling),
+        None => Node::start_with_admit(node_config, services, relay_limits, inbound_ceiling, admit),
     };
     let node = Arc::new(started.map_err(|e| anyhow!("{e}"))?);
     node.shares()
@@ -1186,6 +1217,7 @@ where
     };
     let mut opener = NodeOpener::new(node.clone(), directory.clone())
         .with_shares(home.clone(), services_handle.clone())
+        .with_invites(home.clone())
         .with_known_relays(known_relays.clone());
     if let Some(view) = &acme_view {
         opener = opener.with_acme(view.clone());
@@ -1205,12 +1237,17 @@ where
         let (home, directory, node) = (home.clone(), directory.clone(), node.clone());
         let (policies, rosters) = (policies.clone(), rosters.clone());
         let services = services_handle.clone();
+        let reload_wake = reload_wake.clone();
         tokio::spawn(async move {
             let mut last: HashMap<NetworkId, u64> = HashMap::new();
             loop {
                 let every = crate::cert_renew::test_knob("RELOAD_EVERY")
                     .map_or(RELOAD_EVERY, Duration::from_secs);
-                tokio::time::sleep(every).await;
+                // Or sooner: the admission handler saved documents and wants them adopted.
+                tokio::select! {
+                    () = tokio::time::sleep(every) => {}
+                    () = reload_wake.notified() => {}
+                }
                 // Takes the config lock, which waits for a writer: not on this task.
                 let reloaded = {
                     let (home, node, services) = (home.clone(), node.clone(), services.clone());

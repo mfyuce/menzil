@@ -61,6 +61,7 @@
 
 pub mod acme;
 mod admission;
+pub mod admit_handler;
 mod cert_candidates;
 mod cert_index;
 pub mod channels;

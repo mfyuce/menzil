@@ -23,6 +23,7 @@ pub mod cert_renew;
 pub mod config;
 pub mod expose;
 pub mod home;
+pub mod invite;
 pub mod local;
 pub mod node_cmd;
 pub mod persist;

@@ -87,6 +87,7 @@ async fn a_roster_push_refused_as_over_quota_is_sent_again_after_the_retry_delay
         Observers {
             notes: RelayNotes::new(),
             shares: book,
+            ..Default::default()
         },
     ));
     let until = |want: u64| {

@@ -135,6 +135,12 @@ enum Command {
         #[command(subcommand)]
         command: StewardCommand,
     },
+    /// Make, list and revoke invites (owner, or a steward with `admit`): a token a new device
+    /// redeems at the relay to be admitted without the owner copying certificates by hand.
+    Invite {
+        #[command(subcommand)]
+        command: InviteCommand,
+    },
     /// Install the documents in a membership token an owner gave this device.
     Join {
         /// The token (`menzil1-docs:...`); `-` reads it from standard input, which keeps it out
@@ -521,6 +527,40 @@ enum CertCommand {
 }
 
 #[derive(Subcommand)]
+enum InviteCommand {
+    /// Make an invite and print its token, a bearer secret: whoever holds it can join, once per
+    /// use. Give it to one person over a channel you trust.
+    Create {
+        /// The network, when this device is in more than one.
+        #[arg(long, value_name = "ID")]
+        network: Option<String>,
+        /// How many devices may redeem it.
+        #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u8).range(1..))]
+        uses: u8,
+        /// How long it lives: seconds, or a number with s, m, h or d (at most 30d).
+        #[arg(long, default_value = "7d", value_parser = menzil_cli::invite::parse_life)]
+        expires: u64,
+        /// Fix the device's name in the network (otherwise the joining device chooses).
+        #[arg(long)]
+        name: Option<String>,
+    },
+    /// List the invites: uses spent, expiry, whether revoked and who redeemed each.
+    List {
+        /// The network, when this device is in more than one.
+        #[arg(long, value_name = "ID")]
+        network: Option<String>,
+    },
+    /// Revoke an invite: it admits nobody more (devices already admitted stay).
+    Revoke {
+        /// The first hex digits of the invite id (`menzil invite list`), at least four.
+        id: String,
+        /// The network, when this device is in more than one.
+        #[arg(long, value_name = "ID")]
+        network: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
 enum StewardCommand {
     /// On the device that will be the steward: make its steward key for a network and print the
     /// request to give to the owner. The secret key stays on this device; asking again prints
@@ -846,6 +886,25 @@ async fn run(cli: Cli) -> Result<()> {
             println!("renewed: the network's documents are now #{}", issued.seq);
             println!("every member needs the new documents (`menzil join <token>`):");
             println!("{}", issued.token);
+        }
+        Command::Invite { command } => {
+            use menzil_cli::invite::{CreateSpec, InviteOp};
+            let op = match command {
+                InviteCommand::Create {
+                    network,
+                    uses,
+                    expires,
+                    name,
+                } => InviteOp::Create(CreateSpec {
+                    network,
+                    uses,
+                    life_secs: expires,
+                    name,
+                }),
+                InviteCommand::List { network } => InviteOp::List { network },
+                InviteCommand::Revoke { id, network } => InviteOp::Revoke { network, id },
+            };
+            print!("{}", menzil_cli::invite::run(&home()?, op).await?);
         }
         Command::Steward { command } => match command {
             StewardCommand::Request { network } => {

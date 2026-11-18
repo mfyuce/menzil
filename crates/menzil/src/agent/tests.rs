@@ -2178,3 +2178,125 @@ fn a_known_relay_line_that_is_not_well_formed_is_ignored() {
         Some(good)
     );
 }
+
+// ---- invite requests ----
+
+struct Inviter {
+    seen: Mutex<Vec<crate::invite::InviteOp>>,
+    answer: Result<Vec<String>, String>,
+}
+
+impl Opener for Inviter {
+    async fn open(&self, _target: &str) -> Result<Stream, String> {
+        Err("no streams here".to_string())
+    }
+    async fn invite(&self, op: crate::invite::InviteOp) -> Result<Vec<String>, String> {
+        self.seen.lock().unwrap().push(op);
+        self.answer.clone()
+    }
+}
+
+fn inviter(answer: Result<Vec<String>, String>) -> Arc<Inviter> {
+    Arc::new(Inviter {
+        seen: Mutex::new(Vec::new()),
+        answer,
+    })
+}
+
+#[tokio::test]
+async fn invite_requests_reach_the_node_whole_and_the_answer_lines_come_back() {
+    use crate::invite::{CreateSpec, InviteOp};
+    let long_token = format!("token menzil1-invite:{}", "A".repeat(900));
+    let lines = vec![
+        long_token,
+        "invite_id 00ff".to_string(),
+        "uses 3".to_string(),
+    ];
+    let opener = inviter(Ok(lines.clone()));
+    let ops = [
+        InviteOp::Create(CreateSpec {
+            network: None,
+            uses: 3,
+            life_secs: 86_400,
+            name: Some("kiosk".to_string()),
+        }),
+        InviteOp::List {
+            network: Some("ab".repeat(32)),
+        },
+        InviteOp::Revoke {
+            network: None,
+            id: "00ff".to_string(),
+        },
+    ];
+    for op in &ops {
+        let got = with_agent(opener.clone(), async |socket, uid| {
+            request_invite_as(socket, op, uid).await
+        })
+        .await
+        .unwrap();
+        assert_eq!(got, lines, "a token line is not cut short");
+    }
+    assert_eq!(opener.seen.lock().unwrap().as_slice(), ops);
+}
+
+#[tokio::test]
+async fn an_invite_refusal_is_one_line_and_a_bad_request_never_reaches_the_node() {
+    let opener = inviter(Err("no steward key\nsecond line".to_string()));
+    let op = crate::invite::InviteOp::List { network: None };
+    let error = with_agent(opener.clone(), async |socket, uid| {
+        request_invite_as(socket, &op, uid).await
+    })
+    .await
+    .unwrap_err();
+    match error {
+        AskError::Failed(e) => {
+            let shown = format!("{e:#}");
+            assert!(
+                shown.contains("no steward key") && !shown.contains('\n'),
+                "{shown:?}"
+            );
+        }
+        AskError::NoAgent => panic!("an agent answered"),
+    }
+    let untouched = inviter(Ok(vec![]));
+    for line in [
+        "invite-create network=- uses=x expires=5 name=-",
+        "invite-list",
+        "invite-nuke network=-",
+        "invite-revoke network=- id=1 evil=1",
+    ] {
+        let reply = with_agent(untouched.clone(), async |socket, _uid| {
+            let mut connection = UnixStream::connect(socket).await.unwrap();
+            connection
+                .write_all(format!("{line}\n").as_bytes())
+                .await
+                .unwrap();
+            let mut reply = String::new();
+            let _ = connection.read_to_string(&mut reply).await;
+            reply
+        })
+        .await;
+        assert!(reply.starts_with("error "), "{line}: {reply:?}");
+    }
+    assert!(untouched.seen.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn an_agent_that_manages_no_invites_says_so() {
+    struct Plain;
+    impl Opener for Plain {
+        async fn open(&self, _target: &str) -> Result<Stream, String> {
+            Err("no".to_string())
+        }
+    }
+    let opener = Arc::new(Plain);
+    let op = crate::invite::InviteOp::List { network: None };
+    let error = with_agent(opener, async |socket, uid| {
+        request_invite_as(socket, &op, uid).await
+    })
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(error, AskError::Failed(ref e) if format!("{e:#}").contains("does not manage invites"))
+    );
+}

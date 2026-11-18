@@ -168,6 +168,12 @@ impl Home {
         self.network_dir(network_id).join("documents.bin")
     }
 
+    /// The invite book of a network this device issues invites for: the secrets of the invites
+    /// it made and who redeemed each (mode 0600, written under the network lock).
+    pub fn invites_path(&self, network_id: &NetworkId) -> PathBuf {
+        self.network_dir(network_id).join("invites.cbor")
+    }
+
     /// The owner key of a network this node owns.
     pub fn owner_key_path(&self, network_id: &NetworkId) -> PathBuf {
         self.root

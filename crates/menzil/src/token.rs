@@ -22,8 +22,12 @@
 //! * `menzil1-steward:` + base64url of a network id and a steward public key
 //!   ([`encode_steward_request`]): what `menzil steward request` prints on the device that will
 //!   hold the steward key, what the owner pastes into `menzil steward add`. Public data only.
+//! * `menzil1-invite:` + base64url of a CBOR map `{ invite, secret, relay }`
+//!   ([`encode_invite`]): what `menzil invite create` prints. Unlike the others it is a **bearer
+//!   secret**: whoever holds it can redeem the invite (one use by default), so it travels
+//!   over a channel the inviter trusts and is never logged.
 //!
-//! A token carries only public, signed material. Nothing here verifies a signature; the caller
+//! A token carries only public, signed material, except an invite (above). Nothing here verifies a signature; the caller
 //! does, against the key the document names (an unsigned or forged token must not be trusted
 //! because it decoded).
 
@@ -43,6 +47,10 @@ pub const ROSTER_PREFIX: &str = "menzil1-roster:";
 pub const STEWARD_PREFIX: &str = "menzil1-steward:";
 /// Prefix of a renewed certificate, the token `menzil cert accept` takes.
 pub const CERT_PREFIX: &str = "menzil1-cert:";
+/// Prefix of an invite token (a bearer secret).
+pub const INVITE_PREFIX: &str = "menzil1-invite:";
+/// The longest an invite token's CBOR may be before it is decoded.
+const MAX_INVITE_BYTES: usize = 4096;
 
 /// The longest token text accepted: four documents (a pair and its base) at the size verifiers
 /// allow, base64 encoded, with room for the framing. Checked before any decoding.
@@ -356,6 +364,46 @@ pub fn decode_steward_request(token: &str) -> Result<(NetworkId, StewardKey), To
         NetworkId::from(<[u8; 32]>::try_from(network).expect("32 bytes")),
         StewardKey::from(<[u8; 32]>::try_from(steward).expect("32 bytes")),
     ))
+}
+
+/// What an invite token carries (design note `relay-key-and-invites-design.md` B2): the signed
+/// Invite, its secret and the connection information of the relay the issuer is attached to.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InviteToken {
+    /// The signed invite.
+    pub invite: menzil_proto::Invite,
+    /// The secret the tag of a redemption is keyed with.
+    pub secret: menzil_proto::ByteArray<32>,
+    /// The issuer's relay (`menzil://...`), where the device redeems.
+    pub relay: String,
+}
+
+/// `menzil1-invite:` + base64url of the CBOR map.
+pub fn encode_invite(token: &InviteToken) -> String {
+    let mut bytes = Vec::new();
+    ciborium::into_writer(token, &mut bytes).expect("an invite token encodes into memory");
+    format!("{INVITE_PREFIX}{}", URL_SAFE_NO_PAD.encode(bytes))
+}
+
+/// The invite, secret and relay of an invite token. Nothing is verified here: the signature, the
+/// expiry and the roles are the caller's checks.
+pub fn decode_invite(token: &str) -> Result<InviteToken, TokenError> {
+    let bytes = decode_base64(strip(
+        token,
+        INVITE_PREFIX,
+        &[
+            (JOIN_PREFIX, " (this is a join request, for `menzil admit`)"),
+            (DOCS_PREFIX, OTHER_KIND),
+            (ROSTER_PREFIX, OTHER_KIND),
+            (STEWARD_PREFIX, OTHER_KIND),
+            (CERT_PREFIX, OTHER_KIND),
+        ],
+    )?)?;
+    if bytes.len() > MAX_INVITE_BYTES {
+        return Err(TokenError::Malformed("invite"));
+    }
+    ciborium::from_reader(bytes.as_slice()).map_err(|_| TokenError::Malformed("invite"))
 }
 
 #[cfg(test)]

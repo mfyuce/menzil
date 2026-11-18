@@ -704,6 +704,85 @@ pub fn admit(
     Documents::signed(owner, roster, policy)
 }
 
+/// [`admit`] for several devices at once (invite redemption batches the requests that arrive
+/// together): one pair, `seq + 1`, with every device appended at the end of the Roster and the
+/// Policy in the order given, without roles. Each passes the checks of [`admit`] against the
+/// documents and against the devices before it (a node twice is [`AdminError::AlreadyMember`],
+/// a name twice, letter case aside, is [`AdminError::NameTaken`]); nothing is issued when one
+/// fails. An empty list is refused with [`AdminError::MismatchedDocuments`].
+pub fn admit_many(
+    owner: &OwnerKey,
+    current: &Documents,
+    members: &[(NodeCert, String)],
+    now: u64,
+) -> Result<Documents, AdminError> {
+    let certs = check_admissions(current, members, now)?;
+    let (mut roster, mut policy) = current.successor(owner, now)?;
+    append_members(&mut roster, &mut policy, members, &certs);
+    Documents::signed(owner, roster, policy)
+}
+
+/// [`steward_admit`] for several devices at once: see [`admit_many`].
+pub fn steward_admit_many(
+    steward: &StewardSecret,
+    current: &Documents,
+    members: &[(NodeCert, String)],
+    now: u64,
+) -> Result<Documents, AdminError> {
+    let current = current.clone().into_verified()?;
+    let certs = check_admissions(&current, members, now)?;
+    let (mut roster, mut policy, base) = current.steward_successor(steward, now)?;
+    append_members(&mut roster, &mut policy, members, &certs);
+    current.steward_signed(steward, roster, policy, base, now)
+}
+
+fn check_admissions(
+    current: &Documents,
+    members: &[(NodeCert, String)],
+    now: u64,
+) -> Result<Vec<menzil_proto::NodeCertBody>, AdminError> {
+    if members.is_empty() {
+        return Err(AdminError::MismatchedDocuments("no member to admit"));
+    }
+    let mut certs: Vec<menzil_proto::NodeCertBody> = Vec::with_capacity(members.len());
+    for (cert, name) in members {
+        let body = check_admission(current, cert, name, now)?;
+        if certs.iter().any(|earlier| earlier.node_id == body.node_id) {
+            return Err(AdminError::AlreadyMember(body.node_id));
+        }
+        let wanted = name.to_lowercase();
+        if members
+            .iter()
+            .take(certs.len())
+            .any(|(_, earlier)| earlier.to_lowercase() == wanted)
+        {
+            return Err(AdminError::NameTaken(menzil_proto::shown(name)));
+        }
+        certs.push(body);
+    }
+    Ok(certs)
+}
+
+fn append_members(
+    roster: &mut RosterBody,
+    policy: &mut PolicyBody,
+    members: &[(NodeCert, String)],
+    certs: &[menzil_proto::NodeCertBody],
+) {
+    for ((cert, name), body) in members.iter().zip(certs) {
+        roster.members.push(RosterMember {
+            node_id: body.node_id,
+            min_serial: body.serial,
+        });
+        policy.members.push(PolicyMember {
+            node_id: body.node_id,
+            name: name.clone(),
+            roles: vec![],
+        });
+        policy.certs.push(cert.clone());
+    }
+}
+
 /// What an issuer checks before admitting `member` as `name`: the certificate, the name, that
 /// the node is not a member or revoked already and that no member has the name (letter case
 /// aside).

@@ -64,13 +64,14 @@ use tokio::sync::{mpsc, watch};
 use menzil_carrier::{Backoff, Carrier, ConnectionInfo, DialConfig};
 use menzil_proto::{
     Capability, DocBody, DocReassembler, DocType, GoawayBody, HelloBody, Limits,
-    MIN_SEND_CHARGE_BYTES, NetworkId, PROTOCOL_VERSION, Record, Tai64N, WelcomeBody,
+    MIN_SEND_CHARGE_BYTES, NetworkId, NodeId, PROTOCOL_VERSION, Record, Tai64N, WelcomeBody,
     X25519PublicKey,
 };
 use menzil_session::{
     HandshakePattern, Liveness, NodeHandshake, RekeySchedule, Transport, prologue,
 };
 
+use crate::admit_handler::{AdmitHandler, AdmitOut};
 use crate::error::NodeError;
 use crate::identity::IdentityCell;
 use crate::known_relays::KnownRelays;
@@ -442,6 +443,10 @@ pub struct Session {
     /// be the key of the relay's certificate for the NodeId dialed (expose design S-E4: the
     /// router pins the relay principal's L4 key to it).
     relay_static: X25519PublicKey,
+    /// The timestamp of the HELLO this session sent: what an ADMIT_LISTEN proof binds to.
+    hello_timestamp: Tai64N,
+    /// This node's own id (renewals keep it).
+    own_node_id: NodeId,
     tick: tokio::time::Interval,
 }
 
@@ -462,13 +467,16 @@ impl Session {
         // Decided at every connect, from what the store holds now (protocol.md 4.1).
         let claims = claimable_networks(config, &roster_store);
         let mut carrier = Carrier::dial(&config.dial, env).await?;
-        let (transport, welcome, relay_static) =
+        let (transport, welcome, relay_static, hello_timestamp) =
             run_handshake(&mut carrier, config, &claims, &roster_store).await?;
+        let own_node_id = config.identity.get().node_cert.decode()?.node_id;
         let mut session = Self {
             carrier,
             engine: Engine::new(transport, Instant::now(), Arc::clone(&roster_store), claims),
             welcome,
             relay_static,
+            hello_timestamp,
+            own_node_id,
             tick: tokio::time::interval(TICK),
         };
         session.engine.relay_rosters = session.welcome.rosters.clone();
@@ -490,6 +498,47 @@ impl Session {
             self.send(record).await?;
         }
         Ok(sent)
+    }
+
+    /// Sends ADMIT_LISTEN for each of `networks` this device may issue invites for and that it
+    /// has not sent one for in this attachment (`done` remembers them). The proof binds the
+    /// relay's NodeId, this node's id and this session's HELLO timestamp (protocol.md 7.2).
+    pub(crate) async fn send_listens(
+        &mut self,
+        handler: &AdmitHandler,
+        relay: NodeId,
+        done: &mut std::collections::HashSet<NetworkId>,
+    ) -> Result<(), NodeError> {
+        let wanted: Vec<NetworkId> = self
+            .engine
+            .claimed_networks
+            .iter()
+            .filter(|network| !done.contains(*network))
+            .copied()
+            .collect();
+        if wanted.is_empty() {
+            return Ok(());
+        }
+        let bodies = handler
+            .listen_bodies(
+                wanted,
+                relay,
+                self.own_node_id,
+                self.hello_timestamp,
+                unix_now(),
+            )
+            .await;
+        for body in bodies {
+            done.insert(body.network_id);
+            self.send(Record::AdmitListen(body)).await?;
+        }
+        Ok(())
+    }
+
+    /// Sends the relay the Roster of `network` again, though it is known to hold it.
+    pub(crate) async fn resend_roster(&mut self, network: NetworkId) -> Result<(), NodeError> {
+        self.engine.relay_rosters.remove(&network);
+        self.push_newer_rosters().await.map(|_| ())
     }
 
     /// The networks this session put in HELLO: the configured ones less those this node left out
@@ -731,7 +780,7 @@ async fn run_handshake(
     config: &SessionConfig,
     claims: &[NetworkId],
     roster_store: &RosterStore,
-) -> Result<(Transport, WelcomeBody, X25519PublicKey), NodeError> {
+) -> Result<(Transport, WelcomeBody, X25519PublicKey, Tai64N), NodeError> {
     let info = &config.dial.connection_info;
     // protocol.md 3.2, 4.1: IK with the key this node remembers for the relay, else with the
     // configured `key`, else XX; after an IK attempt failed in the handshake itself, XX.
@@ -760,11 +809,12 @@ async fn run_handshake(
     // One read for the whole handshake, so the certificate and its key cannot come from two
     // different renewals.
     let identity = config.identity.get();
+    let hello_timestamp = tai64n_now();
     let hello = HelloBody {
         v: PROTOCOL_VERSION,
         node_cert: identity.node_cert.clone(),
         networks: claims.to_vec(),
-        timestamp: tai64n_now(),
+        timestamp: hello_timestamp,
         roster_seq,
         caps: config.caps.clone(),
         e2e_protos: config.e2e_protos.clone(),
@@ -820,7 +870,7 @@ async fn run_handshake(
         carrier.send(message3).await?;
     }
     config.known_relays.ik_succeeded(&info.relay_node_id);
-    Ok((transport, welcome, relay_static))
+    Ok((transport, welcome, relay_static, hello_timestamp))
 }
 
 /// The relay is verified BEFORE message 3 (the HELLO in XX) is written: a refusal produces
@@ -1299,6 +1349,14 @@ pub async fn run_session(
     run_session_until(config, env, events, outbound, roster_store, stop).await;
 }
 
+/// The next thing the admission handler wants said to the relay; never ready without one.
+async fn next_admit_out(admit: &Option<Arc<AdmitHandler>>) -> AdmitOut {
+    match admit {
+        Some(handler) => handler.next_out().await,
+        None => std::future::pending().await,
+    }
+}
+
 /// Resolves once `stop` holds `true`. A sender dropped without having sent
 /// `true` stops nothing.
 async fn stopped(stop: &mut watch::Receiver<bool>) {
@@ -1386,6 +1444,9 @@ pub struct Observers {
     pub notes: RelayNotes,
     /// The shares to advertise and the relay's answer to them.
     pub shares: ShareBook,
+    /// The issuer's side of invite redemption (ADMIT_LISTEN on attach, ADMIT_PENDING in,
+    /// ADMIT_REFUSED out), on a device that holds an issuer key; `None` elsewhere.
+    pub admit: Option<Arc<AdmitHandler>>,
 }
 
 impl From<RelayNotes> for Observers {
@@ -1393,6 +1454,7 @@ impl From<RelayNotes> for Observers {
         Self {
             notes,
             shares: ShareBook::new(),
+            admit: None,
         }
     }
 }
@@ -1412,7 +1474,11 @@ pub async fn run_session_observed(
     mut stop: watch::Receiver<bool>,
     observers: impl Into<Observers>,
 ) {
-    let Observers { notes, shares } = observers.into();
+    let Observers {
+        notes,
+        shares,
+        admit: admitter,
+    } = observers.into();
     let mut backoff = Backoff::new();
     let mut epoch = Epoch::first();
     // Subscribed for the life of the node, not of one attachment: a notice that comes while the
@@ -1465,6 +1531,11 @@ pub async fn run_session_observed(
         for req in waiting {
             admit(req, epoch, &mut outbound_queue);
         }
+        // ADMIT_LISTEN goes out after ATTACH and the Rosters of the connect; and again when a
+        // Roster change makes another network eligible.
+        let relay_id = config.dial.connection_info.relay_node_id;
+        let mut listen_due = admitter.is_some();
+        let mut listened: std::collections::HashSet<NetworkId> = std::collections::HashSet::new();
         let mut pending: VecDeque<SessionEvent> = VecDeque::new();
         pending.push_back(SessionEvent::Attached {
             epoch,
@@ -1486,11 +1557,39 @@ pub async fn run_session_observed(
                 stop_attached(&mut session, &mut outbound, &mut outbound_queue, epoch).await;
                 return;
             }
+            if listen_due && let Some(handler) = &admitter {
+                listen_due = false;
+                match tokio::time::timeout(
+                    SEND_TIMEOUT,
+                    session.send_listens(handler, relay_id, &mut listened),
+                )
+                .await
+                {
+                    Ok(Ok(())) => {}
+                    Ok(Err(err)) => {
+                        tracing::warn!(error = %err, "node session ended while registering as an issuer, reconnecting");
+                        break 'attached None;
+                    }
+                    Err(_elapsed) => {
+                        tracing::warn!(
+                            "registering as an issuer stalled past the write timeout, reconnecting"
+                        );
+                        break 'attached None;
+                    }
+                }
+            }
             tokio::select! {
                 recv_result = session.recv(), if pending.is_empty() => {
                     match recv_result {
                         Ok(Record::Credit(body)) => {
                             outbound_queue.note_credit(body.peer, body.bytes);
+                        }
+                        // A device's request, delivered to this issuer: judged in a batch, not
+                        // by the router.
+                        Ok(Record::AdmitPending(body)) if admitter.is_some() => {
+                            if let Some(handler) = &admitter {
+                                handler.submit(body);
+                            }
                         }
                         Ok(record) => {
                             if let Record::AdvertiseAck(body) = &record {
@@ -1595,6 +1694,7 @@ pub async fn run_session_observed(
                 changed = roster_changes.recv() => {
                     // `Closed` cannot happen: the store is held right here.
                     let _ = changed;
+                    listen_due = admitter.is_some();
                     match tokio::time::timeout(SEND_TIMEOUT, session.push_newer_rosters()).await {
                         Ok(Ok(sent)) => {
                             // A Roster the relay did not hold may be what a rejected name was
@@ -1671,6 +1771,29 @@ pub async fn run_session_observed(
                     }
                     Due::Retry => share_changes.mark_changed(),
                 },
+                // What the invite admission handler wants said to the relay: a refusal, or the
+                // Roster again.
+                out = next_admit_out(&admitter) => {
+                    let sent = match out {
+                        AdmitOut::Refused(body) => {
+                            tokio::time::timeout(SEND_TIMEOUT, session.send(Record::AdmitRefused(body))).await
+                        }
+                        AdmitOut::ResendRoster(network) => {
+                            tokio::time::timeout(SEND_TIMEOUT, session.resend_roster(network)).await
+                        }
+                    };
+                    match sent {
+                        Ok(Ok(())) => {}
+                        Ok(Err(err)) => {
+                            tracing::warn!(error = %err, "node session ended while answering the relay about an invite, reconnecting");
+                            break 'attached None;
+                        }
+                        Err(_elapsed) => {
+                            tracing::warn!("answering the relay about an invite stalled past the write timeout, reconnecting");
+                            break 'attached None;
+                        }
+                    }
+                }
                 // A stop (see the check at the top of the loop for one that came during a write).
                 () = stopped(&mut stop) => {
                     stop_attached(&mut session, &mut outbound, &mut outbound_queue, epoch).await;
