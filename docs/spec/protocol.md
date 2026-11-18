@@ -223,9 +223,11 @@ u8 type | body
 | 0x0a | REKEY | both | empty; the sender rekeys its sending state after this record, the receiver rekeys its receiving state on receipt |
 | 0x0b | ADMIT_REQUEST | node to relay | CBOR (7.2) |
 | 0x0c | ADMIT_PENDING | relay to steward node | CBOR (7.2) |
-| 0x0d | ADMIT_RESULT | relay to node | CBOR (7.2) |
+| 0x0d | ADMIT_RESULT | relay to node | CBOR `{ roster, base_roster? } \| { pending: true } \| { refused: u16 }` (7.2) |
 | 0x0e | ERROR | both | CBOR `{ code: u16, msg: str }` |
 | 0x0f | GOAWAY | relay to node | CBOR `{ reason: str, retry_after_ms: u32 }` |
+| 0x10 | ADMIT_LISTEN | node to relay | CBOR `{ network_id, signer: bytes32, sig: bytes64 }` (7.2) |
+| 0x11 | ADMIT_REFUSED | node to relay | CBOR `{ invite_id: bytes16, node_id, code: u16 }` (7.2) |
 
 GOAWAY `reason` is `superseded` (4.1), `revoked` (7.3), `over_quota` or `rate_limited`. `revoked` also ends a session whose node a Roster of a claimed network no longer lists or whose `min_serial` it now exceeds, and the session of every member of a network the operator stopped serving, the ERROR before it says which (`revoked`, `not_member` or `stale_serial`). Before that ERROR the relay sends the node the Roster of the network concerned, when it still holds one (its owner signed base first, DOC `base_roster`, when a steward signed it), so that the node can leave the network out of its next HELLO. A HELLO the relay refuses for `revoked` or `stale_serial` gets the same Roster before its ERROR, when it is newer than the `roster_seq` the HELLO claimed for that network (an absent entry counts as 0); one refused for `not_member` gets none, so that the answer does not tell a served network from an unserved one (isolation rule I2). `over_quota` follows ERROR `over_quota` when a tenant figure turns a session away (4.1); `rate_limited` follows ERROR `rate_limited` when the relay ends a session for sending more than section 10 allows (4.3). Both carry `retry_after_ms`, 60,000 by default, which the node honors (section 3.3).
 
@@ -237,7 +239,7 @@ Flow control and queues: the relay keeps one bounded queue per (source session, 
 
 Pairs: the (sender NodeId, destination NodeId) state of the paragraph above is a pair; it exists from its first admitted SEND until a session of either side ends. A pair belongs to the tenant of the first network of the sender's HELLO list that authorized it and that `dst` claimed. Only the creation of a new pair is ever refused for a count: when the sender already has `limits.max_peers` destinations, or the pair's tenant is at one of its pair figures (section 10). The answer is ERROR `over_quota` (the credit reimbursed, the session kept); a pair that exists keeps working whatever the counts.
 
-Error codes are a registry in `menzil-proto`; version 1 defines at least `bad_cert`, `stale_serial`, `stale_timestamp`, `unknown_network`, `not_member`, `revoked`, `roster_expired`, `forbidden`, `peer_offline`, `unknown_e2e`, `credit_exceeded`, `too_large`, `rate_limited`, `label_taken`, `label_unclaimed`, `bad_invite`, `bad_tag`, `bad_document` (25), `docs_only` (26), `over_quota` (27), `handover_failed` (28), `session_expired` (29). `over_quota` means a tenant figure, or the relay's `max_peers`, refused something (section 10); a node that does not know code 27 treats it as an unknown code, and the same holds for 28 and 29 (L4 CLOSE codes, 5.2). A relay never sends `unknown_network`; an unserved network is answered as 4.1 and 4.3 say. An admission that cannot be delivered yet is not an error; ADMIT_RESULT `{ pending: true }` reports it.
+Error codes are a registry in `menzil-proto`; version 1 defines at least `bad_cert`, `stale_serial`, `stale_timestamp`, `unknown_network`, `not_member`, `revoked`, `roster_expired`, `forbidden`, `peer_offline`, `unknown_e2e`, `credit_exceeded`, `too_large`, `rate_limited`, `label_taken`, `label_unclaimed`, `bad_invite`, `bad_tag`, `bad_document` (25), `docs_only` (26), `over_quota` (27), `handover_failed` (28), `session_expired` (29), `name_taken` (30). `over_quota` means a tenant figure, or the relay's `max_peers`, refused something (section 10); a node that does not know code 27 treats it as an unknown code, and the same holds for 28 and 29 (L4 CLOSE codes, 5.2) and for 30 (`name_taken`: an invite request's device name is in use in the network or is not the name the invite fixes, 7.2). A relay never sends `unknown_network`; an unserved network is answered as 4.1 and 4.3 say. An admission that cannot be delivered yet is not an error; ADMIT_RESULT `{ pending: true }` reports it.
 
 ### 4.3 Documents
 
@@ -467,17 +469,25 @@ A `tcp:` share (`mode = "tcp"` in the node's configuration, `--mode tcp` of `men
 ### 7.2 Invites
 
 ```
-Invite = Signed("invite"){ v: 1, network_id, invite_id: bytes16, secret_hash: bytes32, roles: [str], expires: u64, uses: u8 }
+Invite = Signed("invite"){ v: 1, network_id, invite_id: bytes16, secret_hash: bytes32, roles: [str], expires: u64, uses: u8, name?: str }
 ```
 
-The owner or steward hands the device the Invite plus a 32 byte secret in one URL. The secret never leaves the device. The device connects to the relay with its NodeCert and, as the invite flow is designed, no network claim; until invitations are built a relay refuses a session that claims no network (section 4.1, section 10). It sends
+The owner or steward hands the device the Invite plus a 32 byte secret in one URL. The secret never leaves the device. `roles` must be empty in version 1, for owner and steward invites alike (the usual redeemer cannot be given roles; the owner grants them afterwards); the field stays in the encoding, and the issuer command, the relay and the redeemer each refuse an Invite whose `roles` is not empty. The optional `name` fixes the device name: the request's `name` must then equal it byte for byte. A body without `name` is encoded without the key.
+
+The device connects to the relay with its NodeCert and no network claim, and sends
 
 ```
-ADMIT_REQUEST = CBOR{ invite: Invite, node_cert: NodeCert,
-                      tag: BLAKE2s-256-keyed(key = secret, data = "menzil.v1.admit" || invite_id || node_cert_bytes) }
+ADMIT_REQUEST = CBOR{ invite: Invite, node_cert: NodeCert, name: str,
+                      tag: BLAKE2s-256-keyed(key = secret, data = "menzil.v1.admit" || invite_id || node_cert_bytes || 0x00 || name) }
 ```
 
-The relay checks the Invite signature against the network's owner or steward and stores at most 100 pending requests per network. When the steward node is attached, the relay delivers ADMIT_PENDING with the request. The steward verifies `secret_hash == BLAKE2s(secret)` for the secret it issued, the tag, `expires`, and its own use counter (use counts are enforced by the steward, never by relays). It then issues Roster and Policy `seq + 1` and pushes them; the relay answers the device with ADMIT_RESULT `{ roster: Roster, policy: Policy }` or `{ pending: true }`. A relay cannot mint membership: nothing it holds lets it forge the tag or sign documents.
+`node_cert_bytes` is the NodeCert in its `Signed` encoding (the CBOR array of body and signature). The tag covers `name`, so a relay cannot rename the device, and a tag is compared in constant time. ADMIT_PENDING carries the same body to the issuer.
+
+The device learns the answer in ADMIT_RESULT, exactly one of `{ roster: Roster, base_roster?: Roster }` (the Roster that lists the device and, when a steward signed it, the owner signed base it extends; never a Policy, which the device gets from the issuer's push, section 5.5), `{ pending: true }` (the issuer is not reachable yet) or `{ refused: u16 }` (an error code number, for example `bad_invite`, `bad_tag`, `bad_cert`, `revoked` or `name_taken`). A body with no variant, two variants, `pending: false`, a `base_roster` without a `roster` or an unknown key is refused.
+
+An issuer registers for a network with ADMIT_LISTEN `{ network_id, signer, sig }` where `sig = Ed25519(signer, "menzil.v1.admit-listen" || 0x00 || relay NodeId || session NodeId || HELLO timestamp)` (the session's own HELLO timestamp, 12 bytes). The relay accepts it when `signer` is the network's owner key or a steward of its Roster with `admit` and a `not_after` ahead; the binding to the relay id and the session makes a captured proof useless elsewhere. The registered session answers a request it refuses with ADMIT_REFUSED `{ invite_id, node_id, code }`, which the relay turns into ADMIT_RESULT `{ refused: code }`.
+
+Not built yet (slices B2 to B4): the relay's redeem sessions (a HELLO without a network claim is still refused `not_member`), holding and its figures, the delivery of ADMIT_PENDING, the registration check and the answer on Roster adoption; the issuer's invite book, use counter, checks and batching; the device command, the Roster only state and the Roster only responder (section 5.1). Only the wire layer of this section exists in `menzil-proto`: the bodies, the tag, the listen signing string, the helpers for empty `roles` and the fixed `name`, records 0x10 and 0x11 and `name_taken`. The intended behaviour: the issuer counts uses per NodeId in its own book (relays are never trusted with a count), so a retry costs no use; it refuses a name already used in the network (compared ignoring case) with `name_taken`; the relay cannot mint membership, because nothing it holds lets it forge the tag or sign documents.
 
 ### 7.3 Renewal and revocation
 

@@ -145,6 +145,10 @@ pub enum ErrorCode {
     /// age cap (24 hours and 30 minutes) before a replacement took over. A peer built before
     /// this code existed reads it as [`Self::Unknown`] with the number 29.
     SessionExpired,
+    /// `name_taken` (protocol.md 7.2): the device name of an invite request is already used
+    /// in the network (compared ignoring case) or is not the name the invite fixes. A peer
+    /// built before this code existed reads it as [`Self::Unknown`] with the number 30.
+    NameTaken,
     /// A code this build does not recognize, preserved verbatim.
     Unknown(u16),
 }
@@ -179,6 +183,7 @@ impl ErrorCode {
     const OVER_QUOTA: u16 = 27;
     const HANDOVER_FAILED: u16 = 28;
     const SESSION_EXPIRED: u16 = 29;
+    const NAME_TAKEN: u16 = 30;
 
     /// The symbolic name from protocol.md, e.g. `"bad_cert"`.
     pub fn name(self) -> &'static str {
@@ -212,6 +217,7 @@ impl ErrorCode {
             Self::OverQuota => "over_quota",
             Self::HandoverFailed => "handover_failed",
             Self::SessionExpired => "session_expired",
+            Self::NameTaken => "name_taken",
             Self::Unknown(_) => "unknown",
         }
     }
@@ -249,6 +255,7 @@ impl From<ErrorCode> for u16 {
             ErrorCode::OverQuota => ErrorCode::OVER_QUOTA,
             ErrorCode::HandoverFailed => ErrorCode::HANDOVER_FAILED,
             ErrorCode::SessionExpired => ErrorCode::SESSION_EXPIRED,
+            ErrorCode::NameTaken => ErrorCode::NAME_TAKEN,
             ErrorCode::Unknown(code) => code,
         }
     }
@@ -286,6 +293,7 @@ impl From<u16> for ErrorCode {
             Self::OVER_QUOTA => Self::OverQuota,
             Self::HANDOVER_FAILED => Self::HandoverFailed,
             Self::SESSION_EXPIRED => Self::SessionExpired,
+            Self::NAME_TAKEN => Self::NameTaken,
             other => Self::Unknown(other),
         }
     }
@@ -339,6 +347,7 @@ mod tests {
             ErrorCode::OverQuota,
             ErrorCode::HandoverFailed,
             ErrorCode::SessionExpired,
+            ErrorCode::NameTaken,
         ];
         for code in codes {
             let wire: u16 = code.into();
@@ -387,8 +396,8 @@ mod tests {
         assert_eq!(wire, as_number);
         assert_eq!(u16::from(ErrorCode::Unknown(27)), 27);
         assert_eq!(ErrorCode::Unknown(27).name(), "unknown");
-        // The next number after the re-handshake codes is still free: unknown here.
-        assert_eq!(ErrorCode::from(30), ErrorCode::Unknown(30));
+        // The next number after the invite code is still free: unknown here.
+        assert_eq!(ErrorCode::from(31), ErrorCode::Unknown(31));
     }
 
     #[test]
@@ -409,6 +418,18 @@ mod tests {
             ciborium::into_writer(&number, &mut as_number).unwrap();
             assert_eq!(wire, as_number);
         }
+    }
+
+    #[test]
+    fn name_taken_keeps_its_number_and_name_and_older_peers_read_it_as_unknown() {
+        assert_eq!(u16::from(ErrorCode::NameTaken), 30);
+        assert_eq!(ErrorCode::from(30), ErrorCode::NameTaken);
+        assert_eq!(ErrorCode::NameTaken.name(), "name_taken");
+        let mut wire = Vec::new();
+        ciborium::into_writer(&ErrorCode::NameTaken, &mut wire).unwrap();
+        let mut as_number = Vec::new();
+        ciborium::into_writer(&30u16, &mut as_number).unwrap();
+        assert_eq!(wire, as_number);
     }
 
     #[test]

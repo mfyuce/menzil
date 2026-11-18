@@ -15,8 +15,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::bytes::{DocId, NodeId};
 use crate::error::{ErrorCode, ProtoError};
-use crate::invite::{AdmitPendingBody, AdmitRequestBody};
-use crate::network::{Policy, Roster};
+use crate::invite::{
+    AdmitListenBody, AdmitPendingBody, AdmitRefusedBody, AdmitRequestBody, AdmitResultBody,
+};
 use crate::service::ServiceId;
 use crate::strict;
 
@@ -56,6 +57,12 @@ pub enum RecordType {
     Error = 0x0e,
     /// `GOAWAY`: relay to node, CBOR.
     Goaway = 0x0f,
+    /// `ADMIT_LISTEN`: node to relay, CBOR (protocol.md 7.2): an issuer's
+    /// registration for a network's `ADMIT_PENDING`.
+    AdmitListen = 0x10,
+    /// `ADMIT_REFUSED`: node to relay, CBOR (protocol.md 7.2): the
+    /// registered issuer's refusal of one request.
+    AdmitRefused = 0x11,
 }
 
 impl TryFrom<u8> for RecordType {
@@ -82,6 +89,8 @@ impl TryFrom<u8> for RecordType {
             0x0d => Ok(Self::AdmitResult),
             0x0e => Ok(Self::Error),
             0x0f => Ok(Self::Goaway),
+            0x10 => Ok(Self::AdmitListen),
+            0x11 => Ok(Self::AdmitRefused),
             // Per protocol.md section 9: "Unknown L3 record types produce
             // ERROR unknown_type without closing the session." This
             // distinguishes that case for the caller; sending the ERROR
@@ -275,33 +284,6 @@ pub struct CreditBody {
     pub bytes: u32,
 }
 
-/// `ADMIT_RESULT` (protocol.md 4.2, 7.2): either freshly issued
-/// documents, or a pending marker while the steward is unreachable.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(untagged)]
-pub enum AdmitResult {
-    /// `{ roster: Roster, policy: Policy }`
-    Granted {
-        /// The redeemer's new roster.
-        roster: Roster,
-        /// The redeemer's new policy.
-        policy: Policy,
-    },
-    /// `{ pending: true }`
-    Pending {
-        /// Always `true` on the wire; use [`AdmitResult::pending`] rather
-        /// than constructing this directly.
-        pending: bool,
-    },
-}
-
-impl AdmitResult {
-    /// Builds the `{ pending: true }` form.
-    pub fn pending() -> Self {
-        Self::Pending { pending: true }
-    }
-}
-
 /// `ERROR = CBOR{ code: u16, msg: str }` (protocol.md 4.2).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ErrorBody {
@@ -374,7 +356,11 @@ pub enum Record {
     /// See [`RecordType::AdmitPending`].
     AdmitPending(AdmitPendingBody),
     /// See [`RecordType::AdmitResult`].
-    AdmitResult(AdmitResult),
+    AdmitResult(AdmitResultBody),
+    /// See [`RecordType::AdmitListen`].
+    AdmitListen(AdmitListenBody),
+    /// See [`RecordType::AdmitRefused`].
+    AdmitRefused(AdmitRefusedBody),
     /// See [`RecordType::Error`].
     Error(ErrorBody),
     /// See [`RecordType::Goaway`].
@@ -545,6 +531,8 @@ impl Record {
             Self::AdmitRequest(body) => encode_cbor_body(RecordType::AdmitRequest, body),
             Self::AdmitPending(body) => encode_cbor_body(RecordType::AdmitPending, body),
             Self::AdmitResult(body) => encode_cbor_body(RecordType::AdmitResult, body),
+            Self::AdmitListen(body) => encode_cbor_body(RecordType::AdmitListen, body),
+            Self::AdmitRefused(body) => encode_cbor_body(RecordType::AdmitRefused, body),
             Self::Error(body) => encode_cbor_body(RecordType::Error, body),
             Self::Goaway(body) => encode_cbor_body(RecordType::Goaway, body),
         }
@@ -623,6 +611,8 @@ impl Record {
             RecordType::AdmitRequest => Ok(Self::AdmitRequest(decode_cbor_body(rest)?)),
             RecordType::AdmitPending => Ok(Self::AdmitPending(decode_cbor_body(rest)?)),
             RecordType::AdmitResult => Ok(Self::AdmitResult(decode_cbor_body(rest)?)),
+            RecordType::AdmitListen => Ok(Self::AdmitListen(decode_cbor_body(rest)?)),
+            RecordType::AdmitRefused => Ok(Self::AdmitRefused(decode_cbor_body(rest)?)),
             RecordType::Error => Ok(Self::Error(decode_cbor_body(rest)?)),
             RecordType::Goaway => Ok(Self::Goaway(decode_cbor_body(rest)?)),
         }
@@ -646,6 +636,8 @@ impl fmt::Display for RecordType {
             Self::AdmitRequest => "ADMIT_REQUEST",
             Self::AdmitPending => "ADMIT_PENDING",
             Self::AdmitResult => "ADMIT_RESULT",
+            Self::AdmitListen => "ADMIT_LISTEN",
+            Self::AdmitRefused => "ADMIT_REFUSED",
             Self::Error => "ERROR",
             Self::Goaway => "GOAWAY",
         };
@@ -658,9 +650,11 @@ mod tests {
     use super::*;
     use crate::bytes::{InviteId, NetworkId, SecretHash, X25519PublicKey};
     use crate::identity::{NodeCert, NodeCertBody};
-    use crate::invite::{AdmitRequestBody, hash_invite_secret};
+    use crate::invite::{
+        AdmitListenBody, AdmitRefusedBody, AdmitRequestBody, AdmitResultBody, hash_invite_secret,
+    };
     use crate::invite::{Invite, InviteBody};
-    use crate::network::{PolicyBody, RosterBody};
+    use crate::network::{Roster, RosterBody};
     use ed25519_dalek::SigningKey;
 
     #[test]
@@ -696,6 +690,7 @@ mod tests {
             roles: vec![],
             expires: 1_000_000_000,
             uses: 1,
+            name: None,
         };
         Invite::sign(&key, &body).unwrap()
     }
@@ -714,23 +709,6 @@ mod tests {
             labels: vec![],
         };
         Roster::sign(&key, &body).unwrap()
-    }
-
-    fn sample_policy() -> Policy {
-        let key = SigningKey::generate(&mut rand::rng());
-        let body = PolicyBody {
-            v: crate::PROTOCOL_VERSION,
-            network_id: NetworkId::from([7u8; 32]),
-            seq: 1,
-            issued: 0,
-            expires: 1_000_000_000,
-            members: vec![],
-            certs: vec![],
-            grants: vec![],
-            egress: vec![],
-            accept: vec![],
-        };
-        Policy::sign(&key, &body).unwrap()
     }
 
     fn all_sample_records() -> Vec<Record> {
@@ -789,6 +767,7 @@ mod tests {
             Record::AdmitRequest(AdmitRequestBody {
                 invite: sample_invite(),
                 node_cert: sample_node_cert(),
+                name: "laptop".to_string(),
                 tag: crate::bytes::ByteArray::from(<[u8; 32]>::from(hash_invite_secret(
                     b"whatever",
                 ))),
@@ -796,13 +775,29 @@ mod tests {
             Record::AdmitPending(AdmitRequestBody {
                 invite: sample_invite(),
                 node_cert: sample_node_cert(),
+                name: "laptop".to_string(),
                 tag: crate::bytes::ByteArray::from([0u8; 32]),
             }),
-            Record::AdmitResult(AdmitResult::Granted {
+            Record::AdmitResult(AdmitResultBody::Admitted {
                 roster: sample_roster(),
-                policy: sample_policy(),
+                base_roster: None,
             }),
-            Record::AdmitResult(AdmitResult::pending()),
+            Record::AdmitResult(AdmitResultBody::Admitted {
+                roster: sample_roster(),
+                base_roster: Some(sample_roster()),
+            }),
+            Record::AdmitResult(AdmitResultBody::Pending),
+            Record::AdmitResult(AdmitResultBody::Refused(16)),
+            Record::AdmitListen(AdmitListenBody {
+                network_id: NetworkId::from([1u8; 32]),
+                signer: crate::bytes::ByteArray::from([2u8; 32]),
+                sig: crate::bytes::ByteArray::from([3u8; 64]),
+            }),
+            Record::AdmitRefused(AdmitRefusedBody {
+                invite_id: InviteId::from([4u8; 16]),
+                node_id: NodeId::from([5u8; 32]),
+                code: ErrorCode::NameTaken,
+            }),
             Record::Error(ErrorBody {
                 code: ErrorCode::Forbidden,
                 msg: "no grant".to_string(),

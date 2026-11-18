@@ -48,7 +48,9 @@ pub use error::{ErrorCode, ProtoError};
 pub use handshake::{Capability, HelloBody, Limits, WelcomeBody};
 pub use identity::{NodeCert, NodeCertBody};
 pub use invite::{
-    AdmitPendingBody, AdmitRequestBody, Invite, InviteBody, compute_admit_tag, hash_invite_secret,
+    AdmitListenBody, AdmitPendingBody, AdmitRefusedBody, AdmitRequestBody, AdmitResultBody, Invite,
+    InviteBody, InviteCheckError, admit_listen_signing_bytes, compute_admit_tag,
+    hash_invite_secret, verify_admit_tag,
 };
 pub use names::{NameError, check_name, check_role, is_invisible, is_unsafe, shown};
 pub use network::{
@@ -57,9 +59,9 @@ pub use network::{
     Steward, StewardBody,
 };
 pub use record::{
-    Addr, AdmitResult, AdvertiseAckBody, AdvertiseBody, CreditBody, DocBody, DocType, ErrorBody,
-    GoawayBody, L3_AEAD_TAG_LEN, MIN_SEND_CHARGE_BYTES, PeerStateBody, Record, RecordType,
-    RejectedShare, Share, ShareMode, max_send_payload,
+    Addr, AdvertiseAckBody, AdvertiseBody, CreditBody, DocBody, DocType, ErrorBody, GoawayBody,
+    L3_AEAD_TAG_LEN, MIN_SEND_CHARGE_BYTES, PeerStateBody, Record, RecordType, RejectedShare,
+    Share, ShareMode, max_send_payload,
 };
 pub use service::{
     ServiceId, ServiceIdParseError, ServiceKind, ServicePattern, UnknownServiceKind,
