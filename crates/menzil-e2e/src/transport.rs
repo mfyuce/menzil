@@ -302,6 +302,31 @@ impl E2eTransport {
         counter: u64,
         ciphertext: &[u8],
     ) -> Result<E2eDataBody, E2eError> {
+        let out = self.open_reliable(counter, ciphertext)?;
+        let expected = self.recv_reliable_next;
+        // Parse (and class-check) before committing the advance, not
+        // after: a frame that authenticates and lands on the expected
+        // counter but still fails one of these leaves
+        // `recv_reliable_next` untouched, the same "no state change on
+        // failure" rule `Self::encrypt_data` already follows.
+        let body = E2eDataBody::decode(&out)?;
+        if body.kind().class() != RecordClass::Reliable {
+            return Err(E2eError::RecordClassMismatch {
+                counter_class: RecordClass::Reliable,
+                kind_class: body.kind().class(),
+            });
+        }
+        self.recv_reliable_next = expected.saturating_add(1);
+        if matches!(body, E2eDataBody::Rekey) {
+            self.rekey_incoming();
+        }
+        Ok(body)
+    }
+
+    /// Steps 1 to 3 of [`Self::decrypt_data`], without touching any state: the counter must be
+    /// reliable class, the frame must authenticate, and the counter must be the next expected
+    /// one. Returns the plaintext (`kind byte | body`) undecoded.
+    fn open_reliable(&self, counter: u64, ciphertext: &[u8]) -> Result<Vec<u8>, E2eError> {
         if RecordClass::of_counter(counter) == RecordClass::Datagram {
             return Err(E2eError::UnauthenticatedDatagramCounter);
         }
@@ -322,23 +347,68 @@ impl E2eTransport {
                 actual: counter,
             });
         }
-        // Parse (and class-check) before committing the advance, not
-        // after: a frame that authenticates and lands on the expected
-        // counter but still fails one of these leaves
-        // `recv_reliable_next` untouched, the same "no state change on
-        // failure" rule `Self::encrypt_data` already follows.
-        let body = E2eDataBody::decode(&out)?;
-        if body.kind().class() != RecordClass::Reliable {
-            return Err(E2eError::RecordClassMismatch {
-                counter_class: RecordClass::Reliable,
-                kind_class: body.kind().class(),
+        Ok(out)
+    }
+
+    /// Encrypts a raw reliable plaintext (`kind byte | body`) that is not an [`E2eDataBody`]:
+    /// the CONTINUE and CONTINUE_ACK records of the re-handshake (protocol.md 5.2, R1
+    /// deviation 1). It takes the next reliable counter exactly like [`Self::encrypt_data`] and
+    /// obeys the same plaintext budget and counter ceiling.
+    ///
+    /// **Only the handover kinds are accepted** (`0x06` and `0x07`): any other first byte is
+    /// refused with `UnknownE2eDataKind` before a counter is used, because the other kinds have
+    /// side effects this path would skip (REKEY rekeys the cipher, see [`Self::encrypt_data`]).
+    pub fn encrypt_raw(&mut self, plaintext: &[u8]) -> Result<E2eFrame, E2eError> {
+        match plaintext.first() {
+            Some(&menzil_proto::CONTINUE_KIND) | Some(&menzil_proto::CONTINUE_ACK_KIND) => {}
+            Some(&other) => {
+                return Err(menzil_proto::ProtoError::UnknownE2eDataKind(other).into());
+            }
+            None => {
+                return Err(menzil_proto::ProtoError::MalformedRecord(
+                    "empty L4 data record".to_string(),
+                )
+                .into());
+            }
+        }
+        if self.send_reliable_next >= RELIABLE_COUNTER_CEILING {
+            return Err(E2eError::ReliableCounterExhausted);
+        }
+        if plaintext.len() > self.max_plaintext {
+            return Err(E2eError::BodyTooLarge {
+                len: plaintext.len(),
+                max: self.max_plaintext,
             });
         }
-        self.recv_reliable_next = expected.saturating_add(1);
-        if matches!(body, E2eDataBody::Rekey) {
-            self.rekey_incoming();
+        let counter = self.send_reliable_next;
+        let needed = plaintext.len() + L4_AEAD_TAG_LEN;
+        if needed > MAX_NOISE_MESSAGE {
+            return Err(snow::Error::Input.into());
         }
-        Ok(body)
+        let mut out = vec![0u8; needed];
+        let n = self.inner.write_message(counter, plaintext, &mut out)?;
+        out.truncate(n);
+        self.send_reliable_next = self.send_reliable_next.saturating_add(1);
+        Ok(E2eFrame::Data {
+            receiver_index: self.peer_index,
+            counter,
+            ciphertext: out,
+        })
+    }
+
+    /// Decrypts a reliable record and returns its plaintext (`kind byte | body`) undecoded:
+    /// the receive side of [`Self::encrypt_raw`], for the first record of a replacement
+    /// session. Applies steps 1 to 3 of [`Self::decrypt_data`] (reliable class counter, the
+    /// frame authenticates, the counter is exactly the next one) and advances the receive
+    /// counter on success, so the record is consumed like any other.
+    ///
+    /// **The caller decides what the plaintext is and must not use this for a kind with a side
+    /// effect** (REKEY): a plaintext that is not the record it expected ends the session, which
+    /// is the only thing the handover code does with one.
+    pub fn decrypt_raw(&mut self, counter: u64, ciphertext: &[u8]) -> Result<Vec<u8>, E2eError> {
+        let out = self.open_reliable(counter, ciphertext)?;
+        self.recv_reliable_next = counter.saturating_add(1);
+        Ok(out)
     }
 
     /// The largest datagram payload (`bytes` of a DGRAM body) this session
@@ -1370,6 +1440,55 @@ pub(crate) mod tests {
         assert_eq!(b.reliable_received(), 3);
         b.decrypt_data(counter, &ct).unwrap();
         assert_eq!((a.reliable_sent(), b.reliable_received()), (4, 4));
+    }
+
+    #[test]
+    fn raw_handover_records_round_trip_and_count() {
+        let (mut a, mut b) = run_live_handshake_with_max_record(65_535);
+        let cont = menzil_proto::ContinueBody {
+            prior: 7,
+            sent: 3,
+            binding: [5; 32],
+        };
+        let (counter, ct) = frame_parts(a.encrypt_raw(&cont.encode()).unwrap());
+        assert_eq!(counter, 0);
+        assert_eq!(a.reliable_sent(), 1);
+        let plain = b.decrypt_raw(counter, &ct).unwrap();
+        assert_eq!(menzil_proto::ContinueBody::decode(&plain).unwrap(), cont);
+        assert_eq!(b.reliable_received(), 1);
+        // An ordinary record follows on counter 1 on both ends.
+        let (counter, ct) = frame_parts(a.encrypt_data(&E2eDataBody::Keep).unwrap());
+        assert_eq!(counter, 1);
+        assert_eq!(b.decrypt_data(counter, &ct).unwrap(), E2eDataBody::Keep);
+    }
+
+    #[test]
+    fn raw_encrypt_refuses_other_kinds_without_using_a_counter() {
+        let (mut a, _b) = run_live_handshake_with_max_record(65_535);
+        assert!(a.encrypt_raw(&[0x05]).is_err());
+        assert!(a.encrypt_raw(&[0x01, 1, 2]).is_err());
+        assert!(a.encrypt_raw(&[]).is_err());
+        assert_eq!(a.reliable_sent(), 0);
+    }
+
+    #[test]
+    fn raw_decrypt_enforces_contiguity_and_leaves_state_on_failure() {
+        let (mut a, mut b) = run_live_handshake_with_max_record(65_535);
+        let ack = menzil_proto::ContinueAckBody { sent: 9 }.encode();
+        let (counter, ct) = frame_parts(a.encrypt_raw(&ack).unwrap());
+        assert!(b.decrypt_raw(counter + 1, &ct).is_err());
+        assert_eq!(b.reliable_received(), 0);
+        // A datagram class counter is refused before any decryption.
+        assert!(matches!(
+            b.decrypt_raw(1 << 63, &ct),
+            Err(E2eError::UnauthenticatedDatagramCounter)
+        ));
+        b.decrypt_raw(counter, &ct).unwrap();
+        // Replaying it is a contiguity violation.
+        assert!(matches!(
+            b.decrypt_raw(counter, &ct),
+            Err(E2eError::ReliableContiguityViolation { .. })
+        ));
     }
 
     fn frame_parts(frame: E2eFrame) -> (u64, Vec<u8>) {

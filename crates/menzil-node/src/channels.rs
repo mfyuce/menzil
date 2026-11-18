@@ -188,6 +188,10 @@ pub struct Dropped {
     pub sink_full: u64,
     /// By the sending side ([`SendDrop`]), any reason.
     pub send: u64,
+    /// Across a re-handshake cutover (protocol.md 5.2): a datagram on a replacement session
+    /// that was not proved yet, or on an old session already retired, or one the old session
+    /// had in flight past its keys. Counted by the session actor; never ends anything.
+    pub handover: u64,
 }
 
 struct Sink {
@@ -380,6 +384,11 @@ impl ChannelTable {
         if (id % 2 == 1) == own_parity_is_odd {
             inner.freed.insert(id, now);
         }
+    }
+
+    /// Counts one datagram dropped because of a re-handshake cutover ([`Dropped::handover`]).
+    pub(crate) fn note_handover_drop(&self) {
+        self.lock().dropped.handover += 1;
     }
 
     /// Ends every channel (the session ended): each [`Channel::recv`] returns `None` once it has

@@ -292,14 +292,14 @@
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use futures_util::stream::{FuturesUnordered, StreamExt};
 use menzil_e2e::{E2eError, E2eTransport, Liveness, RekeySchedule};
 use menzil_proto::{
-    E2eDataBody, ErrorCode, MIN_SEND_CHARGE_BYTES, NetworkId, NodeId, RecordClass,
-    e2e_data_frame_len,
+    ContinueAckBody, ContinueBody, E2eDataBody, E2eFrame, ErrorCode, MIN_SEND_CHARGE_BYTES,
+    NetworkId, NodeId, RecordClass, continue_binding, e2e_data_frame_len,
 };
 use menzil_stream::{Mode, RECEIVE_WINDOW_GRANT, Stream, StreamMuxError};
 use tokio::sync::{mpsc, oneshot};
@@ -358,6 +358,12 @@ const CLOSE_SEND_TIMEOUT: Duration = Duration::from_secs(2);
 /// re-armed `sleep`) keeps sustained inbound or outbound traffic from
 /// starving the check indefinitely.
 const CLOCK_TICK: Duration = Duration::from_secs(1);
+
+/// How long an initiator that switched to the replacement transport waits for CONTINUE_ACK
+/// (protocol.md 5.2): the actor's own dead-peer window (`menzil_e2e::Liveness`, 40 s). The old
+/// transport keeps receiving meanwhile; without an ACK by then the session ends with CLOSE
+/// `handover_failed`.
+const HANDOVER_ACK_WINDOW: Duration = Duration::from_secs(40);
 
 /// Upper bound on [`CloseReason::msg`] as actually sent, regardless of
 /// how much a given session's own plaintext budget would allow — see
@@ -480,6 +486,14 @@ pub enum EndReason {
     /// table, say) should know this variant can then never fire for that
     /// session — there is always at least one live clone.
     HandleDropped,
+    /// A re-handshake cutover did not match (protocol.md 5.2): a CONTINUE or CONTINUE_ACK count
+    /// differed from what this side received on the old transport, the first record on the
+    /// replacement transport was not the expected one, the CONTINUE_ACK did not arrive within
+    /// the liveness window, or a handover was asked for out of order. This side sent CLOSE
+    /// `handover_failed` (28) on the transport it sends on and the streams are reset like at
+    /// any session end. The text says which check failed (local diagnostics, also the CLOSE
+    /// message).
+    HandoverFailed(&'static str),
     /// [`L4SessionAcceptor::closed`]'s own fallback when the actor ended
     /// (or never ran at all — a panic, an aborted task) without itself
     /// reporting why. Never produced by [`run`] itself; see this
@@ -984,11 +998,66 @@ pub struct L4SessionHandle {
     /// which drop every datagram.
     channels: Option<ChannelTable>,
     command_tx: mpsc::UnboundedSender<Command>,
+    /// The newest generation [`Self::hand_over`] handed out; shared by every clone.
+    last_generation: Arc<AtomicU32>,
+    /// The newest generation whose cutover completed, written by the actor
+    /// ([`Self::settled_generation`]).
+    settled_generation: Arc<AtomicU32>,
 }
 
-/// One routed `data` frame on its way to the actor, with the permit that
-/// counts its bytes while it waits.
-type InboundItem = (u64, Vec<u8>, InboundPermit);
+/// Names which of a session's transports a routed `data` frame belongs to (protocol.md 5.2,
+/// the re-handshake handover). The transport a session is built with is generation
+/// [`FIRST_GENERATION`] (0); each [`L4SessionHandle::hand_over`] returns the next one. The
+/// router knows which one a frame is for from the `receiver_index` it matched, and passes it
+/// to [`L4SessionHandle::feed_inbound_gen`]; the actor decrypts every record with the keys of
+/// exactly that transport and drops one whose transport it no longer (or not yet) holds.
+pub type Generation = u32;
+
+/// The first generation: the transport a session starts with.
+pub const FIRST_GENERATION: Generation = 0;
+
+/// Which side of a handover this actor is (protocol.md 5.2; see [`L4SessionHandle::hand_over`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HandoverRole {
+    /// This side started the replacement (the chain initiator). `prior` is the `held` index
+    /// the responder offered in `resp`. The actor sends CONTINUE as the first reliable record
+    /// of the new transport, and expects CONTINUE_ACK as the first one back.
+    Initiator {
+        /// The responder's `held` value, which CONTINUE echoes.
+        prior: u32,
+    },
+    /// This side answers. The caller (the router) already decrypted and verified the peer's
+    /// CONTINUE on the new transport (`prior`, `binding`, slot and standing: not the actor's
+    /// business) and passes the `sent` it carried. The actor, when it reaches the item in its
+    /// queue (so after every old record already queued), checks the count against what it
+    /// received on the old transport and answers CONTINUE_ACK.
+    Responder {
+        /// The `sent` of the peer's CONTINUE: how many reliable records it sent on the old
+        /// transport.
+        continue_sent: u64,
+    },
+}
+
+/// The ordered handover item in the actor's inbound queue (see [`L4SessionHandle::hand_over`]).
+struct Handover {
+    generation: Generation,
+    transport: E2eTransport,
+    role: HandoverRole,
+}
+
+/// What travels through the actor's ordered inbound queue: routed `data` frames with the
+/// permit that counts their bytes while they wait, and, between them, handovers. One queue
+/// for both is what puts a handover after every old record queued before it.
+enum InboundItem {
+    Record {
+        generation: Generation,
+        counter: u64,
+        ciphertext: Vec<u8>,
+        permit: InboundPermit,
+    },
+    /// Boxed: a transport is much larger than a record's fields.
+    Handover(Box<Handover>),
+}
 
 impl L4SessionHandle {
     /// This session's peer.
@@ -1035,7 +1104,21 @@ impl L4SessionHandle {
     /// that budget is dropped and the session lives: a datagram that goes missing leaves no gap
     /// anyone depends on. The class is read from the counter, never from the L3 flag.
     pub fn feed_inbound(&self, counter: u64, ciphertext: Vec<u8>) -> Result<(), FeedRefused> {
-        self.feed(counter, ciphertext, true)
+        self.feed(FIRST_GENERATION, counter, ciphertext, true)
+    }
+
+    /// [`Self::feed_inbound`] for a frame of the transport `generation` (see [`Generation`]):
+    /// what the router calls for a session that may have been handed over. `feed_inbound` is
+    /// this with [`FIRST_GENERATION`]. A frame of a generation the actor no longer holds (or
+    /// not yet) is dropped by the actor when it reaches it, a datagram counted in
+    /// [`crate::channels::Dropped::handover`].
+    pub fn feed_inbound_gen(
+        &self,
+        generation: Generation,
+        counter: u64,
+        ciphertext: Vec<u8>,
+    ) -> Result<(), FeedRefused> {
+        self.feed(generation, counter, ciphertext, true)
     }
 
     /// [`Self::feed_inbound`] without the node wide check: the node counter is charged even past
@@ -1046,7 +1129,64 @@ impl L4SessionHandle {
         counter: u64,
         ciphertext: Vec<u8>,
     ) -> Result<(), FeedRefused> {
-        self.feed(counter, ciphertext, false)
+        self.feed(FIRST_GENERATION, counter, ciphertext, false)
+    }
+
+    /// [`Self::feed_inbound_over_ceiling`] for a frame of the transport `generation`.
+    pub fn feed_inbound_over_ceiling_gen(
+        &self,
+        generation: Generation,
+        counter: u64,
+        ciphertext: Vec<u8>,
+    ) -> Result<(), FeedRefused> {
+        self.feed(generation, counter, ciphertext, false)
+    }
+
+    /// Queues the replacement transport of a re-handshake for the actor (protocol.md 5.2,
+    /// slice R2) and returns its [`Generation`], the tag [`Self::feed_inbound_gen`] must use
+    /// for every frame that arrives under the new transport's index from now on. **Router task
+    /// only**, and in the same order as the frames are fed: the generation is numbered here and
+    /// the actor checks it is the next one.
+    ///
+    /// The item rides the same ordered queue as the inbound records, so the actor reaches it
+    /// after every record fed before this call; that order is what the responder's count check
+    /// relies on. The actor then keeps the old transport for receiving only until the cutover
+    /// completes (initiator: until CONTINUE_ACK arrives; responder: at once), sends everything
+    /// from the switch on the new transport and never again anything on the old one, and ends
+    /// the session with CLOSE `handover_failed` if a count or the first record does not match.
+    /// Everything that is not a transport (yamux, streams, channels, budgets, liveness) stays.
+    /// A no-op once the session has ended.
+    pub fn hand_over(&self, transport: E2eTransport, role: HandoverRole) -> Generation {
+        let generation = self.last_generation.fetch_add(1, Ordering::AcqRel) + 1;
+        let _ = self
+            .inbound_data_tx
+            .send(InboundItem::Handover(Box::new(Handover {
+                generation,
+                transport,
+                role,
+            })));
+        generation
+    }
+
+    /// The newest [`Generation`] whose cutover is complete: for a responder, when it switched
+    /// (it sent CONTINUE_ACK and dropped the old transport); for an initiator, when it accepted
+    /// CONTINUE_ACK and dropped the old transport. [`FIRST_GENERATION`] until then. Once it
+    /// equals the generation [`Self::hand_over`] returned, nothing more arrives under the old
+    /// transport's index that matters (the router may release it) and the next replacement may
+    /// be handed over.
+    pub fn settled_generation(&self) -> Generation {
+        self.settled_generation.load(Ordering::Acquire)
+    }
+
+    /// Ends this session because it reached its hard age cap (protocol.md 5.2): CLOSE
+    /// `session_expired` on the transport the session sends on now, then the end. The caller
+    /// owns the clock and the cap; this only names the reason. Same as
+    /// [`Self::close`] with that code.
+    pub fn expire(&self) {
+        self.close(Some(CloseReason {
+            code: ErrorCode::SessionExpired,
+            msg: "the session reached its age cap".to_string(),
+        }));
     }
 
     /// Takes this session's charges out of the node counter at once, for a session the router
@@ -1058,6 +1198,7 @@ impl L4SessionHandle {
 
     fn feed(
         &self,
+        generation: Generation,
         counter: u64,
         ciphertext: Vec<u8>,
         enforce_node: bool,
@@ -1070,7 +1211,12 @@ impl L4SessionHandle {
             // The node wide datagram cap is always enforced: a refusal (the session's own
             // budget or the node's) drops the datagram, never anything else.
             if let Ok(permit) = self.dgram_budget.reserve(charge, true) {
-                let _ = self.inbound_data_tx.send((counter, ciphertext, permit));
+                let _ = self.inbound_data_tx.send(InboundItem::Record {
+                    generation,
+                    counter,
+                    ciphertext,
+                    permit,
+                });
             }
             return Ok(());
         }
@@ -1091,7 +1237,12 @@ impl L4SessionHandle {
         };
         // A send to an actor that is gone hands the message back inside the
         // error; dropping it gives the charge back.
-        let _ = self.inbound_data_tx.send((counter, ciphertext, permit));
+        let _ = self.inbound_data_tx.send(InboundItem::Record {
+            generation,
+            counter,
+            ciphertext,
+            permit,
+        });
         Ok(())
     }
 
@@ -1278,6 +1429,7 @@ fn build(
         .and_then(|node| node.dgram.clone());
     let (command_tx, command_rx) = mpsc::unbounded_channel();
     let (ended_tx, ended_rx) = oneshot::channel();
+    let settled_generation = Arc::new(AtomicU32::new(FIRST_GENERATION));
 
     let handle = L4SessionHandle {
         peer: config.peer,
@@ -1288,6 +1440,8 @@ fn build(
         dgram_budget: InboundBudget::new(DGRAM_BUDGET_PER_SESSION).with_node(dgram_node),
         channels: channels.clone(),
         command_tx,
+        last_generation: Arc::new(AtomicU32::new(FIRST_GENERATION)),
+        settled_generation: settled_generation.clone(),
     };
     let acceptor = L4SessionAcceptor {
         peer: config.peer,
@@ -1320,6 +1474,7 @@ fn build(
         ended_tx,
         dgram_rx,
         channels,
+        settled_generation,
     );
     let task = async move {
         let _end_guard = end_guard;
@@ -1425,6 +1580,36 @@ async fn enqueue_send(
         Ok(frame) => frame,
         Err(err) => return Some(EndReason::EncryptFailed(err)),
     };
+    enqueue_frame(
+        frame,
+        is_rekey,
+        liveness,
+        rekey,
+        outbound,
+        peer,
+        epoch,
+        permit,
+        pending_outcomes,
+    )
+    .await
+}
+
+/// The second half of [`enqueue_send`]: hands an already encrypted reliable frame to `outbound`
+/// (the handover records are encrypted by `E2eTransport::encrypt_raw`, not `encrypt_data`).
+#[allow(clippy::too_many_arguments)]
+async fn enqueue_frame(
+    frame: E2eFrame,
+    is_rekey: bool,
+    liveness: &mut Liveness,
+    rekey: &mut RekeySchedule,
+    outbound: &mpsc::Sender<OutboundSend>,
+    peer: NodeId,
+    epoch: Epoch,
+    permit: Option<SendPermit>,
+    pending_outcomes: &mut FuturesUnordered<
+        tokio::time::Timeout<oneshot::Receiver<EnqueueOutcome>>,
+    >,
+) -> Option<EndReason> {
     let payload = frame.encode();
     debug_assert!(
         permit
@@ -1453,13 +1638,7 @@ async fn enqueue_send(
     } else {
         rekey.note_sent();
     }
-    // Each pushed item carries its own `SEND_OUTCOME_TIMEOUT` bound — a
-    // round-2 red-team review found that decoupling the outcome wait
-    // from the send (point H1 above) had silently dropped this timeout
-    // altogether: a bare `oneshot::Receiver` pushed here has nothing to
-    // ever wake it if the admitting side simply never resolves it, and
-    // this module's own doc comment claimed a bound that, by this
-    // point in that version of the code, no longer existed.
+    // Each pushed item carries its own `SEND_OUTCOME_TIMEOUT` bound: see the module docs.
     pending_outcomes.push(tokio::time::timeout(SEND_OUTCOME_TIMEOUT, outcome_rx));
     None
 }
@@ -1496,6 +1675,287 @@ async fn send_close(
         permit: None,
     };
     let _ = tokio::time::timeout(CLOSE_SEND_TIMEOUT, outbound.send(req)).await;
+}
+
+/// The old transport of an initiator that has switched sending to the replacement and waits
+/// for CONTINUE_ACK (protocol.md 5.2). **Receive only, and only until the ACK:** nothing is
+/// ever encrypted on it after the switch (there is deliberately no way to reach its encrypt
+/// side from the actor's send paths: they all use the actor's current `transport`). Dropped
+/// (its keys zeroize) when the ACK is accepted or the session ends.
+struct Retiring {
+    generation: Generation,
+    transport: E2eTransport,
+    /// When the wait for CONTINUE_ACK ends the session ([`HANDOVER_ACK_WINDOW`]).
+    ack_deadline: Instant,
+}
+
+/// Counts one datagram dropped because of a cutover.
+fn note_handover_drop(channels: &Option<ChannelTable>) {
+    if let Some(channels) = channels {
+        channels.note_handover_drop();
+    }
+}
+
+/// Sends CLOSE `handover_failed` on `transport` (best effort, like every CLOSE) and returns the
+/// reason the session then ends with. `transport` is the one this side sends on now, or, for a
+/// responder that refuses before switching, the replacement transport (nothing was sent on it
+/// yet, so the CLOSE is its first record, which the initiator waiting for CONTINUE_ACK reads).
+async fn fail_handover(
+    transport: &mut E2eTransport,
+    outbound: &mpsc::Sender<OutboundSend>,
+    peer: NodeId,
+    epoch: Epoch,
+    max_record: u32,
+    why: &'static str,
+) -> EndReason {
+    let close = CloseReason {
+        code: ErrorCode::HandoverFailed,
+        msg: why.to_string(),
+    };
+    send_close(transport, outbound, peer, epoch, max_record, &close).await;
+    EndReason::HandoverFailed(why)
+}
+
+/// Decrypts and acts on one `data` frame of `transport` (the session's current transport, or an
+/// initiator's retiring one): the original inbound handling of [`run`], unchanged. A datagram
+/// class counter takes the datagram path (its own replay window, every failure short of an
+/// authenticated malformed body drops the one frame); a reliable one is decrypted, feeds
+/// liveness only on success, and its body is acted on. Returns the reason the session must end.
+#[allow(clippy::too_many_arguments)]
+fn process_inbound(
+    transport: &mut E2eTransport,
+    counter: u64,
+    ciphertext: Vec<u8>,
+    permit: InboundPermit,
+    liveness: &mut Liveness,
+    first_record_noted: &mut bool,
+    observer: &Option<SessionObserver>,
+    stream_mux: &menzil_stream::StreamMux,
+    channels: &Option<ChannelTable>,
+) -> Option<EndReason> {
+    if RecordClass::of_counter(counter) == RecordClass::Datagram {
+        // The datagram class (protocol.md 5.2): its own window and its own
+        // failure rules. Everything short of an authenticated, malformed body
+        // drops the one frame; none of those feeds liveness.
+        let channels = channels.as_ref()?;
+        match transport.decrypt_dgram(counter, &ciphertext) {
+            Ok((channel, bytes)) => {
+                liveness.note_received(clock_now());
+                if !*first_record_noted {
+                    *first_record_noted = true;
+                    if let Some(observer) = observer {
+                        observer.notify(SessionNotice::FirstRecord);
+                    }
+                }
+                drop(ciphertext);
+                // Whatever the channel does with it, `permit` goes with the
+                // datagram: into the sink, or back to the budget on a drop.
+                channels.deliver(channel, bytes, permit);
+            }
+            Err(
+                E2eError::Noise(_)
+                | E2eError::NotADatagramCounter
+                | E2eError::ReservedDatagramCounter
+                | E2eError::DatagramReplayed
+                | E2eError::DatagramTooOld,
+            ) => {}
+            Err(err) => return Some(EndReason::Decrypt(err)),
+        }
+        return None;
+    }
+    match transport.decrypt_data(counter, &ciphertext) {
+        Ok(body) => {
+            // Only here, never in the `Err` arms below: see this module's own
+            // doc comment on why liveness must not be fed by input that never
+            // authenticated at all.
+            liveness.note_received(clock_now());
+            if !*first_record_noted {
+                *first_record_noted = true;
+                if let Some(observer) = observer {
+                    observer.notify(SessionNotice::FirstRecord);
+                }
+            }
+            match body {
+                E2eDataBody::Mux(bytes) => {
+                    // The record's charge goes on with its bytes and is given
+                    // back when `yamux` has read them. Every other arm, and a
+                    // frame that did not decrypt, lets `permit` go at the end.
+                    if let Err(err) = stream_mux.feed_inbound_guarded(bytes, Box::new(permit)) {
+                        return Some(EndReason::StreamMuxFeedFailed(err));
+                    }
+                }
+                E2eDataBody::Close { code, msg } => {
+                    return Some(EndReason::PeerClosed { code, msg });
+                }
+                // REKEY: `decrypt_data` already applied `rekey_incoming`
+                // itself; nothing further beyond the liveness activity above.
+                E2eDataBody::Keep | E2eDataBody::Rekey => {}
+                E2eDataBody::Dgram { .. } => unreachable!(
+                    "decrypt_data refuses every datagram-class counter before \
+                     decryption, so no Dgram body can ever reach this match"
+                ),
+            }
+            None
+        }
+        Err(E2eError::UnauthenticatedDatagramCounter | E2eError::Noise(_)) => {
+            // Pre-authentication (or never-authenticated) failures only drop
+            // the one frame, see this module's own doc comment.
+            None
+        }
+        Err(err) => Some(EndReason::Decrypt(err)),
+    }
+}
+
+/// What an initiator makes of one frame of the replacement transport while it still waits for
+/// CONTINUE_ACK.
+enum AckStep {
+    /// Dropped (a datagram before the session is proved, or a frame that did not
+    /// authenticate); keep waiting.
+    Wait,
+    /// A valid CONTINUE_ACK: the old transport can go.
+    Done,
+    /// The peer ended the session instead (its CLOSE was the first record).
+    PeerEnded(EndReason),
+    /// Anything else: CLOSE `handover_failed` and end.
+    Fail(&'static str),
+    /// A post authentication error from the transport: end like [`EndReason::Decrypt`].
+    Error(EndReason),
+}
+
+/// **The first reliable record on the replacement transport must be CONTINUE_ACK** (protocol.md
+/// 5.2: a candidate is proved by its first reliable record; a datagram that arrives first is
+/// dropped and counted). Its `sent` must equal the number of reliable records received on the
+/// old transport so far (checked, never trusted: the old transport receives in queue order, so
+/// every record the responder sent before its ACK has been counted by now).
+fn expect_continue_ack(
+    new: &mut E2eTransport,
+    old: &E2eTransport,
+    counter: u64,
+    ciphertext: &[u8],
+    liveness: &mut Liveness,
+    channels: &Option<ChannelTable>,
+) -> AckStep {
+    if RecordClass::of_counter(counter) == RecordClass::Datagram {
+        note_handover_drop(channels);
+        return AckStep::Wait;
+    }
+    let plaintext = match new.decrypt_raw(counter, ciphertext) {
+        Ok(plaintext) => plaintext,
+        Err(E2eError::UnauthenticatedDatagramCounter | E2eError::Noise(_)) => {
+            return AckStep::Wait;
+        }
+        Err(err) => return AckStep::Error(EndReason::Decrypt(err)),
+    };
+    liveness.note_received(clock_now());
+    if let Ok(ack) = ContinueAckBody::decode(&plaintext) {
+        return if ack.sent == old.reliable_received() {
+            AckStep::Done
+        } else {
+            AckStep::Fail("CONTINUE_ACK count differs from the records received on the old session")
+        };
+    }
+    // The responder refusing the handover answers with CLOSE as its first record.
+    if let Ok(E2eDataBody::Close { code, msg }) = E2eDataBody::decode(&plaintext) {
+        return AckStep::PeerEnded(EndReason::PeerClosed { code, msg });
+    }
+    AckStep::Fail("the first record on the replacement session is not CONTINUE_ACK")
+}
+
+/// Acts on one [`Handover`] item (protocol.md 5.2; [`L4SessionHandle::hand_over`] has the
+/// overview). Returns the reason the session must end, if any.
+///
+/// **Switch point.** In both roles the replacement transport is encrypted into the first record
+/// (CONTINUE or CONTINUE_ACK) before `transport` is replaced, and from the replacement on every
+/// send of this actor (MUX, KEEP, REKEY, CLOSE, DGRAM) goes through the one `transport`
+/// variable, so nothing can be encrypted on the old transport afterwards. The counters, the
+/// datagram replay window and the rekey schedule start afresh with the new transport (the
+/// schedule is replaced here; the counters and window are the new transport's own).
+///
+/// **Initiator.** CONTINUE carries `prior`, the old transport's `reliable_sent` and
+/// [`continue_binding`] of the old handshake hash, as counter 0 of the new transport. The old
+/// transport moves into `retiring` and keeps receiving until [`expect_continue_ack`] accepts.
+///
+/// **Responder.** The old transport's `reliable_received` must equal the peer's `sent`: the
+/// item sits behind every old record already queued, so equality is the exact condition "all
+/// of them arrived". Otherwise CLOSE `handover_failed` and the end. Else CONTINUE_ACK (`sent` =
+/// old `reliable_sent`) is counter 0 of the new transport, sending switches, and the old
+/// transport is dropped at once (a late record of it is dropped by the generation check).
+#[allow(clippy::too_many_arguments)]
+async fn handle_handover(
+    handover: Handover,
+    transport: &mut E2eTransport,
+    retiring: &mut Option<Retiring>,
+    current_generation: &mut Generation,
+    settled_generation: &AtomicU32,
+    liveness: &mut Liveness,
+    rekey: &mut RekeySchedule,
+    outbound: &mpsc::Sender<OutboundSend>,
+    peer: NodeId,
+    epoch: Epoch,
+    max_record: u32,
+    pending_outcomes: &mut FuturesUnordered<
+        tokio::time::Timeout<oneshot::Receiver<EnqueueOutcome>>,
+    >,
+) -> Option<EndReason> {
+    let Handover {
+        generation,
+        transport: mut new,
+        role,
+    } = handover;
+    // Out of order: the next transport is always the next generation, and one cutover at a
+    // time (the old transport of the last one is still waiting for its ACK).
+    if generation != current_generation.wrapping_add(1) || retiring.is_some() {
+        let why = "a handover arrived out of order";
+        return Some(fail_handover(transport, outbound, peer, epoch, max_record, why).await);
+    }
+    let record = match role {
+        HandoverRole::Initiator { prior } => ContinueBody {
+            prior,
+            sent: transport.reliable_sent(),
+            binding: continue_binding(transport.handshake_hash()),
+        }
+        .encode(),
+        HandoverRole::Responder { continue_sent } => {
+            if transport.reliable_received() != continue_sent {
+                let why = "CONTINUE count differs from the records received on the old session";
+                return Some(fail_handover(&mut new, outbound, peer, epoch, max_record, why).await);
+            }
+            ContinueAckBody {
+                sent: transport.reliable_sent(),
+            }
+            .encode()
+        }
+    };
+    let frame = match new.encrypt_raw(&record) {
+        Ok(frame) => frame,
+        Err(err) => return Some(EndReason::EncryptFailed(err)),
+    };
+    // The switch: from here on only `new` is ever encrypted on.
+    let old = std::mem::replace(transport, new);
+    *current_generation = generation;
+    *rekey = RekeySchedule::new(clock_now());
+    if matches!(role, HandoverRole::Initiator { .. }) {
+        *retiring = Some(Retiring {
+            generation: generation.wrapping_sub(1),
+            transport: old,
+            ack_deadline: clock_now() + HANDOVER_ACK_WINDOW,
+        });
+    } else {
+        drop(old);
+        settled_generation.store(generation, Ordering::Release);
+    }
+    enqueue_frame(
+        frame,
+        false,
+        liveness,
+        rekey,
+        outbound,
+        peer,
+        epoch,
+        None,
+        pending_outcomes,
+    )
+    .await
 }
 
 /// Ends a session's channels when its actor future ends or is dropped.
@@ -1577,6 +2037,7 @@ async fn run(
     ended_tx: oneshot::Sender<EndReason>,
     mut dgram_rx: Option<mpsc::Receiver<DgramOut>>,
     channels: Option<ChannelTable>,
+    settled_generation: Arc<AtomicU32>,
 ) {
     // However this future ends (or is dropped), the channels end with it.
     let _channels_end = CloseChannelsOnDrop(channels.clone());
@@ -1597,6 +2058,10 @@ async fn run(
     // The one outbound `Mux` frame pulled from `menzil-stream` that is
     // still waiting for send-queue space — see [`Staged`].
     let mut staged: Option<Staged> = None;
+    // The transport generation this actor sends and receives on now, and, for an initiator
+    // between its switch and the ACK, the old transport kept for receiving (see [`Retiring`]).
+    let mut generation_now: Generation = FIRST_GENERATION;
+    let mut retiring: Option<Retiring> = None;
 
     let reason = loop {
         tokio::select! {
@@ -1653,7 +2118,7 @@ async fn run(
             }
 
             inbound = inbound_data_rx.recv(), if !inbound_closed => {
-                let Some((counter, ciphertext, permit)) = inbound else {
+                let Some(item) = inbound else {
                     // Unlike `command_rx` below, this alone does not
                     // mean the handle is gone for good — see this
                     // module's own doc comment on why only disabling
@@ -1664,83 +2129,76 @@ async fn run(
                     inbound_closed = true;
                     continue;
                 };
-                if RecordClass::of_counter(counter) == RecordClass::Datagram {
-                    // The datagram class (protocol.md 5.2): its own window and its own
-                    // failure rules. Everything short of an authenticated, malformed body
-                    // drops the one frame; none of those feeds liveness.
-                    let Some(channels) = &channels else {
+                let (generation, counter, ciphertext, permit) = match item {
+                    InboundItem::Record { generation, counter, ciphertext, permit } => {
+                        (generation, counter, ciphertext, permit)
+                    }
+                    InboundItem::Handover(handover) => {
+                        if let Some(reason) = handle_handover(
+                            *handover, &mut transport, &mut retiring, &mut generation_now,
+                            &settled_generation, &mut liveness, &mut rekey, &outbound, peer, epoch, max_record,
+                            &mut pending_outcomes,
+                        ).await {
+                            break reason;
+                        }
                         continue;
-                    };
-                    match transport.decrypt_dgram(counter, &ciphertext) {
-                        Ok((channel, bytes)) => {
-                            liveness.note_received(clock_now());
-                            if !first_record_noted {
-                                first_record_noted = true;
-                                if let Some(observer) = &observer {
-                                    observer.notify(SessionNotice::FirstRecord);
-                                }
-                            }
-                            drop(ciphertext);
-                            // Whatever the channel does with it, `permit` goes with the
-                            // datagram: into the sink, or back to the budget on a drop.
-                            channels.deliver(channel, bytes, permit);
-                        }
-                        Err(
-                            E2eError::Noise(_)
-                            | E2eError::NotADatagramCounter
-                            | E2eError::ReservedDatagramCounter
-                            | E2eError::DatagramReplayed
-                            | E2eError::DatagramTooOld,
-                        ) => {}
-                        Err(err) => break EndReason::Decrypt(err),
                     }
-                    continue;
-                }
-                match transport.decrypt_data(counter, &ciphertext) {
-                    Ok(body) => {
-                        // Only here, never in the `Err` arms below: see
-                        // this module's own doc comment on why liveness
-                        // must not be fed by input that never
-                        // authenticated at all.
-                        liveness.note_received(clock_now());
-                        if !first_record_noted {
-                            first_record_noted = true;
-                            if let Some(observer) = &observer {
-                                observer.notify(SessionNotice::FirstRecord);
+                };
+                let is_dgram = RecordClass::of_counter(counter) == RecordClass::Datagram;
+                // Route by generation: every record is decrypted with the keys of the
+                // transport it was sent under, and a record of a transport this actor does
+                // not hold is dropped (a datagram counted).
+                if generation == generation_now {
+                    if let Some(old) = &retiring {
+                        // An initiator that switched and waits for CONTINUE_ACK: the first
+                        // reliable record on the new transport must be that ACK.
+                        match expect_continue_ack(
+                            &mut transport, &old.transport, counter, &ciphertext, &mut liveness,
+                            &channels,
+                        ) {
+                            AckStep::Wait => {}
+                            AckStep::Done => {
+                                retiring = None;
+                                settled_generation.store(generation_now, Ordering::Release);
+                            }
+                            AckStep::PeerEnded(reason) | AckStep::Error(reason) => break reason,
+                            AckStep::Fail(why) => {
+                                break fail_handover(
+                                    &mut transport, &outbound, peer, epoch, max_record, why,
+                                ).await;
                             }
                         }
-                        match body {
-                            E2eDataBody::Mux(bytes) => {
-                                // The record's charge goes on with its
-                                // bytes and is given back when `yamux`
-                                // has read them. Every other arm, and a
-                                // frame that did not decrypt, lets
-                                // `permit` go at the end of this one.
-                                if let Err(err) =
-                                    stream_mux.feed_inbound_guarded(bytes, Box::new(permit))
-                                {
-                                    break EndReason::StreamMuxFeedFailed(err);
-                                }
-                            }
-                            E2eDataBody::Close { code, msg } => {
-                                break EndReason::PeerClosed { code, msg };
-                            }
-                            // REKEY: `decrypt_data` already applied
-                            // `rekey_incoming` itself; nothing further to
-                            // do beyond the liveness activity above.
-                            E2eDataBody::Keep | E2eDataBody::Rekey => {}
-                            E2eDataBody::Dgram { .. } => unreachable!(
-                                "decrypt_data refuses every datagram-class counter before \
-                                 decryption, so no Dgram body can ever reach this match"
-                            ),
-                        }
+                    } else if let Some(reason) = process_inbound(
+                        &mut transport, counter, ciphertext, permit, &mut liveness,
+                        &mut first_record_noted, &observer, &stream_mux, &channels,
+                    ) {
+                        break reason;
                     }
-                    Err(E2eError::UnauthenticatedDatagramCounter | E2eError::Noise(_)) => {
-                        // Pre-authentication (or never-authenticated)
-                        // failures only drop the one frame — see this
-                        // module's own doc comment.
+                } else if let Some(old) = retiring.as_mut().filter(|r| r.generation == generation) {
+                    // The old transport still receives until the ACK: processed normally,
+                    // so its records count toward `reliable_received`.
+                    if let Some(reason) = process_inbound(
+                        &mut old.transport, counter, ciphertext, permit, &mut liveness,
+                        &mut first_record_noted, &observer, &stream_mux, &channels,
+                    ) {
+                        break reason;
                     }
-                    Err(err) => break EndReason::Decrypt(err),
+                } else if is_dgram {
+                    // A datagram of a transport not held any more (an old one after the
+                    // switch) or not yet (a replacement that is not proved): dropped, counted.
+                    note_handover_drop(&channels);
+                } else if generation.wrapping_sub(generation_now) < u32::MAX / 2 {
+                    // A reliable record of a replacement transport the router has not handed
+                    // over yet: a gap that cannot be closed, so the session ends.
+                    break fail_handover(
+                        &mut transport, &outbound, peer, epoch, max_record,
+                        "a record of a transport that was not handed over yet",
+                    ).await;
+                } else {
+                    // A reliable record of a retired transport arriving after the switch
+                    // (the peer's old records all came before its ACK or CONTINUE, so only
+                    // a misbehaving relay or router produces one): dropped.
+                    tracing::debug!(%peer, "a record of a retired transport was dropped");
                 }
             }
 
@@ -1795,6 +2253,12 @@ async fn run(
 
             _ = clock.tick() => {
                 let now = clock_now();
+                if retiring.as_ref().is_some_and(|r| now >= r.ack_deadline) {
+                    break fail_handover(
+                        &mut transport, &outbound, peer, epoch, max_record,
+                        "no CONTINUE_ACK within the liveness window",
+                    ).await;
+                }
                 if liveness.is_dead(now) {
                     break EndReason::PeerDead;
                 }
@@ -1864,6 +2328,18 @@ mod tests {
     }
 
     fn two_sides(network_seed: u8, max_record: u32) -> (OneSide, OneSide) {
+        two_sides_indexed(network_seed, max_record, 1, 2)
+    }
+
+    /// [`two_sides`] with the two sides' own `sender_index` values chosen: a replacement
+    /// session between the same two nodes (same `network_seed`) with other indices and other
+    /// keys, which is what a re-handshake produces.
+    fn two_sides_indexed(
+        network_seed: u8,
+        max_record: u32,
+        a_index: u32,
+        b_index: u32,
+    ) -> (OneSide, OneSide) {
         let (a_priv, a_pub) = fresh_keypair();
         let (b_priv, b_pub) = fresh_keypair();
         let network_id = NetworkId::from([network_seed; 32]);
@@ -1871,10 +2347,11 @@ mod tests {
         let b_node = NodeId::from([network_seed.wrapping_add(0x20); 32]);
 
         let (mut a_hs, init) =
-            E2eInitiatorHandshake::start(&a_priv, &b_pub, network_id, a_node, b_node, 1).unwrap();
+            E2eInitiatorHandshake::start(&a_priv, &b_pub, network_id, a_node, b_node, a_index)
+                .unwrap();
         let b_hs = E2eResponderHandshake::start(&b_priv, a_node, b_node, &init).unwrap();
         let (b_transport, resp) = b_hs
-            .finish(sample_cert(b_node), 0, 0, vec![], 2, max_record)
+            .finish(sample_cert(b_node), 0, 0, vec![], b_index, max_record)
             .unwrap();
         let (a_transport, _payload, _b_static) = a_hs.finish(&resp, max_record).unwrap();
         let _ = a_pub;
@@ -3969,6 +4446,1143 @@ mod tests {
             );
             assert_eq!(node.in_use(), 0, "round {round}");
             assert_eq!(budget.used(), 0, "round {round}");
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Re-handshake handover (protocol.md 5.2, slice R2)
+    // ------------------------------------------------------------------
+
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+
+    const HSEED: u8 = 7;
+
+    /// The own index of side A (the initiator) in generation `g`, and of side B. Every
+    /// generation has its own pair, so a frame's `receiver_index` names its transport.
+    fn a_idx(g: u32) -> u32 {
+        1 + 2 * g
+    }
+    fn b_idx(g: u32) -> u32 {
+        2 + 2 * g
+    }
+
+    /// One direction of the in memory network between two actors, which also plays the router
+    /// of the receiving side: it maps a frame's `receiver_index` to a generation, decrypts the
+    /// first reliable record of a replacement candidate itself (CONTINUE) and hands the
+    /// transport over (R3's job in production), and can hold, stash or log frames.
+    #[derive(Default)]
+    struct LinkState {
+        gens: HashMap<u32, Generation>,
+        candidates: HashMap<u32, E2eTransport>,
+        hold_all: bool,
+        hold_reliable: bool,
+        held: Vec<Vec<u8>>,
+        stash_dgrams: bool,
+        stashed: Vec<(u32, u64, Vec<u8>)>,
+        /// Added to the `sent` of a CONTINUE before it is passed on (a lying relay or peer).
+        sent_offset: i64,
+        /// `(receiver_index, counter, datagram class)` of every frame, in order.
+        log: Vec<(u32, u64, bool)>,
+        candidate_dgrams: u32,
+    }
+
+    struct Link {
+        dst: L4SessionHandle,
+        st: Mutex<LinkState>,
+    }
+
+    impl Link {
+        fn route(&self, payload: Vec<u8>) {
+            let mut st = self.st.lock().unwrap();
+            let E2eFrame::Data { counter, .. } = E2eFrame::decode(&payload).unwrap() else {
+                panic!("not data");
+            };
+            let dgram = RecordClass::of_counter(counter) == RecordClass::Datagram;
+            if st.hold_all || (st.hold_reliable && !dgram) {
+                st.held.push(payload);
+                return;
+            }
+            self.route_now(&mut st, payload);
+        }
+
+        fn route_now(&self, st: &mut LinkState, payload: Vec<u8>) {
+            let E2eFrame::Data {
+                receiver_index,
+                counter,
+                ciphertext,
+            } = E2eFrame::decode(&payload).unwrap()
+            else {
+                panic!("not data");
+            };
+            let dgram = RecordClass::of_counter(counter) == RecordClass::Datagram;
+            st.log.push((receiver_index, counter, dgram));
+            if dgram && st.stash_dgrams {
+                st.stashed.push((receiver_index, counter, ciphertext));
+                return;
+            }
+            if let Some(&g) = st.gens.get(&receiver_index) {
+                self.dst
+                    .feed_inbound_gen(g, counter, ciphertext)
+                    .expect("within the inbound budget");
+            } else if st.candidates.contains_key(&receiver_index) {
+                if dgram {
+                    st.candidate_dgrams += 1;
+                    return;
+                }
+                let mut t = st.candidates.remove(&receiver_index).unwrap();
+                let plain = t.decrypt_raw(counter, &ciphertext).expect("first record");
+                let cont = ContinueBody::decode(&plain).expect("CONTINUE");
+                let sent = (cont.sent as i64 + st.sent_offset) as u64;
+                let g = self.dst.hand_over(
+                    t,
+                    HandoverRole::Responder {
+                        continue_sent: sent,
+                    },
+                );
+                st.gens.insert(receiver_index, g);
+            } else {
+                panic!("a frame for an unknown index {receiver_index}");
+            }
+        }
+
+        fn release(&self) {
+            let mut st = self.st.lock().unwrap();
+            st.hold_all = false;
+            st.hold_reliable = false;
+            let held = std::mem::take(&mut st.held);
+            for payload in held {
+                self.route_now(&mut st, payload);
+            }
+        }
+
+        fn log(&self) -> Vec<(u32, u64, bool)> {
+            self.st.lock().unwrap().log.clone()
+        }
+    }
+
+    fn link_pump(
+        mut rx: mpsc::Receiver<OutboundSend>,
+        link: Arc<Link>,
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            while let Some(req) = rx.recv().await {
+                let _ = req.outcome.send(EnqueueOutcome::Accepted);
+                link.route(req.payload);
+            }
+        })
+    }
+
+    /// Two member actors joined by two [`Link`]s, A the initiator.
+    #[allow(clippy::type_complexity)]
+    struct Rig {
+        a: L4SessionHandle,
+        a_acceptor: L4SessionAcceptor,
+        b: L4SessionHandle,
+        b_acceptor: L4SessionAcceptor,
+        a_to_b: Arc<Link>,
+        b_to_a: Arc<Link>,
+        _keep: (
+            oneshot::Sender<()>,
+            oneshot::Sender<()>,
+            tokio::task::JoinHandle<()>,
+            tokio::task::JoinHandle<()>,
+            tokio::task::JoinHandle<()>,
+            tokio::task::JoinHandle<()>,
+        ),
+    }
+
+    fn rig() -> Rig {
+        let (a_side, b_side) = two_sides_indexed(HSEED, 65_535, a_idx(0), b_idx(0));
+        let (a, a_acceptor, a_out, a_tx, a_task) = dgram_session(a_side, 65_535, 64);
+        let (b, b_acceptor, b_out, b_tx, b_task) = dgram_session(b_side, 65_535, 64);
+        let a_to_b = Arc::new(Link {
+            dst: b.clone(),
+            st: Mutex::new(LinkState::default()),
+        });
+        let b_to_a = Arc::new(Link {
+            dst: a.clone(),
+            st: Mutex::new(LinkState::default()),
+        });
+        a_to_b.st.lock().unwrap().gens.insert(b_idx(0), 0);
+        b_to_a.st.lock().unwrap().gens.insert(a_idx(0), 0);
+        let p1 = link_pump(a_out, a_to_b.clone());
+        let p2 = link_pump(b_out, b_to_a.clone());
+        Rig {
+            a,
+            a_acceptor,
+            b,
+            b_acceptor,
+            a_to_b,
+            b_to_a,
+            _keep: (a_tx, b_tx, a_task, b_task, p1, p2),
+        }
+    }
+
+    impl Rig {
+        /// Starts replacement number `n` (1, 2, ...): the new transports (fresh keys, indices
+        /// of generation `n`) go to A as initiator; B's side is the candidate its link's
+        /// router decrypts the CONTINUE of.
+        fn start_cutover(&self, n: u32) {
+            let (a_side, b_side) = two_sides_indexed(HSEED, 65_535, a_idx(n), b_idx(n));
+            self.a_to_b
+                .st
+                .lock()
+                .unwrap()
+                .candidates
+                .insert(b_idx(n), b_side.transport);
+            let mut gens = self.b_to_a.st.lock().unwrap();
+            // The tag A will give it; `hand_over` numbers it n.
+            gens.gens.insert(a_idx(n), n);
+            drop(gens);
+            let g = self.a.hand_over(
+                a_side.transport,
+                HandoverRole::Initiator {
+                    prior: b_idx(n - 1),
+                },
+            );
+            assert_eq!(g, n);
+        }
+
+        async fn wait_settled(&self, n: u32) {
+            for _ in 0..1000 {
+                if self.a.settled_generation() == n && self.b.settled_generation() == n {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            panic!(
+                "cutover {n} did not settle: a {} b {}",
+                self.a.settled_generation(),
+                self.b.settled_generation()
+            );
+        }
+
+        async fn cutover(&self, n: u32) {
+            self.start_cutover(n);
+            self.wait_settled(n).await;
+        }
+
+        fn assert_alive(&mut self) {
+            assert!(self.a_acceptor.ended_rx.try_recv().is_err(), "side A ended");
+            assert!(self.b_acceptor.ended_rx.try_recv().is_err(), "side B ended");
+        }
+    }
+
+    fn prng_bytes(seed: u64, n: usize) -> Vec<u8> {
+        let mut x = seed | 1;
+        let mut out = Vec::with_capacity(n);
+        while out.len() < n {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            out.extend_from_slice(&x.to_le_bytes());
+        }
+        out.truncate(n);
+        out
+    }
+
+    /// After the first frame of generation `n` in `log` (CONTINUE or CONTINUE_ACK, which must
+    /// be counter 0), no frame of generation `n - 1` follows: nothing is ever sent on the old
+    /// transport after the switch.
+    fn assert_nothing_on_old_after_switch(log: &[(u32, u64, bool)], old: u32, new: u32) {
+        let first_new = log
+            .iter()
+            .position(|(idx, _, _)| *idx == new)
+            .expect("the new transport carried something");
+        assert_eq!(log[first_new].1, 0, "the first record on the new transport");
+        assert!(!log[first_new].2, "and it is reliable");
+        assert!(
+            !log[first_new..].iter().any(|(idx, _, _)| *idx == old),
+            "a frame was sent on the old transport after the switch"
+        );
+    }
+
+    async fn streams_across_cutovers(cutovers: u32) {
+        use futures_util::io::{AsyncReadExt, AsyncWriteExt};
+        const CHUNK: usize = 16 * 1024;
+        const BYTES: usize = 64 * CHUNK;
+        let mut rig = rig();
+        let ab = prng_bytes(11, BYTES);
+        let ba = prng_bytes(22, BYTES);
+        let progress = Arc::new(AtomicUsize::new(0));
+
+        // A -> B on a stream A opens.
+        let mut s1 = rig.a.open_stream().await.unwrap();
+        let data = ab.clone();
+        let writer_ab = tokio::spawn(async move {
+            for chunk in data.chunks(CHUNK) {
+                s1.write_all(chunk).await.unwrap();
+                s1.flush().await.unwrap();
+                tokio::time::sleep(Duration::from_millis(3)).await;
+            }
+            s1.close().await.unwrap();
+        });
+        let mut b_acceptor = std::mem::replace(
+            &mut rig.b_acceptor,
+            // A placeholder that is never used: the real one moved into the reader task.
+            placeholder_acceptor(),
+        );
+        let p = progress.clone();
+        let reader_ab = tokio::spawn(async move {
+            let mut s = b_acceptor.accept().await.unwrap();
+            let mut got = Vec::new();
+            let mut buf = vec![0u8; CHUNK];
+            loop {
+                let n = s.read(&mut buf).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                got.extend_from_slice(&buf[..n]);
+                p.fetch_add(n, Ordering::SeqCst);
+            }
+            (got, b_acceptor)
+        });
+        // B -> A on a stream B opens.
+        let mut s2 = rig.b.open_stream().await.unwrap();
+        let data = ba.clone();
+        let writer_ba = tokio::spawn(async move {
+            for chunk in data.chunks(CHUNK) {
+                s2.write_all(chunk).await.unwrap();
+                s2.flush().await.unwrap();
+                tokio::time::sleep(Duration::from_millis(3)).await;
+            }
+            s2.close().await.unwrap();
+        });
+        let mut a_acceptor = std::mem::replace(&mut rig.a_acceptor, placeholder_acceptor());
+        let p = progress.clone();
+        let reader_ba = tokio::spawn(async move {
+            let mut s = a_acceptor.accept().await.unwrap();
+            let mut got = Vec::new();
+            let mut buf = vec![0u8; CHUNK];
+            loop {
+                let n = s.read(&mut buf).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                got.extend_from_slice(&buf[..n]);
+                p.fetch_add(n, Ordering::SeqCst);
+            }
+            (got, a_acceptor)
+        });
+
+        let total = 2 * BYTES;
+        for k in 1..=cutovers {
+            let threshold = (k as usize) * total / (cutovers as usize + 1);
+            let mut waited = 0;
+            while progress.load(Ordering::SeqCst) < threshold {
+                tokio::time::sleep(Duration::from_millis(2)).await;
+                waited += 1;
+                assert!(waited < 30_000, "the transfer stalled before cutover {k}");
+            }
+            assert!(
+                progress.load(Ordering::SeqCst) < total,
+                "cutover {k} must happen while bytes are in flight"
+            );
+            rig.cutover(k).await;
+        }
+        let (got_ab, _b_acc) = tokio::time::timeout(Duration::from_secs(120), reader_ab)
+            .await
+            .expect("the A to B stream finishes")
+            .unwrap();
+        let (got_ba, _a_acc) = tokio::time::timeout(Duration::from_secs(120), reader_ba)
+            .await
+            .expect("the B to A stream finishes")
+            .unwrap();
+        writer_ab.await.unwrap();
+        writer_ba.await.unwrap();
+        assert!(got_ab == ab, "A to B bytes differ across the cutovers");
+        assert!(got_ba == ba, "B to A bytes differ across the cutovers");
+        assert_eq!(rig.a.settled_generation(), cutovers);
+        assert_eq!(rig.b.settled_generation(), cutovers);
+        for n in 1..=cutovers {
+            assert_nothing_on_old_after_switch(&rig.a_to_b.log(), b_idx(n - 1), b_idx(n));
+            assert_nothing_on_old_after_switch(&rig.b_to_a.log(), a_idx(n - 1), a_idx(n));
+        }
+        // Neither session ended.
+        assert!(rig.a.dgram_in_use() == 0 && rig.b.dgram_in_use() == 0);
+    }
+
+    /// An acceptor of a session that does not exist, to leave behind where a test moves the
+    /// real one out of the [`Rig`].
+    fn placeholder_acceptor() -> L4SessionAcceptor {
+        let (a_side, _b) = two_sides(99, 65_535);
+        let (_h, acceptor, _out, _tx, _task) = one_session(a_side, 65_535);
+        acceptor
+    }
+
+    #[tokio::test]
+    async fn streams_with_bytes_in_flight_both_ways_survive_one_cutover() {
+        streams_across_cutovers(1).await;
+    }
+
+    #[tokio::test]
+    async fn streams_with_bytes_in_flight_both_ways_survive_three_consecutive_cutovers() {
+        streams_across_cutovers(3).await;
+    }
+
+    #[tokio::test]
+    async fn records_queued_before_the_handover_are_all_delivered_before_the_switch() {
+        use futures_util::io::{AsyncReadExt, AsyncWriteExt};
+        let mut rig = rig();
+        // Everything A sends is held in the network; A writes, then starts the cutover, so
+        // the CONTINUE queues behind the data.
+        rig.a_to_b.st.lock().unwrap().hold_all = true;
+        let mut s = rig.a.open_stream().await.unwrap();
+        let payload = prng_bytes(5, 150_000);
+        s.write_all(&payload).await.unwrap();
+        s.flush().await.unwrap();
+        for _ in 0..500 {
+            if rig.a_to_b.st.lock().unwrap().held.len() >= 4 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let data_frames = rig.a_to_b.st.lock().unwrap().held.len();
+        assert!(data_frames >= 4, "the data is queued");
+        rig.start_cutover(1);
+        for _ in 0..500 {
+            if rig.a_to_b.st.lock().unwrap().held.len() > data_frames {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(
+            rig.a_to_b.st.lock().unwrap().held.len() > data_frames,
+            "the CONTINUE is queued behind the data"
+        );
+        let b_reader = tokio::spawn({
+            let mut acc = std::mem::replace(&mut rig.b_acceptor, placeholder_acceptor());
+            async move {
+                let mut s = acc.accept().await.unwrap();
+                let mut got = vec![0u8; 150_000];
+                s.read_exact(&mut got).await.unwrap();
+                (got, acc)
+            }
+        });
+        rig.a_to_b.release();
+        rig.wait_settled(1).await;
+        let (got, _acc) = tokio::time::timeout(Duration::from_secs(30), b_reader)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(got == payload);
+    }
+
+    #[tokio::test]
+    async fn a_datagram_across_the_switch_is_dropped_and_counted_and_datagrams_resume() {
+        let rig = rig();
+        let mut a_channel = rig.a.channels().unwrap().allocate().unwrap();
+        let mut b_channel = rig
+            .b
+            .channels()
+            .unwrap()
+            .register_remote(a_channel.id())
+            .unwrap();
+        // 1. A datagram sent on the old transport but held back past the cutover.
+        rig.a_to_b.st.lock().unwrap().stash_dgrams = true;
+        a_channel.send(b"old").unwrap();
+        for _ in 0..500 {
+            if !rig.a_to_b.st.lock().unwrap().stashed.is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(rig.a_to_b.st.lock().unwrap().stashed.len(), 1);
+        rig.a_to_b.st.lock().unwrap().stash_dgrams = false;
+        // 2. B's ACK held back: B (settled) sends a datagram on the new transport, which A,
+        // still waiting for the ACK, must drop.
+        rig.b_to_a.st.lock().unwrap().hold_reliable = true;
+        rig.start_cutover(1);
+        for _ in 0..500 {
+            if rig.b.settled_generation() == 1 && !rig.b_to_a.st.lock().unwrap().held.is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(rig.b.settled_generation(), 1);
+        b_channel.send(b"new, before the ack").unwrap();
+        for _ in 0..500 {
+            if rig.a.channels().unwrap().dropped().handover == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(rig.a.channels().unwrap().dropped().handover, 1);
+        rig.b_to_a.release();
+        rig.wait_settled(1).await;
+        // 3. The stale old datagram reaches B after the switch: dropped, counted, not delivered.
+        let (idx, counter, ct) = rig.a_to_b.st.lock().unwrap().stashed.remove(0);
+        assert_eq!(idx, b_idx(0));
+        rig.b.feed_inbound_gen(0, counter, ct).unwrap();
+        // 4. A datagram of a generation not handed over yet.
+        rig.b
+            .feed_inbound_gen(5, (1u64 << 63) | 7, vec![0xAB; 40])
+            .unwrap();
+        for _ in 0..500 {
+            if rig.b.channels().unwrap().dropped().handover == 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(rig.b.channels().unwrap().dropped().handover, 2);
+        assert!(
+            b_channel.try_recv().is_none(),
+            "nothing was delivered twice or at all"
+        );
+        // 5. Datagrams work again under the new keys, both ways (fresh replay window).
+        a_channel.send(b"after").unwrap();
+        let got = tokio::time::timeout(Duration::from_secs(5), b_channel.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(got, b"after");
+        b_channel.send(b"back").unwrap();
+        let got = tokio::time::timeout(Duration::from_secs(5), a_channel.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(got, b"back");
+        let mut rig = rig;
+        rig.assert_alive();
+    }
+
+    #[tokio::test]
+    async fn yamux_mode_and_channel_parity_are_unchanged_by_a_cutover() {
+        use futures_util::io::{AsyncReadExt, AsyncWriteExt};
+        let mut rig = rig();
+        let before_a = rig.a.channels().unwrap().allocate().unwrap();
+        let before_b = rig.b.channels().unwrap().allocate().unwrap();
+        assert_eq!(before_a.id() % 2, 0, "the L4 initiator allocates even ids");
+        assert_eq!(before_b.id() % 2, 1);
+        let s_a = rig.a.open_stream().await.unwrap();
+        let s_b = rig.b.open_stream().await.unwrap();
+        assert_eq!(s_a.id() % 2, 1, "yamux client ids are odd");
+        assert_eq!(s_b.id() % 2, 0, "yamux server ids are even");
+        drop((s_a, s_b));
+        rig.cutover(1).await;
+        let after_a = rig.a.channels().unwrap().allocate().unwrap();
+        let after_b = rig.b.channels().unwrap().allocate().unwrap();
+        assert_eq!(after_a.id() % 2, 0);
+        assert_eq!(after_b.id() % 2, 1);
+        assert_ne!(after_a.id(), before_a.id());
+        // New streams after the cutover keep the roles: A's are odd, B's even, and each side
+        // accepts the other's.
+        let mut n_a = rig.a.open_stream().await.unwrap();
+        let mut n_b = rig.b.open_stream().await.unwrap();
+        assert_eq!(n_a.id() % 2, 1);
+        assert_eq!(n_b.id() % 2, 0);
+        n_a.write_all(b"a2b").await.unwrap();
+        n_a.flush().await.unwrap();
+        n_b.write_all(b"b2a").await.unwrap();
+        n_b.flush().await.unwrap();
+        let mut got = [0u8; 3];
+        let mut accepted = tokio::time::timeout(Duration::from_secs(5), rig.b_acceptor.accept())
+            .await
+            .unwrap()
+            .unwrap();
+        accepted.read_exact(&mut got).await.unwrap();
+        assert_eq!(&got, b"a2b");
+        let mut accepted = tokio::time::timeout(Duration::from_secs(5), rig.a_acceptor.accept())
+            .await
+            .unwrap()
+            .unwrap();
+        accepted.read_exact(&mut got).await.unwrap();
+        assert_eq!(&got, b"b2a");
+        rig.assert_alive();
+    }
+
+    #[tokio::test]
+    async fn expire_ends_both_sides_with_session_expired_before_and_after_a_cutover() {
+        for cutover in [false, true] {
+            let rig = rig();
+            if cutover {
+                rig.cutover(1).await;
+            }
+            rig.a.expire();
+            let mut rig = rig;
+            let b_end = tokio::time::timeout(Duration::from_secs(5), rig.b_acceptor.closed())
+                .await
+                .unwrap();
+            assert!(
+                matches!(
+                    b_end.as_ref(),
+                    EndReason::PeerClosed { code, .. } if *code == ErrorCode::SessionExpired
+                ),
+                "{b_end:?}"
+            );
+            let a_end = rig.a_acceptor.closed().await;
+            assert!(
+                matches!(
+                    a_end.as_ref(),
+                    EndReason::ClosedLocally(Some(c)) if c.code == ErrorCode::SessionExpired
+                ),
+                "{a_end:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_count_the_peer_lies_about_ends_both_sides_with_handover_failed() {
+        let rig = rig();
+        // The CONTINUE reaches B claiming one record more than A sent on the old session.
+        rig.a_to_b.st.lock().unwrap().sent_offset = 1;
+        rig.start_cutover(1);
+        let mut rig = rig;
+        let b_end = tokio::time::timeout(Duration::from_secs(5), rig.b_acceptor.closed())
+            .await
+            .unwrap();
+        assert!(
+            matches!(b_end.as_ref(), EndReason::HandoverFailed(_)),
+            "{b_end:?}"
+        );
+        // A reads B's CLOSE as the first record on the new transport.
+        let a_end = tokio::time::timeout(Duration::from_secs(5), rig.a_acceptor.closed())
+            .await
+            .unwrap();
+        assert!(
+            matches!(
+                a_end.as_ref(),
+                EndReason::PeerClosed { code, .. } if *code == ErrorCode::HandoverFailed
+            ),
+            "{a_end:?}"
+        );
+    }
+
+    // ---- one actor against a hand driven peer ----
+
+    type Seen = Arc<Mutex<Vec<(u32, u64, Vec<u8>)>>>;
+
+    /// One actor and the test as its peer: the test holds the peer's old and new transports,
+    /// feeds frames itself and reads what the actor sent.
+    struct Solo {
+        handle: L4SessionHandle,
+        acceptor: L4SessionAcceptor,
+        out: Option<mpsc::Receiver<OutboundSend>>,
+        seen: Seen,
+        peer_old: E2eTransport,
+        peer_new: E2eTransport,
+        actor_new: Option<E2eTransport>,
+        /// `receiver_index` the actor stamps on its old and on its new frames.
+        old_idx: u32,
+        new_idx: u32,
+        _tx: oneshot::Sender<()>,
+        _task: tokio::task::JoinHandle<()>,
+    }
+
+    fn solo(initiator: bool) -> Solo {
+        let (a0, b0) = two_sides_indexed(HSEED, 65_535, a_idx(0), b_idx(0));
+        let (a1, b1) = two_sides_indexed(HSEED, 65_535, a_idx(1), b_idx(1));
+        let (actor, peer_old, actor_new, peer_new, old_idx, new_idx) = if initiator {
+            (
+                a0,
+                b0.transport,
+                a1.transport,
+                b1.transport,
+                b_idx(0),
+                b_idx(1),
+            )
+        } else {
+            (
+                b0,
+                a0.transport,
+                b1.transport,
+                a1.transport,
+                a_idx(0),
+                a_idx(1),
+            )
+        };
+        let (handle, acceptor, out, tx, task) = dgram_session(actor, 65_535, 64);
+        Solo {
+            handle,
+            acceptor,
+            out: Some(out),
+            seen: Arc::new(Mutex::new(Vec::new())),
+            peer_old,
+            peer_new,
+            actor_new: Some(actor_new),
+            old_idx,
+            new_idx,
+            _tx: tx,
+            _task: task,
+        }
+    }
+
+    impl Solo {
+        /// Starts answering every send `Accepted` and recording what it carried.
+        fn collect(&mut self) {
+            let mut out = self.out.take().expect("collect once");
+            let seen = self.seen.clone();
+            tokio::spawn(async move {
+                while let Some(req) = out.recv().await {
+                    let _ = req.outcome.send(EnqueueOutcome::Accepted);
+                    if let E2eFrame::Data {
+                        receiver_index,
+                        counter,
+                        ciphertext,
+                    } = E2eFrame::decode(&req.payload).unwrap()
+                    {
+                        seen.lock()
+                            .unwrap()
+                            .push((receiver_index, counter, ciphertext));
+                    }
+                }
+            });
+        }
+
+        /// Waits until the actor has sent a frame under the new index and returns the number
+        /// of frames it sent under the old one before it, and the new frames so far.
+        async fn first_new_frame(&self) -> (usize, Vec<(u64, Vec<u8>)>) {
+            for _ in 0..1000 {
+                {
+                    let seen = self.seen.lock().unwrap();
+                    if seen.iter().any(|(idx, _, _)| *idx == self.new_idx) {
+                        let old = seen
+                            .iter()
+                            .take_while(|(idx, _, _)| *idx == self.old_idx)
+                            .count();
+                        let new = seen
+                            .iter()
+                            .filter(|(idx, _, _)| *idx == self.new_idx)
+                            .map(|(_, c, ct)| (*c, ct.clone()))
+                            .collect();
+                        return (old, new);
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            panic!("the actor never sent under the new index");
+        }
+
+        fn feed_old_keep(&mut self) {
+            let E2eFrame::Data {
+                counter,
+                ciphertext,
+                ..
+            } = self.peer_old.encrypt_data(&E2eDataBody::Keep).unwrap()
+            else {
+                panic!()
+            };
+            self.handle
+                .feed_inbound_gen(0, counter, ciphertext)
+                .unwrap();
+        }
+
+        fn feed_new(&mut self, generation: Generation, body: &E2eDataBody) {
+            let E2eFrame::Data {
+                counter,
+                ciphertext,
+                ..
+            } = self.peer_new.encrypt_data(body).unwrap()
+            else {
+                panic!()
+            };
+            self.handle
+                .feed_inbound_gen(generation, counter, ciphertext)
+                .unwrap();
+        }
+
+        fn feed_new_raw(&mut self, generation: Generation, plain: &[u8]) {
+            let E2eFrame::Data {
+                counter,
+                ciphertext,
+                ..
+            } = self.peer_new.encrypt_raw(plain).unwrap()
+            else {
+                panic!()
+            };
+            self.handle
+                .feed_inbound_gen(generation, counter, ciphertext)
+                .unwrap();
+        }
+
+        /// The actor's last record on the new transport must be its CLOSE: the peer's new
+        /// transport decrypts the actor's new records in order from the `skip`th on (records
+        /// before it were read already) and the last one is returned.
+        fn close_on_new(&mut self, skip: usize) -> (ErrorCode, String) {
+            let records: Vec<(u64, Vec<u8>)> = self
+                .seen
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(idx, _, _)| *idx == self.new_idx)
+                .skip(skip)
+                .map(|(_, c, ct)| (*c, ct.clone()))
+                .collect();
+            let mut last = None;
+            for (counter, ct) in &records {
+                last = Some(self.peer_new.decrypt_data(*counter, ct).unwrap());
+            }
+            match last.expect("a record on the new transport") {
+                E2eDataBody::Close { code, msg } => (code, msg),
+                other => panic!("not a CLOSE: {other:?}"),
+            }
+        }
+
+        /// [`Self::ended`] with a tight bound: for a test whose point is that the session
+        /// ends at once, not by the slower ACK window or liveness fallback.
+        async fn ended_at_once(&mut self) -> Arc<EndReason> {
+            tokio::time::timeout(Duration::from_secs(3), self.acceptor.closed())
+                .await
+                .expect("the session ends at once, not by a timeout")
+        }
+
+        async fn ended(&mut self) -> Arc<EndReason> {
+            tokio::time::timeout(Duration::from_secs(60), self.acceptor.closed())
+                .await
+                .expect("the session ends")
+        }
+
+        fn is_alive(&mut self) -> bool {
+            self.acceptor.ended_rx.try_recv().is_err()
+        }
+
+        async fn settled(&self, n: Generation) {
+            for _ in 0..1000 {
+                if self.handle.settled_generation() == n {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            panic!("never settled at {n}");
+        }
+    }
+
+    /// CONTINUE as the peer's router would see it: decrypt the actor's first new frame with
+    /// the peer's new transport.
+    fn decode_continue(peer_new: &mut E2eTransport, counter: u64, ct: &[u8]) -> ContinueBody {
+        let plain = peer_new.decrypt_raw(counter, ct).unwrap();
+        ContinueBody::decode(&plain).unwrap()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn initiator_sends_continue_first_accepts_the_ack_and_drops_the_old_transport() {
+        let mut s = solo(true);
+        s.collect();
+        // One old record before the handover, one after the switch (it keeps counting).
+        s.feed_old_keep();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let new = s.actor_new.take().unwrap();
+        let g = s
+            .handle
+            .hand_over(new, HandoverRole::Initiator { prior: 77 });
+        assert_eq!(g, 1);
+        let (old_sent, new_frames) = s.first_new_frame().await;
+        let (counter, ct) = &new_frames[0];
+        assert_eq!(*counter, 0, "CONTINUE is the first record");
+        let cont = decode_continue(&mut s.peer_new, *counter, ct);
+        assert_eq!(cont.prior, 77);
+        assert_eq!(
+            cont.sent, old_sent as u64,
+            "all it sent on the old transport"
+        );
+        assert_eq!(cont.binding, continue_binding(s.peer_old.handshake_hash()));
+        // An old record that arrives after the switch is processed and counted.
+        s.feed_old_keep();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            s.handle.settled_generation(),
+            0,
+            "not settled before the ACK"
+        );
+        s.feed_new_raw(1, &ContinueAckBody { sent: 2 }.encode());
+        s.settled(1).await;
+        // The old transport is gone: 50 s later (past the ACK window) the session lives, the
+        // peer being kept alive on the new transport; a late old record is dropped.
+        for _ in 0..5 {
+            tokio::time::sleep(Duration::from_secs(10)).await;
+            s.feed_new(1, &E2eDataBody::Keep);
+        }
+        s.feed_old_keep();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(s.is_alive(), "ended: {:?}", s.acceptor.ended_cached);
+        // And the new transport carries the session: a CLOSE on it ends it.
+        s.feed_new(
+            1,
+            &E2eDataBody::Close {
+                code: ErrorCode::NoGrant,
+                msg: String::new(),
+            },
+        );
+        let end = s.ended().await;
+        assert!(
+            matches!(end.as_ref(), EndReason::PeerClosed { .. }),
+            "{end:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn initiator_ends_with_handover_failed_when_the_ack_count_is_wrong() {
+        for wrong in [1u64, 3] {
+            let mut s = solo(true);
+            s.collect();
+            s.feed_old_keep();
+            s.feed_old_keep();
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let new = s.actor_new.take().unwrap();
+            s.handle
+                .hand_over(new, HandoverRole::Initiator { prior: 2 });
+            let (_, new_frames) = s.first_new_frame().await;
+            decode_continue(&mut s.peer_new, new_frames[0].0, &new_frames[0].1);
+            s.feed_new_raw(1, &ContinueAckBody { sent: wrong }.encode());
+            let end = s.ended().await;
+            assert!(
+                matches!(end.as_ref(), EndReason::HandoverFailed(_)),
+                "{end:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            // Its CLOSE is the second record on the new transport (CONTINUE was the first).
+            let (code, _) = s.close_on_new(1);
+            assert_eq!(code, ErrorCode::HandoverFailed);
+            assert_eq!(s.handle.settled_generation(), 0);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn initiator_ends_when_the_first_record_on_the_new_transport_is_not_the_ack() {
+        for variant in 0..3 {
+            let mut s = solo(true);
+            s.collect();
+            let new = s.actor_new.take().unwrap();
+            s.handle
+                .hand_over(new, HandoverRole::Initiator { prior: 2 });
+            let (_, new_frames) = s.first_new_frame().await;
+            decode_continue(&mut s.peer_new, new_frames[0].0, &new_frames[0].1);
+            match variant {
+                0 => s.feed_new(1, &E2eDataBody::Keep),
+                1 => s.feed_new(1, &E2eDataBody::Mux(vec![0; 12])),
+                // A CONTINUE (not an ACK) is as wrong as anything else.
+                _ => s.feed_new_raw(
+                    1,
+                    &ContinueBody {
+                        prior: 2,
+                        sent: 0,
+                        binding: [0; 32],
+                    }
+                    .encode(),
+                ),
+            }
+            let end = s.ended_at_once().await;
+            assert!(
+                matches!(end.as_ref(), EndReason::HandoverFailed(_)),
+                "variant {variant}: {end:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let (code, _) = s.close_on_new(1);
+            assert_eq!(code, ErrorCode::HandoverFailed);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn initiator_reads_the_responders_refusal_as_the_peers_close() {
+        let mut s = solo(true);
+        s.collect();
+        let new = s.actor_new.take().unwrap();
+        s.handle
+            .hand_over(new, HandoverRole::Initiator { prior: 2 });
+        let (_, new_frames) = s.first_new_frame().await;
+        decode_continue(&mut s.peer_new, new_frames[0].0, &new_frames[0].1);
+        s.feed_new(
+            1,
+            &E2eDataBody::Close {
+                code: ErrorCode::HandoverFailed,
+                msg: "no".into(),
+            },
+        );
+        let end = s.ended().await;
+        assert!(
+            matches!(end.as_ref(), EndReason::PeerClosed { code, .. } if *code == ErrorCode::HandoverFailed),
+            "{end:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn initiator_ends_when_no_ack_comes_within_the_liveness_window() {
+        let mut s = solo(true);
+        s.collect();
+        let new = s.actor_new.take().unwrap();
+        s.handle
+            .hand_over(new, HandoverRole::Initiator { prior: 2 });
+        let (_, new_frames) = s.first_new_frame().await;
+        decode_continue(&mut s.peer_new, new_frames[0].0, &new_frames[0].1);
+        // The peer keeps talking on the old transport (so it is alive) but never ACKs.
+        for _ in 0..3 {
+            tokio::time::sleep(Duration::from_secs(10)).await;
+            s.feed_old_keep();
+        }
+        assert!(s.is_alive(), "30 s is inside the window");
+        for _ in 0..3 {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            s.feed_old_keep();
+        }
+        let end = s.ended().await;
+        assert!(
+            matches!(end.as_ref(), EndReason::HandoverFailed(_)),
+            "{end:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let (code, _) = s.close_on_new(1);
+        assert_eq!(code, ErrorCode::HandoverFailed);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_second_handover_before_the_ack_and_a_record_of_a_future_transport_end_the_session() {
+        let mut s = solo(true);
+        s.collect();
+        let new = s.actor_new.take().unwrap();
+        s.handle
+            .hand_over(new, HandoverRole::Initiator { prior: 2 });
+        let (_, _) = s.first_new_frame().await;
+        let (_a2, b2) = two_sides_indexed(HSEED, 65_535, a_idx(2), b_idx(2));
+        s.handle
+            .hand_over(b2.transport, HandoverRole::Initiator { prior: 4 });
+        let end = s.ended().await;
+        assert!(
+            matches!(end.as_ref(), EndReason::HandoverFailed(_)),
+            "{end:?}"
+        );
+
+        let mut s = solo(true);
+        s.collect();
+        // A reliable record of generation 1 before generation 1 was handed over.
+        s.handle.feed_inbound_gen(1, 0, vec![0u8; 40]).unwrap();
+        let end = s.ended().await;
+        assert!(
+            matches!(end.as_ref(), EndReason::HandoverFailed(_)),
+            "{end:?}"
+        );
+    }
+
+    /// The responder side of a solo test: the peer's CONTINUE is read by the test, as the
+    /// router does, before the handover item goes in.
+    fn responder_handover(s: &mut Solo, old_records: u64, claimed: u64) {
+        for _ in 0..old_records {
+            s.feed_old_keep();
+        }
+        let E2eFrame::Data {
+            counter,
+            ciphertext,
+            ..
+        } = s
+            .peer_new
+            .encrypt_raw(
+                &ContinueBody {
+                    prior: s.old_idx,
+                    sent: claimed,
+                    binding: continue_binding(s.peer_old.handshake_hash()),
+                }
+                .encode(),
+            )
+            .unwrap()
+        else {
+            panic!()
+        };
+        let mut new = s.actor_new.take().unwrap();
+        new.decrypt_raw(counter, &ciphertext).unwrap();
+        s.handle.hand_over(
+            new,
+            HandoverRole::Responder {
+                continue_sent: claimed,
+            },
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn responder_acks_switches_sends_only_on_the_new_transport_and_drops_the_old() {
+        let mut s = solo(false);
+        s.collect();
+        responder_handover(&mut s, 3, 3);
+        let (old_sent, new_frames) = s.first_new_frame().await;
+        let (counter, ct) = &new_frames[0];
+        assert_eq!(*counter, 0, "the ACK is the first record");
+        let plain = s.peer_new.decrypt_raw(*counter, ct).unwrap();
+        let ack = ContinueAckBody::decode(&plain).unwrap();
+        assert_eq!(
+            ack.sent, old_sent as u64,
+            "all it sent on the old transport"
+        );
+        s.settled(1).await;
+        // From the switch on, everything it sends is on the new transport: a stream, KEEPs
+        // (time passes), a CLOSE.
+        let mut stream = s.handle.open_stream().await.unwrap();
+        {
+            use futures_util::io::AsyncWriteExt;
+            stream.write_all(b"after the switch").await.unwrap();
+            stream.flush().await.unwrap();
+        }
+        for _ in 0..3 {
+            tokio::time::sleep(Duration::from_secs(10)).await;
+            s.feed_new(1, &E2eDataBody::Keep);
+        }
+        // A record of the old transport after the switch is dropped, the session lives.
+        s.feed_old_keep();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(s.is_alive());
+        s.handle.close(Some(CloseReason {
+            code: ErrorCode::NoGrant,
+            msg: "bye".into(),
+        }));
+        let end = s.ended().await;
+        assert!(
+            matches!(end.as_ref(), EndReason::ClosedLocally(_)),
+            "{end:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let seen = s.seen.lock().unwrap().clone();
+        let first_new = seen.iter().position(|(i, _, _)| *i == s.new_idx).unwrap();
+        assert!(
+            seen[first_new..].iter().all(|(i, _, _)| *i == s.new_idx),
+            "a frame was sent on the old transport after the switch"
+        );
+        assert!(
+            seen.len() > first_new + 2,
+            "the stream and the CLOSE were sent"
+        );
+        drop(seen);
+        // The CLOSE decrypts under the new keys, in order after the ACK and the data.
+        let n_new = s
+            .seen
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(i, _, _)| *i == s.new_idx)
+            .count();
+        // Records 1..n_new-1 are Mux/Keep: decrypt them in order to reach the CLOSE.
+        let new_records: Vec<_> = s
+            .seen
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(i, _, _)| *i == s.new_idx)
+            .map(|(_, c, ct)| (*c, ct.clone()))
+            .collect();
+        let mut last = None;
+        for (c, ct) in new_records.iter().skip(1) {
+            last = Some(s.peer_new.decrypt_data(*c, ct).unwrap());
+        }
+        assert!(n_new >= 3);
+        assert!(
+            matches!(last, Some(E2eDataBody::Close { code, .. }) if code == ErrorCode::NoGrant)
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn responder_ends_with_handover_failed_when_the_count_differs() {
+        for (received, claimed) in [(3u64, 4u64), (3, 2), (0, 1)] {
+            let mut s = solo(false);
+            s.collect();
+            responder_handover(&mut s, received, claimed);
+            let end = s.ended().await;
+            assert!(
+                matches!(end.as_ref(), EndReason::HandoverFailed(_)),
+                "{end:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            // Nothing was sent on the old transport after the refusal, and the CLOSE is the
+            // first record on the new transport.
+            let (code, _) = s.close_on_new(0);
+            assert_eq!(code, ErrorCode::HandoverFailed);
+            assert_eq!(s.handle.settled_generation(), 0);
         }
     }
 }
