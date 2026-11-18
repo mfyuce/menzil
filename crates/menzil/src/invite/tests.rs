@@ -640,3 +640,62 @@ fn creating_through_execute_prints_the_token_and_what_to_know() {
     .unwrap();
     assert_eq!(revoked, [format!("revoked {id}")]);
 }
+
+#[test]
+fn the_awaiting_seed_is_the_redeemed_devices_until_expiry_plus_the_longest_roster_life() {
+    let fx = fixture();
+    let made = make(&fx.owner, &CreateSpec::default());
+    let dev = device();
+    let out = run(
+        &fx.owner,
+        &fx.network,
+        vec![request(&made.token, &dev, "d0")],
+    );
+    assert_eq!(out.admitted, 1);
+    let deadline = made.expires + DOC_MAX_LIFETIME;
+    // A new process reads the same book: the seed is found again.
+    assert_eq!(
+        awaiting_from_book(&fx.owner, &fx.network, NOW),
+        vec![(dev.id, deadline)]
+    );
+    assert_eq!(
+        awaiting_from_book(&fx.owner, &fx.network, deadline - 1),
+        vec![(dev.id, deadline)]
+    );
+    assert!(awaiting_from_book(&fx.owner, &fx.network, deadline).is_empty());
+}
+
+#[test]
+fn a_revoked_invite_still_seeds_the_devices_it_admitted_and_an_unused_one_seeds_nothing() {
+    let fx = fixture();
+    let unused = make(&fx.owner, &CreateSpec::default());
+    assert!(awaiting_from_book(&fx.owner, &fx.network, NOW).is_empty());
+    let dev = device();
+    let used = make(&fx.owner, &CreateSpec::default());
+    run(
+        &fx.owner,
+        &fx.network,
+        vec![request(&used.token, &dev, "d0")],
+    );
+    let _ = unused;
+    revoke(&fx.owner, None, &hex_prefix(&used.token), NOW).unwrap();
+    let seed = awaiting_from_book(&fx.owner, &fx.network, NOW);
+    assert_eq!(seed.len(), 1);
+    assert_eq!(seed[0].0, dev.id);
+}
+
+fn hex_prefix(token: &str) -> String {
+    let id = decode_invite(token)
+        .unwrap()
+        .invite
+        .decode()
+        .unwrap()
+        .invite_id;
+    id.to_hex()
+}
+
+#[test]
+fn a_home_without_a_book_seeds_nothing() {
+    let fx = fixture();
+    assert!(awaiting_from_book(&fx.owner, &fx.network, NOW).is_empty());
+}

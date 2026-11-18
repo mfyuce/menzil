@@ -1262,6 +1262,7 @@ where
     ));
     // The certificate: a check now and every six hours (renews 60 days before it runs out).
     let cert_task = tokio::spawn(cert_node::run(renewer));
+    seed_awaiting(home, &node, unix_now());
     let reload_task = {
         let (home, directory, node) = (home.clone(), directory.clone(), node.clone());
         let (policies, rosters) = (policies.clone(), rosters.clone());
@@ -1306,6 +1307,8 @@ where
                         spawn_push(&node, network_id);
                     }
                 }
+                // Devices an invite admitted that may still lack the Policy (idempotent).
+                seed_awaiting(&home, &node, unix_now());
             }
         })
     };
@@ -1329,6 +1332,31 @@ where
         keeper,
         _instance: instance,
     })
+}
+
+/// Tells the node which invite admitted devices to keep trying with (see
+/// [`crate::invite::awaiting_from_book`]): only for networks this device issues for.
+pub(crate) fn seed_awaiting(home: &Home, node: &Node, now: u64) {
+    for (network_id, member, deadline) in awaiting_seed(home, now) {
+        node.await_policy(network_id, member, deadline);
+    }
+}
+
+/// What [`seed_awaiting`] tells the node: (network, device, deadline).
+pub(crate) fn awaiting_seed(home: &Home, now: u64) -> Vec<(NetworkId, NodeId, u64)> {
+    let Ok(networks) = home.networks() else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for network_id in networks {
+        if !is_issuer(home, &network_id) {
+            continue;
+        }
+        for (member, deadline) in crate::invite::awaiting_from_book(home, &network_id, now) {
+            out.push((network_id, member, deadline));
+        }
+    }
+    out
 }
 
 /// What a reload of the `[[share]]` entries does: the set to advertise, and the shares of the

@@ -2061,3 +2061,32 @@ fn a_second_corrupt_known_relays_file_in_the_same_second_does_not_replace_the_fi
         b"second"
     );
 }
+
+#[test]
+fn only_an_issuer_seeds_the_awaiting_set_from_its_invite_book() {
+    use crate::invite::{CreateSpec, create, load_book, save_book};
+    use crate::local::{init, network_create};
+    const NOW: u64 = 1_800_000_000;
+    let dir = tempfile::tempdir().unwrap();
+    let home = Home::new(dir.path().join("h"));
+    init(&home, NOW).unwrap();
+    let network = network_create(&home, "owner", NOW).unwrap();
+    let made = create(
+        &home,
+        &CreateSpec::default(),
+        "menzil://relay.example.org:443/_menzil/v1?id=abababababababababababababababababababababababababababababababab",
+        NOW,
+    )
+    .unwrap();
+    let mut book = load_book(&home, &network).unwrap();
+    let member = menzil_admin::NodeKeys::generate().node_id();
+    book.invites[0].redeemed.push(member);
+    save_book(&home, &network, &mut book, NOW).unwrap();
+    assert_eq!(
+        awaiting_seed(&home, NOW),
+        vec![(network, member, made.expires + DOC_MAX_LIFETIME)]
+    );
+    // The same book on a device that holds no signing key seeds nothing.
+    std::fs::remove_file(home.owner_key_path(&network)).unwrap();
+    assert!(awaiting_seed(&home, NOW).is_empty());
+}

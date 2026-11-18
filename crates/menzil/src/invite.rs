@@ -40,6 +40,7 @@ use menzil_admin::{Documents, StewardSecret};
 use menzil_node::admit_handler::{
     AdmitIssuer, AdmitTxn, InviteRecord, IssueFault, NotIssuer, Standing,
 };
+use menzil_proto::trust::DOC_MAX_LIFETIME;
 use menzil_proto::{
     AdmitListenBody, ByteArray, Invite, InviteBody, InviteId, NetworkId, NodeCert, NodeId,
     PROTOCOL_VERSION, Tai64N, hash_invite_secret,
@@ -150,6 +151,39 @@ pub fn load_book(home: &Home, network: &NetworkId) -> Result<InviteBook> {
         bail!("{} is of a newer format ({})", path.display(), book.v);
     }
     Ok(book)
+}
+
+/// The devices `network` admitted by invite that its issuer should keep trying to give the
+/// Policy to (the awaiting set of the node, seeded at start and after a reload): every
+/// `redeemed` NodeId of an invite that is not past `expires` plus [`DOC_MAX_LIFETIME`] (the
+/// longest life of the Roster that admitted it), with that moment as its deadline. A revoked
+/// invite still counts: revoking stops further admissions, not the devices it admitted. A book
+/// that cannot be read gives nothing (and a warning): the tail is a help, not a gate.
+pub fn awaiting_from_book(home: &Home, network: &NetworkId, now: u64) -> Vec<(NodeId, u64)> {
+    let book = match load_book(home, network) {
+        Ok(book) => book,
+        Err(error) => {
+            tracing::warn!(%network, error = %format!("{error:#}"), "cannot read the invite book to seed the awaiting set");
+            return Vec::new();
+        }
+    };
+    let mut out: Vec<(NodeId, u64)> = Vec::new();
+    for entry in &book.invites {
+        let Ok(body) = entry.invite.decode() else {
+            continue;
+        };
+        let deadline = body.expires.saturating_add(DOC_MAX_LIFETIME);
+        if now >= deadline {
+            continue;
+        }
+        for node in &entry.redeemed {
+            match out.iter_mut().find(|(n, _)| n == node) {
+                Some(seen) => seen.1 = seen.1.max(deadline),
+                None => out.push((*node, deadline)),
+            }
+        }
+    }
+    out
 }
 
 /// Writes the book (pruned first), atomically, mode 0600. The caller holds the network lock.
