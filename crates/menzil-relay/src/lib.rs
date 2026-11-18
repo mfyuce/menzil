@@ -73,7 +73,7 @@ pub use front_door::{
     FRONT_DOOR_V6_48_FACTOR, FrontDoorConfig, FrontDoorConfigError,
 };
 pub use hello::{HelloRejection, check_hello};
-pub use identity::RelayIdentity;
+pub use identity::{PreviousKey, RelayIdentity, previous_key_answers};
 pub use listener::{FALLBACK_PAGE_MAX_BYTES, FallbackPage, Listener};
 pub use names::{
     Claim, NEW_NAMES_WINDOW_DAYS, NameFigures, NameRecord, NameRefusal, NameState, NamesStateError,

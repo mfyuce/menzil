@@ -105,7 +105,7 @@ pub(crate) mod tests {
         NodeCert::sign(&key, &body).unwrap()
     }
 
-    fn sample_hello() -> HelloBody {
+    pub(crate) fn sample_hello() -> HelloBody {
         HelloBody {
             v: menzil_proto::PROTOCOL_VERSION,
             node_cert: node_cert(1),
@@ -129,6 +129,7 @@ pub(crate) mod tests {
                 credit: 1_048_576,
             },
             rosters: HashMap::new(),
+            relay_next: None,
         }
     }
 

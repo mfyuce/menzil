@@ -833,8 +833,7 @@ const NOT_BEFORE_SKEW: u64 = 3600;
 /// `id`; the window (`not_after > now`, `not_before <= now + 3600`); `x25519_pub` equals the
 /// handshake's static key; then the serial rule against what `known` holds for this relay
 /// ([`KnownRelays::accept`]: a lower serial is [`NodeError::RelayRollback`], a higher one is
-/// written before this returns). `relay_next` (the 30 day window of a rotated key) is slice A2
-/// and not read here.
+/// written before this returns). Then `relay_next`, if present ([`remember_relay_next`]).
 fn verify_relay_identity(
     info: &ConnectionInfo,
     welcome: &WelcomeBody,
@@ -842,9 +841,27 @@ fn verify_relay_identity(
     known: &KnownRelays,
     now: u64,
 ) -> Result<(), NodeError> {
+    let cert_body = check_relay_cert(info, &welcome.relay_cert, now)?;
+    if cert_body.x25519_pub != *relay_static {
+        return Err(NodeError::RelayIdentityMismatch(
+            "relay_cert.x25519_pub does not match the relay's negotiated Noise static key",
+        ));
+    }
+    known.accept(&info.relay_node_id, &welcome.relay_cert, &cert_body, now)?;
+    remember_relay_next(info, welcome, &cert_body, known, now);
+    Ok(())
+}
+
+/// The checks every relay certificate passes, in this order: the self signature under the dialed
+/// `id`, `node_id` equals `id`, the window (`not_after > now`, `not_before <= now + 3600`).
+fn check_relay_cert(
+    info: &ConnectionInfo,
+    cert: &menzil_proto::NodeCert,
+    now: u64,
+) -> Result<menzil_proto::NodeCertBody, NodeError> {
     let verifying_key = VerifyingKey::from_bytes(&<[u8; 32]>::from(info.relay_node_id))?;
-    welcome.relay_cert.verify(&verifying_key)?;
-    let cert_body = welcome.relay_cert.decode()?;
+    cert.verify(&verifying_key)?;
+    let cert_body = cert.decode()?;
     if cert_body.node_id != info.relay_node_id {
         return Err(NodeError::RelayIdentityMismatch(
             "relay_cert.node_id does not match the dialed connection information's id",
@@ -860,14 +877,42 @@ fn verify_relay_identity(
             not_before: cert_body.not_before,
         });
     }
-    if cert_body.x25519_pub != *relay_static {
-        return Err(NodeError::RelayIdentityMismatch(
-            "relay_cert.x25519_pub does not match the relay's negotiated Noise static key",
-        ));
+    Ok(cert_body)
+}
+
+/// WELCOME's `relay_next` (design note A5): the relay's current certificate, sent when it
+/// answered with its previous key. It is verified like `relay_cert` and must carry a serial
+/// above `relay_cert`'s; if it then passes the serial rule it becomes the stored record, so the
+/// next dial is IK with its key. One that fails is ignored with a warning: the session stands on
+/// `relay_cert`.
+fn remember_relay_next(
+    info: &ConnectionInfo,
+    welcome: &WelcomeBody,
+    relay_cert: &menzil_proto::NodeCertBody,
+    known: &KnownRelays,
+    now: u64,
+) {
+    let Some(next) = &welcome.relay_next else {
+        return;
+    };
+    let result = check_relay_cert(info, next, now).and_then(|body| {
+        if body.serial > relay_cert.serial {
+            known
+                .accept(&info.relay_node_id, next, &body, now)
+                .map(|_| ())
+        } else {
+            Err(NodeError::RelayIdentityMismatch(
+                "relay_next does not carry a higher serial than relay_cert",
+            ))
+        }
+    });
+    if let Err(error) = result {
+        tracing::warn!(
+            relay = %info.relay_node_id.fingerprint(),
+            %error,
+            "the relay's relay_next certificate is ignored"
+        );
     }
-    known
-        .accept(&info.relay_node_id, &welcome.relay_cert, &cert_body, now)
-        .map(|_| ())
 }
 
 /// The system clock in Unix seconds, for the time rules of protocol.md 2.3.
@@ -2080,6 +2125,7 @@ mod tests {
                 credit: 1_048_576,
             },
             rosters: HashMap::new(),
+            relay_next: None,
         }
     }
 
@@ -2792,6 +2838,106 @@ mod tests {
         let (info, welcome, static_key) = relay_welcome(&key, 7, 5, 0, NOW - 1);
         assert!(verify_relay_identity(&info, &welcome, &static_key, &known, NOW).is_err());
         assert!(known.views().is_empty());
+    }
+
+    /// A certificate of `key` for serial `serial` and static `x25519`, window open at `NOW`.
+    fn relay_cert_for(key: &SigningKey, serial: u32, x25519: u8) -> NodeCert {
+        NodeCert::sign(
+            key,
+            &NodeCertBody {
+                v: PROTOCOL_VERSION,
+                node_id: NodeId::from(key.verifying_key().to_bytes()),
+                x25519_pub: X25519PublicKey::from([x25519; 32]),
+                serial,
+                not_before: NOW - 86_400,
+                not_after: NOW + 86_400 * 100,
+            },
+        )
+        .unwrap()
+    }
+
+    /// A session answered by the previous key (serial 1, static 5) that also sends `next`.
+    fn previous_key_welcome(
+        key: &SigningKey,
+        next: Option<NodeCert>,
+    ) -> (ConnectionInfo, WelcomeBody, X25519PublicKey) {
+        let (info, mut welcome, static_key) =
+            relay_welcome(key, 1, 5, NOW - 86_400, NOW + 86_400 * 100);
+        welcome.relay_next = next;
+        (info, welcome, static_key)
+    }
+
+    #[test]
+    fn a_valid_relay_next_with_a_higher_serial_becomes_the_stored_record() {
+        let key = SigningKey::generate(&mut rand::rng());
+        let known = KnownRelays::in_memory();
+        let id = NodeId::from(key.verifying_key().to_bytes());
+        let (info, welcome, static_key) =
+            previous_key_welcome(&key, Some(relay_cert_for(&key, 2, 9)));
+        verify_relay_identity(&info, &welcome, &static_key, &known, NOW).unwrap();
+        // The next dial is IK with the new key.
+        assert_eq!(known.stored(&id).unwrap().0, 2);
+        assert_eq!(
+            known.dial_key(&id, None),
+            Some(X25519PublicKey::from([9u8; 32]))
+        );
+    }
+
+    #[test]
+    fn a_relay_next_that_is_not_higher_or_does_not_verify_is_ignored() {
+        let key = SigningKey::generate(&mut rand::rng());
+        let other = SigningKey::generate(&mut rand::rng());
+        let id = NodeId::from(key.verifying_key().to_bytes());
+        for (label, next) in [
+            ("equal serial", relay_cert_for(&key, 1, 9)),
+            ("lower serial", relay_cert_for(&key, 0, 9)),
+            ("another signer", relay_cert_for(&other, 2, 9)),
+        ] {
+            let known = KnownRelays::in_memory();
+            let (info, welcome, static_key) = previous_key_welcome(&key, Some(next));
+            // The session stands on relay_cert, which is remembered; relay_next is not.
+            verify_relay_identity(&info, &welcome, &static_key, &known, NOW)
+                .unwrap_or_else(|e| panic!("{label}: {e:?}"));
+            assert_eq!(known.stored(&id).unwrap().0, 1, "{label}");
+            assert_eq!(
+                known.dial_key(&id, None),
+                Some(X25519PublicKey::from([5u8; 32])),
+                "{label}"
+            );
+        }
+        // An expired relay_next is ignored too.
+        let known = KnownRelays::in_memory();
+        let expired = NodeCert::sign(
+            &key,
+            &NodeCertBody {
+                v: PROTOCOL_VERSION,
+                node_id: id,
+                x25519_pub: X25519PublicKey::from([9u8; 32]),
+                serial: 2,
+                not_before: NOW - 1000,
+                not_after: NOW,
+            },
+        )
+        .unwrap();
+        let (info, welcome, static_key) = previous_key_welcome(&key, Some(expired));
+        verify_relay_identity(&info, &welcome, &static_key, &known, NOW).unwrap();
+        assert_eq!(known.stored(&id).unwrap().0, 1);
+    }
+
+    #[test]
+    fn a_relay_next_below_what_the_node_remembers_is_ignored() {
+        let key = SigningKey::generate(&mut rand::rng());
+        let id = NodeId::from(key.verifying_key().to_bytes());
+        let known = KnownRelays::in_memory();
+        // The node already holds serial 5 (static 7).
+        verify_at(&known, &key, 5, 7).unwrap();
+        // A session on a key of serial 5 itself, sending a relay_next of serial 3: not higher
+        // than relay_cert, so ignored; the record stays.
+        let (info, mut welcome, static_key) =
+            relay_welcome(&key, 5, 7, NOW - 86_400, NOW + 86_400 * 100);
+        welcome.relay_next = Some(relay_cert_for(&key, 3, 9));
+        verify_relay_identity(&info, &welcome, &static_key, &known, NOW).unwrap();
+        assert_eq!(known.stored(&id).unwrap().0, 5);
     }
 
     #[test]

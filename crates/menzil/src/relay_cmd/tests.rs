@@ -3698,3 +3698,443 @@ async fn a_stop_flush_of_both_keepers_is_bounded_by_one_grace() {
     running.stop();
     drop(busy);
 }
+
+// ---- relay key rotation (design note A5, A6) ----
+
+mod rotation_tests {
+    use super::*;
+    use crate::relay_cmd::rotation::{
+        self, RotateOptions, Step, load_previous, renew_cert, retire_previous_if_due, rotate_key,
+        rotate_key_with,
+    };
+
+    fn serial_of(home: &Home) -> u32 {
+        relay_identity(home)
+            .unwrap()
+            .node_cert
+            .decode()
+            .unwrap()
+            .serial
+    }
+
+    fn x25519_of(home: &Home) -> menzil_proto::X25519PublicKey {
+        relay_identity(home)
+            .unwrap()
+            .node_cert
+            .decode()
+            .unwrap()
+            .x25519_pub
+    }
+
+    fn initialised() -> (tempfile::TempDir, Home) {
+        let (dir, home) = home();
+        init(&home, clock()).unwrap();
+        (dir, home)
+    }
+
+    #[test]
+    fn rotate_key_makes_a_new_key_under_the_same_node_id_and_keeps_the_old_one() {
+        let (_d, home) = initialised();
+        let before = relay_identity(&home).unwrap();
+        let old = before.node_cert.decode().unwrap();
+        let rotated = rotate_key(&home, &RotateOptions::default(), clock()).unwrap();
+        assert_eq!((rotated.old_serial, rotated.new_serial), (1, 2));
+        assert_eq!(rotated.window_days, 30);
+        assert_eq!(rotated.retire_at, Some(clock() + 30 * DAY));
+        let after = relay_identity(&home).unwrap();
+        let new = after.node_cert.decode().unwrap();
+        // The same NodeId, a new key, serial + 1, a day back and 400 days from there.
+        assert_eq!(new.node_id, old.node_id);
+        assert_ne!(new.x25519_pub, old.x25519_pub);
+        assert_eq!(new.serial, 2);
+        assert_eq!(new.not_before, clock() - DAY);
+        assert_eq!(new.not_after, clock() - DAY + 400 * DAY);
+        assert!(rotated.connection_info.contains(&new.x25519_pub.to_hex()));
+        // The previous key file holds the old pair, 0600, and answers until its window ends.
+        let previous = load_previous(&home).unwrap().unwrap();
+        assert_eq!(previous.cert, before.node_cert);
+        assert_eq!(*previous.x25519_private, before.x25519_private);
+        assert_eq!(previous.retire_at, clock() + 30 * DAY);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(home.previous_key_path())
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+    }
+
+    #[test]
+    fn the_window_is_clamped_and_zero_keeps_no_previous_key() {
+        let (_d, home) = initialised();
+        let error = rotate_key(
+            &home,
+            &RotateOptions {
+                window_days: Some(31),
+                ..RotateOptions::default()
+            },
+            clock(),
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("at most 30"));
+        assert_eq!(serial_of(&home), 1, "a refused rotation changed nothing");
+        let rotated = rotate_key(
+            &home,
+            &RotateOptions {
+                window_days: Some(0),
+                ..RotateOptions::default()
+            },
+            clock(),
+        )
+        .unwrap();
+        assert_eq!(rotated.retire_at, None);
+        assert!(load_previous(&home).unwrap().is_none());
+        assert_eq!(serial_of(&home), 2);
+    }
+
+    #[test]
+    fn a_rotation_inside_the_window_needs_force_and_then_replaces_the_previous_key() {
+        let (_d, home) = initialised();
+        rotate_key(&home, &RotateOptions::default(), clock()).unwrap();
+        let first_new_key = x25519_of(&home);
+        let error = rotate_key(&home, &RotateOptions::default(), clock() + 10).unwrap_err();
+        assert!(format!("{error:#}").contains("--force"), "{error:#}");
+        assert_eq!(serial_of(&home), 2, "the refusal changed nothing");
+        // With --force: serial 3, and the previous key is now the one that was current.
+        let forced = rotate_key(
+            &home,
+            &RotateOptions {
+                force: true,
+                ..RotateOptions::default()
+            },
+            clock() + 10,
+        )
+        .unwrap();
+        assert_eq!(forced.new_serial, 3);
+        let previous = load_previous(&home).unwrap().unwrap();
+        assert_eq!(previous.cert.decode().unwrap().x25519_pub, first_new_key);
+        assert_eq!(previous.cert.decode().unwrap().serial, 2);
+        // --force with no window drops the previous key altogether.
+        rotate_key(
+            &home,
+            &RotateOptions {
+                force: true,
+                window_days: Some(0),
+                ..RotateOptions::default()
+            },
+            clock() + 20,
+        )
+        .unwrap();
+        assert!(load_previous(&home).unwrap().is_none());
+    }
+
+    #[test]
+    fn a_previous_key_past_its_window_is_not_in_the_way_and_is_wiped() {
+        let (_d, home) = initialised();
+        rotate_key(&home, &RotateOptions::default(), clock()).unwrap();
+        let later = clock() + 31 * DAY;
+        // Past retire_at: a new rotation needs no --force and the old file is replaced.
+        let rotated = rotate_key(&home, &RotateOptions::default(), later).unwrap();
+        assert_eq!(rotated.new_serial, 3);
+        let previous = load_previous(&home).unwrap().unwrap();
+        assert_eq!(previous.retire_at, later + 30 * DAY);
+        // retire_previous_if_due wipes and deletes one that is due, keeps one that is not.
+        assert!(retire_previous_if_due(&home, later + 1).unwrap().is_some());
+        assert!(home.previous_key_path().exists());
+        assert!(
+            retire_previous_if_due(&home, later + 30 * DAY)
+                .unwrap()
+                .is_none(),
+            "retire_at itself has passed"
+        );
+        assert!(!home.previous_key_path().exists());
+    }
+
+    #[test]
+    fn a_previous_key_whose_certificate_has_ended_is_retired_before_retire_at() {
+        // An identity made 390 days ago: its certificate ends in about ten days, well inside
+        // the 30 day window the rotation gives its key.
+        let (_d, home) = home();
+        init(&home, clock() - 390 * DAY).unwrap();
+        rotate_key(&home, &RotateOptions::default(), clock()).unwrap();
+        // The previous certificate (made by init) ends 400 days after its not_before.
+        let ended = load_previous(&home)
+            .unwrap()
+            .unwrap()
+            .cert
+            .decode()
+            .unwrap()
+            .not_after;
+        assert!(retire_previous_if_due(&home, ended - 1).unwrap().is_some());
+        assert!(retire_previous_if_due(&home, ended).unwrap().is_none());
+        assert!(!home.previous_key_path().exists());
+    }
+
+    #[test]
+    fn the_serial_is_the_highest_of_current_previous_and_the_given_one_plus_one() {
+        let (_d, home) = initialised();
+        // --serial above the current one.
+        let r = rotate_key(
+            &home,
+            &RotateOptions {
+                serial: Some(40),
+                window_days: Some(0),
+                ..RotateOptions::default()
+            },
+            clock(),
+        )
+        .unwrap();
+        assert_eq!(r.new_serial, 41);
+        // --serial below: the current one wins.
+        let r = rotate_key(
+            &home,
+            &RotateOptions {
+                serial: Some(5),
+                window_days: Some(0),
+                ..RotateOptions::default()
+            },
+            clock(),
+        )
+        .unwrap();
+        assert_eq!(r.new_serial, 42);
+        // The previous key's serial counts too (a forced rotation with a window held).
+        rotate_key(&home, &RotateOptions::default(), clock()).unwrap();
+        assert_eq!(serial_of(&home), 43);
+        let r = rotate_key(
+            &home,
+            &RotateOptions {
+                force: true,
+                ..RotateOptions::default()
+            },
+            clock(),
+        )
+        .unwrap();
+        assert_eq!(r.new_serial, 44);
+    }
+
+    #[test]
+    fn a_previous_key_with_a_higher_serial_than_the_restored_identity_raises_the_serial() {
+        let (_d, home) = initialised();
+        let identity_key = std::fs::read(home.identity_key_path()).unwrap();
+        let identity_cert = std::fs::read(home.identity_cert_path()).unwrap();
+        // Two rotations (the second forced): the previous key holds serial 2, the identity 3.
+        rotate_key(&home, &RotateOptions::default(), clock()).unwrap();
+        let forced = RotateOptions {
+            force: true,
+            ..RotateOptions::default()
+        };
+        rotate_key(&home, &forced, clock()).unwrap();
+        assert_eq!(serial_of(&home), 3);
+        // An old backup of the identity (serial 1) is restored; previous.key stays.
+        std::fs::write(home.identity_key_path(), identity_key).unwrap();
+        std::fs::write(home.identity_cert_path(), identity_cert).unwrap();
+        assert_eq!(serial_of(&home), 1);
+        // The new serial must beat the previous key's 2 as well as the identity's 1.
+        let rotated = rotate_key(&home, &forced, clock()).unwrap();
+        assert_eq!(rotated.new_serial, 3);
+    }
+
+    #[test]
+    fn the_serial_cannot_overflow() {
+        let (_d, home) = initialised();
+        let error = rotate_key(
+            &home,
+            &RotateOptions {
+                serial: Some(u32::MAX),
+                ..RotateOptions::default()
+            },
+            clock(),
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("serial"), "{error:#}");
+        assert_eq!(serial_of(&home), 1, "nothing was written");
+        assert!(load_previous(&home).unwrap().is_none());
+    }
+
+    #[test]
+    fn the_writes_go_previous_key_then_cert_then_key() {
+        let (_d, home) = initialised();
+        let original = relay_identity(&home).unwrap();
+        let mut order = Vec::new();
+        rotate_key_with(&home, &RotateOptions::default(), clock(), &mut |step| {
+            order.push(step);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(
+            order,
+            vec![Step::PreviousKey, Step::IdentityCert, Step::IdentityKey]
+        );
+
+        // A crash after the first write: the identity is whole and unchanged, and the previous
+        // key is on disk.
+        let (_d2, home2) = initialised();
+        let before = relay_identity(&home2).unwrap();
+        let error = rotate_key_with(&home2, &RotateOptions::default(), clock(), &mut |step| {
+            if step == Step::PreviousKey {
+                anyhow::bail!("crash");
+            }
+            Ok(())
+        })
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("crash"));
+        assert_eq!(
+            relay_identity(&home2).unwrap().node_cert.clone(),
+            before.node_cert.clone()
+        );
+        assert!(load_previous(&home2).unwrap().is_some());
+
+        // A crash after the second: `identity.cert` is new and the key old, which loading
+        // refuses loudly; the same command, run again, finishes the job.
+        let (_d3, home3) = initialised();
+        let _ = rotate_key_with(&home3, &RotateOptions::default(), clock(), &mut |step| {
+            if step == Step::IdentityCert {
+                anyhow::bail!("crash");
+            }
+            Ok(())
+        });
+        let error = relay_identity(&home3).expect_err("does not load");
+        assert!(
+            format!("{error:#}").contains("do not belong together"),
+            "{error:#}"
+        );
+        let rotated = rotate_key(
+            &home3,
+            &RotateOptions {
+                force: true,
+                serial: Some(2),
+                ..RotateOptions::default()
+            },
+            clock() + 5,
+        )
+        .unwrap();
+        assert_eq!(rotated.new_serial, 3);
+        assert_eq!(serial_of(&home3), 3);
+        // The previous key the interrupted run wrote is still the original pair.
+        let previous = load_previous(&home3).unwrap().unwrap();
+        assert_eq!(previous.cert.decode().unwrap().serial, 1);
+        let _ = original;
+    }
+
+    #[tokio::test]
+    async fn rotate_key_and_renew_cert_are_refused_while_a_relay_runs_here() {
+        let (_o, owner, _id, _) = token_of_a_network();
+        let (dir, relay_home) = home();
+        init(&relay_home, clock()).unwrap();
+        add_network(&relay_home, &relay_token(&owner), clock()).unwrap();
+        let running = start(&relay_home, &run_options(dir.path())).await.unwrap();
+        for result in [
+            rotate_key(&relay_home, &RotateOptions::default(), clock()).map(|_| ()),
+            renew_cert(&relay_home, clock()).map(|_| ()),
+        ] {
+            let error = result.unwrap_err();
+            assert!(
+                format!("{error:#}").contains("relay is running"),
+                "{error:#}"
+            );
+        }
+        assert_eq!(serial_of(&relay_home), 1);
+        // A second relay on the same home does not start either.
+        let second = start(&relay_home, &run_options(dir.path()))
+            .await
+            .err()
+            .unwrap();
+        assert!(
+            format!("{second:#}").contains("relay is running"),
+            "{second:#}"
+        );
+        running.stop();
+        drop(running);
+        // Stopped: it goes.
+        rotate_key(&relay_home, &RotateOptions::default(), clock()).unwrap();
+    }
+
+    #[test]
+    fn renew_cert_keeps_the_keys_and_takes_the_serial_up_by_one() {
+        let (_d, home) = initialised();
+        let key_before = x25519_of(&home);
+        let renewed = renew_cert(&home, clock() + 100 * DAY).unwrap();
+        assert_eq!((renewed.old_serial, renewed.new_serial), (1, 2));
+        assert_eq!(x25519_of(&home), key_before);
+        assert_eq!(serial_of(&home), 2);
+        let body = relay_identity(&home).unwrap().node_cert.decode().unwrap();
+        assert_eq!(body.not_after, renewed.not_after);
+        assert_eq!(body.not_before, clock() + 99 * DAY);
+        // No previous key comes of it.
+        assert!(load_previous(&home).unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn the_relay_reload_loads_answers_and_retires_the_previous_key() {
+        let (_o, owner, _id, _) = token_of_a_network();
+        let (dir, relay_home) = home();
+        init(&relay_home, clock()).unwrap();
+        add_network(&relay_home, &relay_token(&owner), clock()).unwrap();
+        rotate_key(&relay_home, &RotateOptions::default(), unix_now()).unwrap();
+        let running = start(&relay_home, &run_options(dir.path())).await.unwrap();
+        assert!(running.relay.holds_previous(), "loaded at start");
+        // The window ends (the file is rewritten as an operator or a clock jump would leave it).
+        let previous = load_previous(&relay_home).unwrap().unwrap();
+        std::fs::remove_file(relay_home.previous_key_path()).unwrap();
+        let _ = previous;
+        let mut announced = Vec::new();
+        reload_once(&running.relay, &relay_home, &mut announced);
+        assert!(!running.relay.holds_previous(), "dropped at the reload");
+        running.stop();
+    }
+
+    #[test]
+    fn the_start_refuses_an_expired_certificate_and_warns_before_the_end() {
+        let (_d, home) = initialised();
+        let cert = relay_identity(&home).unwrap().node_cert.clone();
+        let not_after = cert.decode().unwrap().not_after;
+        assert_eq!(
+            rotation::cert_standing(&cert, not_after - 61 * DAY).unwrap(),
+            None
+        );
+        let warning = rotation::cert_standing(&cert, not_after - 60 * DAY)
+            .unwrap()
+            .expect("a warning from 60 days before");
+        assert!(warning.contains("renew-cert"));
+        let error = rotation::cert_standing(&cert, not_after).unwrap_err();
+        assert!(format!("{error:#}").contains("expired"));
+    }
+
+    #[test]
+    fn forget_deletes_one_known_relay_and_is_refused_while_a_node_runs() {
+        use ed25519_dalek::SigningKey;
+        use menzil_proto::{NodeCert, NodeCertBody, NodeId, PROTOCOL_VERSION, X25519PublicKey};
+        let (_d, home) = initialised();
+        let key = SigningKey::generate(&mut rand::rng());
+        let id = NodeId::from(key.verifying_key().to_bytes());
+        let cert = NodeCert::sign(
+            &key,
+            &NodeCertBody {
+                v: PROTOCOL_VERSION,
+                node_id: id,
+                x25519_pub: X25519PublicKey::from([4u8; 32]),
+                serial: 3,
+                not_before: 0,
+                not_after: 4_000_000_000,
+            },
+        )
+        .unwrap();
+        let file = crate::node_cmd::HomeRelayFile { home: home.clone() };
+        let known = menzil_node::KnownRelays::open(Box::new(file), clock());
+        known
+            .accept(&id, &cert, &cert.decode().unwrap(), clock())
+            .unwrap();
+        assert!(home.known_relays_path().exists());
+
+        // A node on the home: refused, the record stays.
+        let node_lock = home.lock_node().unwrap();
+        let error = rotation::forget_relay(&home, &id.to_hex(), clock()).unwrap_err();
+        assert!(format!("{error:#}").contains("node runs"), "{error:#}");
+        drop(node_lock);
+        assert!(rotation::forget_relay(&home, &id.to_hex(), clock()).unwrap());
+        assert!(!rotation::forget_relay(&home, &id.to_hex(), clock()).unwrap());
+        assert!(rotation::forget_relay(&home, "nonsense", clock()).is_err());
+    }
+}

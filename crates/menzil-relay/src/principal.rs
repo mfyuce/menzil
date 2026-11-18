@@ -84,6 +84,7 @@ use menzil_proto::{
     E2eDataBody, E2eFrame, ErrorCode, NetworkId, NodeId, OpenBody, OpenMeta, PROTOCOL_VERSION,
     ServiceId, ServiceKind, X25519PublicKey,
 };
+use menzil_session::StaticUsed;
 use menzil_stream::{Mode, MuxLimits, OpenError, Stream, StreamMux, StreamMuxError, initiate_open};
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
@@ -769,6 +770,7 @@ impl Principal {
             index,
             l3_session: attached.session_id,
             node_static: attached.x25519_pub,
+            relay_key: attached.relay_key,
             relay_id,
         };
         tokio::spawn(session.run(frames_rx, ready_tx, kill_rx));
@@ -888,6 +890,9 @@ struct Session {
     index: u32,
     l3_session: u32,
     node_static: X25519PublicKey,
+    /// Which of the relay's static keys answered the node's L3 session: the L4 session is
+    /// opened with that one, or the node's `relay_static` pin of that L3 epoch refuses it.
+    relay_key: StaticUsed,
     relay_id: NodeId,
 }
 
@@ -1027,8 +1032,21 @@ impl Session {
     ) -> Result<E2eTransport, PrincipalError> {
         let relay = &self.shared.relay;
         let (node, network) = self.key;
+        // The key of the L3 session. A previous key that was retired since is gone: the session
+        // ends and the node's next one is on the current key.
+        let previous = match self.relay_key {
+            StaticUsed::Current => None,
+            StaticUsed::Previous => Some(relay.previous_key(unix_now()).ok_or_else(|| {
+                PrincipalError::HandshakeFailed(
+                    "the relay key this node's session was opened with is retired".to_string(),
+                )
+            })?),
+        };
+        let own_static = previous
+            .as_ref()
+            .map_or(&relay.identity.x25519_private, |key| &key.x25519_private);
         let (mut handshake, init) = E2eInitiatorHandshake::start(
-            &relay.identity.x25519_private,
+            own_static,
             &self.node_static,
             network,
             self.relay_id,

@@ -1334,6 +1334,7 @@ version = "0.0.1"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
+ "ciborium",
  "clap",
  "ed25519-dalek",
  "futures-util",

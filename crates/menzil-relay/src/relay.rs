@@ -14,6 +14,7 @@ use tokio::net::TcpListener;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use menzil_proto::{Limits, NodeId, X25519PublicKey};
+use menzil_session::StaticUsed;
 
 use crate::acme::RelayAcme;
 use crate::admission::IpSlot;
@@ -22,7 +23,7 @@ use crate::advertise::LabelRegistry;
 use crate::endpoint::RelayEndpoint;
 use crate::forward::{ForwardTable, RelaySendOutcome};
 use crate::front_door::{FrontDoor, FrontDoorConfig};
-use crate::identity::RelayIdentity;
+use crate::identity::{PreviousKey, RelayIdentity};
 use crate::listener::{Listener, Upgrader};
 use crate::log_throttle::LogThrottle;
 use crate::node_history::NodeHistory;
@@ -103,6 +104,9 @@ pub(crate) type TestHook = Arc<dyn Fn() + Send + Sync>;
 #[derive(Clone)]
 pub struct Relay {
     pub(crate) identity: Arc<RelayIdentity>,
+    /// The previous static key, answered for a window after a rotation (`PreviousKey`); shared
+    /// by every clone so that the reload swaps it for all.
+    previous: Arc<RwLock<Option<Arc<PreviousKey>>>>,
     pub(crate) rosters: Arc<RosterStore>,
     pub(crate) history: Arc<NodeHistory>,
     pub(crate) registry: Arc<SessionRegistry>,
@@ -149,6 +153,10 @@ pub struct AttachedNode {
     pub session_id: u32,
     /// The static key the node's L3 session was authenticated with.
     pub x25519_pub: X25519PublicKey,
+    /// Which of the relay's own static keys answered that session. An L4 session the relay
+    /// opens over it (the principal) must use the same one, or the node's `relay_static` pin
+    /// refuses it.
+    pub relay_key: StaticUsed,
 }
 
 impl Relay {
@@ -197,6 +205,7 @@ impl Relay {
         let relay_id = identity.node_cert.decode().ok().map(|body| body.node_id);
         Self {
             identity: Arc::new(identity),
+            previous: Arc::new(RwLock::new(None)),
             rosters: Arc::new(RosterStore::new()),
             history: Arc::new(NodeHistory::new()),
             registry: Arc::new(SessionRegistry::new()),
@@ -220,6 +229,29 @@ impl Relay {
             #[cfg(test)]
             before_loop: Arc::new(std::sync::Mutex::new(None)),
         }
+    }
+
+    /// Sets (or, with `None`, drops) the previous static key. The old one is wiped when its last
+    /// session handle goes. The reload of `menzil relay run` calls this with what
+    /// `relay/previous.key` holds, `None` once the window has passed.
+    pub fn set_previous(&self, previous: Option<PreviousKey>) {
+        *self.previous.write().unwrap() = previous.map(Arc::new);
+    }
+
+    /// The previous key if one is held and may answer a handshake at `now` (`retire_at` ahead,
+    /// certificate window open).
+    pub(crate) fn previous_key(&self, now: u64) -> Option<Arc<PreviousKey>> {
+        self.previous
+            .read()
+            .unwrap()
+            .as_ref()
+            .filter(|previous| previous.answers_at(now))
+            .cloned()
+    }
+
+    /// Whether a previous key is held at all (answering or not), for the reload's bookkeeping.
+    pub fn holds_previous(&self) -> bool {
+        self.previous.read().unwrap().is_some()
     }
 
     /// This relay's own NodeId.
@@ -246,6 +278,7 @@ impl Relay {
             .map(|attachment| AttachedNode {
                 session_id: attachment.session_id,
                 x25519_pub: attachment.x25519_pub,
+                relay_key: attachment.relay_key,
             })
     }
 

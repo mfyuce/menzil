@@ -28,6 +28,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
 use menzil_proto::{NetworkId, NodeId, Record, X25519PublicKey};
+use menzil_session::StaticUsed;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::admission::AttachedSlot;
@@ -49,6 +50,8 @@ struct Registration {
     /// session id: whoever opens an L4 session to this node as the relay (the expose
     /// principal) pins the key of the L3 session it opens it over.
     x25519_pub: X25519PublicKey,
+    /// Which of the relay's own static keys answered this session's handshake.
+    relay_key: StaticUsed,
     /// Networks this session claimed in its own HELLO (protocol.md 4.1),
     /// used to target DOC propagation (protocol.md 4.3) at sessions that
     /// actually asked to hear about a given network, not merely at every
@@ -76,6 +79,7 @@ struct Registration {
 pub(crate) struct Attachment {
     pub(crate) session_id: u32,
     pub(crate) x25519_pub: X25519PublicKey,
+    pub(crate) relay_key: StaticUsed,
     pub(crate) claimed_networks: Vec<NetworkId>,
 }
 
@@ -131,6 +135,7 @@ impl SessionRegistry {
             node_id,
             session_id,
             X25519PublicKey::from([0u8; 32]),
+            StaticUsed::Current,
             claimed_networks,
             None,
             None,
@@ -140,11 +145,13 @@ impl SessionRegistry {
     /// [`Self::attach`] that also hands the registration the session's place in the attached
     /// count: the registry gives it back when the registration is replaced or removed, not when
     /// the session task happens to finish.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn attach_counted(
         &self,
         node_id: NodeId,
         session_id: u32,
         x25519_pub: X25519PublicKey,
+        relay_key: StaticUsed,
         claimed_networks: Vec<NetworkId>,
         slot: Option<AttachedSlot>,
         tenant_slot: Option<TenantAttached>,
@@ -162,6 +169,7 @@ impl SessionRegistry {
             Registration {
                 session_id,
                 x25519_pub,
+                relay_key,
                 claimed_networks,
                 supersede: supersede_tx,
                 outbound: outbound_tx,
@@ -271,6 +279,7 @@ impl SessionRegistry {
             .map(|registration| Attachment {
                 session_id: registration.session_id,
                 x25519_pub: registration.x25519_pub,
+                relay_key: registration.relay_key,
                 claimed_networks: registration.claimed_networks.clone(),
             })
     }
@@ -383,6 +392,7 @@ mod tests {
             Some(Attachment {
                 session_id: 1,
                 x25519_pub: X25519PublicKey::from([0u8; 32]),
+                relay_key: StaticUsed::Current,
                 claimed_networks: vec![x]
             })
         );
@@ -392,6 +402,7 @@ mod tests {
             Some(Attachment {
                 session_id: 2,
                 x25519_pub: X25519PublicKey::from([0u8; 32]),
+                relay_key: StaticUsed::Current,
                 claimed_networks: vec![y, x]
             }),
             "claims and session id always belong together"
@@ -406,10 +417,12 @@ mod tests {
             X25519PublicKey::from([0x11; 32]),
             X25519PublicKey::from([0x22; 32]),
         );
-        let _first = registry.attach_counted(node_id, 1, k1, vec![], None, None);
+        let _first =
+            registry.attach_counted(node_id, 1, k1, StaticUsed::Current, vec![], None, None);
         assert_eq!(registry.attachment_of(&node_id).unwrap().x25519_pub, k1);
         // A re-attach with another key replaces it together with the session id.
-        let _second = registry.attach_counted(node_id, 2, k2, vec![], None, None);
+        let _second =
+            registry.attach_counted(node_id, 2, k2, StaticUsed::Current, vec![], None, None);
         let attachment = registry.attachment_of(&node_id).unwrap();
         assert_eq!((attachment.session_id, attachment.x25519_pub), (2, k2));
         registry.detach(&node_id, 2);

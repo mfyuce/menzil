@@ -24,7 +24,7 @@ pub use credit::CreditLedger;
 pub use error::SessionError;
 pub use handshake::{
     HandshakePattern, NodeHandshake, RelayHandshake, RelayHandshakeAwaitingHello,
-    RelayHandshakeStep, prologue,
+    RelayHandshakeStep, StaticUsed, prologue,
 };
 pub use liveness::Liveness;
 pub use rekey::RekeySchedule;

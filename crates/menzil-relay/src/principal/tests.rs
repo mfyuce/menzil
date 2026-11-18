@@ -28,8 +28,9 @@ use tokio::task::JoinHandle;
 use super::*;
 use crate::endpoint::EndpointCredit;
 use crate::forward::ForwardItem;
-use crate::identity::RelayIdentity;
+use crate::identity::{PreviousKey, RelayIdentity};
 use crate::tenant::Slug;
+use menzil_session::StaticUsed;
 
 /// A test that hangs (a mutant that stops a session from ending, say) fails after this instead.
 const BOUND: Duration = Duration::from_secs(20);
@@ -174,6 +175,8 @@ impl Behaviour {
 #[derive(Default)]
 struct Seen {
     inits: Mutex<Vec<NetworkId>>,
+    /// The static key each `init` was made with (the relay's key of the session).
+    init_statics: Mutex<Vec<X25519PublicKey>>,
     opens: Mutex<Vec<OpenRequest>>,
     closes: Mutex<Vec<(ErrorCode, String)>>,
     keeps: AtomicUsize,
@@ -304,10 +307,22 @@ fn inject(relay: &Relay, credit: &EndpointCredit, src: NodeId, session_id: u32, 
 }
 
 fn attach(relay: &Relay, node: &TestNode, session_id: u32, behaviour: Behaviour) -> Attached {
+    attach_with_key(relay, node, session_id, behaviour, StaticUsed::Current)
+}
+
+/// [`attach`] for a node whose L3 session the relay's `relay_key` answered.
+fn attach_with_key(
+    relay: &Relay,
+    node: &TestNode,
+    session_id: u32,
+    behaviour: Behaviour,
+    relay_key: StaticUsed,
+) -> Attached {
     let (supersede, outbound, forward_rx) = relay.registry.attach_counted(
         node.node_id,
         session_id,
         node.x25519_public,
+        relay_key,
         vec![],
         None,
         None,
@@ -398,6 +413,10 @@ async fn responder(
                 ) else {
                     continue;
                 };
+                seen.init_statics
+                    .lock()
+                    .unwrap()
+                    .push(*handshake.initiator_static());
                 let cert = if behaviour.wrong_cert {
                     TestNode::new().cert()
                 } else {
@@ -1749,5 +1768,98 @@ async fn the_backoff_table_is_bounded() {
         state.backoff.len(),
         1,
         "the departed nodes' entries are swept"
+    );
+}
+
+// ---- the key of the L3 session (relay key rotation, design note A5) ----
+
+/// A previous key for `relay`: a fresh X25519 pair with a certificate of the relay's own NodeId
+/// is not needed here (the principal reads only the private key), so any valid certificate does.
+fn previous_key(retire_at: u64) -> (PreviousKey, X25519PublicKey) {
+    let kp = snow::Builder::new(ik_params()).generate_keypair().unwrap();
+    let node = TestNode::new();
+    (
+        PreviousKey {
+            node_cert: node.cert(),
+            x25519_private: <[u8; 32]>::try_from(kp.private).unwrap(),
+            retire_at,
+        },
+        X25519PublicKey::from(<[u8; 32]>::try_from(kp.public).unwrap()),
+    )
+}
+
+fn far_future() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        + 3_600
+}
+
+#[tokio::test]
+async fn the_principal_opens_over_the_key_that_answered_the_nodes_l3_session() {
+    let n = network(1);
+    let raw = TestNode::new();
+    let current_pub = raw.x25519_public;
+    let relay = Relay::new(
+        RelayIdentity {
+            node_cert: raw.cert(),
+            x25519_private: raw.x25519_private,
+        },
+        limits(),
+    );
+    let (previous, previous_pub) = previous_key(far_future());
+    relay.set_previous(Some(previous));
+    let principal = Principal::with_config(&relay, quick());
+    let (on_previous, on_current) = (TestNode::new(), TestNode::new());
+    let a = attach_with_key(
+        &relay,
+        &on_previous,
+        7,
+        Behaviour::serving(&[n]),
+        StaticUsed::Previous,
+    );
+    let b = attach_with_key(
+        &relay,
+        &on_current,
+        8,
+        Behaviour::serving(&[n]),
+        StaticUsed::Current,
+    );
+    for node in [&on_previous, &on_current] {
+        bounded(
+            "open",
+            principal.open(&TenantId::Default, node.node_id, n, service("demo"), meta()),
+        )
+        .await
+        .expect("the stream opens");
+    }
+    assert_eq!(*a.seen.init_statics.lock().unwrap(), vec![previous_pub]);
+    assert_eq!(*b.seen.init_statics.lock().unwrap(), vec![current_pub]);
+}
+
+#[tokio::test]
+async fn a_session_on_a_previous_key_that_is_gone_cannot_open() {
+    let n = network(1);
+    let relay = relay_with(limits());
+    let principal = Principal::with_config(&relay, quick());
+    let node = TestNode::new();
+    let _attached = attach_with_key(
+        &relay,
+        &node,
+        7,
+        Behaviour::serving(&[n]),
+        StaticUsed::Previous,
+    );
+    // No previous key is held (it was retired): the open fails rather than using the current key.
+    let error = bounded(
+        "open",
+        principal.open(&TenantId::Default, node.node_id, n, service("demo"), meta()),
+    )
+    .await
+    .expect_err("no key to open with");
+    assert!(
+        matches!(error, PrincipalError::HandshakeFailed(_)),
+        "{error:?}"
     );
 }

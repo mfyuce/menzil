@@ -401,6 +401,35 @@ enum RelayCommand {
         #[arg(long)]
         json: bool,
     },
+    /// Make a new X25519 static key for this relay under the same NodeId (it needs the relay's
+    /// seed on this machine, and the relay must be stopped). Nodes remember the relay's
+    /// certificate serial and refuse a lower one, so a stolen old key cannot be answered as the
+    /// relay again; for a window the relay still answers nodes that dial with the old key and
+    /// tells them the new certificate. After a static key leak use `--window-days 0`; after a
+    /// seed leak the relay needs a new identity (new connection information).
+    RotateKey {
+        /// How many days the old key keeps answering (default and most 30; 0: none).
+        #[arg(long, value_name = "N")]
+        window_days: Option<u64>,
+        /// A serial the new certificate must beat: what nodes hold after an old backup of the
+        /// relay was restored (they print it in their `RelayRollback` error).
+        #[arg(long, value_name = "S")]
+        serial: Option<u32>,
+        /// Rotate although the previous key is still inside its window (nodes dialing it fall
+        /// back to XX).
+        #[arg(long)]
+        force: bool,
+    },
+    /// Give this relay a new certificate over the same keys (serial + 1, 400 days), before the
+    /// old one ends. The relay must be stopped; `relay run` warns daily from 60 days before the
+    /// end and refuses to start on an expired certificate.
+    RenewCert,
+    /// Delete one relay from this device's known relays file (the relay a node used to dial):
+    /// for tidying after a relay got a new identity. Refused while a node runs on this home.
+    Forget {
+        /// The relay's NodeId (64 hex digits).
+        relay_id: String,
+    },
     /// Run the relay until interrupted and print the connection information for nodes.
     Run {
         /// Where to listen.
@@ -1046,6 +1075,57 @@ async fn run(cli: Cli) -> Result<()> {
                 info.network_ids.len()
             );
             eprintln!("a running relay serves them at its next reload");
+        }
+        Command::Relay {
+            command:
+                RelayCommand::RotateKey {
+                    window_days,
+                    serial,
+                    force,
+                },
+        } => {
+            let rotated = relay_cmd::rotation::rotate_key(
+                &home()?,
+                &relay_cmd::rotation::RotateOptions {
+                    window_days,
+                    serial,
+                    force,
+                },
+                now(),
+            )?;
+            println!(
+                "rotated: certificate serial {} -> {}",
+                rotated.old_serial, rotated.new_serial
+            );
+            match rotated.retire_at {
+                Some(at) => println!(
+                    "the old key answers nodes that still dial it for {} day(s) (until Unix time {at})",
+                    rotated.window_days
+                ),
+                None => println!("the old key is not kept: nodes that dial it fall back to XX"),
+            }
+            println!("new connection information (put the host name in):");
+            println!("  relay = \"{}\"", rotated.connection_info);
+            eprintln!("start the relay again: `menzil relay run ...`");
+        }
+        Command::Relay {
+            command: RelayCommand::RenewCert,
+        } => {
+            let renewed = relay_cmd::rotation::renew_cert(&home()?, now())?;
+            println!(
+                "renewed: certificate serial {} -> {}, valid until Unix time {}",
+                renewed.old_serial, renewed.new_serial, renewed.not_after
+            );
+            eprintln!("start the relay again: `menzil relay run ...`");
+        }
+        Command::Relay {
+            command: RelayCommand::Forget { relay_id },
+        } => {
+            if relay_cmd::rotation::forget_relay(&home()?, &relay_id, now())? {
+                println!("forgot relay {relay_id}");
+            } else {
+                println!("no record of relay {relay_id} here");
+            }
         }
         Command::Relay {
             command: RelayCommand::Tenants,

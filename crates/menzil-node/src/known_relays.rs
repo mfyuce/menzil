@@ -323,6 +323,29 @@ impl KnownRelays {
     }
 }
 
+/// Deletes the record of `relay` from the file, under the file's lock (`menzil relay forget`,
+/// for tidying after a new relay identity; never needed for safety). Returns whether a record
+/// was there. A file that is not there, or has no such record, is left as it is; a corrupt one
+/// is set aside like the node does and counts as having no record.
+pub fn forget_in_file(file: &dyn RelayFile, relay: &NodeId, now: u64) -> io::Result<bool> {
+    let _guard = file.lock()?;
+    let Some(bytes) = file.read()? else {
+        return Ok(false);
+    };
+    let mut records = match parse_file(&bytes) {
+        Ok(records) => records,
+        Err(_) => {
+            file.set_aside(now)?;
+            return Ok(false);
+        }
+    };
+    if records.remove(relay).is_none() {
+        return Ok(false);
+    }
+    file.write(&encode_file(&records))?;
+    Ok(true)
+}
+
 /// Drops records past [`MAX_KNOWN_RELAYS`], the one whose certificate expired longest ago first.
 fn evict(records: &mut HashMap<NodeId, Record>) {
     while records.len() > MAX_KNOWN_RELAYS {
@@ -518,6 +541,26 @@ pub(crate) mod tests {
     fn with_file() -> (KnownRelays, SharedFile) {
         let file = SharedFile::default();
         (KnownRelays::open(Box::new(file.clone()), NOW), file)
+    }
+
+    #[test]
+    fn forget_in_file_deletes_one_record_and_keeps_the_others() {
+        let (known, file) = with_file();
+        let (a, b) = (relay_key(), relay_key());
+        let (ca, ba) = cert(&a, 1, 7);
+        let (cb, bb) = cert(&b, 1, 8);
+        known.accept(&id_of(&a), &ca, &ba, NOW).unwrap();
+        known.accept(&id_of(&b), &cb, &bb, NOW).unwrap();
+        assert!(forget_in_file(&file, &id_of(&a), NOW).unwrap());
+        // Not there any more: a second forget finds nothing.
+        assert!(!forget_in_file(&file, &id_of(&a), NOW).unwrap());
+        let reopened = KnownRelays::open(Box::new(file.clone()), NOW);
+        assert_eq!(reopened.stored(&id_of(&a)), None);
+        assert!(reopened.stored(&id_of(&b)).is_some());
+        // No file at all: nothing to forget, nothing created.
+        let empty = SharedFile::default();
+        assert!(!forget_in_file(&empty, &id_of(&a), NOW).unwrap());
+        assert!(empty.0.bytes.lock().unwrap().is_none());
     }
 
     #[test]

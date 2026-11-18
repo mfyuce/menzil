@@ -11,6 +11,7 @@
 //! <home>/owner/<id>.key            32 secret bytes: the owner key of a network (0600)
 //! <home>/node.lock                 held by a running `menzil node`: one per home
 //! <home>/known-relays.cbor         the highest certificate verified per relay (0600; strict CBOR)
+//! <home>/relay/running.lock       held by a running `menzil relay run`
 //! <home>/known-relays.lock         held around a read, merge and write of that file
 //! <home>/config.lock               held while `menzil expose` (or the node) changes config.toml
 //! <home>/networks/<id>/.lock       held while a command changes that network's documents
@@ -290,6 +291,26 @@ impl Home {
             format!(
                 "another `menzil relay add-network` is changing {}; try again in a moment",
                 dir.display()
+            )
+        })
+    }
+
+    /// Where the relay's previous static key is kept for the window after `menzil relay
+    /// rotate-key` (`relay/previous.key`, 0600).
+    pub fn previous_key_path(&self) -> PathBuf {
+        self.root.join("relay").join("previous.key")
+    }
+
+    /// Takes the lock a running `menzil relay run` holds for as long as it runs: the commands
+    /// that change the relay's identity (`rotate-key`, `renew-cert`) refuse while it is held.
+    /// Fails at once when another process holds it.
+    pub fn lock_relay_running(&self) -> Result<FileLock> {
+        let dir = self.root.join("relay");
+        create_private_dirs(&dir)?;
+        lock_file(&dir.join("running.lock"), Duration::ZERO).with_context(|| {
+            format!(
+                "a relay is running with {} (stop it first)",
+                self.root.display()
             )
         })
     }

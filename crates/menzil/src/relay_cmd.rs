@@ -32,6 +32,7 @@ use crate::persist::{Attempt, FlushReport, Outcome, Worker};
 use crate::token::{roster_from_bytes, roster_to_bytes};
 
 pub mod names_state;
+pub mod rotation;
 pub mod status;
 pub mod tenants;
 
@@ -506,6 +507,9 @@ fn raise_nofile_for(config: &FrontDoorConfig, http: bool) {
 /// How long a clean stop waits for the keeper to write the last Roster adopted over DOC.
 pub const STOP_GRACE: std::time::Duration = std::time::Duration::from_secs(3);
 
+/// How often the relay repeats its warning about a certificate that ends soon.
+const CERT_WATCH_EVERY: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
+
 /// How often a relay reloads its Rosters unless told otherwise.
 pub const DEFAULT_RELOAD_EVERY: std::time::Duration = std::time::Duration::from_secs(15);
 
@@ -549,6 +553,10 @@ pub struct RunningRelay {
     reload: JoinHandle<()>,
     /// Writes `relay/status.json` every few seconds ([`status`]).
     status: JoinHandle<()>,
+    /// Says daily that the certificate ends soon.
+    cert_watch: JoinHandle<()>,
+    /// The "a relay runs here" lock, held until the relay is stopped or dropped.
+    running_lock: std::sync::Mutex<Option<crate::home::FileLock>>,
     keeper: Arc<Worker<(NetworkId, Roster, Option<Roster>)>>,
     /// Writes `relay/names.state` after every change of the name state (MT9).
     names_keeper: Arc<Worker<NameState>>,
@@ -604,6 +612,15 @@ impl RunningRelay {
         self.task.abort();
         self.reload.abort();
         self.status.abort();
+        self.cert_watch.abort();
+        // A stopped relay no longer runs here: `rotate-key` and `renew-cert` may go ahead (the
+        // keeper's last flush touches the Rosters, never the identity).
+        drop(
+            self.running_lock
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take(),
+        );
     }
 }
 
@@ -708,7 +725,18 @@ pub(crate) async fn start_tuned(
             Some(FrontDoorConfig::new(host, &front.share_domain)?)
         }
     };
+    // One relay per home: the identity commands (`rotate-key`, `renew-cert`) refuse while this
+    // is held, and two relays with one identity would displace each other.
+    let running_lock = home.lock_relay_running()?;
     let identity = relay_identity(home)?;
+    // An expired certificate is refused by every node: no point in starting. One that ends
+    // soon is said now and every day.
+    let cert_note = rotation::cert_standing(&identity.node_cert, unix_now())?;
+    if let Some(note) = &cert_note {
+        tracing::warn!("{note}");
+        eprintln!("warning: {note}");
+    }
+    let cert_not_after = identity.node_cert.decode()?.not_after;
     let all_rosters = load_rosters(home)?;
     // The tenant files, before anything is served: a network a tenant file refuses is held
     // back, and one that cannot be told apart from the operator's intent stops the start (its
@@ -793,6 +821,8 @@ pub(crate) async fn start_tuned(
         .map(tokio::net::TcpListener::local_addr)
         .transpose()?;
     let mut relay = Relay::new(identity, LIMITS);
+    // The previous key, answered for the window after a rotation (or dropped and wiped).
+    rotation::sync_previous(&relay, home, unix_now());
     if let Some(limits) = options.admission {
         relay = relay.with_admission_limits(limits);
     }
@@ -965,6 +995,23 @@ pub(crate) async fn start_tuned(
         })
     };
     let status = status::spawn_exporter(relay.clone(), home.clone(), status_every);
+    // The certificate's end, said once a day from 60 days before it.
+    let cert_watch = tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(CERT_WATCH_EVERY).await;
+            let now = unix_now();
+            if cert_not_after <= now {
+                tracing::error!(
+                    "the relay's certificate has expired: every node refuses it; stop the relay and run `menzil relay renew-cert`"
+                );
+            } else if cert_not_after - now <= rotation::CERT_WARN_BEFORE_SECS {
+                tracing::warn!(
+                    days_left = (cert_not_after - now).div_ceil(24 * 60 * 60),
+                    "the relay's certificate ends soon: run `menzil relay renew-cert` while the relay is stopped"
+                );
+            }
+        }
+    });
     Ok(RunningRelay {
         addr,
         connection_info: info,
@@ -974,6 +1021,8 @@ pub(crate) async fn start_tuned(
         task,
         reload,
         status,
+        cert_watch,
+        running_lock: std::sync::Mutex::new(Some(running_lock)),
         keeper,
         names_keeper,
     })
@@ -1092,6 +1141,8 @@ fn reload_once_with(
             }
         }
     }
+    // The previous static key: wiped and dropped once its window or its certificate has ended.
+    rotation::sync_previous(relay, home, unix_now());
     before_swap();
     if let Some(book) = loaded {
         relay.set_tenants(book);

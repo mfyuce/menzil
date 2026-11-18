@@ -214,6 +214,15 @@ impl NodeHandshake {
 // Relay (responder) side
 // ---------------------------------------------------------------------
 
+/// Which of a relay's static keys read an `Ik` message 1 ([`RelayHandshake::start_with_previous`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StaticUsed {
+    /// The current key (always the case for `Xx`).
+    Current,
+    /// The previous key.
+    Previous,
+}
+
 /// A relay-side handshake after reading message 1, awaiting the
 /// caller's decision on what to put in WELCOME.
 pub struct RelayHandshake {
@@ -247,6 +256,34 @@ impl RelayHandshake {
             }
         };
         Ok(Self { hs, pattern, hello })
+    }
+
+    /// [`Self::start`] for a relay that may hold a previous static key (design note
+    /// `relay-key-and-invites-design.md` A5). `Xx` always uses `current`. `Ik` reads message 1
+    /// with `current` first; when that does not decrypt (a Noise failure, not a HELLO that
+    /// decrypted and does not decode) and `previous` is given, message 1 is read again with
+    /// `previous`. Which key answered comes back with the handshake.
+    pub fn start_with_previous(
+        pattern: HandshakePattern,
+        current: &[u8; 32],
+        previous: Option<&[u8; 32]>,
+        prologue: &[u8],
+        message1: &[u8],
+    ) -> Result<(Self, StaticUsed), SessionError> {
+        match Self::start(pattern, current, prologue, message1) {
+            Ok(handshake) => Ok((handshake, StaticUsed::Current)),
+            Err(SessionError::Noise(error))
+                if pattern == HandshakePattern::Ik && previous.is_some() =>
+            {
+                match Self::start(pattern, previous.expect("checked"), prologue, message1) {
+                    Ok(handshake) => Ok((handshake, StaticUsed::Previous)),
+                    // Neither key reads it: the first failure is the one that is reported.
+                    Err(SessionError::Noise(_)) => Err(SessionError::Noise(error)),
+                    Err(other) => Err(other),
+                }
+            }
+            Err(error) => Err(error),
+        }
     }
 
     /// The node's HELLO, if already known at this point (`Ik` only;
@@ -390,6 +427,87 @@ mod tests {
     #[test]
     fn live_ik_handshake_completes() {
         run_live_handshake(HandshakePattern::Ik);
+    }
+
+    fn ik_message1(responder_static: &[u8; 32], prologue: &[u8]) -> Vec<u8> {
+        use snow::Builder;
+        let node = Builder::new(HandshakePattern::Ik.params())
+            .generate_keypair()
+            .unwrap();
+        let hello = crate::transport::tests::sample_hello();
+        let (_, message1) = NodeHandshake::start(
+            HandshakePattern::Ik,
+            node.private.as_slice().try_into().unwrap(),
+            Some(&X25519PublicKey::from(*responder_static)),
+            prologue,
+            &hello,
+        )
+        .unwrap();
+        message1
+    }
+
+    fn keypair() -> ([u8; 32], [u8; 32]) {
+        let kp = snow::Builder::new(HandshakePattern::Ik.params())
+            .generate_keypair()
+            .unwrap();
+        (
+            kp.private.as_slice().try_into().unwrap(),
+            kp.public.as_slice().try_into().unwrap(),
+        )
+    }
+
+    #[test]
+    fn ik_message1_is_read_by_the_key_it_was_addressed_to() {
+        let pro = prologue("menzil.v1", "menzil.v1", HandshakePattern::Ik);
+        let (cur_priv, cur_pub) = keypair();
+        let (prev_priv, prev_pub) = keypair();
+        let to_current = ik_message1(&cur_pub, &pro);
+        let to_previous = ik_message1(&prev_pub, &pro);
+        let go = |m: &[u8], prev: Option<&[u8; 32]>| {
+            RelayHandshake::start_with_previous(HandshakePattern::Ik, &cur_priv, prev, &pro, m)
+                .map(|(_, used)| used)
+        };
+        assert_eq!(
+            go(&to_current, Some(&prev_priv)).unwrap(),
+            StaticUsed::Current
+        );
+        assert_eq!(
+            go(&to_previous, Some(&prev_priv)).unwrap(),
+            StaticUsed::Previous
+        );
+        // No previous key held: the same message does not read.
+        assert!(go(&to_previous, None).is_err());
+        // Neither key reads it.
+        let (other_priv, _) = keypair();
+        assert!(go(&to_previous, Some(&other_priv)).is_err());
+    }
+
+    #[test]
+    fn xx_never_uses_the_previous_key() {
+        let pro = prologue("menzil.v1", "menzil.v1", HandshakePattern::Xx);
+        let (cur_priv, _) = keypair();
+        let (prev_priv, _) = keypair();
+        let hello = crate::transport::tests::sample_hello();
+        let node = snow::Builder::new(HandshakePattern::Xx.params())
+            .generate_keypair()
+            .unwrap();
+        let (_, message1) = NodeHandshake::start(
+            HandshakePattern::Xx,
+            node.private.as_slice().try_into().unwrap(),
+            None,
+            &pro,
+            &hello,
+        )
+        .unwrap();
+        let (_, used) = RelayHandshake::start_with_previous(
+            HandshakePattern::Xx,
+            &cur_priv,
+            Some(&prev_priv),
+            &pro,
+            &message1,
+        )
+        .unwrap();
+        assert_eq!(used, StaticUsed::Current);
     }
 
     #[test]

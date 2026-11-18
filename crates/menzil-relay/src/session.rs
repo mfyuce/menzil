@@ -44,6 +44,7 @@
 //! decrypted, logged, and otherwise ignored.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use menzil_proto::{
@@ -51,8 +52,8 @@ use menzil_proto::{
     Record, WelcomeBody, X25519PublicKey,
 };
 use menzil_session::{
-    HandshakePattern, Liveness, RekeySchedule, RelayHandshake, RelayHandshakeStep, Transport,
-    prologue,
+    HandshakePattern, Liveness, RekeySchedule, RelayHandshake, RelayHandshakeStep, StaticUsed,
+    Transport, prologue,
 };
 use tokio::sync::broadcast;
 
@@ -136,7 +137,16 @@ fn unix_now() -> u64 {
 /// so it carries the relay's `max_peers` while the tenant's `destinations_per_node` is what is
 /// enforced once the session attaches. Nodes ignore `max_peers` today; if one starts to rely on
 /// it, an `Xx` node learns the lower figure only by a refused first SEND (ERROR `over_quota`).
-fn build_welcome(relay: &Relay, session_id: u32, rosters: HashMap<NetworkId, u64>) -> WelcomeBody {
+///
+/// `answered_by` is the key that read message 1: with the previous key, `relay_cert` is the
+/// previous certificate (its key is the handshake's static) and `relay_next` the current one,
+/// for the node to learn (design note `relay-key-and-invites-design.md` A5).
+fn build_welcome(
+    relay: &Relay,
+    session_id: u32,
+    rosters: HashMap<NetworkId, u64>,
+    answered_by: &Answered,
+) -> WelcomeBody {
     let mut limits = relay.limits;
     if !rosters.is_empty() {
         let book = relay.tenants();
@@ -148,13 +158,38 @@ fn build_welcome(relay: &Relay, session_id: u32, rosters: HashMap<NetworkId, u64
             }
         }
     }
+    let (relay_cert, relay_next) = match answered_by {
+        Answered::Current => (relay.identity.node_cert.clone(), None),
+        Answered::Previous(previous) => (
+            previous.node_cert.clone(),
+            Some(relay.identity.node_cert.clone()),
+        ),
+    };
     WelcomeBody {
         v: menzil_proto::PROTOCOL_VERSION,
-        relay_cert: relay.identity.node_cert.clone(),
+        relay_cert,
+        relay_next,
         session: session_id,
         time: unix_now(),
         limits,
         rosters,
+    }
+}
+
+/// Which static key answered a handshake: the current one, or the previous one (held while
+/// the handler runs, so a reload that retires it cannot pull the certificate from under the
+/// WELCOME being written).
+enum Answered {
+    Current,
+    Previous(Arc<crate::identity::PreviousKey>),
+}
+
+impl Answered {
+    fn used(&self) -> StaticUsed {
+        match self {
+            Self::Current => StaticUsed::Current,
+            Self::Previous(_) => StaticUsed::Previous,
+        }
     }
 }
 
@@ -163,6 +198,8 @@ fn build_welcome(relay: &Relay, session_id: u32, rosters: HashMap<NetworkId, u64
 pub(crate) struct PreAttach {
     _node: NodeSlot,
     _tenants: TenantUnattached,
+    /// Which of the relay's static keys answered the handshake (registered with the session).
+    relay_key: StaticUsed,
 }
 
 /// The admission steps of a HELLO that is proven and in standing (see `check_hello_admitting`):
@@ -174,6 +211,7 @@ fn admit_session(
     relay: &Relay,
     node_id: &NodeId,
     claimed: &[NetworkId],
+    relay_key: StaticUsed,
 ) -> Result<PreAttach, HelloRejection> {
     let node = relay.admission.admit_node(*node_id).ok_or_else(|| {
         over_limit("too many sessions of this node are waiting to attach; try again shortly")
@@ -193,6 +231,7 @@ fn admit_session(
     Ok(PreAttach {
         _node: node,
         _tenants: tenants,
+        relay_key,
     })
 }
 
@@ -235,12 +274,24 @@ async fn run_handshake_and_validate(
         pattern,
     );
 
-    let relay_handshake = RelayHandshake::start(
+    // `Ik` is read with the current key first, then with the previous key while one is held
+    // and within its window; `Xx` always uses the current key (design note A5).
+    let previous = if pattern == HandshakePattern::Ik {
+        relay.previous_key(unix_now())
+    } else {
+        None
+    };
+    let (relay_handshake, used) = RelayHandshake::start_with_previous(
         pattern,
         &relay.identity.x25519_private,
+        previous.as_ref().map(|key| &key.x25519_private),
         &prologue_bytes,
         &message1,
     )?;
+    let answered = match (used, previous) {
+        (StaticUsed::Previous, Some(previous)) => Answered::Previous(previous),
+        _ => Answered::Current,
+    };
     // `Ik` only: HELLO and the node's static key are both known after message 1. The check
     // runs exactly once per session (it records the HELLO's serial and timestamp).
     let early = match (relay_handshake.hello(), relay_handshake.remote_static()) {
@@ -250,7 +301,7 @@ async fn run_handshake_and_validate(
             &relay.rosters,
             &relay.history,
             unix_now(),
-            |node_id, claimed| admit_session(relay, node_id, claimed),
+            |node_id, claimed| admit_session(relay, node_id, claimed, answered.used()),
         )),
         _ => None,
     };
@@ -258,7 +309,7 @@ async fn run_handshake_and_validate(
         (Some(Ok(_)), Some(hello)) => relay.rosters.seqs_for(&dedup_networks(&hello.networks)),
         _ => HashMap::new(),
     };
-    let welcome = build_welcome(relay, session_id, proven_rosters);
+    let welcome = build_welcome(relay, session_id, proven_rosters, &answered);
     let (step, _node_static_ik, message2) = relay_handshake.write_welcome(&welcome)?;
     conn.send(message2).await?;
 
@@ -277,7 +328,7 @@ async fn run_handshake_and_validate(
                 &relay.rosters,
                 &relay.history,
                 unix_now(),
-                |node_id, claimed| admit_session(relay, node_id, claimed),
+                |node_id, claimed| admit_session(relay, node_id, claimed, answered.used()),
             );
             (transport, hello, checked)
         }
@@ -959,6 +1010,7 @@ async fn run_attached_loop(
             }
         };
     // From here on the session counts as attached, no longer as waiting to.
+    let relay_key = pre_attach.relay_key;
     drop(pre_attach);
     drop(ip_slot);
 
@@ -982,6 +1034,7 @@ async fn run_attached_loop(
         node_id,
         session_id,
         cert_x25519,
+        relay_key,
         claimed_networks.clone(),
         Some(attached_slot),
         Some(tenant_slot),

@@ -6166,3 +6166,235 @@ async fn a_helloed_session_is_not_routable_until_its_attach() {
         other => panic!("expected RECV after the ATTACH, got {other:?}"),
     }
 }
+
+// ---- relay key rotation: the previous key (design note A5) ----
+
+/// A relay whose current key is serial 2 and whose previous key (serial 1, under the same
+/// signing key) answers until `retire_at`. Returns the relay, a listener, the TLS certificate,
+/// the two certificates and the two static public keys (current, previous).
+struct RotatingRelay {
+    relay: Relay,
+    listener: Listener,
+    tls_cert: CertificateDer<'static>,
+    current: NodeCert,
+    previous: NodeCert,
+    current_pub: X25519PublicKey,
+    previous_pub: X25519PublicKey,
+}
+
+async fn rotating_relay(retire_at: u64, previous_not_after: u64) -> RotatingRelay {
+    let (_unused, listener, tls_cert, _) = bind_test_relay().await;
+    let raw = generate_identity();
+    let current = node_cert_for(&raw, 2);
+    let prev_kp = snow::Builder::new(ik_params()).generate_keypair().unwrap();
+    let prev_private = <[u8; 32]>::try_from(prev_kp.private).unwrap();
+    let previous_pub = X25519PublicKey::from(<[u8; 32]>::try_from(prev_kp.public).unwrap());
+    let previous = NodeCert::sign(
+        &raw.signing_key,
+        &NodeCertBody {
+            v: PROTOCOL_VERSION,
+            node_id: raw.node_id,
+            x25519_pub: previous_pub,
+            serial: 1,
+            not_before: 0,
+            not_after: previous_not_after,
+        },
+    )
+    .unwrap();
+    let relay = Relay::new(
+        RelayIdentity {
+            node_cert: current.clone(),
+            x25519_private: raw.x25519_private,
+        },
+        test_limits(),
+    )
+    .with_admission_limits(crate::admission::AdmissionLimits {
+        connections_per_ip_per_minute: 1_000_000,
+        max_unattached_per_ip: 1_000_000,
+        max_handshakes_per_ip: 1_000_000,
+        max_handshakes_per_v6_48: 1_000_000,
+        ..crate::admission::AdmissionLimits::default()
+    });
+    relay.set_previous(Some(crate::identity::PreviousKey {
+        node_cert: previous.clone(),
+        x25519_private: prev_private,
+        retire_at,
+    }));
+    RotatingRelay {
+        relay,
+        listener,
+        tls_cert,
+        current,
+        previous,
+        current_pub: raw.x25519_public,
+        previous_pub,
+    }
+}
+
+fn unix_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+}
+
+/// One IK attempt at `static_key`: `Some` message 2, or `None` when the relay closes or says
+/// nothing within two seconds.
+async fn ik_attempt(
+    addr: SocketAddr,
+    cert: CertificateDer<'static>,
+    identity: &TestIdentity,
+    static_key: X25519PublicKey,
+    networks: Vec<NetworkId>,
+) -> Option<Vec<u8>> {
+    let mut ws = test_client(addr, cert, "/_menzil/v1").await;
+    let prologue_bytes = prologue("menzil.v1", "menzil.v1", HandshakePattern::Ik);
+    let hello = HelloBody {
+        v: PROTOCOL_VERSION,
+        node_cert: node_cert_for(identity, 1),
+        networks,
+        timestamp: Tai64N::from([0u8; 12]),
+        roster_seq: HashMap::new(),
+        caps: vec![],
+        e2e_protos: vec![0x01],
+    };
+    let (_hs, message1) = NodeHandshake::start(
+        HandshakePattern::Ik,
+        &identity.x25519_private,
+        Some(&static_key),
+        &prologue_bytes,
+        &hello,
+    )
+    .unwrap();
+    ws.send(Message::Binary(message1.into())).await.unwrap();
+    match tokio::time::timeout(Duration::from_secs(2), ws.next()).await {
+        Ok(Some(Ok(Message::Binary(bytes)))) => Some(bytes.to_vec()),
+        _ => None,
+    }
+}
+
+#[tokio::test]
+async fn ik_on_the_previous_key_is_answered_with_the_previous_cert_and_relay_next() {
+    let r = rotating_relay(unix_secs() + 3600, 4_000_000_000).await;
+    let addr = r.listener.local_addr().unwrap();
+    let serving = r.relay.clone();
+    let listener = r.listener;
+    tokio::spawn(async move { serving.serve(&listener).await });
+    let identity = generate_identity();
+    let (networks, seq) = seed_network(&r.relay, &[&identity]);
+    let (mut client, welcome) = TestClient::connect(
+        addr,
+        r.tls_cert.clone(),
+        &identity,
+        r.previous_pub,
+        networks,
+        seq,
+        1,
+        10,
+    )
+    .await;
+    assert_eq!(welcome.relay_cert, r.previous);
+    assert_eq!(welcome.relay_next, Some(r.current.clone()));
+    client.send(Record::Attach).await;
+    ping_pong(&mut client, [1; 8]).await;
+    let attached = r.relay.attached_node(&identity.node_id).unwrap();
+    assert_eq!(attached.relay_key, menzil_session::StaticUsed::Previous);
+}
+
+#[tokio::test]
+async fn ik_on_the_current_key_has_no_relay_next_and_records_the_current_key() {
+    let r = rotating_relay(unix_secs() + 3600, 4_000_000_000).await;
+    let addr = r.listener.local_addr().unwrap();
+    let serving = r.relay.clone();
+    let listener = r.listener;
+    tokio::spawn(async move { serving.serve(&listener).await });
+    let identity = generate_identity();
+    let (networks, seq) = seed_network(&r.relay, &[&identity]);
+    let (mut client, welcome) = TestClient::connect(
+        addr,
+        r.tls_cert.clone(),
+        &identity,
+        r.current_pub,
+        networks,
+        seq,
+        1,
+        10,
+    )
+    .await;
+    assert_eq!(welcome.relay_cert, r.current);
+    assert_eq!(welcome.relay_next, None);
+    client.send(Record::Attach).await;
+    ping_pong(&mut client, [1; 8]).await;
+    let attached = r.relay.attached_node(&identity.node_id).unwrap();
+    assert_eq!(attached.relay_key, menzil_session::StaticUsed::Current);
+}
+
+#[tokio::test]
+async fn ik_on_the_previous_key_is_not_answered_after_retire_at_or_with_an_expired_cert() {
+    // retire_at already passed.
+    let r = rotating_relay(unix_secs() - 1, 4_000_000_000).await;
+    let addr = r.listener.local_addr().unwrap();
+    let (serving, listener) = (r.relay.clone(), r.listener);
+    tokio::spawn(async move { serving.serve(&listener).await });
+    let identity = generate_identity();
+    let (networks, _) = seed_network(&r.relay, &[&identity]);
+    assert!(
+        ik_attempt(
+            addr,
+            r.tls_cert.clone(),
+            &identity,
+            r.previous_pub,
+            networks.clone()
+        )
+        .await
+        .is_none(),
+        "past retire_at the previous key answers nothing"
+    );
+    // The current key still does.
+    assert!(
+        ik_attempt(addr, r.tls_cert.clone(), &identity, r.current_pub, networks)
+            .await
+            .is_some()
+    );
+
+    // retire_at ahead, but the previous certificate's window has ended.
+    let r = rotating_relay(unix_secs() + 3600, unix_secs() - 1).await;
+    let addr = r.listener.local_addr().unwrap();
+    let (serving, listener) = (r.relay.clone(), r.listener);
+    tokio::spawn(async move { serving.serve(&listener).await });
+    let (networks, _) = seed_network(&r.relay, &[&identity]);
+    assert!(
+        ik_attempt(
+            addr,
+            r.tls_cert.clone(),
+            &identity,
+            r.previous_pub,
+            networks
+        )
+        .await
+        .is_none(),
+        "an expired previous certificate is never answered with"
+    );
+}
+
+#[tokio::test]
+async fn xx_is_answered_with_the_current_key_even_while_a_previous_key_is_held() {
+    let r = rotating_relay(unix_secs() + 3600, 4_000_000_000).await;
+    let addr = r.listener.local_addr().unwrap();
+    let (serving, listener) = (r.relay.clone(), r.listener);
+    tokio::spawn(async move { serving.serve(&listener).await });
+    let identity = generate_identity();
+    let (networks, _) = seed_network(&r.relay, &[&identity]);
+    let (mut client, welcome) =
+        TestClient::connect_xx(addr, r.tls_cert.clone(), &identity, networks, 10).await;
+    assert_eq!(welcome.relay_cert, r.current);
+    assert_eq!(welcome.relay_next, None);
+    client.send(Record::Attach).await;
+    // An XX HELLO claims no Roster sequence, so the attach is followed by the catch-up push.
+    let _ = client.recv_roster_doc().await;
+    ping_pong(&mut client, [2; 8]).await;
+    assert_eq!(
+        r.relay.attached_node(&identity.node_id).unwrap().relay_key,
+        menzil_session::StaticUsed::Current
+    );
+}

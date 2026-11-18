@@ -177,6 +177,12 @@ pub struct WelcomeBody {
     /// This relay's current Roster `seq` per network, so the node knows
     /// whether to push a newer one (protocol.md 4.3).
     pub rosters: HashMap<NetworkId, u64>,
+    /// Present only when the relay answered with its previous static key (protocol.md 4.1,
+    /// design note `relay-key-and-invites-design.md` A5): the relay's current certificate, for
+    /// the node to verify like `relay_cert` and, when its serial is higher, remember. Old
+    /// nodes ignore the key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relay_next: Option<NodeCert>,
 }
 
 impl WelcomeBody {
@@ -253,10 +259,45 @@ mod tests {
                 credit: 1_048_576,
             },
             rosters,
+            relay_next: None,
         };
         let encoded = welcome.encode().unwrap();
         let decoded = WelcomeBody::decode(&encoded).unwrap();
         assert_eq!(decoded, welcome);
+        // Absent means the key is not on the wire at all: an old node sees the old shape.
+        let mut as_value: ciborium::Value = ciborium::from_reader(&encoded[..]).unwrap();
+        let ciborium::Value::Map(entries) = &mut as_value else {
+            panic!("not a map")
+        };
+        assert!(
+            !entries
+                .iter()
+                .any(|(k, _)| k == &ciborium::Value::Text("relay_next".into()))
+        );
+    }
+
+    #[test]
+    fn welcome_with_relay_next_round_trips_and_an_old_shape_decodes_without_it() {
+        let mut welcome = WelcomeBody {
+            v: crate::PROTOCOL_VERSION,
+            relay_cert: sample_cert(),
+            session: 1,
+            time: 5,
+            limits: Limits {
+                max_record: 65_535,
+                max_peers: 100,
+                credit: 1_048_576,
+            },
+            rosters: HashMap::new(),
+            relay_next: Some(sample_cert()),
+        };
+        let decoded = WelcomeBody::decode(&welcome.encode().unwrap()).unwrap();
+        assert_eq!(decoded, welcome);
+        assert!(decoded.relay_next.is_some());
+        // An old relay's WELCOME (no key) decodes with `None`.
+        welcome.relay_next = None;
+        let decoded = WelcomeBody::decode(&welcome.encode().unwrap()).unwrap();
+        assert_eq!(decoded.relay_next, None);
     }
 
     #[test]

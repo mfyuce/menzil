@@ -629,8 +629,8 @@ pub struct NodeOpener {
 /// The known relays file of a home: [`menzil_node::RelayFile`] over `known-relays.cbor`, its lock
 /// and `Home::write_secret`.
 #[derive(Debug)]
-struct HomeRelayFile {
-    home: Home,
+pub(crate) struct HomeRelayFile {
+    pub(crate) home: Home,
 }
 
 impl RelayFile for HomeRelayFile {
