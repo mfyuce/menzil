@@ -17,6 +17,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
+use crate::sock::{UnixListener, UnixStream};
 use anyhow::{Context, Result, anyhow, bail};
 use menzil_carrier::DialConfig;
 use menzil_node::acme::{
@@ -32,7 +33,6 @@ use menzil_node::{
 use menzil_proto::trust::{DOC_MAX_LIFETIME, Reason};
 use menzil_proto::{ErrorCode, NetworkId, NodeId, OpenTarget, ServiceId, ServiceKind, Share};
 use menzil_stream::Stream;
-use tokio::net::{UnixListener, UnixStream};
 use tokio::task::JoinHandle;
 
 use crate::agent::{self, Opener};
@@ -301,6 +301,20 @@ pub async fn bind_agent_socket(path: &Path) -> Result<UnixListener> {
 #[cfg(unix)]
 pub type FileIdentity = (u64, u64);
 
+/// Without Unix sockets there is no socket file to tell apart (D11 W1).
+#[cfg(not(unix))]
+pub type FileIdentity = ();
+
+#[cfg(not(unix))]
+pub fn file_identity(_path: &Path) -> std::io::Result<FileIdentity> {
+    Ok(())
+}
+
+#[cfg(not(unix))]
+pub fn remove_if_unchanged(_path: &Path, _identity: FileIdentity) -> bool {
+    false
+}
+
 /// The identity of the file at `path`; a link is not followed.
 #[cfg(unix)]
 pub fn file_identity(path: &Path) -> std::io::Result<FileIdentity> {
@@ -462,11 +476,11 @@ pub async fn prepare_socket_directory(path: &Path, kind: &SocketKind) -> Result<
 /// The directory must have been through [`prepare_socket_directory`].
 pub async fn bind_in_prepared_directory(path: &Path, kind: &SocketKind) -> Result<UnixListener> {
     match fs::symlink_metadata(path) {
-        Ok(found) => {
+        Ok(_found) => {
             #[cfg(unix)]
             let is_socket = {
                 use std::os::unix::fs::FileTypeExt;
-                found.file_type().is_socket()
+                _found.file_type().is_socket()
             };
             #[cfg(not(unix))]
             let is_socket = true;

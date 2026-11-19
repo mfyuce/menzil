@@ -113,11 +113,11 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::sock::{UnixListener, UnixStream};
 use anyhow::{Context, Result, anyhow, bail};
 use futures_util::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use menzil_stream::Stream;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
-use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::Semaphore;
 use tokio::time::timeout;
 
@@ -979,8 +979,8 @@ async fn handle<O: Opener>(connection: UnixStream, opener: &O) -> Result<()> {
 /// What a stream that was asked for came to: an error line, or `ok` and the bridge.
 async fn answer_open(
     opened: Result<Result<Stream, String>, tokio::time::error::Elapsed>,
-    read: BufReader<tokio::net::unix::OwnedReadHalf>,
-    mut write: tokio::net::unix::OwnedWriteHalf,
+    read: BufReader<crate::sock::OwnedReadHalf>,
+    mut write: crate::sock::OwnedWriteHalf,
 ) -> Result<()> {
     let opened = match opened {
         Ok(Ok(stream)) => stream,
@@ -1121,8 +1121,8 @@ where
 /// sends its success reply only now). Dropping it closes the connection and the agent resets the
 /// stream.
 pub struct Opened {
-    read: BufReader<tokio::net::unix::OwnedReadHalf>,
-    write: tokio::net::unix::OwnedWriteHalf,
+    read: BufReader<crate::sock::OwnedReadHalf>,
+    write: crate::sock::OwnedWriteHalf,
 }
 
 /// The client side of `connect`: asks the agent at `socket` to open a stream to the destination

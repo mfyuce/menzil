@@ -34,6 +34,7 @@ pub mod proxy;
 pub mod reach;
 pub mod relay_cmd;
 pub mod signals;
+pub mod sock;
 pub mod stdio;
 pub mod steward_loop;
 pub mod text;
