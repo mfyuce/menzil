@@ -122,7 +122,7 @@ impl Admin {
         T: Send + 'static,
         F: FnOnce(&Home) -> Result<T, Status> + Send + 'static,
     {
-        let Ok(_permit) = self.permits.clone().try_acquire_owned() else {
+        let Ok(permit) = self.permits.clone().try_acquire_owned() else {
             tracing::warn!(rpc, slug, "too many concurrent requests");
             return Err(Status::resource_exhausted("too many requests at once"));
         };
@@ -134,6 +134,10 @@ impl Admin {
         let home = self.home.clone();
         let writes = self.writes.clone();
         let task = tokio::task::spawn_blocking(move || {
+            // The permit lives as long as the blocking work: a request that timed out still
+            // occupies its thread (and its place in the queue of the write mutex) until the work
+            // has seen the cancel flag or finished.
+            let _permit = permit;
             let _held = write.then(|| writes.lock().unwrap_or_else(|e| e.into_inner()));
             if cancelled.load(Ordering::SeqCst) {
                 return Err(Status::cancelled("the request was abandoned"));

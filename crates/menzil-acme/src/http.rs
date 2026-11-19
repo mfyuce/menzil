@@ -126,10 +126,10 @@ impl HttpsTransport {
             target.push_str(query);
         }
         let bytes = encode_request(request, host, port, &target)?;
-        let tcp = TcpStream::connect((host, port))
+        let tcp = TcpStream::connect((dial_host(host), port))
             .await
             .map_err(|e| http(&e))?;
-        let name = ServerName::try_from(host.to_string()).map_err(|e| http(&e))?;
+        let name = ServerName::try_from(dial_host(host).to_string()).map_err(|e| http(&e))?;
         let mut tls = TlsConnector::from(self.config.clone())
             .connect(name, tcp)
             .await
@@ -325,6 +325,14 @@ fn decode_chunked(mut rest: &[u8]) -> Result<Option<Vec<u8>>, AcmeError> {
     }
 }
 
+/// The host of a URL as a socket address wants it: `Url::host_str` keeps the brackets of an IPv6
+/// literal, which neither `connect` nor a TLS server name accepts.
+fn dial_host(host: &str) -> &str {
+    host.strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host)
+}
+
 #[cfg(test)]
 mod chunked_tests {
     use super::*;
@@ -341,5 +349,18 @@ mod chunked_tests {
     fn an_ordinary_chunked_body_decodes() {
         let got = decode_chunked(b"3\r\nabc\r\n2\r\nde\r\n0\r\n\r\n").unwrap();
         assert_eq!(got, Some(b"abcde".to_vec()));
+    }
+}
+
+#[cfg(test)]
+mod dial_tests {
+    use super::*;
+
+    #[test]
+    fn an_ipv6_literal_is_dialled_without_its_brackets() {
+        assert_eq!(dial_host("[::1]"), "::1");
+        assert_eq!(dial_host("[2001:db8::7]"), "2001:db8::7");
+        assert_eq!(dial_host("ca.example.org"), "ca.example.org");
+        assert_eq!(dial_host("192.0.2.1"), "192.0.2.1");
     }
 }

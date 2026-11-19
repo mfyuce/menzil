@@ -266,3 +266,42 @@ async fn a_request_over_its_deadline_is_dropped_and_its_change_never_runs() {
     assert!(!t.terminated, "the abandoned change ran after its deadline");
     fx.shutdown().await;
 }
+
+/// The permit of a request stays taken while its blocking work still occupies a thread, also
+/// after the request timed out: 32 changes stuck behind the write mutex time out, yet a 33rd
+/// request is still turned away until the work has ended (review R-2).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_timed_out_request_keeps_its_permit_until_its_work_ends() {
+    let fx = Fixture::start_with_timeout(Some(Duration::from_millis(2500))).await;
+    let mut c = fx.client().await;
+    let a = Owner::new();
+    c.create_tenant(create("alpha", &a.token())).await.unwrap();
+    let guard = fx.admin.hold_writes();
+    let mut tasks = Vec::new();
+    for _ in 0..4 {
+        let c = fx.client().await;
+        for _ in 0..8 {
+            let mut c = c.clone();
+            tasks.push(tokio::spawn(async move {
+                c.update_tenant(terminate("alpha", true)).await
+            }));
+        }
+    }
+    for t in tasks {
+        let e = t.await.unwrap().unwrap_err();
+        assert_eq!(e.code(), Code::DeadlineExceeded, "{e:?}");
+    }
+    let e = c
+        .get_tenant(TenantRef {
+            slug: "alpha".into(),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(
+        e.code(),
+        Code::ResourceExhausted,
+        "32 threads are still queued behind the mutex: {e:?}"
+    );
+    drop(guard);
+    fx.shutdown().await;
+}

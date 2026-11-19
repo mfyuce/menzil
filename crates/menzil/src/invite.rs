@@ -650,7 +650,7 @@ pub fn render(op: &InviteOp, lines: &[String], now: u64) -> String {
             out.push_str("the token is a bearer secret: whoever holds it can join, once per use; give it to one person over a channel you trust:\n");
             out.push_str(value("token"));
             out.push('\n');
-            out.push_str("(the device side, `menzil join <token>`, is not built yet)\n");
+            out.push_str("(the device redeems it with `menzil join <token>`)\n");
         }
         InviteOp::List { .. } => {
             out.push_str("ID        USED  EXPIRES(unix)  REVOKED  REDEEMED BY\n");

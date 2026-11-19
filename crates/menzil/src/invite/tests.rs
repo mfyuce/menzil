@@ -622,6 +622,11 @@ fn creating_through_execute_prints_the_token_and_what_to_know() {
         text.contains(token) && text.contains("bearer secret"),
         "{text}"
     );
+    assert!(
+        !text.contains("not built"),
+        "the device side exists: {text}"
+    );
+    assert!(text.contains("menzil join <token>"), "{text}");
     // Every line fits the agent's answer limit.
     assert!(lines.iter().all(|l| l.chars().count() < 1200));
     // Revoke through the same path.

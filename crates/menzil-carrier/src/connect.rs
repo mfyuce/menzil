@@ -233,11 +233,36 @@ async fn drain_body(
     Ok(())
 }
 
+/// The authentication schemes a `Proxy-Authenticate` header (or several) offers: a header value
+/// can carry several challenges separated by commas (`NTLM, Basic realm="x"`), and a comma also
+/// separates the parameters of one challenge, so only a piece that starts with a bare token
+/// (no `=`) opens a new scheme. Commas inside quotes do not split.
 fn challenge_schemes(values: &[String]) -> Vec<String> {
-    values
-        .iter()
-        .filter_map(|v| v.split_whitespace().next().map(str::to_string))
-        .collect()
+    let mut schemes = Vec::new();
+    for value in values {
+        let mut piece = String::new();
+        let mut quoted = false;
+        let mut pieces = Vec::new();
+        for ch in value.chars() {
+            match ch {
+                '"' => {
+                    quoted = !quoted;
+                    piece.push(ch);
+                }
+                ',' if !quoted => pieces.push(std::mem::take(&mut piece)),
+                _ => piece.push(ch),
+            }
+        }
+        pieces.push(piece);
+        for piece in pieces {
+            if let Some(first) = piece.split_whitespace().next()
+                && !first.contains('=')
+            {
+                schemes.push(first.to_string());
+            }
+        }
+    }
+    schemes
 }
 
 #[cfg(test)]
@@ -433,5 +458,18 @@ mod tests {
             .unwrap_err();
         assert!(err.to_string().contains("403"), "{err}");
         server.await.unwrap();
+    }
+
+    #[test]
+    fn schemes_are_read_from_every_comma_separated_challenge() {
+        let values = vec![
+            "NTLM, Basic realm=\"corp, main\"".to_string(),
+            "Negotiate".to_string(),
+            "Digest realm=\"x\", charset=UTF-8".to_string(),
+        ];
+        assert_eq!(
+            challenge_schemes(&values),
+            ["NTLM", "Basic", "Negotiate", "Digest"]
+        );
     }
 }
