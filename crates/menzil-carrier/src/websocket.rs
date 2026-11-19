@@ -4,7 +4,8 @@
 
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
-use tokio_tungstenite::{WebSocketStream, client_async};
+use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
+use tokio_tungstenite::{WebSocketStream, client_async_with_config};
 
 use crate::error::CarrierError;
 
@@ -49,7 +50,12 @@ where
             .expect("SUBPROTOCOL is a valid header value"),
     );
 
-    let (ws, response) = client_async(request, stream).await?;
+    // One message is one L3 record (protocol.md 3.3): the library's defaults (64 MiB a message)
+    // would let a peer make us buffer far more than any record can be.
+    let config = WebSocketConfig::default()
+        .max_message_size(Some(crate::MAX_MESSAGE_BYTES))
+        .max_frame_size(Some(crate::MAX_MESSAGE_BYTES));
+    let (ws, response) = client_async_with_config(request, stream, Some(config)).await?;
 
     let selected_subprotocol = response
         .headers()
@@ -127,5 +133,39 @@ mod tests {
         let result = upgrade(tcp, "relay.example", "/not-menzil").await;
         assert!(result.is_err());
         server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_message_over_the_l3_maximum_is_refused_on_receive() {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (sock, _) = listener.accept().await.unwrap();
+            #[allow(clippy::result_large_err)] // callback type fixed by tungstenite
+            let callback = |_: &Request, mut resp: Response| {
+                resp.headers_mut()
+                    .insert("Sec-WebSocket-Protocol", SUBPROTOCOL.parse().unwrap());
+                Ok(resp)
+            };
+            let mut ws = tokio_tungstenite::accept_hdr_async(sock, callback)
+                .await
+                .unwrap();
+            let big = vec![0u8; crate::MAX_MESSAGE_BYTES + 1];
+            let _ = ws.send(Message::Binary(big.into())).await;
+            while ws.next().await.is_some() {}
+        });
+        let tcp = TcpStream::connect(addr).await.unwrap();
+        let (mut ws, _) = upgrade(tcp, "relay.example", "/_menzil/v1").await.unwrap();
+        let got = tokio::time::timeout(std::time::Duration::from_secs(5), ws.next())
+            .await
+            .unwrap();
+        assert!(
+            matches!(got, Some(Err(_))),
+            "oversized message accepted: {got:?}"
+        );
+        drop(ws);
+        let _ = server.await;
     }
 }
