@@ -102,6 +102,7 @@ async fn a_device_joins_with_an_invite_and_its_node_then_gets_the_policy() {
             fallback_page: None,
             admission: None,
             audit_file: None,
+            redeem: None,
         },
     )
     .await

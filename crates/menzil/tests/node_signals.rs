@@ -138,6 +138,7 @@ async fn every_signal_that_stops_a_node_resets_the_connections_it_serves() {
             fallback_page: None,
             admission: None,
             audit_file: None,
+            redeem: None,
         },
     )
     .await

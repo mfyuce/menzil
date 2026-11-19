@@ -360,6 +360,9 @@ pub struct RunOptions {
     pub admission: Option<menzil_relay::AdmissionLimits>,
     /// The audit file to append to (`docs/spec/audit-format.md`), or `None` for none.
     pub audit_file: Option<PathBuf>,
+    /// The redeem session figures (invites) to run with, or `None` for the defaults
+    /// (`menzil_relay::RedeemLimits`).
+    pub redeem: Option<menzil_relay::RedeemLimits>,
 }
 
 /// The admission limits the `--connections-per-ip-per-minute`, `--handshakes-per-ip` and
@@ -381,6 +384,37 @@ pub fn admission_limits(
     }
     if let Some(n) = unattached {
         limits.max_unattached_per_ip = n as usize;
+    }
+    Some(limits)
+}
+
+/// The redeem limits the `--redeem-*` flags ask for on top of the defaults; `None` when none was
+/// given.
+pub fn redeem_limits(
+    per_network: Option<u32>,
+    per_invite: Option<u32>,
+    per_address: Option<u32>,
+    max_wait_secs: Option<u32>,
+) -> Option<menzil_relay::RedeemLimits> {
+    if per_network.is_none()
+        && per_invite.is_none()
+        && per_address.is_none()
+        && max_wait_secs.is_none()
+    {
+        return None;
+    }
+    let mut limits = menzil_relay::RedeemLimits::default();
+    if let Some(n) = per_network {
+        limits.per_network = n as usize;
+    }
+    if let Some(n) = per_invite {
+        limits.per_invite = n as usize;
+    }
+    if let Some(n) = per_address {
+        limits.per_address = n as usize;
+    }
+    if let Some(n) = max_wait_secs {
+        limits.max_wait = std::time::Duration::from_secs(u64::from(n));
     }
     Some(limits)
 }
@@ -825,6 +859,9 @@ pub(crate) async fn start_tuned(
     rotation::sync_previous(&relay, home, unix_now());
     if let Some(limits) = options.admission {
         relay = relay.with_admission_limits(limits);
+    }
+    if let Some(limits) = options.redeem {
+        relay = relay.with_redeem_limits(limits);
     }
     if let Some(path) = &options.audit_file {
         let audit = menzil_audit::AuditLog::open(path, menzil_audit::Source::Relay, false)

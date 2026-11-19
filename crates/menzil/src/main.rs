@@ -31,6 +31,8 @@ struct Cli {
     command: Command,
 }
 
+// Parsed once at start: the size gap from `relay run`'s many options costs nothing.
+#[allow(clippy::large_enum_variant)]
 #[derive(Subcommand)]
 enum Command {
     /// Make this device's identity and print the join request to give to a network owner.
@@ -510,6 +512,18 @@ enum RelayCommand {
         /// the file, start again.
         #[arg(long, value_name = "FILE")]
         audit_file: Option<PathBuf>,
+        /// Invite redemptions the relay may hold per network (default 100).
+        #[arg(long, value_name = "N", value_parser = clap::value_parser!(u32).range(1..=100_000))]
+        redeem_per_network: Option<u32>,
+        /// Held redemptions per invite (default 8).
+        #[arg(long, value_name = "N", value_parser = clap::value_parser!(u32).range(1..=100_000))]
+        redeem_per_invite: Option<u32>,
+        /// Held redemptions per source address (default 4).
+        #[arg(long, value_name = "N", value_parser = clap::value_parser!(u32).range(1..=100_000))]
+        redeem_per_address: Option<u32>,
+        /// Seconds a held redemption may wait for the issuer (default 600).
+        #[arg(long, value_name = "SECS", value_parser = clap::value_parser!(u32).range(1..=86_400))]
+        redeem_max_wait_secs: Option<u32>,
     },
 }
 
@@ -1266,8 +1280,18 @@ async fn run(cli: Cli) -> Result<()> {
                     handshakes_per_ip,
                     unattached_per_ip,
                     audit_file,
+                    redeem_per_network,
+                    redeem_per_invite,
+                    redeem_per_address,
+                    redeem_max_wait_secs,
                 },
         } => {
+            let redeem = relay_cmd::redeem_limits(
+                redeem_per_network,
+                redeem_per_invite,
+                redeem_per_address,
+                redeem_max_wait_secs,
+            );
             let admission = relay_cmd::admission_limits(
                 connections_per_ip_per_minute,
                 handshakes_per_ip,
@@ -1293,6 +1317,7 @@ async fn run(cli: Cli) -> Result<()> {
                     fallback_page,
                     admission,
                     audit_file,
+                    redeem,
                 },
                 front.as_ref(),
             )

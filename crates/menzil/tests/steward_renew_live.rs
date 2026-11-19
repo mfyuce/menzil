@@ -100,6 +100,7 @@ async fn a_steward_node_renews_by_itself_and_a_member_adopts_without_a_restart()
             fallback_page: None,
             admission: None,
             audit_file: None,
+            redeem: None,
         },
     )
     .await

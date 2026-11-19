@@ -157,6 +157,7 @@ async fn a_phone_reaches_a_service_on_a_laptop_through_a_relay() {
             fallback_page: None,
             admission: None,
             audit_file: None,
+            redeem: None,
         },
     )
     .await

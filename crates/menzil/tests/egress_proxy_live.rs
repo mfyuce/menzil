@@ -229,6 +229,7 @@ async fn the_proxy_carries_a_connect_to_an_exit_and_the_exit_refuses_what_it_mus
             fallback_page: None,
             admission: None,
             audit_file: None,
+            redeem: None,
         },
     )
     .await

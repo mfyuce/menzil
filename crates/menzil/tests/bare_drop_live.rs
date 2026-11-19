@@ -89,6 +89,7 @@ async fn a_bare_drop_of_a_running_node_ends_its_relay_session() {
             fallback_page: None,
             admission: None,
             audit_file: None,
+            redeem: None,
         },
     )
     .await

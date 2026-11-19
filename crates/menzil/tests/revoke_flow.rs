@@ -299,6 +299,7 @@ async fn ungrant_and_revoke_cut_a_running_phone_off_and_the_status_goes_on_worki
             fallback_page: None,
             admission: None,
             audit_file: None,
+            redeem: None,
         },
     )
     .await

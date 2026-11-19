@@ -242,6 +242,7 @@ async fn invites_redeem_exactly_as_often_as_they_allow() {
             fallback_page: None,
             admission: None,
             audit_file: None,
+            redeem: None,
         },
     )
     .await

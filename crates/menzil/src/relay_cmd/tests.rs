@@ -264,6 +264,7 @@ async fn a_relay_starts_with_its_networks_and_says_how_to_reach_it() {
         fallback_page: None,
         admission: None,
         audit_file: None,
+        redeem: None,
     };
 
     // No network yet: a relay that would refuse everyone does not start.
@@ -289,6 +290,23 @@ async fn a_relay_starts_with_its_networks_and_says_how_to_reach_it() {
             .node_id
     );
     running.stop();
+}
+
+#[test]
+fn the_redeem_flags_change_only_what_they_name() {
+    assert_eq!(redeem_limits(None, None, None, None), None);
+    let d = menzil_relay::RedeemLimits::default();
+    let l = redeem_limits(Some(7), None, None, None).unwrap();
+    assert_eq!(
+        (l.per_network, l.per_invite, l.per_address),
+        (7, d.per_invite, d.per_address)
+    );
+    assert_eq!(l.max_wait, d.max_wait);
+    let l = redeem_limits(None, Some(2), Some(3), Some(90)).unwrap();
+    assert_eq!(
+        (l.per_network, l.per_invite, l.per_address, l.max_wait),
+        (d.per_network, 2, 3, Duration::from_secs(90))
+    );
 }
 
 #[test]
@@ -368,6 +386,7 @@ async fn one_damaged_roster_file_does_not_stop_the_reload_of_the_others() {
             fallback_page: None,
             admission: None,
             audit_file: None,
+            redeem: None,
         },
     )
     .await
@@ -417,6 +436,7 @@ async fn a_running_relay_picks_up_a_newer_roster_added_to_its_directory() {
             fallback_page: None,
             admission: None,
             audit_file: None,
+            redeem: None,
         },
     )
     .await
@@ -470,6 +490,7 @@ async fn an_expired_roster_on_disk_is_held_but_forwards_nothing() {
         fallback_page: None,
         admission: None,
         audit_file: None,
+        redeem: None,
     };
     let running = start(&relay_home, &options)
         .await
@@ -697,6 +718,7 @@ async fn a_relay_starts_and_reloads_with_a_steward_signed_roster() {
         fallback_page: None,
         admission: None,
         audit_file: None,
+        redeem: None,
     };
     // The relay got the owner's Roster first; the steward's, made from it, is added later.
     add_network(&relay_home, &relay_token(&owner), clock()).unwrap();
@@ -737,6 +759,7 @@ fn run_options(dir: &Path) -> RunOptions {
         fallback_page: None,
         admission: None,
         audit_file: None,
+        redeem: None,
     }
 }
 

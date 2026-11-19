@@ -132,6 +132,7 @@ async fn a_device_that_starts_after_the_ladder_still_gets_the_policy_from_the_ta
             fallback_page: None,
             admission: None,
             audit_file: None,
+            redeem: None,
         },
     )
     .await

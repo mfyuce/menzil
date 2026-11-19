@@ -181,6 +181,7 @@ async fn start_relay(root: &Path, tls: &Tls, owner_home: &Home) -> relay_cmd::Ru
             fallback_page: None,
             admission: None,
             audit_file: None,
+            redeem: None,
         },
     )
     .await
