@@ -582,6 +582,9 @@ pub struct RouterParts {
     /// Bounded; when its reader falls behind, further events are dropped
     /// (with a warning), never the router stalled.
     pub passthrough: mpsc::Receiver<SessionEvent>,
+    /// Set to `true` by whoever takes `passthrough` to read it: only then is a dropped event
+    /// worth a warning.
+    pub reader_taken: Arc<AtomicBool>,
     /// The epoch the router is attached under right now, `None` between
     /// attachments. Updated as the router handles `Attached` and
     /// `Detached`, so a caller that wants to wait for the relay can wait
@@ -603,6 +606,7 @@ pub fn new_router(
     let (commands_tx, commands_rx) = mpsc::channel(COMMAND_CAPACITY);
     let (ready_tx, ready) = mpsc::unbounded_channel();
     let (passthrough_tx, passthrough) = mpsc::channel(PASSTHROUGH_CAPACITY);
+    let reader_taken = Arc::new(AtomicBool::new(false));
     let (notices_tx, notices_rx) = mpsc::unbounded_channel();
     let (attachment_tx, attachment) = watch::channel(None);
     let engine = Engine::new(
@@ -619,6 +623,7 @@ pub fn new_router(
         commands_rx,
         notices_rx,
         passthrough_tx,
+        Arc::clone(&reader_taken),
     ));
     RouterParts {
         handle: RouterHandle {
@@ -626,6 +631,7 @@ pub fn new_router(
         },
         ready,
         passthrough,
+        reader_taken,
         attachment,
         task,
     }
@@ -3409,6 +3415,7 @@ async fn run_router(
     mut commands: mpsc::Receiver<Command>,
     mut notices: mpsc::UnboundedReceiver<(u64, SessionNotice)>,
     passthrough: mpsc::Sender<SessionEvent>,
+    reader_taken: Arc<AtomicBool>,
 ) {
     let mut tick = tokio::time::interval(TICK);
     let mut commands_open = true;
@@ -3432,15 +3439,15 @@ async fn run_router(
                 match event {
                     SessionEvent::Attached { epoch, limits, relay_static } => {
                         engine.on_attached(epoch, limits, relay_static);
-                        forward(&passthrough, SessionEvent::Attached { epoch, limits, relay_static }, &mut dropped_log);
+                        forward(&passthrough, SessionEvent::Attached { epoch, limits, relay_static }, &mut dropped_log, &reader_taken);
                     }
                     SessionEvent::Detached { epoch } => {
                         engine.on_detached(epoch);
-                        forward(&passthrough, SessionEvent::Detached { epoch }, &mut dropped_log);
+                        forward(&passthrough, SessionEvent::Detached { epoch }, &mut dropped_log, &reader_taken);
                     }
                     SessionEvent::Record { epoch, record } => {
                         if let Some(record) = engine.on_record(epoch, *record, Now::capture()) {
-                            forward(&passthrough, SessionEvent::Record { epoch, record: Box::new(record) }, &mut dropped_log);
+                            forward(&passthrough, SessionEvent::Record { epoch, record: Box::new(record) }, &mut dropped_log, &reader_taken);
                         }
                     }
                 }
@@ -3514,14 +3521,26 @@ pub(crate) fn grant_removed_close() -> CloseReason {
 }
 
 /// Hands an event the router does not consume to its reader, dropping it
-/// (with a warning, at most once a second) rather than waiting if the
-/// reader is behind.
-fn forward(passthrough: &mpsc::Sender<SessionEvent>, event: SessionEvent, log: &mut LogThrottle) {
+/// rather than waiting if the reader is behind. The drop is logged (at most
+/// once a second) only when a reader was taken (`wanted`, see
+/// [`RouterParts::reader_taken`]): nobody to warn about otherwise.
+fn forward(
+    passthrough: &mpsc::Sender<SessionEvent>,
+    event: SessionEvent,
+    log: &mut LogThrottle,
+    wanted: &AtomicBool,
+) {
     if let Err(error) = passthrough.try_send(event)
-        && let Some(held_back) = log.allow(Instant::now())
+        && let Some(held_back) = drop_warning(wanted.load(Ordering::Relaxed), log, Instant::now())
     {
         tracing::warn!(%error, held_back, "dropped an L3 event nobody was reading");
     }
+}
+
+/// Whether a dropped passthrough event gets a log line now: `Some(n)` (how many were held back
+/// since the last line) only if a reader was taken and the throttle allows it.
+fn drop_warning(reader_taken: bool, log: &mut LogThrottle, now: Instant) -> Option<u64> {
+    if reader_taken { log.allow(now) } else { None }
 }
 
 #[cfg(test)]

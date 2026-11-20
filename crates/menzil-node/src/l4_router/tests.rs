@@ -2060,6 +2060,29 @@ fn a_log_throttle_lets_one_line_through_a_second_and_counts_the_rest() {
     assert_eq!(throttle.allow(t0 + Duration::from_secs(2)), Some(1));
 }
 
+#[test]
+fn a_dropped_passthrough_event_is_only_worth_a_warning_when_a_reader_was_taken() {
+    // `Node::take_events` is called by the library users that read it; the CLI node never does, and
+    // warning about a reader that does not exist printed a line a second for ever (2026-11-20).
+    let t0 = Instant::now();
+    let mut unread = LogThrottle::new();
+    assert_eq!(drop_warning(false, &mut unread, t0), None);
+    assert_eq!(
+        drop_warning(false, &mut unread, t0 + Duration::from_secs(5)),
+        None
+    );
+    let mut read = LogThrottle::new();
+    assert_eq!(drop_warning(true, &mut read, t0), Some(0));
+    assert_eq!(
+        drop_warning(true, &mut read, t0 + Duration::from_millis(10)),
+        None
+    );
+    assert_eq!(
+        drop_warning(true, &mut read, t0 + Duration::from_secs(1)),
+        Some(1)
+    );
+}
+
 #[tokio::test(start_paused = true)]
 async fn a_handshake_frame_the_full_outbound_channel_could_not_take_goes_out_on_a_later_tick() {
     // The session actors share the outbound channel, so with bulk

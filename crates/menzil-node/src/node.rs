@@ -188,6 +188,8 @@ pub struct Node {
     /// Unix seconds of the last change of [`Self::is_attached`] (the start of the node counts).
     attach_since: Arc<AtomicU64>,
     events: Option<mpsc::Receiver<SessionEvent>>,
+    /// Set once [`Node::take_events`] handed the reader out (the router warns about dropped events only then).
+    events_taken: Arc<std::sync::atomic::AtomicBool>,
     policies: Arc<PolicyStore>,
     rosters: Arc<RosterStore>,
     sync: Arc<DocsSync>,
@@ -415,6 +417,7 @@ impl Node {
             handle,
             ready,
             passthrough,
+            reader_taken,
             attachment,
             task: router,
         } = new_router(router_config, outbound_tx, events_rx);
@@ -500,6 +503,7 @@ impl Node {
             attachment,
             attach_since,
             events: Some(passthrough),
+            events_taken: reader_taken,
             policies,
             rosters,
             sync,
@@ -668,7 +672,12 @@ impl Node {
     /// warning at most once a second), so take it only if it will be
     /// read.
     pub fn take_events(&mut self) -> Option<mpsc::Receiver<SessionEvent>> {
-        self.events.take()
+        let events = self.events.take();
+        if events.is_some() {
+            self.events_taken
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        events
     }
 
     /// Ends the node the polite way, within `grace`: every L4 session is

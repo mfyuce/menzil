@@ -36,8 +36,10 @@ priority lane after it.
 Experiment: credit and node budget both cut to 256 KiB. With the 15 Mbit/s cap the warm small request fell
 from 1860 to 1151 ms, but uncapped throughput fell from 50 to 16 Mbit/s (4 streams): the in flight limit
 must be at least the bandwidth delay product (100 Mbit/s x 230 ms = 2.9 MB), so no fixed constant serves
-both the slow wifi line and a fast long path. The same arithmetic gives a hard ceiling today: credit /
-RTT = 1 MiB / 0.23 s = 36 Mbit/s for one (source, destination) pair, whatever the line.
+both the slow wifi line and a fast long path. Credit returns when the relay writes the RECV, so the credit loop is node to relay (115 ms): the ceiling
+for one (source, destination) pair is 1 MiB / 0.115 s = about 73 Mbit/s (an earlier draft said 36, wrong).
+Lab caveat: `delayproxy.py` buffers without limit, so TCP never pushes back and the slow laptop leg is not
+reproduced faithfully; fix first (design note slice 0).
 
 ## Other findings from the owner's log (reading of the code)
 
