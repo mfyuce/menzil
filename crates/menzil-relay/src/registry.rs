@@ -339,9 +339,7 @@ impl SessionRegistry {
     }
 
     /// Whether `node_id` currently has an attached session, and if so,
-    /// its session id. Tests only: the relay session passes its own id to
-    /// `crate::forward::ForwardTable::forward_in_session` (review R-6).
-    #[cfg(test)]
+    /// its session id. `forward_in_session` reads it before taking the pair lock.
     pub(crate) fn attached_session_id(&self, node_id: &NodeId) -> Option<u32> {
         self.by_node
             .read()

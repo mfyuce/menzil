@@ -67,9 +67,10 @@
 //! On a fresh attach the pairs `node_id` made as the sender are also marked revoked
 //! ([`ForwardTable::supersede_for`], round T1 M1), so what the old session queued toward a slow
 //! destination is skipped by that destination's drain loop and the queued bytes toward it never
-//! stack past [`MAX_QUEUE_BYTES`] across reconnects. `admit` compares session ids (they only
-//! grow) so a SEND of a superseded session never creates or reuses a pair that binds the newer
-//! session's credit (round T1 L1).
+//! stack past [`MAX_QUEUE_BYTES`] across reconnects. Session ids are a keyed permutation of a
+//! counter, so only their equality means anything: `forward_in_session` asks the registry which
+//! session is current (never under the pair lock), and a SEND of a superseded session never
+//! creates or reuses a pair that binds the newer session's credit (round T1 L1).
 //!
 //! Reliable and droppable SENDs share the same [`MAX_QUEUE_BYTES`] budget
 //! (`PairState::queued_bytes`), but reliable's own ceiling is its credit
@@ -608,9 +609,10 @@ pub enum RelaySendOutcome {
 /// the registry's lock first and the pair table's second).
 enum Early {
     Dropped,
-    /// The caller's session is older than the one that made the pair: its SEND is dropped
-    /// without a violation and without a CREDIT (the CREDIT would reach the newer session).
-    Stale,
+    /// The pair belongs to another session of the sender than the caller's. Session ids are a
+    /// keyed permutation of a counter (equality is all they mean), so `admit` cannot tell which
+    /// is newer: nothing was changed, and the caller asks the registry which one is current.
+    Mismatch,
     CreditViolation(ErrorBody),
     OverQuota(TenantId, DataQuota),
 }
@@ -789,8 +791,15 @@ impl ForwardTable {
             .find(|network| target.claimed_networks.contains(network))
             .unwrap_or(&authorizing[0]);
 
+        // Session ids carry no order, so staleness is decided by the registry alone, and never
+        // while the pair table's lock is held (lock order: registry, then pair table). A caller
+        // that is not the current session is dropped without a violation and without a CREDIT
+        // (the CREDIT would reach the newer session).
+        if registry.attached_session_id(src) != Some(src_session_id) {
+            return ForwardOutcome::Dropped;
+        }
         let book = self.book();
-        let admitted = self.admit(
+        let mut admitted = self.admit(
             &book,
             limits,
             src,
@@ -800,10 +809,30 @@ impl ForwardTable {
             reliable,
             charge,
             Instant::now(),
+            false,
         );
+        if matches!(admitted, Err(Early::Mismatch)) {
+            // The pair is another session's. If the caller is still the current one, the pair
+            // is the superseded session's and is replaced; otherwise the caller is the stale one.
+            if !registry.is_current(src, src_session_id) {
+                return ForwardOutcome::Dropped;
+            }
+            admitted = self.admit(
+                &book,
+                limits,
+                src,
+                dst,
+                src_session_id,
+                pair_network,
+                reliable,
+                charge,
+                Instant::now(),
+                true,
+            );
+        }
         let (generation, shared, created) = match admitted {
             Ok(admitted) => admitted,
-            Err(Early::Dropped | Early::Stale) => return ForwardOutcome::Dropped,
+            Err(Early::Dropped | Early::Mismatch) => return ForwardOutcome::Dropped,
             Err(Early::CreditViolation(error)) => return ForwardOutcome::CreditViolation(error),
             Err(Early::OverQuota(tenant, quota)) => {
                 reimburse();
@@ -823,8 +852,8 @@ impl ForwardTable {
         // registry's `detach_then` takes the registry lock and then this one, so this table never
         // calls the registry under its lock): a newer session may have attached and run
         // `supersede_for` in between, and a pair made now would bind the newer session to this
-        // one's credit (round T1, L1). Ids grow with every session, so `admit` already compares
-        // them against a pair that exists; for a new one the check is made here, and a stale
+        // one's credit (round T1, L1). Ids are not ordered, so a pair that exists is judged by
+        // the registry in the retry above; for a new one the check is made here, and a stale
         // session's pairs are removed (marked revoked) with nothing delivered and no CREDIT
         // sent: a CREDIT would reach the newer session.
         if created && !registry.is_current(src, src_session_id) {
@@ -1060,21 +1089,23 @@ impl ForwardTable {
         reliable: bool,
         charge: u32,
         now: Instant,
+        replace: bool,
     ) -> Result<(u64, Arc<PairShared>, bool), Early> {
         let mut guard = self.table();
         let table = &mut *guard;
         let key = (*src, *dst);
-        // A pair of another session of `src` (session ids only grow): the caller is older, so
-        // its SEND is stale; or newer, so the pair is the old session's and is replaced, its
-        // queued items marked revoked (undelivered data of a superseded session is the loss
-        // protocol.md 4.2 accepts).
+        // A pair of another session of `src`. Ids have no order, so this function cannot say
+        // which session is newer: without `replace` it reports `Mismatch` and changes nothing;
+        // with `replace` (the caller found its session current) the pair is the old session's
+        // and is replaced, its queued items marked revoked (undelivered data of a superseded
+        // session is the loss protocol.md 4.2 accepts).
         let mut created = false;
         if let Some(pair) = table.pairs.get(&key)
             && pair.counted
             && pair.src_session != src_session
         {
-            if src_session < pair.src_session {
-                return Err(Early::Stale);
+            if !replace {
+                return Err(Early::Mismatch);
             }
             if let Some(old) = table.pairs.remove(&key) {
                 old.shared.revoked.store(true, Ordering::Release);
@@ -1375,14 +1406,35 @@ impl ForwardTable {
     /// destination are only removed: its queue went with its old session. A session that ends
     /// (detach) keeps using [`Self::clear_for`], so what it sent just before closing is still
     /// delivered.
-    pub(crate) fn supersede_for(&self, node_id: &NodeId) {
+    ///
+    /// `new_session_id` is the attaching session: this call may run late, after that session
+    /// (or a racing earlier attach's) already made pairs, and those must survive. Only
+    /// src-role pairs of another session are revoked and removed; the dst role is cleared whole.
+    pub(crate) fn supersede_for(&self, node_id: &NodeId, new_session_id: u32) {
         let mut guard = self.table();
-        for (key, pair) in guard.pairs.iter() {
-            if &key.0 == node_id {
+        let stale: Vec<(NodeId, NodeId)> = guard
+            .pairs
+            .iter()
+            .filter(|(key, pair)| &key.0 == node_id && pair.src_session != new_session_id)
+            .map(|(key, _)| *key)
+            .collect();
+        for key in stale {
+            if let Some(pair) = guard.pairs.remove(&key) {
                 pair.shared.revoked.store(true, Ordering::Release);
+                guard.uncount(&key.0, &pair);
             }
         }
-        guard.remove_involving(node_id);
+        let dst_keys: Vec<(NodeId, NodeId)> = guard
+            .pairs
+            .keys()
+            .filter(|key| &key.1 == node_id)
+            .copied()
+            .collect();
+        for key in dst_keys {
+            if let Some(pair) = guard.pairs.remove(&key) {
+                guard.uncount(&key.0, &pair);
+            }
+        }
     }
 
     /// The credit `src` currently has remaining to send to `dst`, or
@@ -3214,7 +3266,7 @@ mod tests {
         for _round in 0..4 {
             session += 1;
             src_handles.push(f.registry.attach(f.src, session, vec![f.network_id]));
-            table.supersede_for(&f.src); // what crate::session does right after attach
+            table.supersede_for(&f.src, session); // what crate::session does right after attach
             for _ in 0..(credit as usize / 65_535) {
                 let (e, fl, p) = reliable_send(65_535);
                 let out = table.forward_in_session(
@@ -3303,7 +3355,7 @@ mod tests {
             1_000,
         );
         assert!(matches!(out, ForwardOutcome::Queued));
-        table.supersede_for(&f.dst);
+        table.supersede_for(&f.dst, 20);
         table.clear_for(&f.src);
         match dst_rx.try_recv() {
             Ok(ForwardItem::Recv { shared, .. }) => assert!(!shared.is_revoked()),
@@ -3331,7 +3383,7 @@ mod tests {
         };
         // New session 7 attached and cleared; then the old session 1's SEND lands.
         let mut handles = f.registry.attach(f.src, 7, vec![f.network_id]);
-        table.supersede_for(&f.src);
+        table.supersede_for(&f.src, 7);
         let (e, fl, p) = reliable_send(1_000);
         let out = table.forward_in_session(
             &f.rosters,
@@ -3440,6 +3492,153 @@ mod tests {
         assert_eq!((revoked, live), (1, 1));
         let (pairs, _) = table.tenant_counts(&TenantId::Default);
         assert_eq!(pairs, 1);
+    }
+
+    /// Fix of round T1 F1: ids are a permutation, a NEWER session can have a SMALLER id. The
+    /// current session 5 sends while old session 900's pair is on file: Queued and charged, the
+    /// old pair's items revoked.
+    #[test]
+    fn the_current_session_with_a_smaller_id_replaces_the_old_sessions_pair() {
+        let f = fixture(4_000_000_000);
+        let table = ForwardTable::new();
+        let limits = test_limits();
+        let (_s, _o, mut dst_rx) = f.registry.attach(f.dst, 20, vec![f.network_id]);
+        let _old = f.registry.attach(f.src, 900, vec![f.network_id]);
+        let send = |session: u32| {
+            let (e, fl, p) = reliable_send(1_000);
+            table.forward_in_session(
+                &f.rosters,
+                &f.registry,
+                &f.labels,
+                &limits,
+                &f.src,
+                session,
+                &[f.network_id],
+                &f.dst,
+                e,
+                fl,
+                p,
+                1_000,
+            )
+        };
+        assert!(matches!(send(900), ForwardOutcome::Queued));
+        // Session 5 attaches; the reset has not run yet.
+        let _new = f.registry.attach(f.src, 5, vec![f.network_id]);
+        assert!(matches!(send(5), ForwardOutcome::Queued));
+        assert_eq!(
+            table.remaining_credit(&f.src, &f.dst),
+            Some(limits.credit - 1_000)
+        );
+        let (mut revoked, mut live) = (0, 0);
+        while let Ok(ForwardItem::Recv { shared, .. }) = dst_rx.try_recv() {
+            if shared.is_revoked() {
+                revoked += 1;
+            } else {
+                live += 1;
+            }
+        }
+        assert_eq!((revoked, live), (1, 1));
+        assert_eq!(table.tenant_counts(&TenantId::Default).0, 1);
+    }
+
+    /// Fix of round T1 F1: the old session 900 (no longer current) sends late while session 5's
+    /// pair is live: Dropped, and the live pair and its queued item are untouched.
+    #[test]
+    fn a_late_send_of_the_old_session_with_a_larger_id_does_not_touch_the_live_pair() {
+        let f = fixture(4_000_000_000);
+        let table = ForwardTable::new();
+        let limits = test_limits();
+        let (_s, _o, mut dst_rx) = f.registry.attach(f.dst, 20, vec![f.network_id]);
+        let _old = f.registry.attach(f.src, 900, vec![f.network_id]);
+        let _new = f.registry.attach(f.src, 5, vec![f.network_id]);
+        let send = |session: u32| {
+            let (e, fl, p) = reliable_send(1_000);
+            table.forward_in_session(
+                &f.rosters,
+                &f.registry,
+                &f.labels,
+                &limits,
+                &f.src,
+                session,
+                &[f.network_id],
+                &f.dst,
+                e,
+                fl,
+                p,
+                1_000,
+            )
+        };
+        assert!(matches!(send(5), ForwardOutcome::Queued));
+        assert!(matches!(send(900), ForwardOutcome::Dropped));
+        assert_eq!(
+            table.remaining_credit(&f.src, &f.dst),
+            Some(limits.credit - 1_000)
+        );
+        match dst_rx.try_recv() {
+            Ok(ForwardItem::Recv { shared, .. }) => assert!(!shared.is_revoked()),
+            other => panic!("expected the queued RECV, got {other:?}"),
+        }
+        assert_eq!(table.tenant_counts(&TenantId::Default).0, 1);
+    }
+
+    /// Fix of round T1 F2: a LATE `supersede_for` of an earlier attach (session 5) must not
+    /// touch the pairs session 5 made; a pair of another src session is revoked and removed.
+    #[test]
+    fn a_late_supersede_leaves_the_new_sessions_pairs_alone() {
+        let f = fixture(4_000_000_000);
+        let table = ForwardTable::new();
+        let limits = test_limits();
+        let (_s, _o, mut dst_rx) = f.registry.attach(f.dst, 20, vec![f.network_id]);
+        let _old = f.registry.attach(f.src, 900, vec![f.network_id]);
+        let send = |session: u32| {
+            let (e, fl, p) = reliable_send(1_000);
+            table.forward_in_session(
+                &f.rosters,
+                &f.registry,
+                &f.labels,
+                &limits,
+                &f.src,
+                session,
+                &[f.network_id],
+                &f.dst,
+                e,
+                fl,
+                p,
+                1_000,
+            )
+        };
+        // A pair of session 900 on file, then session 5 becomes current and makes its own pair
+        // toward another destination (a second node).
+        assert!(matches!(send(900), ForwardOutcome::Queued));
+        let other_dst = f.dst;
+        let _new = f.registry.attach(f.src, 5, vec![f.network_id]);
+        // Simulate: session 5's pair exists (replaces 900's on its first SEND).
+        assert!(matches!(send(5), ForwardOutcome::Queued));
+        // A pair of a third session (id 77) toward another key, inserted directly.
+        let third = NodeId::from([0x77u8; 32]);
+        {
+            let generation = table.next_generation.fetch_add(1, Ordering::Relaxed);
+            let mut t = table.table();
+            t.count(&TenantId::Default, &f.src);
+            t.pairs.insert(
+                (f.src, third),
+                PairState::new(1024, Instant::now(), generation, TenantId::Default, 77),
+            );
+        }
+        let _ = other_dst;
+        table.supersede_for(&f.src, 5); // the late call
+        assert_eq!(
+            table.remaining_credit(&f.src, &f.dst),
+            Some(limits.credit - 1_000)
+        );
+        assert!(table.remaining_credit(&f.src, &third).is_none());
+        assert_eq!(table.tenant_counts(&TenantId::Default).0, 1);
+        let mut items = Vec::new();
+        while let Ok(ForwardItem::Recv { shared, .. }) = dst_rx.try_recv() {
+            items.push(shared.is_revoked());
+        }
+        // 900's item was revoked by the replacement, 5's item is live.
+        assert_eq!(items, vec![true, false]);
     }
 }
 
