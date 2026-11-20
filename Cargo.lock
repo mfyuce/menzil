@@ -1504,6 +1504,7 @@ dependencies = [
  "rustls",
  "serde_json",
  "snow",
+ "socket2",
  "tempfile",
  "thiserror",
  "tokio",

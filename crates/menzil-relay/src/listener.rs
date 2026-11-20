@@ -26,6 +26,10 @@ use crate::connection::InboundConnection;
 use crate::error::RelayError;
 use crate::prefixed::{PrefixedTcp, Replay};
 
+/// `TCP_NOTSENT_LOWAT` of accepted sockets: above one maximum record, so a record is never held
+/// back for lack of room, and far below the megabytes the kernel would otherwise queue.
+const RELAY_NOTSENT_LOWAT: u32 = 128 * 1024;
+
 /// Accepts inbound connections on one bound address, completing TLS and
 /// the L3 WebSocket upgrade for each.
 pub struct Listener {
@@ -118,6 +122,10 @@ impl Listener {
         // `menzil_carrier::connect`'s `low_latency`): the relay's writes
         // are the small records of every session it serves.
         tcp.set_nodelay(true)?;
+        // A shallow unsent backlog toward the destination: credit goes back to a sender when its
+        // RECV reaches this socket's buffer, so a deep buffer on a slow client's leg is a queue
+        // credit cannot see (docs/private/adaptive-inflight-design.md, slice 1).
+        menzil_carrier::apply_notsent_lowat(&tcp, RELAY_NOTSENT_LOWAT);
         Ok((tcp, peer))
     }
 
@@ -421,6 +429,11 @@ mod tests {
             assert!(
                 conn.tcp_nodelay().unwrap(),
                 "an accepted socket must have Nagle's algorithm off"
+            );
+            assert_eq!(
+                conn.tcp_notsent_lowat().unwrap(),
+                128 * 1024,
+                "an accepted socket must keep its unsent backlog shallow, so a CREDIT is not hidden behind megabytes of RECV (throughput design note, slice 1)"
             );
             let msg = conn.recv().await.unwrap();
             assert_eq!(msg, b"hello from client");

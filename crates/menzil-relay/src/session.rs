@@ -67,7 +67,7 @@ use crate::connection::InboundConnection;
 use crate::doc::{self, AcceptOutcome, PendingBases};
 use crate::endpoint::{EndpointCredit, EndpointOutcome};
 use crate::error::RelayError;
-use crate::forward::{ForwardItem, ForwardOutcome};
+use crate::forward::{ForwardItem, ForwardOutcome, pull_pending};
 use crate::hello::{
     HelloRejection, check_hello_admitting, dedup_networks, over_limit, over_quota, roster_standing,
 };
@@ -1095,6 +1095,9 @@ async fn run_attached_loop(
         }
     }
 
+    // RECVs taken off `forward_rx` and not yet written (credits are written as they are found).
+    let mut backlog: std::collections::VecDeque<ForwardItem> = std::collections::VecDeque::new();
+
     // Phase 2: attached and routable; stay alive until idle, closed, or
     // superseded.
     loop {
@@ -1147,32 +1150,38 @@ async fn run_attached_loop(
                 let _ = send_record(&mut conn, &mut transport, record).await;
             }
             Some(item) = forward_rx.recv() => {
+                // Taken off the channel and sorted: credits first, RECVs one at a time (the
+                // arm below), so a credit never waits behind a destination's RECV backlog.
                 match item {
-                    ForwardItem::Recv { record, src, charge, reliable, generation, src_session_id, shared } => {
-                        // Only now — once this RECV record has actually
-                        // been handed to this (destination) connection to
-                        // send, not merely admitted into `ForwardTable`
-                        // — does the sending side's credit get granted
-                        // back (protocol.md 4.2: "replenished as bytes
-                        // are written to the destination socket") and a
-                        // CREDIT record queued for it (see `drained`'s
-                        // own doc comment for why that record travels
-                        // this same reliable channel, not `send_to`'s
-                        // lossy one).
-                        if shared.is_revoked() {
-                            // `src` was evicted from a network while this was queued: it is
-                            // not delivered, and nothing is charged for it.
-                            tracing::debug!(session_id, "dropping a queued RECV of an evicted sender");
-                            relay.forwarding.released(&relay.registry, &src, &node_id, charge, reliable, generation, src_session_id, &shared);
-                        } else {
-                            let _ = send_record(&mut conn, &mut transport, *record).await;
-                            relay.forwarding.drained(&relay.registry, &src, &node_id, charge, reliable, generation, src_session_id, &shared);
-                        }
-                    }
                     ForwardItem::Credit { peer, bytes } => {
                         let _ = send_record(
                             &mut conn, &mut transport, Record::Credit(CreditBody { peer, bytes }),
                         ).await;
+                    }
+                    recv => backlog.push_back(recv),
+                }
+            }
+            () = std::future::ready(()), if !backlog.is_empty() => {
+                for (peer, bytes) in pull_pending(&mut forward_rx, &mut backlog) {
+                    let _ = send_record(
+                        &mut conn, &mut transport, Record::Credit(CreditBody { peer, bytes }),
+                    ).await;
+                }
+                if let Some(ForwardItem::Recv { record, src, charge, reliable, generation, src_session_id, shared }) = backlog.pop_front() {
+                    // Only now, once this RECV record has actually been handed to this
+                    // (destination) connection to send, not merely admitted into
+                    // `ForwardTable`, does the sending side's credit get granted back
+                    // (protocol.md 4.2: "replenished as bytes are written to the destination
+                    // socket") and a CREDIT record queued for it (see `drained`'s own doc
+                    // comment for why that record travels this same reliable channel).
+                    if shared.is_revoked() {
+                        // `src` was evicted from a network while this was queued: it is not
+                        // delivered, and nothing is charged for it.
+                        tracing::debug!(session_id, "dropping a queued RECV of an evicted sender");
+                        relay.forwarding.released(&relay.registry, &src, &node_id, charge, reliable, generation, src_session_id, &shared);
+                    } else {
+                        let _ = send_record(&mut conn, &mut transport, *record).await;
+                        relay.forwarding.drained(&relay.registry, &src, &node_id, charge, reliable, generation, src_session_id, &shared);
                     }
                 }
             }
@@ -1198,6 +1207,9 @@ async fn run_attached_loop(
     // way).
     forward_rx.close();
     while let Ok(item) = forward_rx.try_recv() {
+        backlog.push_back(item);
+    }
+    while let Some(item) = backlog.pop_front() {
         if let ForwardItem::Recv {
             src,
             charge,

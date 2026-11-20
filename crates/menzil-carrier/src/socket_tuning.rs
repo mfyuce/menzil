@@ -12,8 +12,15 @@ const LOWAT_BYTES: u32 = 16 * 1024;
 /// Applies the watermark to `stream`, logging and continuing on any
 /// failure (unsupported platform, or the syscall itself failing).
 pub fn apply(stream: &TcpStream) {
+    apply_with(stream, LOWAT_BYTES);
+}
+
+/// [`apply`] with a watermark of the caller's choosing (the relay keeps 128 KiB toward its
+/// destinations: a slow client's backlog must stay short, but a larger watermark than a node's
+/// keeps its own writer busy).
+pub fn apply_with(stream: &TcpStream, bytes: u32) {
     let sock = SockRef::from(stream);
-    if let Err(err) = set_notsent_lowat(&sock, LOWAT_BYTES) {
+    if let Err(err) = set_notsent_lowat(&sock, bytes) {
         tracing::debug!(%err, "TCP_NOTSENT_LOWAT unavailable, continuing without it");
     }
 }

@@ -526,6 +526,25 @@ pub(crate) enum ForwardItem {
     Credit { peer: NodeId, bytes: u32 },
 }
 
+/// Takes everything pending off a destination's channel without waiting: the CREDITs owed to
+/// senders come back (to be written first) and the RECVs are appended to `backlog` in the order
+/// they arrived. A credit queued behind a slow destination's RECVs used to wait for all of them
+/// (the sender's window stayed shut for the whole backlog); a RECV is only ever written one at a
+/// time between two such pulls (docs/private/adaptive-inflight-design.md, slice 1).
+pub(crate) fn pull_pending(
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<ForwardItem>,
+    backlog: &mut std::collections::VecDeque<ForwardItem>,
+) -> Vec<(NodeId, u32)> {
+    let mut credits = Vec::new();
+    while let Ok(item) = rx.try_recv() {
+        match item {
+            ForwardItem::Credit { peer, bytes } => credits.push((peer, bytes)),
+            recv @ ForwardItem::Recv { .. } => backlog.push_back(recv),
+        }
+    }
+    credits
+}
+
 /// What [`ForwardTable::forward`] decided.
 #[derive(Debug)]
 pub(crate) enum ForwardOutcome {
@@ -1480,6 +1499,55 @@ impl ForwardTable {
 
 #[cfg(test)]
 mod tests {
+
+    fn recv_item(tag: u8) -> ForwardItem {
+        ForwardItem::Recv {
+            record: Box::new(Record::Recv {
+                src: NodeId::from([1; 32]),
+                e2e_proto: 1,
+                flags: 0,
+                payload: vec![tag],
+            }),
+            src: NodeId::from([1; 32]),
+            charge: 1,
+            reliable: true,
+            generation: 0,
+            src_session_id: 1,
+            shared: Arc::new(PairShared::untracked()),
+        }
+    }
+
+    #[test]
+    fn a_credit_queued_behind_receives_is_taken_ahead_of_them_and_the_receives_keep_their_order() {
+        // One FIFO carries both for a destination, and a credit owed to a sender sat behind every
+        // RECV queued before it, however slow the destination's socket (throughput design note,
+        // slice 1): the sender's window stayed shut for the whole backlog.
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let peer = NodeId::from([9; 32]);
+        for item in [
+            recv_item(1),
+            recv_item(2),
+            ForwardItem::Credit { peer, bytes: 77 },
+            recv_item(3),
+        ] {
+            tx.send(item).unwrap();
+        }
+        let mut backlog = std::collections::VecDeque::new();
+        let credits = pull_pending(&mut rx, &mut backlog);
+        assert_eq!(credits, vec![(peer, 77)]);
+        let tags: Vec<u8> = backlog
+            .iter()
+            .map(|item| match item {
+                ForwardItem::Recv { record, .. } => match record.as_ref() {
+                    Record::Recv { payload, .. } => payload[0],
+                    _ => unreachable!(),
+                },
+                ForwardItem::Credit { .. } => panic!("a credit left in the receive backlog"),
+            })
+            .collect();
+        assert_eq!(tags, vec![1, 2, 3]);
+        assert!(rx.try_recv().is_err(), "everything pending was taken");
+    }
     use super::*;
     use ed25519_dalek::SigningKey;
     use menzil_proto::{Roster, RosterBody, RosterMember};

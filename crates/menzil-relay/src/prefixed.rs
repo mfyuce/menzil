@@ -36,6 +36,12 @@ impl PrefixedTcp {
     pub(crate) fn nodelay(&self) -> io::Result<bool> {
         self.tcp.nodelay()
     }
+
+    /// The socket's `TCP_NOTSENT_LOWAT` (0 when unset).
+    #[cfg(test)]
+    pub(crate) fn notsent_lowat(&self) -> io::Result<u32> {
+        socket2::SockRef::from(&self.tcp).tcp_notsent_lowat()
+    }
 }
 
 impl AsyncRead for PrefixedTcp {
