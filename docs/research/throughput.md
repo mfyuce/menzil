@@ -68,3 +68,11 @@ reproduced faithfully; fix first (design note slice 0).
 3. A test that a blocked carrier write does not stall PING answering or the dead link tick.
 4. OPEN carrying the first bytes; OPEN_ACK timeout and streams across a reconnect (TBD 96).
 5. Nearer relay or a direct path (RTT), the owner's priority 1.
+
+## Second round (2026-11-21): lab results of the in-flight work and the real ceiling
+
+Lab: loopback, 57 ms one way each side (RTT 0.23 s), own relay and nodes, `docs/private/tools/bench` (private notes repository; the figures below are what matters).
+
+- Slices built: relay `TCP_NOTSENT_LOWAT` 128 KiB with CREDIT written ahead of queued RECVs; node send window as an adaptive controller per destination; L4 send budget 128 KiB per destination; outbound frame budget 64 to 4; capability `adaptive-window` giving a node 3 MiB relay credit.
+- Two way 15 Mbit/s line, a small request while two bulk streams run: 1110 ms before, 586 ms after (target 500 ms not met); a new connection 2530 ms to 1180 ms; total throughput 13.1 to 13.7 Mbit/s (nothing lost). Uncapped: warm request 470 to 400 to 465 ms, new connection 1300 to about 900 ms.
+- Uncapped throughput stays at 25 Mbit/s for one stream and about 48 to 51 Mbit/s for sixteen. A probe (adaptive window, window fixed at 1024 and at 3072 KiB, nodes restarted so they reconnect with the larger credit) gave the same figures, and the relay process used about 3 % of a core. So the ceiling is not the node window, not the relay credit and not CPU. One stream at 34.8 Mbit/s is 1 MiB per 0.23 s round trip, and sixteen streams about 1.5 MiB per round trip: the end to end window of the stream layer (yamux receive window, per stream and per connection) is the next lever, a design question of its own (memory per stream against throughput on a long path).
