@@ -566,6 +566,7 @@ async fn frames_that_lie_are_a_reset_not_a_crash() {
     server.abort();
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn current_uid_is_the_user_of_this_process() {
     use std::os::unix::fs::MetadataExt;

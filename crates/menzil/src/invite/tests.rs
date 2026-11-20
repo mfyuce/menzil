@@ -1,3 +1,4 @@
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 
 use menzil_admin::NodeKeys;
@@ -131,6 +132,7 @@ fn two_invites_differ_in_id_and_secret() {
     assert_ne!(ta.secret.0, tb.secret.0);
 }
 
+#[cfg(unix)]
 #[test]
 fn the_book_is_private_whole_and_leaves_nothing_behind() {
     let fx = fixture();

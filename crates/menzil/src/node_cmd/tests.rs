@@ -2006,6 +2006,7 @@ mod acme_wiring {
 
 /// The known relays file of a home: a record written by one node process is read by the next,
 /// the file is private, and a corrupt file is set aside (never stops the node).
+#[cfg(unix)]
 #[test]
 fn the_known_relays_file_of_a_home_is_kept_private_and_a_corrupt_one_is_set_aside() {
     use ed25519_dalek::SigningKey;

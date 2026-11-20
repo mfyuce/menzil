@@ -898,8 +898,9 @@ mod tests {
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    use crate::sock::{UnixListener, UnixStream};
     use tokio::io::{AsyncBufReadExt, BufReader, duplex};
-    use tokio::net::{TcpStream, UnixListener, UnixStream};
+    use tokio::net::TcpStream;
     use tokio::sync::mpsc;
 
     use super::*;
@@ -2505,6 +2506,7 @@ mod tests {
         PathBuf::from(name)
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn the_proxy_socket_is_private_and_goes_away_when_the_proxy_stops() {
         use std::os::unix::fs::PermissionsExt;
@@ -2703,6 +2705,8 @@ mod tests {
 
     /// At the end of a run the path may lead somewhere else (a link in it was pointed elsewhere):
     /// only the files this run made are removed.
+    #[cfg(unix)]
+    #[cfg(unix)]
     #[tokio::test]
     async fn a_proxy_that_stops_leaves_alone_what_its_path_names_by_then() {
         let base = tempfile::tempdir().unwrap();

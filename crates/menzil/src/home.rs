@@ -653,6 +653,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn secrets_are_created_readable_by_their_owner_only() {
         use std::os::unix::fs::PermissionsExt;

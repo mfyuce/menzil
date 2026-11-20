@@ -1948,11 +1948,13 @@ fn the_certificate_report_says_when_a_network_does_not_list_the_current_one() {
 
 // ---- new identity and replace (cert-rotation design S7) ----
 
+#[cfg(unix)]
 fn mode_of(path: &std::path::Path) -> u32 {
     use std::os::unix::fs::PermissionsExt;
     fs::metadata(path).unwrap().permissions().mode() & 0o777
 }
 
+#[cfg(unix)]
 #[test]
 fn a_new_identity_puts_the_old_one_aside_privately_and_says_where_it_had_a_place() {
     let two = joined_member();

@@ -774,6 +774,7 @@ fn concurrent_changes_to_the_file_are_all_kept() {
     assert_eq!(config.services.len(), 1);
 }
 
+#[cfg(unix)]
 #[test]
 fn the_file_is_written_atomically_readable_by_its_owner_only_and_a_link_stays_a_link() {
     use std::os::unix::fs::{MetadataExt, symlink};

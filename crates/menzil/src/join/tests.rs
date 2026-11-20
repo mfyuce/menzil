@@ -1,3 +1,4 @@
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 
 use menzil_proto::{Invite, InviteId, NodeId, PROTOCOL_VERSION, RevokedMember, verify_admit_tag};
@@ -358,6 +359,7 @@ fn every_refusal_code_has_its_own_message() {
 
 // ---- the Roster only file -------------------------------------------------------------------
 
+#[cfg(unix)]
 #[test]
 fn the_roster_only_file_is_private_whole_and_leaves_nothing_behind() {
     let fx = fx();
@@ -520,6 +522,7 @@ fn status_says_admitted_waiting_for_the_policy() {
 
 // ---- config.toml ------------------------------------------------------------------------------
 
+#[cfg(unix)]
 #[test]
 fn relay_goes_into_a_config_without_one_and_into_none_that_has_one() {
     let fx = fx();

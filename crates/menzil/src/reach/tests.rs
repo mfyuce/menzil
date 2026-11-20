@@ -2,14 +2,17 @@
 //! at its end is the point (the third red-team round, M3: a reset used to arrive as a clean end
 //! of file because the write half's drop sent a FIN first).
 
+#[cfg_attr(not(unix), allow(unused_imports))]
 use std::fs;
 use std::io;
+#[cfg_attr(not(unix), allow(unused_imports))]
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
+use crate::sock::{UnixListener, UnixStream};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::net::{TcpListener, TcpStream, UnixListener, UnixStream};
+use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio::time::timeout;

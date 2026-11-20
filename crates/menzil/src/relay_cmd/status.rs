@@ -505,6 +505,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn the_file_is_written_with_the_tenant_files_mode_and_leaves_nothing_beside_it() {
         use std::os::unix::fs::PermissionsExt;
