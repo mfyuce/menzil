@@ -301,18 +301,15 @@ pub async fn bind_agent_socket(path: &Path) -> Result<UnixListener> {
 #[cfg(unix)]
 pub type FileIdentity = (u64, u64);
 
-/// Without Unix sockets there is no socket file to tell apart (D11 W1).
+/// Without Unix sockets the socket file is the loopback token file (D11 W2): its identity is a
+/// digest of what it holds, so shutdown removes the file this process made and not one another
+/// instance wrote in its place.
 #[cfg(not(unix))]
-pub type FileIdentity = ();
+pub type FileIdentity = [u8; 32];
 
 #[cfg(not(unix))]
-pub fn file_identity(_path: &Path) -> std::io::Result<FileIdentity> {
-    Ok(())
-}
-
-#[cfg(not(unix))]
-pub fn remove_if_unchanged(_path: &Path, _identity: FileIdentity) -> bool {
-    false
+pub fn file_identity(path: &Path) -> std::io::Result<FileIdentity> {
+    crate::sock::loopback::file_digest(path)
 }
 
 /// The identity of the file at `path`; a link is not followed.
@@ -336,6 +333,15 @@ pub fn remove_if_unchanged(path: &Path, identity: FileIdentity) -> bool {
         Ok(now) if !now.is_dir() && (now.dev(), now.ino()) == identity => {
             fs::remove_file(path).is_ok()
         }
+        _ => false,
+    }
+}
+
+/// The loopback token file: removed only if it still holds what this process wrote.
+#[cfg(not(unix))]
+pub fn remove_if_unchanged(path: &Path, identity: FileIdentity) -> bool {
+    match (fs::symlink_metadata(path), file_identity(path)) {
+        (Ok(now), Ok(found)) if now.is_file() && found == identity => fs::remove_file(path).is_ok(),
         _ => false,
     }
 }
@@ -466,8 +472,46 @@ pub async fn prepare_socket_directory(path: &Path, kind: &SocketKind) -> Result<
         })?;
     }
     #[cfg(not(unix))]
-    fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    {
+        // The token file is private only where the directory is: under the user's profile, whose
+        // ACL Windows makes private. Nothing here can check an ACL (no unsafe), so a directory
+        // elsewhere is refused (review W2-3).
+        let profile = std::env::var_os("USERPROFILE").map(PathBuf::from);
+        if !within_profile(dir, profile.as_deref()) {
+            bail!(
+                "on this platform {} must be a directory under your user profile ({}): the socket file holds a secret and only the profile is known to be private; set {} to a path there",
+                dir.display(),
+                profile
+                    .as_deref()
+                    .map_or("USERPROFILE is not set".to_string(), |p| p
+                        .display()
+                        .to_string()),
+                kind.setting
+            );
+        }
+        fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    }
     Ok(())
+}
+
+/// Whether `dir` lies under `profile` (no `..` steps, compared by path components, ignoring
+/// ASCII case as Windows does). Pure so that it is tested on every platform.
+#[cfg_attr(unix, allow(dead_code))]
+pub(crate) fn within_profile(dir: &Path, profile: Option<&Path>) -> bool {
+    use std::path::Component;
+    let Some(profile) = profile else {
+        return false;
+    };
+    if dir.components().any(|c| c == Component::ParentDir) {
+        return false;
+    }
+    let lower = |p: &Path| -> Vec<String> {
+        p.components()
+            .map(|c| c.as_os_str().to_string_lossy().to_ascii_lowercase())
+            .collect()
+    };
+    let (d, p) = (lower(dir), lower(profile));
+    !p.is_empty() && d.len() >= p.len() && d[..p.len()] == p[..]
 }
 
 /// The second half: a socket file left by a process that died is removed; one with a process
@@ -483,7 +527,7 @@ pub async fn bind_in_prepared_directory(path: &Path, kind: &SocketKind) -> Resul
                 _found.file_type().is_socket()
             };
             #[cfg(not(unix))]
-            let is_socket = true;
+            let is_socket = crate::sock::loopback::is_socket_file(path);
             if !is_socket {
                 bail!(
                     "{} exists and is not a socket: not touching it (is {} pointing at the wrong file?)",
@@ -493,6 +537,19 @@ pub async fn bind_in_prepared_directory(path: &Path, kind: &SocketKind) -> Resul
             }
             match UnixStream::connect(path).await {
                 Ok(_) => bail!("{} is already listening on {}", kind.holder, path.display()),
+                // Without Unix sockets only a refused connection or a server that cannot prove
+                // the token marks the file stale; any other error (a sharing violation) is not
+                // taken for a dead agent.
+                #[cfg(not(unix))]
+                Err(error)
+                    if !matches!(
+                        error.kind(),
+                        std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::InvalidData
+                    ) =>
+                {
+                    return Err(error)
+                        .with_context(|| format!("looking at the socket file {}", path.display()));
+                }
                 Err(_) => fs::remove_file(path)
                     .with_context(|| format!("removing the stale socket {}", path.display()))?,
             }

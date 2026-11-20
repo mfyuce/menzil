@@ -2090,3 +2090,22 @@ fn only_an_issuer_seeds_the_awaiting_set_from_its_invite_book() {
     std::fs::remove_file(home.owner_key_path(&network)).unwrap();
     assert!(awaiting_seed(&home, NOW).is_empty());
 }
+
+#[test]
+fn a_socket_directory_must_lie_under_the_profile_where_there_are_no_unix_sockets() {
+    use super::within_profile;
+    use std::path::Path;
+    let profile = Some(Path::new("C:/Users/Ayse"));
+    assert!(within_profile(
+        Path::new("C:/Users/Ayse/AppData/menzil"),
+        profile
+    ));
+    assert!(within_profile(Path::new("c:/users/AYSE"), profile));
+    assert!(!within_profile(Path::new("C:/Users/Ayse2/x"), profile));
+    assert!(!within_profile(Path::new("C:/ProgramData/menzil"), profile));
+    assert!(!within_profile(
+        Path::new("C:/Users/Ayse/../Bob/x"),
+        profile
+    ));
+    assert!(!within_profile(Path::new("C:/Users/Ayse/x"), None));
+}

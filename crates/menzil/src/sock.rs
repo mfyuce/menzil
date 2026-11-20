@@ -1,7 +1,7 @@
 //! The Unix socket types the agent, reach and proxy code use, from one place: tokio's on Unix,
-//! the stand-ins of [`unsupported`] elsewhere (D11 W1).
+//! the loopback plus token stand-ins of [`loopback`] elsewhere (D11 W2).
 
-mod unsupported;
+pub(crate) mod loopback;
 
 #[cfg(unix)]
 pub use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
@@ -9,4 +9,4 @@ pub use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 pub use tokio::net::{UnixListener, UnixStream};
 
 #[cfg(not(unix))]
-pub use unsupported::{OwnedReadHalf, OwnedWriteHalf, UnixListener, UnixStream};
+pub use loopback::{OwnedReadHalf, OwnedWriteHalf, UnixListener, UnixStream};
