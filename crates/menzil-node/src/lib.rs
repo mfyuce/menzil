@@ -89,6 +89,7 @@ mod roster_store;
 mod serve;
 mod session;
 mod shares;
+mod window;
 
 pub use admission::{
     HandshakeAdmission, InitiatorAdmission, PolicyAuthorizer, decide_initiator_admission,
