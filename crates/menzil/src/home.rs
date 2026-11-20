@@ -100,9 +100,24 @@ impl Home {
 
     /// The directory the environment names (see the module documentation).
     pub fn locate() -> Result<Self> {
-        let var = |name| std::env::var_os(name).filter(|v| !v.is_empty());
+        Self::locate_with(
+            |name| std::env::var_os(name).filter(|v| !v.is_empty()),
+            cfg!(windows),
+        )
+    }
+
+    /// [`locate`](Self::locate) with the environment and the platform given, so that both
+    /// orders are tested on any machine. On Windows `%APPDATA%` (under the user profile, whose
+    /// ACL is private) comes before `HOME`, which only a Unix-like shell sets there.
+    pub(crate) fn locate_with(
+        var: impl Fn(&str) -> Option<std::ffi::OsString>,
+        windows: bool,
+    ) -> Result<Self> {
         if let Some(path) = var("MENZIL_HOME") {
             return Ok(Self::new(path));
+        }
+        if windows && let Some(appdata) = var("APPDATA") {
+            return Ok(Self::new(PathBuf::from(appdata).join("menzil")));
         }
         if let Some(base) = var("XDG_CONFIG_HOME") {
             return Ok(Self::new(PathBuf::from(base).join("menzil")));
@@ -558,6 +573,25 @@ fn write_atomically(path: &Path, bytes: &[u8], secret: bool) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn on_windows_appdata_comes_before_home_and_on_unix_it_does_not() {
+        let env = |name: &str| match name {
+            "HOME" => Some("/h".into()),
+            "APPDATA" => Some("C:/Users/A/AppData/Roaming".into()),
+            _ => None,
+        };
+        let win = Home::locate_with(env, true).unwrap();
+        assert_eq!(win.root(), Path::new("C:/Users/A/AppData/Roaming/menzil"));
+        let unix = Home::locate_with(env, false).unwrap();
+        assert_eq!(unix.root(), Path::new("/h/.config/menzil"));
+        let only_appdata = |name: &str| (name == "APPDATA").then(|| "C:/R".into());
+        assert_eq!(
+            Home::locate_with(only_appdata, false).unwrap().root(),
+            Path::new("C:/R/menzil")
+        );
+        assert!(Home::locate_with(|_| None, true).is_err());
+    }
+
     use super::*;
 
     #[test]

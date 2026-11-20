@@ -2109,3 +2109,11 @@ fn a_socket_directory_must_lie_under_the_profile_where_there_are_no_unix_sockets
     ));
     assert!(!within_profile(Path::new("C:/Users/Ayse/x"), None));
 }
+
+#[test]
+fn a_long_socket_path_is_refused_only_where_there_is_a_unix_socket_limit() {
+    use super::{AGENT_SOCKET, check_path_length_at};
+    let long = std::path::PathBuf::from(format!("/{}", "a".repeat(150)));
+    assert!(check_path_length_at(&long, &AGENT_SOCKET, Some(100)).is_err());
+    assert!(check_path_length_at(&long, &AGENT_SOCKET, None).is_ok());
+}

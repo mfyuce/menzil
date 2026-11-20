@@ -20,6 +20,16 @@ pub struct Shutdown {
     terminate: tokio::signal::unix::Signal,
     #[cfg(unix)]
     hangup: tokio::signal::unix::Signal,
+    // Windows: Ctrl+C, Ctrl+Break, the console window closing and logoff or shutdown take the
+    // same path as SIGINT, SIGHUP and SIGTERM do (D11 W3).
+    #[cfg(not(unix))]
+    interrupt: tokio::signal::windows::CtrlC,
+    #[cfg(not(unix))]
+    break_: tokio::signal::windows::CtrlBreak,
+    #[cfg(not(unix))]
+    close: tokio::signal::windows::CtrlClose,
+    #[cfg(not(unix))]
+    shutdown: tokio::signal::windows::CtrlShutdown,
 }
 
 impl Shutdown {
@@ -38,7 +48,13 @@ impl Shutdown {
     /// Starts catching the signals.
     #[cfg(not(unix))]
     pub fn catch() -> io::Result<Self> {
-        Ok(Self {})
+        use tokio::signal::windows;
+        Ok(Self {
+            interrupt: tokio::signal::windows::ctrl_c()?,
+            break_: windows::ctrl_break()?,
+            close: windows::ctrl_close()?,
+            shutdown: windows::ctrl_shutdown()?,
+        })
     }
 
     /// Completes when the process is asked to stop; says which signal it was.
@@ -54,8 +70,12 @@ impl Shutdown {
     /// Completes when the process is asked to stop; says which signal it was.
     #[cfg(not(unix))]
     pub async fn wait(&mut self) -> io::Result<&'static str> {
-        tokio::signal::ctrl_c().await?;
-        Ok("interrupt")
+        Ok(tokio::select! {
+            _ = self.interrupt.recv() => "interrupt",
+            _ = self.break_.recv() => "break",
+            _ = self.close.recv() => "hangup",
+            _ = self.shutdown.recv() => "terminate",
+        })
     }
 }
 

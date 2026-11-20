@@ -224,8 +224,18 @@ const MAX_SOCKET_PATH_BYTES: usize = 100;
 
 /// Refuses a socket path too long to use, with the remedy.
 pub fn check_path_length(path: &Path, kind: &SocketKind) -> Result<()> {
+    // Only a real Unix socket has the limit; the loopback socket file of other platforms is an
+    // ordinary file (D11 W3).
+    check_path_length_at(path, kind, cfg!(unix).then_some(MAX_SOCKET_PATH_BYTES))
+}
+
+pub(crate) fn check_path_length_at(
+    path: &Path,
+    kind: &SocketKind,
+    limit: Option<usize>,
+) -> Result<()> {
     let length = path.as_os_str().len();
-    if length > MAX_SOCKET_PATH_BYTES {
+    if limit.is_some_and(|limit| length > limit) {
         bail!(
             "{} path is {length} bytes, more than a Unix socket path can be (about {MAX_SOCKET_PATH_BYTES}): set {} to a shorter path in a directory that only you can use, such as one under $XDG_RUNTIME_DIR: {}",
             kind.what,
