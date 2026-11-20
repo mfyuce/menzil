@@ -54,6 +54,9 @@ pub enum Capability {
     /// The node can host a terminated-mode public share (protocol.md
     /// 6.3).
     ShareTerminated,
+    /// The node sizes its send window from the CREDIT it receives, so the relay may grant it
+    /// the larger initial credit (protocol.md 4.1, 4.2).
+    AdaptiveWindow,
     /// A capability string this build does not recognize, preserved
     /// verbatim.
     Unknown(String),
@@ -67,6 +70,7 @@ impl Capability {
             Self::Docs => "docs",
             Self::ShareBlind => "share-blind",
             Self::ShareTerminated => "share-terminated",
+            Self::AdaptiveWindow => "adaptive-window",
             Self::Unknown(s) => s,
         }
     }
@@ -86,6 +90,7 @@ impl<'de> Deserialize<'de> for Capability {
             "docs" => Self::Docs,
             "share-blind" => Self::ShareBlind,
             "share-terminated" => Self::ShareTerminated,
+            "adaptive-window" => Self::AdaptiveWindow,
             _ => Self::Unknown(s),
         })
     }
@@ -230,6 +235,7 @@ mod tests {
             roster_seq,
             caps: vec![
                 Capability::Dgram,
+                Capability::AdaptiveWindow,
                 Capability::Unknown("future-cap".to_string()),
             ],
             e2e_protos: vec![0x01],
@@ -242,6 +248,20 @@ mod tests {
         let encoded = hello.encode().unwrap();
         let decoded = HelloBody::decode(&encoded).unwrap();
         assert_eq!(decoded, hello);
+    }
+
+    #[test]
+    fn the_adaptive_window_capability_has_its_wire_name_and_round_trips() {
+        assert_eq!(Capability::AdaptiveWindow.as_str(), "adaptive-window");
+        let mut hello = sample_hello();
+        hello.caps = vec![Capability::AdaptiveWindow];
+        let encoded = hello.encode().unwrap();
+        let decoded = HelloBody::decode(&encoded).unwrap();
+        assert_eq!(decoded.caps, vec![Capability::AdaptiveWindow]);
+        assert_ne!(
+            decoded.caps,
+            vec![Capability::Unknown("adaptive-window".to_string())]
+        );
     }
 
     #[test]

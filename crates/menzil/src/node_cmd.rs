@@ -1203,7 +1203,9 @@ where
         }
         .into(),
         networks,
-        caps: vec![],
+        // The send window follows the CREDIT the relay grants (`menzil-node::window`), so the
+        // relay may give this node the larger initial credit (protocol.md 4.2).
+        caps: vec![menzil_proto::Capability::AdaptiveWindow],
         e2e_protos: vec![0x01],
         known_relays: known_relays.clone(),
     };

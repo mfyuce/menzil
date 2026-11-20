@@ -52,8 +52,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use menzil_proto::{
-    CreditBody, DocReassembler, ErrorBody, ErrorCode, GoawayBody, HelloBody, NetworkId, NodeId,
-    Record, Tai64N, WelcomeBody, X25519PublicKey,
+    CreditBody, DocReassembler, ErrorBody, ErrorCode, GoawayBody, HelloBody, Limits, NetworkId,
+    NodeId, Record, Tai64N, WelcomeBody, X25519PublicKey,
 };
 use menzil_session::{
     HandshakePattern, Liveness, RekeySchedule, RelayHandshake, RelayHandshakeStep, StaticUsed,
@@ -151,8 +151,10 @@ fn build_welcome(
     session_id: u32,
     rosters: HashMap<NetworkId, u64>,
     answered_by: &Answered,
+    credit: u32,
 ) -> WelcomeBody {
     let mut limits = relay.limits;
+    limits.credit = credit;
     if !rosters.is_empty() {
         let book = relay.tenants();
         let claimed: Vec<NetworkId> = rosters.keys().copied().collect();
@@ -270,7 +272,17 @@ async fn run_handshake_and_validate(
     mut conn: InboundConnection,
     relay: &Relay,
     session_id: u32,
-) -> Result<(InboundConnection, Transport, NodeId, HelloBody, PreAttach), RelayError> {
+) -> Result<
+    (
+        InboundConnection,
+        Transport,
+        NodeId,
+        HelloBody,
+        PreAttach,
+        u32,
+    ),
+    RelayError,
+> {
     let message1 = conn.recv().await?;
     let pattern = detect_pattern(&message1);
     let prologue_bytes = prologue(
@@ -315,7 +327,15 @@ async fn run_handshake_and_validate(
         (Some(Ok(_)), Some(hello)) => relay.rosters.seqs_for(&dedup_networks(&hello.networks)),
         _ => HashMap::new(),
     };
-    let welcome = build_welcome(relay, session_id, proven_rosters, &answered);
+    // The credit this session gets, announced in WELCOME and used for every pair it sends on.
+    // `Ik` knows the HELLO's caps here; `Xx` writes WELCOME before HELLO exists, so it keeps the
+    // base credit (the safe reading: nothing is granted on a capability not yet seen).
+    let credit = relay.session_credit(
+        relay_handshake
+            .hello()
+            .map_or(&[][..], |hello| hello.caps.as_slice()),
+    );
+    let welcome = build_welcome(relay, session_id, proven_rosters, &answered, credit);
     let (step, _node_static_ik, message2) = relay_handshake.write_welcome(&welcome)?;
     conn.send(message2).await?;
 
@@ -342,7 +362,7 @@ async fn run_handshake_and_validate(
     };
 
     match checked {
-        Ok((node_id, pre_attach)) => Ok((conn, transport, node_id, hello, pre_attach)),
+        Ok((node_id, pre_attach)) => Ok((conn, transport, node_id, hello, pre_attach, credit)),
         Err(rejection) => {
             // A node refused for its standing (revoked, or `min_serial` above its serial) is
             // first sent the Roster of the network concerned, as `send_eviction` does, so that it
@@ -486,6 +506,7 @@ async fn dispatch(
     claimed_networks: &[NetworkId],
     hello_timestamp: Tai64N,
     endpoint_credit: &EndpointCredit,
+    limits: &Limits,
     incoming: Result<Vec<u8>, RelayError>,
 ) -> Dispatch {
     let bytes = match incoming {
@@ -732,7 +753,7 @@ async fn dispatch(
                     &relay.rosters,
                     &relay.registry,
                     &relay.labels,
-                    &relay.limits,
+                    limits,
                     node_id,
                     session_id,
                     claimed_networks,
@@ -940,7 +961,13 @@ async fn run_attached_loop(
     their_roster_seq: HashMap<NetworkId, u64>,
     pre_attach: PreAttach,
     ip_slot: IpSlot,
+    credit: u32,
 ) {
+    // The relay's limits with this session's credit, as WELCOME announced it.
+    let limits = Limits {
+        credit,
+        ..relay.limits
+    };
     // Listening before judging, so a Roster adopted between the two is heard; HELLO was judged
     // against whatever was held then.
     let mut watch = StandingWatch::new(relay);
@@ -965,7 +992,7 @@ async fn run_attached_loop(
     // What this session may still send: ADVERTISE and DOC allowances (`crate::rate`).
     let mut budget = SessionBudget::new(&relay.rates, claimed_networks.len());
     // What this session may send to the relay's own NodeId (`crate::endpoint`).
-    let endpoint_credit = EndpointCredit::new(&relay.limits);
+    let endpoint_credit = EndpointCredit::new(&limits);
 
     // Phase 1: not yet routable, waiting for ATTACH as the node's first
     // transport record. Liveness and REKEY are already driven here too,
@@ -991,7 +1018,7 @@ async fn run_attached_loop(
             incoming = conn.recv() => {
                 let outcome = dispatch(
                     &mut conn, &mut transport, &mut liveness, &mut doc_reassembler, &mut pending_bases, &mut budget, relay,
-                    &node_id, session_id, &claimed_networks, hello_timestamp, &endpoint_credit, incoming,
+                    &node_id, session_id, &claimed_networks, hello_timestamp, &endpoint_credit, &limits, incoming,
                 ).await;
                 match outcome {
                     Dispatch::Attach => break,
@@ -1109,7 +1136,7 @@ async fn run_attached_loop(
             incoming = conn.recv() => {
                 let outcome = dispatch(
                     &mut conn, &mut transport, &mut liveness, &mut doc_reassembler, &mut pending_bases, &mut budget, relay,
-                    &node_id, session_id, &claimed_networks, hello_timestamp, &endpoint_credit, incoming,
+                    &node_id, session_id, &claimed_networks, hello_timestamp, &endpoint_credit, &limits, incoming,
                 ).await;
                 match outcome {
                     Dispatch::Attach | Dispatch::Continue => {}
@@ -1280,7 +1307,7 @@ pub(crate) async fn handle_connection(
         }
     };
     match handshake {
-        Ok((conn, transport, node_id, hello, pre_attach)) => {
+        Ok((conn, transport, node_id, hello, pre_attach, credit)) => {
             // The NodeCert was verified by `check_hello`; this reads the serial it judged.
             let Ok(cert) = hello.node_cert.decode() else {
                 tracing::warn!(
@@ -1313,6 +1340,7 @@ pub(crate) async fn handle_connection(
                 hello.roster_seq,
                 pre_attach,
                 ip_slot,
+                credit,
             )
             .await;
         }

@@ -15,9 +15,9 @@ use std::net::SocketAddr;
 use ed25519_dalek::SigningKey;
 use futures_util::{SinkExt, StreamExt};
 use menzil_proto::{
-    AdvertiseBody, DocReassembler, DocType, ErrorCode, HelloBody, Label, Limits, NetworkId,
-    NodeCert, NodeCertBody, NodeId, PROTOCOL_VERSION, Record, Roster, RosterBody, RosterMember,
-    Share, ShareMode, Tai64N, WelcomeBody, X25519PublicKey,
+    AdvertiseBody, Capability, DocReassembler, DocType, ErrorCode, HelloBody, Label, Limits,
+    NetworkId, NodeCert, NodeCertBody, NodeId, PROTOCOL_VERSION, Record, Roster, RosterBody,
+    RosterMember, Share, ShareMode, Tai64N, WelcomeBody, X25519PublicKey,
 };
 use menzil_session::{HandshakePattern, NodeHandshake, Transport, prologue};
 use rustls::pki_types::CertificateDer;
@@ -166,6 +166,33 @@ impl TestClient {
         serial: u32,
         timestamp_byte: u8,
     ) -> (Self, WelcomeBody) {
+        Self::connect_with_caps(
+            addr,
+            cert,
+            client_identity,
+            relay_x25519,
+            networks,
+            roster_seq,
+            serial,
+            timestamp_byte,
+            vec![],
+        )
+        .await
+    }
+
+    /// [`Self::connect`] with the capabilities the HELLO offers.
+    #[allow(clippy::too_many_arguments)]
+    async fn connect_with_caps(
+        addr: SocketAddr,
+        cert: CertificateDer<'static>,
+        client_identity: &TestIdentity,
+        relay_x25519: X25519PublicKey,
+        networks: Vec<NetworkId>,
+        roster_seq: HashMap<NetworkId, u64>,
+        serial: u32,
+        timestamp_byte: u8,
+        caps: Vec<Capability>,
+    ) -> (Self, WelcomeBody) {
         let mut ws = test_client(addr, cert, "/_menzil/v1").await;
         let pattern = HandshakePattern::Ik;
         let prologue_bytes = prologue("menzil.v1", "menzil.v1", pattern);
@@ -177,7 +204,7 @@ impl TestClient {
             networks,
             timestamp: Tai64N::from(timestamp),
             roster_seq,
-            caps: vec![],
+            caps,
             e2e_protos: vec![0x01],
         };
         let (node_handshake, message1) = NodeHandshake::start(
@@ -1272,6 +1299,19 @@ async fn two_attached_members(
     cert: CertificateDer<'static>,
     relay_x25519: X25519PublicKey,
 ) -> (TestClient, NodeId, TestClient, NodeId) {
+    two_attached_members_with_caps(relay, addr, cert, relay_x25519, vec![], vec![]).await
+}
+
+/// [`two_attached_members`] with the capabilities each HELLO offers; returns A's WELCOME
+/// credit as announced too.
+async fn two_attached_members_with_caps(
+    relay: &Relay,
+    addr: SocketAddr,
+    cert: CertificateDer<'static>,
+    relay_x25519: X25519PublicKey,
+    caps_a: Vec<Capability>,
+    caps_b: Vec<Capability>,
+) -> (TestClient, NodeId, TestClient, NodeId) {
     let owner = SigningKey::generate(&mut rand::rng());
     let network_id = NetworkId::from(owner.verifying_key().to_bytes());
     let identity_a = generate_identity();
@@ -1301,7 +1341,7 @@ async fn two_attached_members(
         .set(&Roster::sign(&owner, &roster).unwrap())
         .unwrap();
 
-    let (mut client_a, _) = TestClient::connect(
+    let (mut client_a, _) = TestClient::connect_with_caps(
         addr,
         cert.clone(),
         &identity_a,
@@ -1310,12 +1350,13 @@ async fn two_attached_members(
         HashMap::new(),
         1,
         10,
+        caps_a,
     )
     .await;
     client_a.send(Record::Attach).await;
     let _ = client_a.recv_roster_doc().await;
 
-    let (mut client_b, _) = TestClient::connect(
+    let (mut client_b, _) = TestClient::connect_with_caps(
         addr,
         cert,
         &identity_b,
@@ -1324,6 +1365,7 @@ async fn two_attached_members(
         HashMap::new(),
         1,
         10,
+        caps_b,
     )
     .await;
     client_b.send(Record::Attach).await;
@@ -1382,6 +1424,124 @@ async fn a_send_between_attached_common_members_is_forwarded_and_credited() {
         relay.forwarding.remaining_credit(&node_a, &node_b),
         Some(test_limits().credit),
         "the relay's own ledger, not just the CREDIT record sent, must reflect the grant"
+    );
+}
+
+const MIB: u32 = 1024 * 1024;
+
+#[tokio::test]
+async fn welcome_credit_is_3_mib_with_adaptive_window_and_1_mib_without() {
+    let (relay, listener, cert, relay_x25519) = bind_test_relay().await;
+    let addr = listener.local_addr().unwrap();
+    let serve_relay = relay.clone();
+    tokio::spawn(async move { serve_relay.serve(&listener).await });
+    let owner = SigningKey::generate(&mut rand::rng());
+    let network_id = NetworkId::from(owner.verifying_key().to_bytes());
+    let identity_new = generate_identity();
+    let identity_old = generate_identity();
+    let identity_odd = generate_identity();
+    let roster = RosterBody {
+        v: PROTOCOL_VERSION,
+        network_id,
+        seq: 1,
+        issued: 0,
+        expires: 4_000_000_000,
+        members: vec![
+            RosterMember {
+                node_id: identity_new.node_id,
+                min_serial: 1,
+            },
+            RosterMember {
+                node_id: identity_old.node_id,
+                min_serial: 1,
+            },
+            RosterMember {
+                node_id: identity_odd.node_id,
+                min_serial: 1,
+            },
+        ],
+        revoked: vec![],
+        stewards: vec![],
+        labels: vec![],
+    };
+    relay
+        .rosters()
+        .set(&Roster::sign(&owner, &roster).unwrap())
+        .unwrap();
+
+    let (_c1, welcome) = TestClient::connect_with_caps(
+        addr,
+        cert.clone(),
+        &identity_new,
+        relay_x25519,
+        vec![network_id],
+        HashMap::new(),
+        1,
+        10,
+        vec![Capability::Dgram, Capability::AdaptiveWindow],
+    )
+    .await;
+    assert_eq!(welcome.limits.credit, 3 * MIB);
+
+    // An old node: no capability, the configured 1 MiB, unchanged.
+    let (_c2, welcome) = TestClient::connect(
+        addr,
+        cert.clone(),
+        &identity_old,
+        relay_x25519,
+        vec![network_id],
+        HashMap::new(),
+        1,
+        10,
+    )
+    .await;
+    assert_eq!(welcome.limits.credit, MIB);
+
+    // An unknown capability string does not earn it either.
+    let (_c3, welcome) = TestClient::connect_with_caps(
+        addr,
+        cert,
+        &identity_odd,
+        relay_x25519,
+        vec![network_id],
+        HashMap::new(),
+        1,
+        11,
+        vec![Capability::Unknown("adaptive-window2".to_string())],
+    )
+    .await;
+    assert_eq!(welcome.limits.credit, MIB);
+}
+
+#[tokio::test]
+async fn the_credit_of_a_session_with_adaptive_window_is_what_the_relay_enforces() {
+    let (relay, listener, cert, relay_x25519) = bind_test_relay().await;
+    let addr = listener.local_addr().unwrap();
+    let serve_relay = relay.clone();
+    tokio::spawn(async move { serve_relay.serve(&listener).await });
+    // A is new, B is old: A's pair toward B starts at 3 MiB; B's toward A at 1 MiB.
+    let (mut client_a, node_a, mut client_b, node_b) = two_attached_members_with_caps(
+        &relay,
+        addr,
+        cert,
+        relay_x25519,
+        vec![Capability::AdaptiveWindow],
+        vec![],
+    )
+    .await;
+    client_a.send(send_record(node_b, vec![1u8; 100])).await;
+    assert!(matches!(client_b.recv().await, Some(Record::Recv { .. })));
+    assert!(matches!(client_a.recv().await, Some(Record::Credit(_))));
+    assert_eq!(
+        relay.forwarding.remaining_credit(&node_a, &node_b),
+        Some(3 * MIB)
+    );
+    client_b.send(send_record(node_a, vec![1u8; 100])).await;
+    assert!(matches!(client_a.recv().await, Some(Record::Recv { .. })));
+    assert!(matches!(client_b.recv().await, Some(Record::Credit(_))));
+    assert_eq!(
+        relay.forwarding.remaining_credit(&node_b, &node_a),
+        Some(MIB)
     );
 }
 

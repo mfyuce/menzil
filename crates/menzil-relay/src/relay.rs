@@ -162,7 +162,30 @@ pub struct AttachedNode {
     pub relay_key: StaticUsed,
 }
 
+/// Initial credit granted to a session whose HELLO offered `adaptive-window` (protocol.md 4.2).
+pub const ADAPTIVE_CREDIT_BYTES: u32 = 3 * 1024 * 1024;
+
+/// Room kept in a pair's queue for droppable frames when the reliable credit is fully used.
+const DROPPABLE_ROOM_BYTES: usize = 1024 * 1024;
+
+/// The initial credit for a session that offered `caps`, given the configured `base`: `base`,
+/// or [`ADAPTIVE_CREDIT_BYTES`] with `adaptive-window`, clamped so that at least
+/// [`DROPPABLE_ROOM_BYTES`] of the pair queue stay free of reliable bytes. Never below `base`
+/// (an operator's own figure is not lowered here; `Relay::new` already clamped it to the queue).
+pub(crate) fn credit_for(base: u32, caps: &[menzil_proto::Capability]) -> u32 {
+    if !caps.contains(&menzil_proto::Capability::AdaptiveWindow) {
+        return base;
+    }
+    let ceiling = crate::forward::MAX_QUEUE_BYTES.saturating_sub(DROPPABLE_ROOM_BYTES) as u32;
+    ADAPTIVE_CREDIT_BYTES.min(ceiling).max(base)
+}
+
 impl Relay {
+    /// The initial credit for a session that offered `caps` ([`credit_for`]).
+    pub(crate) fn session_credit(&self, caps: &[menzil_proto::Capability]) -> u32 {
+        credit_for(self.limits.credit, caps)
+    }
+
     /// A relay with `identity` and `limits`, serving no networks yet:
     /// seed Rosters through [`Relay::rosters`] before or while calling
     /// [`Relay::serve`]. protocol.md 10 gives no stated default for
@@ -748,5 +771,42 @@ mod tests {
         assert_eq!(outputs.len(), 20_000);
         // Another key gives another mapping.
         assert!((0..16u32).any(|n| a.permute(n) != b.permute(n)));
+    }
+}
+
+#[cfg(test)]
+mod credit_tests {
+    use menzil_proto::Capability;
+
+    use super::{ADAPTIVE_CREDIT_BYTES, credit_for};
+    use crate::forward::MAX_QUEUE_BYTES;
+
+    const MIB: u32 = 1 << 20;
+
+    #[test]
+    fn only_adaptive_window_raises_the_credit() {
+        assert_eq!(credit_for(MIB, &[]), MIB);
+        assert_eq!(credit_for(MIB, &[Capability::Dgram, Capability::Docs]), MIB);
+        assert_eq!(
+            credit_for(MIB, &[Capability::Unknown("adaptive-window2".into())]),
+            MIB
+        );
+        assert_eq!(
+            credit_for(MIB, &[Capability::Dgram, Capability::AdaptiveWindow]),
+            ADAPTIVE_CREDIT_BYTES
+        );
+        assert_eq!(ADAPTIVE_CREDIT_BYTES, 3 * MIB);
+    }
+
+    #[test]
+    fn the_adaptive_credit_leaves_one_mib_of_the_queue_for_datagrams() {
+        const { assert!(MAX_QUEUE_BYTES - ADAPTIVE_CREDIT_BYTES as usize >= 1 << 20) };
+        // An operator's own figure is never lowered by this rule.
+        assert_eq!(
+            credit_for(2 * MIB, &[Capability::AdaptiveWindow]),
+            ADAPTIVE_CREDIT_BYTES
+        );
+        assert_eq!(credit_for(4 * MIB, &[Capability::AdaptiveWindow]), 4 * MIB);
+        assert_eq!(credit_for(4 * MIB, &[]), 4 * MIB);
     }
 }

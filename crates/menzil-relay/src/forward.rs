@@ -69,7 +69,9 @@
 //! ledger alone (never refused purely for shared occupancy, matching
 //! protocol.md naming droppable, not reliable, as the class that yields)
 //! — so droppable admission reserves `PairState::initial_credit` worth of
-//! headroom for reliable's worst case up front, rather than comparing
+//! headroom for reliable's worst case up front (the pair's droppable bytes alone are held to
+//! `MAX_QUEUE_BYTES - initial_credit`, so a datagram is still admitted when the reliable
+//! credit is fully used, and the two classes together never pass the cap), rather than comparing
 //! against the raw [`MAX_QUEUE_BYTES`] (a fifth finding, L1: comparing
 //! against the raw cap let droppable fill nearly all of it and reliable
 //! then add its own full credit on top, overshooting the documented bound
@@ -1087,7 +1089,7 @@ impl ForwardTable {
             let tenant_held = per_tenant
                 .get(&shared.tenant)
                 .map_or(0, |held| held.droppable_bytes);
-            if pair.queued_bytes + charge as usize > droppable_ceiling
+            if pair.droppable_bytes + charge as usize > droppable_ceiling
                 || tenant_cap.is_some_and(|cap| tenant_held + charge as usize > cap)
                 || !pair.dgram_bucket.try_take(charge as usize, now)
             {
@@ -1256,7 +1258,7 @@ impl ForwardTable {
             }
         } else {
             let droppable_ceiling = MAX_QUEUE_BYTES.saturating_sub(pair.initial_credit as usize);
-            if pair.queued_bytes + charge as usize > droppable_ceiling
+            if pair.droppable_bytes + charge as usize > droppable_ceiling
                 || !pair.dgram_bucket.try_take(charge as usize, now)
             {
                 return Err(RelaySendOutcome::Dropped);
@@ -2556,6 +2558,41 @@ mod tests {
             table.remaining_credit(&f.src, &f.dst).unwrap(),
             test_limits().credit
         );
+    }
+
+    #[test]
+    fn a_datagram_is_still_admitted_when_an_adaptive_sessions_reliable_credit_is_fully_used() {
+        let f = fixture(4_000_000_000);
+        let table = ForwardTable::new();
+        let credit = crate::relay::credit_for(1 << 20, &[menzil_proto::Capability::AdaptiveWindow]);
+        assert_eq!(credit, 3 << 20);
+        let limits = Limits {
+            max_record: 65_535,
+            max_peers: 10,
+            credit,
+        };
+        let send = |(e2e, flags, payload)| {
+            table.forward(
+                &f.rosters,
+                &f.registry,
+                &f.labels,
+                &limits,
+                &f.src,
+                &[f.network_id],
+                &f.dst,
+                e2e,
+                flags,
+                payload,
+                1_000,
+            )
+        };
+        assert!(matches!(
+            send(reliable_send(credit as usize)),
+            ForwardOutcome::Queued
+        ));
+        assert_eq!(table.remaining_credit(&f.src, &f.dst), Some(0));
+        // The queue keeps 1 MiB for droppable frames: a datagram still gets in.
+        assert!(matches!(send(droppable_send(1)), ForwardOutcome::Queued));
     }
 
     #[test]
