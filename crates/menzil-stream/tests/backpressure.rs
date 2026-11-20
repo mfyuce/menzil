@@ -114,12 +114,17 @@ async fn a_consumer_that_stops_draining_pauses_the_driver_instead_of_ending_it()
 
     // Now something drains: every held-back writer must make progress and
     // finish, with no frame lost along the way.
-    let drain = tokio::spawn(async move {
-        let mut frames = 0usize;
-        while let Some(_frame) = outbound.next_frame().await {
-            frames += 1;
+    let seen = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let drain = tokio::spawn({
+        let seen = std::sync::Arc::clone(&seen);
+        async move {
+            let mut bytes = 0usize;
+            while let Some(frame) = outbound.next_frame().await {
+                bytes += frame.len();
+                seen.store(bytes, std::sync::atomic::Ordering::Relaxed);
+            }
+            bytes
         }
-        frames
     });
     for writer in writers {
         tokio::time::timeout(Duration::from_secs(10), writer)
@@ -129,14 +134,27 @@ async fn a_consumer_that_stops_draining_pauses_the_driver_instead_of_ending_it()
             .expect("a resumed write must succeed");
     }
     assert!(!driver.is_finished());
+    // The writers are done once their bytes are in `yamux`; the last frames may still be on their
+    // way through the (shallow) outbound channel, so wait for them before ending the connection.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while seen.load(std::sync::atomic::Ordering::Relaxed) < STREAMS * INITIAL_WINDOW
+        && std::time::Instant::now() < deadline
+    {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
 
     drop(mux);
-    let frames = tokio::time::timeout(Duration::from_secs(5), drain)
+    let bytes = tokio::time::timeout(Duration::from_secs(5), drain)
         .await
         .expect("the drain task must end once the connection does")
         .unwrap();
-    // 40 streams x 16 full frames each, at the least.
-    assert!(frames >= STREAMS * 16, "only {frames} frames were produced");
+    // Every byte of 40 streams' windows, at the least: counted in bytes, not frames, because how
+    // many frames carry them depends on how many wait in the outbound channel (a shallow channel
+    // lets `yamux` pack a stream's data into fewer, larger frames).
+    assert!(
+        bytes >= STREAMS * INITIAL_WINDOW,
+        "only {bytes} bytes were produced"
+    );
 }
 
 fn ping(nonce: u32) -> Vec<u8> {

@@ -128,19 +128,16 @@ use crate::frame_format::{FrameFormatError, HEADER_LEN, declared_frame_len};
 /// before `yamux` is paused — see this module's own doc comment for why a
 /// full channel pauses rather than fails.
 ///
-/// Sized for latency, not for throughput (TODO.md L4h5). Backpressure
-/// makes any size safe, and a larger one buys nothing: at `yamux`'s
-/// default 16 KiB split size this is about 1 MiB of frames, one WELCOME
-/// credit window (protocol.md 4.1's default), which is already as much as
-/// the relay would let through per round trip — and every byte that waits
-/// here delays everything queued behind it, `yamux`'s output being FIFO
-/// across streams (a keystroke on one stream waits for the bulk data of
-/// another that got here first). It was 256 (about 4 MiB) while this
-/// limit was a hard failure and the number had to be big enough not to
-/// trip. A session configured with a smaller `max_record` (see
-/// [`crate::driver::config_for`]) packs more, smaller frames into the
-/// same count, so the memory bound only gets tighter.
-const OUTBOUND_FRAME_BUDGET: usize = 64;
+/// Sized for latency, not for throughput (TODO.md L4h5, then 2026-11-20). Backpressure makes any
+/// size safe, and a larger one buys nothing: the node's send budget and the relay's credit already
+/// hold the bytes a long path needs in flight, and every frame that waits here delays everything
+/// queued behind it, `yamux`'s output being FIFO across streams (a keystroke on one stream waits
+/// for the bulk data of another that got here first). It was 256 (about 4 MiB) while this limit
+/// was a hard failure, then 64 (about 1 MiB at `yamux`'s 16 KiB split size); 4 (about 64 KiB)
+/// leaves the ordering to `yamux`'s own round robin. A session configured with a smaller
+/// `max_record` (see [`crate::driver::config_for`]) packs more, smaller frames into the same
+/// count, so the memory bound only gets tighter.
+const OUTBOUND_FRAME_BUDGET: usize = 4;
 
 /// Something a caller wants kept alive exactly as long as one inbound
 /// record is still waiting to be read: dropped once `yamux` has read the
@@ -527,6 +524,18 @@ mod tests {
         let mut frame = header;
         frame.extend_from_slice(b"\xABcde");
         assert_eq!(outbound_rx.next().await.unwrap(), frame);
+    }
+
+    #[tokio::test]
+    async fn only_a_few_frames_wait_in_the_channel_so_yamuxs_round_robin_decides_the_order() {
+        // `yamux` serves its streams round robin, but this channel is a FIFO after it: every frame
+        // that waits here is one a small stream's frame cannot pass. 64 frames (about 1 MiB) made a
+        // keystroke wait behind another stream's bulk (lab 2026-11-20: warm small request under
+        // load 1.13 s at a 15 Mbit/s line against 0.85 s with 4); the node's own send budget and
+        // the relay's credit hold the rest.
+        let (mut io, _inbound_tx, _outbound_rx) = RecordIo::new();
+        let accepted = fill_until_pending(&mut io);
+        assert!(accepted <= 8, "{accepted} frames wait in the channel");
     }
 
     #[tokio::test]
