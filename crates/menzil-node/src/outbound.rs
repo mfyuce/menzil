@@ -47,11 +47,15 @@
 //! difference from the precedent, not an oversight.
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use menzil_proto::{MIN_SEND_CHARGE_BYTES, NodeId, Record, max_send_payload};
 use menzil_session::CreditLedger;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot};
+
+use crate::window::{WindowConfig, WindowController};
 
 /// One attachment to the relay (protocol.md 5.1's path pinning), counting
 /// from 1 and incrementing on every successful
@@ -291,7 +295,7 @@ pub enum EnqueueOutcome {
 /// throughput. Well under the queue's own per-destination cap
 /// ([`MAX_QUEUED_BYTES_PER_DST`]), so that what is left over covers every
 /// send that does not reserve space first.
-pub(crate) const L4_SEND_BUDGET_PER_DST: usize = 1024 * 1024;
+pub(crate) const L4_SEND_BUDGET_PER_DST: usize = 128 * 1024;
 
 /// What L4 sessions may have queued across *all* destinations at once.
 /// Below [`MAX_QUEUED_BYTES`] for the same reason as
@@ -301,7 +305,44 @@ pub(crate) const L4_SEND_BUDGET_PER_DST: usize = 1024 * 1024;
 /// own 50 s liveness window) keeps its share, and a third peer's staged
 /// frames then time out after 35 s instead of being refused at once as
 /// the queue's own 3/4 + 1/4 split would have.
-pub(crate) const L4_SEND_BUDGET_TOTAL: usize = 2 * 1024 * 1024;
+pub(crate) const L4_SEND_BUDGET_TOTAL: usize = 512 * 1024;
+
+/// The window floor: two maximum records, so a record always fits.
+const WINDOW_FLOOR: usize = 128 * 1024;
+/// The window ceiling: never above the relay's credit, and never above this.
+const WINDOW_CEILING: usize = 4 * 1024 * 1024;
+/// The window of a new pair: the old fixed behaviour, so nothing starts slower than before.
+const WINDOW_START: usize = 1024 * 1024;
+/// The standing queue the window aims for (throughput design note, question 1).
+const WINDOW_TARGET_DELAY: Duration = Duration::from_millis(100);
+
+/// `[transport] fixed_window_kib` of config.toml, in bytes (0: adaptive). Process wide because one
+/// node runs per process and the setting is read once at start.
+static FIXED_WINDOW: AtomicUsize = AtomicUsize::new(0);
+
+/// Fixes the in-flight window of every destination at `bytes` (`None`: adaptive again). An escape
+/// hatch for debugging the controller, off by default.
+pub fn set_fixed_window(bytes: Option<usize>) {
+    FIXED_WINDOW.store(bytes.unwrap_or(0), Ordering::Relaxed);
+}
+
+fn window_config(initial_credit: u32, fixed: Option<usize>) -> WindowConfig {
+    if let Some(bytes) = fixed {
+        return WindowConfig {
+            floor: bytes,
+            ceiling: bytes,
+            start: bytes,
+            target_delay: WINDOW_TARGET_DELAY,
+        };
+    }
+    let ceiling = (initial_credit as usize).clamp(WINDOW_FLOOR, WINDOW_CEILING);
+    WindowConfig {
+        floor: WINDOW_FLOOR,
+        ceiling,
+        start: WINDOW_START.min(ceiling),
+        target_delay: WINDOW_TARGET_DELAY,
+    }
+}
 
 const _: () = {
     assert!(L4_SEND_BUDGET_PER_DST < MAX_QUEUED_BYTES_PER_DST);
@@ -461,6 +502,12 @@ pub struct OutboundQueue {
     /// [`EnqueueOutcome::TooLarge`]).
     max_payload: usize,
     credit: HashMap<NodeId, CreditLedger>,
+    /// The in-flight window of each destination with a ledger (see [`crate::window`]): a reliable
+    /// record is ready only while the credit covers it and the bytes sent and not yet credited
+    /// back, plus this one, fit the window (or nothing is in flight).
+    windows: HashMap<NodeId, WindowController>,
+    /// The fixed window, when configured.
+    fixed_window: Option<usize>,
     queue: VecDeque<QueuedSend>,
     queued_bytes: usize,
     /// Each destination's own share of `queued_bytes`, capped
@@ -483,10 +530,18 @@ impl OutboundQueue {
     /// used to compute [`Self::max_payload`] once, up front, rather than
     /// on every [`Self::enqueue`] call.
     pub fn new(initial_credit: u32, max_record: u32) -> Self {
+        let fixed = FIXED_WINDOW.load(Ordering::Relaxed);
+        Self::with_window(initial_credit, max_record, (fixed > 0).then_some(fixed))
+    }
+
+    /// [`Self::new`] with the window fixed at `fixed` bytes instead of adaptive.
+    pub fn with_window(initial_credit: u32, max_record: u32, fixed: Option<usize>) -> Self {
         Self {
             initial_credit,
             max_payload: max_send_payload(max_record),
             credit: HashMap::new(),
+            windows: HashMap::new(),
+            fixed_window: fixed,
             queue: VecDeque::new(),
             queued_bytes: 0,
             queued_bytes_per_dst: HashMap::new(),
@@ -510,8 +565,16 @@ impl OutboundQueue {
     /// permanently short the first time a stale CREDIT happened to
     /// arrive before this queue's own first send to it).
     pub fn note_credit(&mut self, peer: NodeId, bytes: u32) {
+        self.note_credit_at(peer, bytes, Instant::now());
+    }
+
+    /// [`Self::note_credit`] at a given time (the ack clock of the window controller).
+    pub fn note_credit_at(&mut self, peer: NodeId, bytes: u32, now: Instant) {
         if let Some(ledger) = self.credit.get_mut(&peer) {
             ledger.grant(bytes);
+            if let Some(window) = self.windows.get_mut(&peer) {
+                window.on_credit(now, bytes);
+            }
         }
     }
 
@@ -560,6 +623,10 @@ impl OutboundQueue {
             self.credit
                 .entry(send.dst)
                 .or_insert_with(|| CreditLedger::new(initial));
+            let fixed = self.fixed_window;
+            self.windows.entry(send.dst).or_insert_with(|| {
+                WindowController::new(window_config(initial, fixed), Instant::now())
+            });
         }
 
         let charge = send.charge() as usize;
@@ -610,6 +677,10 @@ impl OutboundQueue {
         self.credit
             .get(&send.dst)
             .is_some_and(|ledger| ledger.remaining() >= send.charge())
+            && self.windows.get(&send.dst).is_none_or(|window| {
+                window.in_flight() == 0
+                    || window.in_flight() + u64::from(send.charge()) <= window.window() as u64
+            })
     }
 
     /// Whether anything is queued at all, ready or still waiting for credit.
@@ -663,6 +734,11 @@ impl OutboundQueue {
     /// loss protocol.md 4.2 already accepts for a session that just
     /// ends.
     pub fn next_ready_to_send(&mut self) -> Option<Record> {
+        self.next_ready_to_send_at(Instant::now())
+    }
+
+    /// [`Self::next_ready_to_send`] at a given time (the send clock of the window controller).
+    pub fn next_ready_to_send_at(&mut self, now: Instant) -> Option<Record> {
         let index = self.ready_index()?;
         let send = self
             .queue
@@ -688,6 +764,15 @@ impl OutboundQueue {
             ledger
                 .consume(send.charge())
                 .expect("is_sendable already confirmed enough credit for this exact charge");
+            // Something else for this destination waits behind this record: the window (or the
+            // credit) is what holds the sender back.
+            let waiting = self
+                .queue
+                .iter()
+                .any(|other| other.dst == send.dst && other.is_reliable());
+            if let Some(window) = self.windows.get_mut(&send.dst) {
+                window.on_sent(now, send.charge(), waiting);
+            }
         }
         Some(Record::Send {
             dst: send.dst,
@@ -726,6 +811,80 @@ mod tests {
     /// [`EnqueueOutcome::TooLarge`].
     fn q(initial_credit: u32) -> OutboundQueue {
         OutboundQueue::new(initial_credit, u32::MAX)
+    }
+
+    /// How many reliable sends of `payload` bytes to `dst` leave before the queue says none is
+    /// ready (nothing is credited back meanwhile).
+    fn sends_until_blocked(q: &mut OutboundQueue, dst: NodeId, payload: usize) -> (usize, usize) {
+        let mut queued = 0;
+        while q.enqueue(dst, 0x01, RELIABLE, vec![0; payload]) == EnqueueOutcome::Accepted {
+            queued += 1;
+            if queued == 30 {
+                break;
+            }
+        }
+        let mut left = 0;
+        while q.next_ready_to_send().is_some() {
+            left += 1;
+        }
+        (queued, left)
+    }
+
+    #[test]
+    fn sends_stop_when_the_window_is_full_even_though_the_credit_would_allow_more() {
+        // Credit 4 MiB, but the window starts at 1 MiB (the throughput design note, slice 3): a
+        // standing queue longer than the path needs is what made small records wait seconds.
+        let mut q = OutboundQueue::with_window(4 * 1024 * 1024, 65_535, Some(1 << 20));
+        let (queued, left) = sends_until_blocked(&mut q, peer(1), 60_000);
+        assert_eq!(queued, 30);
+        let in_flight = left * 60_000;
+        assert!(
+            (1024 * 1024 - 60_000..=1024 * 1024 + 60_000).contains(&in_flight),
+            "{left} sends of 60000 left before the window closed"
+        );
+    }
+
+    #[test]
+    fn credit_coming_back_reopens_the_window() {
+        let mut q = OutboundQueue::with_window(4 * 1024 * 1024, 65_535, Some(1 << 20));
+        let (_, left) = sends_until_blocked(&mut q, peer(1), 60_000);
+        assert!(left > 0 && !q.has_ready_to_send());
+        q.note_credit(peer(1), 60_000);
+        assert!(
+            q.has_ready_to_send(),
+            "a credited record must make room for the next"
+        );
+        assert!(q.next_ready_to_send().is_some());
+        assert!(!q.has_ready_to_send());
+    }
+
+    #[test]
+    fn a_record_larger_than_the_window_still_goes_out_when_nothing_is_in_flight() {
+        let mut q = OutboundQueue::with_window(1 << 20, 65_535, Some(1024));
+        q.enqueue(peer(1), 0x01, RELIABLE, vec![0; 20_000]);
+        q.enqueue(peer(1), 0x01, RELIABLE, vec![1; 20_000]);
+        assert!(
+            q.next_ready_to_send().is_some(),
+            "progress with an empty pipe"
+        );
+        assert!(
+            !q.has_ready_to_send(),
+            "the second waits for the first's credit"
+        );
+    }
+
+    #[test]
+    fn a_window_is_kept_per_destination() {
+        let mut q = OutboundQueue::with_window(1 << 20, 65_535, Some(1024));
+        q.enqueue(peer(1), 0x01, RELIABLE, vec![0; 20_000]);
+        q.enqueue(peer(1), 0x01, RELIABLE, vec![0; 20_000]);
+        q.enqueue(peer(2), 0x01, RELIABLE, vec![0; 20_000]);
+        assert!(q.next_ready_to_send().is_some());
+        let second = q
+            .next_ready_to_send()
+            .expect("the other destination's window is empty");
+        assert_eq!(unwrap_send(second).0, peer(2));
+        assert!(!q.has_ready_to_send());
     }
 
     #[test]
@@ -1029,7 +1188,8 @@ mod tests {
 
     #[test]
     fn unreserved_occupancy_is_released_when_sends_leave_and_never_underflows() {
-        let mut q = q(u32::MAX);
+        // A window far larger than the queue: this is about occupancy, not the in-flight window.
+        let mut q = OutboundQueue::with_window(u32::MAX, u32::MAX, Some(1 << 40));
         let (used, _) = fill_permitless(&mut q, peer(1), RELIABLE);
         assert_eq!(q.unreserved_bytes, used);
         assert_eq!(q.unreserved_per_dst[&peer(1)], used);
@@ -1182,8 +1342,8 @@ mod tests {
         let budget = SendBudgets::new().for_peer(peer(1));
         let mut q = q(0); // no credit: nothing ever leaves
         for _ in 0..4 {
-            let permit = budget.acquire(100_000).await;
-            q.enqueue_with_permit(peer(1), 0x01, RELIABLE, vec![0; 100_000], Some(permit));
+            let permit = budget.acquire(30_000).await;
+            q.enqueue_with_permit(peer(1), 0x01, RELIABLE, vec![0; 30_000], Some(permit));
         }
         assert!(!is_immediately_granted(&budget, L4_SEND_BUDGET_PER_DST).await);
         drop(q);
@@ -1227,22 +1387,23 @@ mod tests {
     #[tokio::test]
     async fn the_total_is_shared_across_peers() {
         let budgets = SendBudgets::new();
-        let p1 = budgets.for_peer(peer(1));
-        let p2 = budgets.for_peer(peer(2));
-        let p3 = budgets.for_peer(peer(3));
-        let a = p1.acquire(L4_SEND_BUDGET_PER_DST).await;
-        let _b = p2.acquire(L4_SEND_BUDGET_PER_DST).await;
         assert_eq!(
             L4_SEND_BUDGET_TOTAL,
-            2 * L4_SEND_BUDGET_PER_DST,
+            4 * L4_SEND_BUDGET_PER_DST,
             "this test's premise"
         );
+        let busy: Vec<_> = (1..=4).map(|i| budgets.for_peer(peer(i))).collect();
+        let mut held = Vec::new();
+        for p in &busy {
+            held.push(p.acquire(L4_SEND_BUDGET_PER_DST).await);
+        }
+        let fifth = budgets.for_peer(peer(5));
         assert!(
-            !is_immediately_granted(&p3, 1).await,
-            "two busy peers have used the whole total; a third waits"
+            !is_immediately_granted(&fifth, 1).await,
+            "four busy peers have used the whole total; a fifth waits"
         );
-        drop(a);
-        assert!(is_immediately_granted(&p3, 1).await);
+        held.pop();
+        assert!(is_immediately_granted(&fifth, 1).await);
     }
 
     #[tokio::test]
@@ -1262,18 +1423,17 @@ mod tests {
         // The destination share is taken before the total one; a waiter
         // that gives up between the two must not leave the first held.
         let budgets = SendBudgets::new();
-        let (p1, p2, p3) = (
-            budgets.for_peer(peer(1)),
-            budgets.for_peer(peer(2)),
-            budgets.for_peer(peer(3)),
-        );
-        let _a = p1.acquire(L4_SEND_BUDGET_PER_DST).await;
-        let _b = p2.acquire(L4_SEND_BUDGET_PER_DST).await; // total now exhausted
+        let busy: Vec<_> = (1..=4).map(|i| budgets.for_peer(peer(i))).collect();
+        let p3 = budgets.for_peer(peer(5));
+        let mut held = Vec::new();
+        for p in &busy {
+            held.push(p.acquire(L4_SEND_BUDGET_PER_DST).await); // total now exhausted
+        }
         assert!(
             timeout(Duration::from_millis(50), p3.acquire(4096))
                 .await
                 .is_err(),
-            "peer 3 gets its destination share, then waits on the total"
+            "a fifth peer gets its destination share, then waits on the total"
         );
         assert_eq!(
             p3.dst.available_permits(),

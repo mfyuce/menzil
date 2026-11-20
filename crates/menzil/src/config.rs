@@ -31,6 +31,11 @@
 //! # [limits]
 //! # inbound_ceiling_mib = 1024    # 64 to 65536; absent is 1 GiB (TBD 75)
 //!
+//! # Optional: how the node sends over the relay. The in-flight window adapts to the path by
+//! # default; this fixes it (a debugging aid).
+//! # [transport]
+//! # fixed_window_kib = 1024       # 128 to 4096; absent is adaptive
+//!
 //! # Optional: append an audit line for every egress stream this node serves (JSON lines).
 //! # [audit]
 //! # file = "/var/lib/menzil/audit.jsonl"
@@ -123,6 +128,9 @@ pub struct Config {
     /// Node wide limits: `[limits]`.
     #[serde(default)]
     pub limits: LimitsSettings,
+    /// How the node sends over the relay: `[transport]`.
+    #[serde(default)]
+    pub transport: TransportSettings,
     /// The audit file: `[audit]` (docs/spec/audit-format.md). Off without it.
     #[serde(default)]
     pub audit: AuditSettings,
@@ -346,6 +354,35 @@ pub struct LimitsSettings {
     /// Unread inbound data of all L4 sessions together, in MiB (64 to 65536). Past it the
     /// session holding the most gives way (protocol.md 5.2, TBD 75). Absent: 1 GiB.
     pub inbound_ceiling_mib: Option<u64>,
+}
+
+/// The `[transport]` table: how the node sends over the relay.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct TransportSettings {
+    /// Fixes the in-flight window per destination at this many KiB (128 to 4096) instead of
+    /// letting it adapt to the path (docs/private/adaptive-inflight-design.md). A debugging aid.
+    pub fixed_window_kib: Option<u64>,
+}
+
+/// The smallest and largest `[transport] fixed_window_kib`.
+pub const MIN_FIXED_WINDOW_KIB: u64 = 128;
+/// See [`MIN_FIXED_WINDOW_KIB`].
+pub const MAX_FIXED_WINDOW_KIB: u64 = 4096;
+
+impl TransportSettings {
+    /// The fixed window in bytes, `None` for the adaptive one; a figure outside the range is refused.
+    pub fn fixed_window(&self) -> Result<Option<usize>> {
+        let Some(kib) = self.fixed_window_kib else {
+            return Ok(None);
+        };
+        if !(MIN_FIXED_WINDOW_KIB..=MAX_FIXED_WINDOW_KIB).contains(&kib) {
+            bail!(
+                "fixed_window_kib in [transport] of config.toml is {kib}: it must be from {MIN_FIXED_WINDOW_KIB} to {MAX_FIXED_WINDOW_KIB} (leave the key out for the adaptive window)"
+            );
+        }
+        Ok(Some((kib << 10) as usize))
+    }
 }
 
 /// The `[audit]` table: a file this node appends JSON lines to (format:
@@ -695,6 +732,11 @@ impl Config {
         self.limits.inbound_ceiling()
     }
 
+    /// The fixed in-flight window `[transport]` asks for, in bytes, validated; `None` is adaptive.
+    pub fn fixed_window(&self) -> Result<Option<usize>> {
+        self.transport.fixed_window()
+    }
+
     /// The relay's share domain in lowercase, if one is configured: a host name of at least two
     /// labels (letters, digits and hyphens, no trailing dot, at most 253 characters). A value
     /// that is not one is an error here, since it would be printed as part of a URL.
@@ -782,6 +824,31 @@ mod tests {
         );
         assert!(on.audit.include_ips);
         assert!(Config::parse(&text("[audit]\nfle = \"x\"")).is_err());
+    }
+
+    /// `[transport] fixed_window_kib` (throughput design note, slice 3): absent is the adaptive
+    /// window; a figure fixes the in-flight window per destination; outside the range is refused.
+    #[test]
+    fn the_fixed_window_key_is_validated_and_converted_to_bytes() {
+        let text = |body: &str| format!("{body}\n[services]\n\"tcp:ssh\" = \"127.0.0.1:22\"\n");
+        let window = |body: &str| Config::parse(&text(body)).unwrap().fixed_window();
+        assert_eq!(window("").unwrap(), None);
+        assert_eq!(window("[transport]").unwrap(), None);
+        assert_eq!(
+            window("[transport]\nfixed_window_kib = 128").unwrap(),
+            Some(128 << 10)
+        );
+        assert_eq!(
+            window("[transport]\nfixed_window_kib = 4096").unwrap(),
+            Some(4096 << 10)
+        );
+        for bad in [0u64, 127, 4097] {
+            let err = window(&format!("[transport]\nfixed_window_kib = {bad}"))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("from 128 to 4096"), "{err}");
+        }
+        assert!(Config::parse(&text("[transport]\nunknown_key = 1")).is_err());
     }
 
     /// `[limits] inbound_ceiling_mib` (TBD 75 addendum): absent is the default, the range edges

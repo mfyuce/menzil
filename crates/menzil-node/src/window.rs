@@ -19,8 +19,6 @@
 //!
 //! Wired into the node's send queue by slice 3; until then only the tests use it.
 
-#![allow(dead_code)]
-
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 

@@ -121,6 +121,7 @@ pub use l5_stream::{
 pub use node::{Node, NodeConfig, NodeOpenError, RefuseAll, StartError};
 pub use outbound::{
     EnqueueOutcome, Epoch, OutboundQueue, OutboundSend, SendBudget, SendBudgets, SendPermit,
+    set_fixed_window,
 };
 pub use policy_store::{PolicyStore, roster_standing};
 pub use relay_notes::{ATTACH_SETTLED, RelayError, RelayNotes, listed_in_own_roster};

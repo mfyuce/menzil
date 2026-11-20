@@ -1961,9 +1961,11 @@ mod tests {
         let budgets = crate::outbound::SendBudgets::new();
         let epoch = Epoch::first();
         let (mut waiting, mut bytes, mut receivers) = (Vec::new(), 0usize, Vec::new());
-        // 4 permitted sends (1 MiB) and 12 permit-less ones (3 MiB): exactly the 4 MiB total.
+        // 1 permitted send (256 KiB, its reservation clamped to the destination's 128 KiB budget) and 15
+        // permit-less ones (3.75 MiB, more than the 3.5 MiB the queue keeps for them): exactly the 4 MiB
+        // total.
         for i in 0..16u8 {
-            let permit = if i < 4 {
+            let permit = if i < 1 {
                 Some(budgets.for_peer(NodeId::from([i; 32])).acquire(CHUNK).await)
             } else {
                 None
@@ -1992,7 +1994,7 @@ mod tests {
         let mut refused = 0;
         for (i, mut rx) in receivers {
             let outcome = rx.try_recv().expect("every held send has an outcome");
-            if i < 4 {
+            if i < 1 {
                 assert_eq!(outcome, EnqueueOutcome::Accepted, "permitted send {i}");
             } else if outcome == EnqueueOutcome::QueueFull {
                 refused += 1;
@@ -2002,7 +2004,7 @@ mod tests {
         }
         assert!(
             refused > 0,
-            "3 MiB of permit-less sends do not all fit the 2 MiB share the queue keeps for them"
+            "3.75 MiB of permit-less sends do not all fit the 3.5 MiB share the queue keeps for them"
         );
     }
 

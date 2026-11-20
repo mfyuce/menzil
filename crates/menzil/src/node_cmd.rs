@@ -1265,6 +1265,7 @@ where
     let challenges = acme.as_ref().map(|_| ChallengeBook::new());
     let relay_limits = config.relay_limits()?;
     let inbound_ceiling = config.inbound_ceiling()?;
+    menzil_node::set_fixed_window(config.fixed_window()?);
     // A device that holds an owner or steward key registers with the relay as an issuer and
     // admits the devices that redeem its invites (a key made after the start needs a restart).
     let reload_wake = Arc::new(tokio::sync::Notify::new());
