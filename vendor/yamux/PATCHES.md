@@ -207,8 +207,7 @@ a connection, and 256 connections at most unless configured otherwise).
   cfg the quickcheck modules are skipped). The last time this was done (2026-10-13, with patch 4,
   before the cfg gate existed) all of it passed: the unit tests (14: 5 upstream, 9 for patch 1)
   and upstream's integration tests `ack_backlog`, `ack_timing` and `poll_api` (property tests
-  over random message sizes included). Patches 5 and its cfg gate have not been run against the
-  upstream commit (not available offline): that run is still owed.
+  over random message sizes included). The run with patches 1 to 6 and the cfg gate was done 2026-11-21 against rust-yamux commit 6610cff ("prepare v0.14.1"; its `yamux/src` is identical to the published crate, the crate's recorded sha is not in the public history): 24 unit tests, `ack_backlog`, `ack_timing` and `poll_api` (8) all passed.
 - Regenerate `menzil.patch` with `diff -ruN a b` after any change here, `a` being the published
   crate.
 
