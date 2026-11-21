@@ -3,7 +3,7 @@
 This directory is the source of the `yamux` crate, version 0.14.1, as published on
 crates.io (upstream commit `cc3d0e89f615ef4f329f7a246c95a8ff1e8cc12d` of
 github.com/libp2p/rust-yamux, whose `yamux/src` is also what its release commit `6610cff`
-holds), with the five patches below. `menzil-stream` depends on it by
+holds), with the six patches below. `menzil-stream` depends on it by
 path. Licence: Apache-2.0 OR MIT, copyright Parity Technologies (UK) Ltd.; the texts are
 `LICENSE-APACHE` and `LICENSE-MIT` in this directory, copied from the upstream commit. Why
 the crate is vendored and not used from the registry: `docs/spec/decisions/0002-vendored-yamux.md`.
@@ -129,6 +129,27 @@ M1).
 
 Defaults leave behavior unchanged. Nothing on the wire changes.
 
+## Patch 6: a grown receive window is given back when the stream does not use it (`src/connection/stream/flow_control.rs`, `src/connection/rtt.rs` test helper)
+
+Upstream (and this directory before patch 6) never lowers a stream's `max_receive_window`; the
+growth returns to the connection's budget only when the stream is dropped. A long lived stream that
+once moved a bulk transfer (an SSH session, a WebSocket) kept its grown maximum for life, and with
+`menzil-stream`'s per session growth budget (15.75 MiB) a few of them left every later stream at the
+initial 256 KiB (design note `docs/private/yamux-window-design.md`, section 2).
+
+Now, when a window update is due (half the maximum has been read) and the previous update was at
+least `max(1 s, 4 x RTT)` ago, the credit that would be granted is not granted: the maximum falls by
+that amount (not below `DEFAULT_CREDIT`) and the same amount goes back to the shared counter. The
+sender keeps every byte of credit it already holds; the maximum never drops below credit outstanding
+plus data buffered, so an honest peer is never cut off and `assert_invariants` still holds. A stream
+that fills half its window in less than that keeps it. Wire format unchanged, receiver only. One
+step per due update; a stream idle for long converges to 256 KiB over successive updates.
+
+Tests (`shrink_tests` in the same file, in `cargo test --lib`): an idle grown window returns its whole
+growth to the counter and grants only `DEFAULT_CREDIT`; a shrink with credit outstanding and unread
+data stays at or above their sum; a fast stream keeps its window. Mutants: `if false &&` on the
+condition and dropping the counter return both fail the first test.
+
 ## Memory this does not bound
 
 The windows (and patch 1) bound what a peer can have us hold of *its* data. Patch 5 makes
@@ -164,8 +185,8 @@ a connection, and 256 connections at most unless configured otherwise).
   upstream_quickcheck))]` since 2026-11-15 (patch 5 follow up, round T1d N1): quickcheck is not a
   dependency of the published package (it needs `quickcheck-ext`, a path dependency of upstream's
   workspace), so without the gate `cargo test --lib` did not even compile and the unit tests above
-  never ran. Now `cd vendor/yamux && CARGO_TARGET_DIR=<own> cargo test --offline --lib` runs 15
-  tests (2 upstream, 12 chunks, 1 frame cap); `docs/private/tools/gate.sh` runs it after the
+  never ran. Now `cd vendor/yamux && CARGO_TARGET_DIR=<own> cargo test --offline --lib` runs 18
+  tests (2 upstream, 12 chunks, 1 frame cap, 3 window shrink); `docs/private/tools/gate.sh` runs it after the
   workspace tests. Remove the `Cargo.lock` cargo leaves in this directory (the directory is
   excluded from the workspace).
 - To run upstream's own suite against these sources, take the upstream commit above, replace its

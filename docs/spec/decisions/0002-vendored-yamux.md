@@ -42,3 +42,7 @@ The wire format does not change: an RST is a standard yamux frame.
 ## Related
 
 `protocol.md` sections 5.2 and 5.3. `vendor/yamux/PATCHES.md`. Decision 0001.
+
+## Addendum 2026-11-21: patch 6, a grown window is given back
+
+A stream that grew its receive window kept it until it was dropped, so a few long lived streams could hold the whole per session growth budget and leave later streams at 256 KiB. Patch 6 (`vendor/yamux/PATCHES.md`) lowers a stream's maximum, receiver only and not on the wire, when half a window took longer than max(1 s, 4 x RTT) to arrive, and returns the difference to the budget. Window sizes, per stream maximum, session budget and spec limits are unchanged (TBD 110).

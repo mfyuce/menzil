@@ -53,6 +53,38 @@ impl FlowController {
             return None;
         }
 
+        // Patch 6 (menzil): give grown window back. Half a window took longer than
+        // max(1 s, 4 x RTT) to arrive, so the stream is not using its grown maximum: the credit
+        // that would be granted now is not granted, and the maximum falls by that much, down to
+        // `DEFAULT_CREDIT`. The bytes the sender already holds credit for stay valid (the maximum
+        // never drops below credit outstanding plus data buffered), so an honest peer is never
+        // cut off; the growth budget gets the difference back for other streams.
+        if self.max_receive_window > DEFAULT_CREDIT {
+            let idle_after = cmp::max(
+                std::time::Duration::from_secs(1),
+                self.rtt.get().unwrap_or_default() * 4,
+            );
+            if self.last_window_update.elapsed() >= idle_after {
+                let reduce = cmp::min(next_window_update, self.max_receive_window - DEFAULT_CREDIT);
+                *self.accumulated_max_stream_windows.lock() -= reduce as usize;
+                self.max_receive_window -= reduce;
+                next_window_update -= reduce;
+                log::debug!(
+                    "idle, window_max down by {} bytes to {}",
+                    reduce,
+                    self.max_receive_window
+                );
+                if next_window_update == 0 {
+                    self.assert_invariants(buffer_len);
+                    return None;
+                }
+                self.last_window_update = Instant::now();
+                self.receive_window += next_window_update;
+                self.assert_invariants(buffer_len);
+                return Some(next_window_update);
+            }
+        }
+
         log::trace!(
             "received {} mb in {} seconds ({} mbit/s)",
             next_window_update as f64 / crate::MIB as f64,
@@ -298,5 +330,78 @@ mod tests {
         }
 
         QuickCheck::new().quickcheck(property as fn(_))
+    }
+}
+
+/// Patch 6 tests (menzil).
+#[cfg(test)]
+mod shrink_tests {
+    use super::*;
+    use std::time::Duration;
+
+    fn controller(acc: &Arc<Mutex<usize>>, rtt_ms: u64, grown: u32) -> FlowController {
+        let mut config = Config::default();
+        config.set_max_num_streams(512);
+        config.set_max_connection_receive_window(Some(
+            512 * DEFAULT_CREDIT as usize + 16 * 1024 * 1024,
+        ));
+        let mut c = FlowController::new(
+            DEFAULT_CREDIT,
+            DEFAULT_CREDIT,
+            acc.clone(),
+            Rtt::with_sample(Duration::from_millis(rtt_ms)),
+            Arc::new(config),
+        );
+        // A stream that grew to `grown` and whose sender has used all of its credit.
+        *acc.lock() += (grown - DEFAULT_CREDIT) as usize;
+        c.max_receive_window = grown;
+        c.receive_window = 0;
+        c
+    }
+
+    #[test]
+    fn an_idle_grown_window_gives_its_growth_back_as_credit_is_spent() {
+        let acc = Arc::new(Mutex::new(0usize));
+        let mib = 1024 * 1024u32;
+        let mut c = controller(&acc, 200, 8 * mib);
+        c.last_window_update = Instant::now() - Duration::from_secs(5);
+        // The reader has consumed everything the sender spent: 8 MiB due, nothing buffered.
+        let upd = c.next_window_update(0);
+        assert_eq!(c.max_receive_window, DEFAULT_CREDIT);
+        assert_eq!(*acc.lock(), 0, "the whole growth is back in the budget");
+        // Only the guaranteed window is granted again, never more than the new maximum.
+        assert_eq!(upd, Some(DEFAULT_CREDIT));
+        assert_eq!(c.receive_window, DEFAULT_CREDIT);
+        drop(c);
+        assert_eq!(*acc.lock(), 0);
+    }
+
+    #[test]
+    fn a_shrink_never_drops_below_credit_outstanding_plus_buffered_data() {
+        let acc = Arc::new(Mutex::new(0usize));
+        let mib = 1024 * 1024u32;
+        let mut c = controller(&acc, 200, 8 * mib);
+        c.last_window_update = Instant::now() - Duration::from_secs(5);
+        c.receive_window = 3 * mib; // the sender still holds 3 MiB of credit
+                                    // 5 MiB received, 1 MiB of it still unread: 4 MiB read and due.
+        c.next_window_update(mib as usize);
+        assert!(c.max_receive_window >= c.receive_window + mib);
+        assert_eq!(
+            *acc.lock(),
+            (c.max_receive_window - DEFAULT_CREDIT) as usize
+        );
+    }
+
+    #[test]
+    fn a_fast_stream_keeps_its_window() {
+        let acc = Arc::new(Mutex::new(0usize));
+        let mib = 1024 * 1024u32;
+        let mut c = controller(&acc, 200, 8 * mib);
+        c.last_window_update = Instant::now() - Duration::from_millis(300);
+        c.next_window_update(0);
+        assert!(
+            c.max_receive_window >= 8 * mib,
+            "300 ms is not idle at RTT 200 ms"
+        );
     }
 }

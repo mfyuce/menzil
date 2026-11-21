@@ -91,6 +91,13 @@ impl Rtt {
         Action::None
     }
 
+    #[cfg(test)]
+    pub(crate) fn with_sample(rtt: Duration) -> Self {
+        let r = Self::new();
+        r.inner.lock().rtt = Some(rtt);
+        r
+    }
+
     pub(crate) fn get(&self) -> Option<Duration> {
         self.inner.lock().rtt
     }
