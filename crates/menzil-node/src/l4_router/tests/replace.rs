@@ -863,6 +863,37 @@ async fn a_resp_with_the_matching_held_continues_the_session_and_the_cutover_com
     assert!(timeout(secs(1), ready.acceptor.closed()).await.is_err());
 }
 
+/// The offer of the handshake that continues a session is the one the session goes by: a
+/// replacement `resp` that offers early bytes raises it from 0, one that offers none drops it
+/// back to 0 (review R-2: the old offer was kept).
+#[tokio::test(start_paused = true)]
+async fn a_continued_session_takes_the_early_offer_of_the_new_handshake() {
+    for (offer, want) in [(Some(4_096u32), 4_096u32), (None, 0)] {
+        let (m, b) = (party(), party());
+        let (w, stores) = world_of(&m, &b);
+        let mut e = eng(&b, &stores, cfg(20, 100));
+        let (r, init) = start_replacement(&mut e, &m, &b, &w, 20).await;
+        // The session as first established says the opposite of what the continuation will.
+        r.ready
+            .handle
+            .set_peer_early(if offer.is_some() { 0 } else { 8_192 });
+        let hs = E2eResponderHandshake::start(&m.x25519_private, b.id, m.id, &init).unwrap();
+        let hs = match offer {
+            Some(n) => hs.offer_early(n),
+            None => hs,
+        };
+        let (_t2, resp) = hs
+            .finish_offering_held(m.cert.clone(), 1, 1, vec![0x01], 7_001, 7_002, 65_535)
+            .unwrap();
+        e.recv(m.id, &resp);
+        assert!(
+            e.engine.ages.values().any(|a| a.cutover.is_some()),
+            "continued"
+        );
+        assert_eq!(r.ready.handle.peer_early(), want);
+    }
+}
+
 #[tokio::test(start_paused = true)]
 async fn a_resp_without_a_matching_held_starts_the_replacement_afresh() {
     for held in [None, Some(9_999)] {

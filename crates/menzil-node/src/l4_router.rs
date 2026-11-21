@@ -2607,6 +2607,7 @@ impl Engine {
                     attached,
                     tag,
                     held,
+                    payload.early,
                     index,
                     (peer, network),
                     responder_static,
@@ -2708,6 +2709,7 @@ impl Engine {
         attached: Attached,
         tag: u64,
         held: u32,
+        early: Option<u32>,
         index: SessionIndex,
         (peer, network): (NodeId, NetworkId),
         responder_static: X25519PublicKey,
@@ -2758,6 +2760,9 @@ impl Engine {
         );
         let (peer_index, handshake_hash) = (transport.peer_index(), *transport.handshake_hash());
         let replacement = handle.hand_over(transport, HandoverRole::Initiator { prior: held });
+        // What the responder offered in THIS handshake (absent: none, an older build): the
+        // continued session must not keep the offer of the handshake it replaces (review R-2).
+        handle.set_peer_early(early.unwrap_or(0));
         let label = Entry {
             handle,
             peer,
