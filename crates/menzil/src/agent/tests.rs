@@ -2483,3 +2483,52 @@ fn only_whole_leading_data_frames_that_fit_the_offer_are_peeled() {
     huge.extend(((MAX_FRAME_PAYLOAD + 1) as u32).to_be_bytes());
     assert_eq!(peel_data_frames(&huge, usize::MAX), (Vec::new(), 0));
 }
+
+/// Round E4, L1: an early frame of the full 16 KiB is peeled whole (the agent's buffer holds the
+/// request line and one whole frame), not left for the slow path.
+#[tokio::test]
+async fn a_full_sixteen_kib_early_frame_reaches_the_opener_whole() {
+    let opener = early_opener(16 * 1024);
+    let seen = opener.clone();
+    let big = vec![7u8; 16 * 1024];
+    let (echoed, end) = with_agent(opener, {
+        let big = big.clone();
+        async move |socket, uid| echo_through(socket, uid, &big, b"").await
+    })
+    .await;
+    assert!(matches!(end, End::Clean));
+    assert_eq!(seen.took.lock().unwrap().as_deref(), Some(&big[..]));
+    assert!(echoed.len() >= big.len(), "the whole frame came back");
+}
+
+/// Round E4, L2: a reset error met in the 3 ms grace (reported once by a TCP socket) still resets
+/// the stream; it is not read again as an end of file and sent as a clean END.
+#[tokio::test]
+async fn an_input_reset_met_in_the_grace_resets_the_stream() {
+    // Like a TCP socket: the error is reported once, the next read is an end of file.
+    struct Resets(bool);
+    impl AsyncRead for Resets {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            _buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<io::Result<()>> {
+            if std::mem::replace(&mut self.0, true) {
+                return std::task::Poll::Ready(Ok(()));
+            }
+            std::task::Poll::Ready(Err(io::Error::from(io::ErrorKind::ConnectionReset)))
+        }
+    }
+    let mut rig = rig();
+    let (mut stdout, _collect) = duplex(1024);
+    let end = timeout(
+        WAIT,
+        connect_and_bridge(&rig.socket, "peer/w", &mut Resets(false), &mut stdout),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(matches!(end, End::Reset(_)));
+    let remote = timeout(WAIT, rig.seen.recv()).await.unwrap().unwrap();
+    assert_eq!(remote, Err(io::ErrorKind::ConnectionReset));
+}

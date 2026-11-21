@@ -888,7 +888,9 @@ async fn serve_user<O: Opener>(listener: UnixListener, opener: Arc<O>, uid: u32)
 
 async fn handle<O: Opener>(connection: UnixStream, opener: &O) -> Result<()> {
     let (read, mut write) = connection.into_split();
-    let mut read = BufReader::new(read);
+    // Big enough for the request line plus one whole early DATA frame (round E4, L1: with the
+    // default 8 KiB a frame above about 8 KiB could never be peeled whole).
+    let mut read = BufReader::with_capacity(MAX_REQUEST_BYTES + 5 + EARLY_CLIENT_MAX, read);
     let line = timeout(REQUEST_TIMEOUT, read_line(&mut read, MAX_REQUEST_BYTES))
         .await
         .context("the request did not arrive in time")??
@@ -1179,11 +1181,23 @@ where
     // TBD 112), so a node whose peer offered early bytes needs no round trip for it. The wait
     // is a few milliseconds at most, and only for a program that speaks later (a server that
     // speaks first, such as sshd, has nothing to send yet).
-    let early = grab_early(input).await;
-    request_as_with(socket, &request_line(target), uid, &early)
-        .await?
-        .bridge(input, output)
-        .await
+    let (early, failed) = match grab_early(input).await {
+        Early::Bytes(bytes) => (bytes, None),
+        Early::None => (Vec::new(), None),
+        Early::Failed(message) => (Vec::new(), Some(message)),
+    };
+    let opened = request_as_with(socket, &request_line(target), uid, &early).await?;
+    match failed {
+        None => opened.bridge(input, output).await,
+        // The input failed during the grace (a reset is reported once): the stream is asked
+        // for and reset, as a failure met by the bridge would do, never an end of file the
+        // bridge would send as a clean END (round E4, L2).
+        Some(message) => {
+            let mut write = opened.write;
+            let _ = write_frame(&mut write, FRAME_RESET, message.as_bytes()).await;
+            Ok(End::Reset(message))
+        }
+    }
 }
 
 /// An agent connection that has said `ok` to a request: frames follow ([`Self::bridge`]). Until
@@ -1240,17 +1254,26 @@ const EARLY_GRACE: Duration = Duration::from_millis(3);
 /// The most early bytes a client sends (the figure of `menzil_node::EARLY_MAX`).
 const EARLY_CLIENT_MAX: usize = 16 * 1024;
 
-/// What `input` delivers within [`EARLY_GRACE`], at most [`EARLY_CLIENT_MAX`] bytes; nothing at
-/// an end of file (the bridge reads it again and says `END`) or on an error (the bridge meets it
-/// again). Cancel safe: a read that did not finish consumed nothing.
-async fn grab_early<R: AsyncRead + Unpin>(input: &mut R) -> Vec<u8> {
+/// What [`grab_early`] found.
+enum Early {
+    Bytes(Vec<u8>),
+    /// Nothing within the grace, or an end of file (the bridge reads it again and says `END`).
+    None,
+    /// The read failed; an error is reported once (a TCP reset), so it must not be dropped.
+    Failed(String),
+}
+
+/// What `input` delivers within [`EARLY_GRACE`], at most [`EARLY_CLIENT_MAX`] bytes. Cancel safe:
+/// a read that did not finish consumed nothing.
+async fn grab_early<R: AsyncRead + Unpin>(input: &mut R) -> Early {
     let mut buffer = vec![0u8; EARLY_CLIENT_MAX];
     match timeout(EARLY_GRACE, input.read(&mut buffer)).await {
         Ok(Ok(n)) if n > 0 => {
             buffer.truncate(n);
-            buffer
+            Early::Bytes(buffer)
         }
-        _ => Vec::new(),
+        Ok(Err(error)) => Early::Failed(one_line(&error.to_string())),
+        _ => Early::None,
     }
 }
 
