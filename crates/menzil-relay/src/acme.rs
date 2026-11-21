@@ -539,7 +539,7 @@ where
         acme.limiter.retain(|name| names.iter().any(|n| n == name));
         for name in &names {
             let validity = store.validity(name);
-            if acme.certs.get(name).is_none() && validity.is_some() {
+            if acme.certs.get(name).is_none() && stored_is_servable(validity, unix_now()) {
                 load_stored(&store, &acme.certs, name);
             }
             let due = match validity {
@@ -576,6 +576,12 @@ fn jitter_of(name: &str) -> f64 {
         acc.wrapping_mul(31).wrapping_add(u32::from(b))
     });
     f64::from(sum % 1000) / 1000.0
+}
+
+/// Whether a certificate found on disk may be put into the book: only one that has not expired
+/// (an expired one would be presented to clients until the renewal order finishes).
+fn stored_is_servable(validity: Option<(u64, u64)>, now: u64) -> bool {
+    validity.is_some_and(|(_, not_after)| now < not_after)
 }
 
 fn load_stored(store: &CertStore, certs: &RelayCertBook, name: &str) {
@@ -749,6 +755,14 @@ mod tests {
         );
         assert!(limiter.try_start_at("a.example", later).is_some());
     }
+    #[test]
+    fn a_stored_certificate_past_its_not_after_is_not_loaded_into_the_book() {
+        assert!(stored_is_servable(Some((100, 200)), 199));
+        assert!(!stored_is_servable(Some((100, 200)), 200));
+        assert!(!stored_is_servable(Some((100, 200)), 5_000));
+        assert!(!stored_is_servable(None, 150));
+    }
+
     use crate::front_door::tests::{H, OWN, World, ali, share, tests_unix_now, world};
     use crate::front_door::{FrontDoor, FrontDoorConfig, REFUSAL};
     use crate::relay::Accepting;
