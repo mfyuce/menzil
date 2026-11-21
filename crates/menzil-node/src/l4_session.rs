@@ -1003,7 +1003,14 @@ pub struct L4SessionHandle {
     /// The newest generation whose cutover completed, written by the actor
     /// ([`Self::settled_generation`]).
     settled_generation: Arc<AtomicU32>,
+    /// The early bytes the peer offered in its handshake payload (protocol.md 5.1, 5.3): how
+    /// many application bytes an OPEN on this session may carry. 0 until [`Self::set_peer_early`]
+    /// (a responder side session, or a peer that offered none). Shared by every clone.
+    peer_early: Arc<AtomicU32>,
 }
+
+/// The most early bytes (protocol.md 5.3) a responder offers and an initiator sends on one OPEN.
+pub const EARLY_MAX: u32 = 16_384;
 
 /// Names which of a session's transports a routed `data` frame belongs to (protocol.md 5.2,
 /// the re-handshake handover). The transport a session is built with is generation
@@ -1068,6 +1075,17 @@ impl L4SessionHandle {
     /// This session's network (see [`L4SessionConfig::network_id`]).
     pub fn network_id(&self) -> NetworkId {
         self.network_id
+    }
+
+    /// The early bytes the peer offered (0: none; protocol.md 5.3).
+    pub fn peer_early(&self) -> u32 {
+        self.peer_early.load(Ordering::Relaxed)
+    }
+
+    /// Records the peer's offer, read from its handshake payload; clamped to [`EARLY_MAX`].
+    pub fn set_peer_early(&self, offered: u32) {
+        self.peer_early
+            .store(offered.min(EARLY_MAX), Ordering::Relaxed);
     }
 
     /// Opens a new outbound L5 stream (protocol.md 5.3's OPEN/OPEN_ACK
@@ -1442,6 +1460,7 @@ fn build(
         command_tx,
         last_generation: Arc::new(AtomicU32::new(FIRST_GENERATION)),
         settled_generation: settled_generation.clone(),
+        peer_early: Arc::new(AtomicU32::new(0)),
     };
     let acceptor = L4SessionAcceptor {
         peer: config.peer,

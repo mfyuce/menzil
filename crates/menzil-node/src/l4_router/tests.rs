@@ -779,6 +779,24 @@ async fn a_responders_first_data_does_not_overtake_its_resp_held_back_by_a_full_
     opener.abort();
 }
 
+/// Early bytes (TBD 112): a member responder offers them in its `resp`, the initiator's session
+/// carries the offer, and the responder side session has none (an initiator offers nothing).
+#[tokio::test(start_paused = true)]
+async fn the_initiator_learns_the_responders_early_bytes_offer_and_the_responder_none() {
+    let w = world();
+    let (a, b) = (party(), party());
+    let stores = w.stores(&[&a, &b], vec![w.grant(&a, &b)]);
+    let net = Net::new();
+    let mut na = node(&net, &a, &stores).await;
+    let mut nb = node(&net, &b, &stores).await;
+    let handle = ensure(&na, b.id, w.network).await.unwrap();
+    assert_eq!(handle.peer_early(), crate::l4_session::EARLY_MAX);
+    let ready_a = na.next_ready().await;
+    let ready_b = nb.next_ready().await;
+    assert_eq!(ready_a.handle.peer_early(), crate::l4_session::EARLY_MAX);
+    assert_eq!(ready_b.handle.peer_early(), 0);
+}
+
 #[tokio::test(start_paused = true)]
 async fn the_responder_reuses_the_session_instead_of_starting_a_second_one() {
     let w = world();

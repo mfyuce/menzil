@@ -111,7 +111,7 @@ pub use error::StreamMuxError;
 pub use frame_format::FrameFormatError;
 pub use open::{
     Authorizer, OpenDecision, OpenError, OpenRefusal, OpenRequest, Responded, ServiceHandler,
-    initiate_open, respond_to_open,
+    initiate_open, initiate_open_with_early, respond_to_open,
 };
 pub use record_io::InboundGuard;
 pub use stream::{Stream, TornDown};

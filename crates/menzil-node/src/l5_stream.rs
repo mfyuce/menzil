@@ -118,7 +118,7 @@ use menzil_proto::{
 };
 use menzil_stream::{
     Authorizer, OpenDecision, OpenError, OpenRefusal, OpenRequest, Responded, ServiceHandler,
-    Stream, StreamMuxError, initiate_open, respond_to_open,
+    Stream, StreamMuxError, initiate_open_with_early, respond_to_open,
 };
 use tokio::sync::{Notify, Semaphore};
 
@@ -240,6 +240,27 @@ pub async fn open(
     service: ServiceId,
     target: Option<OpenTarget>,
 ) -> Result<Stream, OpenStreamError> {
+    open_early(session, service, target, |_| Vec::new()).await
+}
+
+/// [`open`], with early bytes (protocol.md 5.3, TBD 112): when the peer offered early bytes in
+/// its handshake ([`L4SessionHandle::peer_early`] above 0), `take_early(max)` is called once,
+/// after the raw stream exists and before the OPEN is written, and the bytes it returns (at most
+/// `max`, never waiting: only what the caller has in hand now) go out in the same write as the
+/// OPEN, so a request that is already there costs no extra round trip. A peer that offered none
+/// never has `take_early` called, so the caller still holds every byte it has. More than `max`
+/// bytes returned is an error ([`OpenStreamError::Channel`]), never a silent cut. If the OPEN
+/// is refused, the early bytes are gone with it: the caller reports the refusal and drops the
+/// local connection.
+pub async fn open_early<F>(
+    session: &L4SessionHandle,
+    service: ServiceId,
+    target: Option<OpenTarget>,
+    take_early: F,
+) -> Result<Stream, OpenStreamError>
+where
+    F: FnOnce(usize) -> Vec<u8> + Send,
+{
     if target.is_some() && service != ServiceId::new(ServiceKind::Egress, "*") {
         return Err(OpenStreamError::InvalidTarget);
     }
@@ -252,7 +273,12 @@ pub async fn open(
     {
         return Err(OpenStreamError::Channel("a UDP OPEN needs open_udp"));
     }
-    match tokio::time::timeout(OPEN_TIMEOUT, open_inner(session, service, target)).await {
+    match tokio::time::timeout(
+        OPEN_TIMEOUT,
+        open_inner(session, service, target, take_early),
+    )
+    .await
+    {
         Ok(result) => result.map(|(stream, _ack_channel)| stream),
         Err(_elapsed) => Err(OpenStreamError::Timeout(OPEN_TIMEOUT)),
     }
@@ -287,7 +313,7 @@ pub async fn open_udp(
     };
     let (stream, ack_channel) = match tokio::time::timeout(
         OPEN_TIMEOUT,
-        open_inner(session, service, Some(target)),
+        open_inner(session, service, Some(target), |_| Vec::new()),
     )
     .await
     {
@@ -317,11 +343,15 @@ pub async fn open_udp(
 /// [`open`]'s own body, run under its single [`OPEN_TIMEOUT`] deadline —
 /// split out only so that deadline can wrap `session.open_stream()` too,
 /// not just the exchange that follows it.
-async fn open_inner(
+async fn open_inner<F>(
     session: &L4SessionHandle,
     service: ServiceId,
     target: Option<OpenTarget>,
-) -> Result<(Stream, Option<u16>), OpenStreamError> {
+    take_early: F,
+) -> Result<(Stream, Option<u16>), OpenStreamError>
+where
+    F: FnOnce(usize) -> Vec<u8> + Send,
+{
     let mut stream = session.open_stream().await?;
     let open = OpenBody {
         v: menzil_proto::PROTOCOL_VERSION,
@@ -329,7 +359,14 @@ async fn open_inner(
         target,
         meta: OpenMeta::default(),
     };
-    let ack = initiate_open(&mut stream, &open).await?;
+    let max = session.peer_early() as usize;
+    let early = if max > 0 { take_early(max) } else { Vec::new() };
+    if early.len() > max {
+        return Err(OpenStreamError::Channel(
+            "more early bytes than the peer offered",
+        ));
+    }
+    let ack = initiate_open_with_early(&mut stream, &open, &early).await?;
     if ack.ok {
         Ok((stream, ack.channel))
     } else {
@@ -1143,6 +1180,172 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         assert_eq!(accepted.load(Ordering::SeqCst), 1);
+        accept_task.abort();
+    }
+
+    /// A handler that reads `want` bytes the moment it owns the stream and reports them.
+    struct ReadsFirst {
+        want: usize,
+        tx: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<Vec<u8>>>>,
+    }
+    impl ServiceHandler<Stream> for ReadsFirst {
+        type Opened = ();
+        type Handling = std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>;
+
+        async fn open(&self, _request: &OpenRequest) -> Result<(), OpenRefusal> {
+            Ok(())
+        }
+
+        fn handle(&self, mut stream: Stream, _request: OpenRequest, _opened: ()) -> Self::Handling {
+            let tx = self.tx.lock().unwrap().take();
+            let want = self.want;
+            Box::pin(async move {
+                let mut buf = vec![0u8; want];
+                let _ = stream.read_exact(&mut buf).await;
+                if let Some(tx) = tx {
+                    let _ = tx.send(buf);
+                }
+            })
+        }
+    }
+
+    /// Early bytes (TBD 112): with the peer's offer on the handle they ride with the OPEN and
+    /// reach the service, in order, as its first bytes; `take_early` is asked for exactly the
+    /// offered figure.
+    #[tokio::test]
+    async fn early_bytes_reach_the_service_in_order_when_the_peer_offered_them() {
+        let TwoSessions {
+            a,
+            a_acceptor: _a_acceptor,
+            mut b,
+            b_handle: _b_handle,
+            _pump_a_to_b,
+            _pump_b_to_a,
+            _task_a,
+            _task_b,
+            _a_epoch_ended_tx,
+            _b_epoch_ended_tx,
+        } = two_sessions();
+        a.set_peer_early(crate::l4_session::EARLY_MAX);
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let handler = ReadsFirst {
+            want: 11,
+            tx: std::sync::Mutex::new(Some(tx)),
+        };
+        let accept_task = tokio::spawn(async move {
+            accept_loop(&mut b, AllowAll, handler).await;
+        });
+        let asked = Arc::new(AtomicUsize::new(0));
+        let asked_in = Arc::clone(&asked);
+        let _stream = open_early(&a, ssh(), None, move |max| {
+            asked_in.store(max, Ordering::SeqCst);
+            b"hello early".to_vec()
+        })
+        .await
+        .expect("open was not refused");
+        let got = tokio::time::timeout(Duration::from_secs(5), rx)
+            .await
+            .expect("the service read its first bytes")
+            .unwrap();
+        assert_eq!(got, b"hello early");
+        assert_eq!(
+            asked.load(Ordering::SeqCst),
+            crate::l4_session::EARLY_MAX as usize
+        );
+        accept_task.abort();
+    }
+
+    /// Mixed versions: a peer that offered nothing (an older build, or no offer yet) is never
+    /// sent early bytes, and `take_early` is never called, so the caller keeps its bytes.
+    #[tokio::test]
+    async fn a_peer_that_offered_no_early_bytes_gets_none_and_is_never_asked() {
+        let TwoSessions {
+            a,
+            a_acceptor: _a_acceptor,
+            mut b,
+            b_handle: _b_handle,
+            _pump_a_to_b,
+            _pump_b_to_a,
+            _task_a,
+            _task_b,
+            _a_epoch_ended_tx,
+            _b_epoch_ended_tx,
+        } = two_sessions();
+        assert_eq!(a.peer_early(), 0);
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let handler = ReadsFirst {
+            want: 1,
+            tx: std::sync::Mutex::new(Some(tx)),
+        };
+        let accept_task = tokio::spawn(async move {
+            accept_loop(&mut b, AllowAll, handler).await;
+        });
+        let called = Arc::new(AtomicUsize::new(0));
+        let called_in = Arc::clone(&called);
+        let mut stream = open_early(&a, ssh(), None, move |_| {
+            called_in.fetch_add(1, Ordering::SeqCst);
+            b"never sent".to_vec()
+        })
+        .await
+        .expect("open was not refused");
+        assert_eq!(called.load(Ordering::SeqCst), 0);
+        stream.write_all(b"A").await.unwrap();
+        let got = tokio::time::timeout(Duration::from_secs(5), rx)
+            .await
+            .expect("the service read its first byte")
+            .unwrap();
+        assert_eq!(got, b"A", "only what was written after the ack arrives");
+        accept_task.abort();
+    }
+
+    /// More bytes than offered is an error, not a silent cut; the offer is clamped at EARLY_MAX.
+    #[tokio::test]
+    async fn more_early_bytes_than_offered_is_an_error_and_the_offer_is_clamped() {
+        let TwoSessions {
+            a,
+            a_acceptor: _a_acceptor,
+            b: _b,
+            b_handle: _b_handle,
+            _pump_a_to_b,
+            _pump_b_to_a,
+            _task_a,
+            _task_b,
+            _a_epoch_ended_tx,
+            _b_epoch_ended_tx,
+        } = two_sessions();
+        a.set_peer_early(u32::MAX);
+        assert_eq!(a.peer_early(), crate::l4_session::EARLY_MAX);
+        let over = vec![0u8; crate::l4_session::EARLY_MAX as usize + 1];
+        let result = open_early(&a, ssh(), None, move |_| over).await;
+        assert!(matches!(result, Err(OpenStreamError::Channel(_))));
+    }
+
+    /// A refusal ends the exchange as before; the early bytes are gone with it.
+    #[tokio::test]
+    async fn a_refused_open_with_early_bytes_is_refused_not_hung() {
+        let TwoSessions {
+            a,
+            a_acceptor: _a_acceptor,
+            mut b,
+            b_handle: _b_handle,
+            _pump_a_to_b,
+            _pump_b_to_a,
+            _task_a,
+            _task_b,
+            _a_epoch_ended_tx,
+            _b_epoch_ended_tx,
+        } = two_sessions();
+        a.set_peer_early(crate::l4_session::EARLY_MAX);
+        let accept_task = tokio::spawn(async move {
+            accept_loop(&mut b, AllowAll, RefuseAll).await;
+        });
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            open_early(&a, ssh(), None, |_| b"secret request".to_vec()),
+        )
+        .await
+        .expect("no hang");
+        assert!(matches!(result, Err(OpenStreamError::Refused { .. })));
         accept_task.abort();
     }
 

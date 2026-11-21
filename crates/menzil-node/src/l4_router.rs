@@ -1396,6 +1396,8 @@ impl Engine {
         // continue the streams (protocol.md 5.2).
         let offer = self.held_offer_for(&src, &network_id, &peer_static, attached.epoch);
         let cert = self.identity.get().node_cert.clone();
+        // Early bytes (protocol.md 5.3, TBD 112): every member responder offers them.
+        let hs = hs.offer_early(crate::l4_session::EARLY_MAX);
         let finished = match offer {
             Some(held) => hs.finish_offering_held(
                 cert,
@@ -2631,6 +2633,8 @@ impl Engine {
             SessionKind::Member,
         );
         let handle = entry.handle.clone();
+        // What the responder offered (absent: none, an older build).
+        handle.set_peer_early(payload.early.unwrap_or(0));
         match self
             .table
             .install_session(index, peer, network, Role::Initiator, entry, now.instant)

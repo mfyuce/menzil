@@ -383,6 +383,24 @@ pub async fn initiate_open<S: AsyncRead + AsyncWrite + Unpin>(
     OpenAckBody::decode(&raw).map_err(OpenError::Malformed)
 }
 
+/// [`initiate_open`] with early bytes (protocol.md 5.3, TBD 112): `early` is written in the
+/// same write as the OPEN header, so the responder's first read of the stream already holds
+/// them, and they reach the service after the OPEN_ACK exactly as bytes written after it would.
+/// The caller sends early bytes only to a responder that offered them in its handshake payload
+/// (`early`), and at most the figure offered. An empty `early` is [`initiate_open`].
+pub async fn initiate_open_with_early<S: AsyncRead + AsyncWrite + Unpin>(
+    stream: &mut S,
+    open: &OpenBody,
+    early: &[u8],
+) -> Result<OpenAckBody, OpenError> {
+    let mut encoded = open.encode().map_err(OpenError::Encode)?;
+    encoded.extend_from_slice(early);
+    stream.write_all(&encoded).await.map_err(OpenError::Io)?;
+    stream.flush().await.map_err(OpenError::Io)?;
+    let raw = read_len_prefixed(stream).await?;
+    OpenAckBody::decode(&raw).map_err(OpenError::Malformed)
+}
+
 /// Runs the *responder* side of one OPEN/OPEN_ACK exchange on a stream
 /// the peer just opened (one [`crate::Inbound::accept`] result, in
 /// practice): reads the OPEN header, asks `authorizer` then `handler`,
