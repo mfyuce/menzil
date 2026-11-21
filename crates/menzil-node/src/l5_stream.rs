@@ -781,6 +781,15 @@ fn register<H>(
 ) where
     H: std::future::Future<Output = ()> + Send + 'static,
 {
+    // A revoke that already moved the generation and denies this request: never start the
+    // handling at all, so early bytes (5.3) cannot reach a target in the time between the spawn
+    // and the compare below (round E4, residual). The compare after the spawn stays: a revoke
+    // can also land in between.
+    if streams.generation() != generation
+        && let OpenDecision::Deny(_) = authorizer.authorize(&request)
+    {
+        return;
+    }
     let id = streams.inner.next_id.fetch_add(1, Ordering::Relaxed);
     let guard = EntryGuard {
         streams: streams.clone(),
@@ -2950,5 +2959,103 @@ mod tests {
         assert!(lines[0].contains("no longer allowed"), "{}", lines[0]);
         assert!(!lines[0].contains("aborted"), "{}", lines[0]);
         accept_task.abort();
+    }
+
+    // Round E4: early bytes on an OPEN authorized before a revoke, released after it:
+    // does the target (handle) ever read them before the registration's abort?
+    #[derive(Clone, Default)]
+    struct EarlyCountingHandler {
+        inner: EchoHandler,
+        delivered: Arc<AtomicUsize>,
+    }
+    impl ServiceHandler<Stream> for EarlyCountingHandler {
+        type Opened = ();
+        type Handling = std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>;
+        async fn open(&self, request: &OpenRequest) -> Result<(), OpenRefusal> {
+            self.inner.open(request).await
+        }
+        fn handle(&self, mut stream: Stream, _request: OpenRequest, _opened: ()) -> Self::Handling {
+            let delivered = Arc::clone(&self.delivered);
+            Box::pin(async move {
+                let mut buf = [0u8; 64];
+                while let Ok(n) = stream.read(&mut buf).await {
+                    if n == 0 {
+                        break;
+                    }
+                    delivered.fetch_add(n, Ordering::SeqCst);
+                }
+            })
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn early_bytes_of_an_open_revoked_before_its_release_reach_no_target() {
+        let (mut hits, runs) = (0, 100);
+        for _ in 0..runs {
+            let TwoSessions {
+                a,
+                a_acceptor: _a_acceptor,
+                mut b,
+                b_handle: _b_handle,
+                _pump_a_to_b,
+                _pump_b_to_a,
+                _task_a,
+                _task_b,
+                _a_epoch_ended_tx,
+                _b_epoch_ended_tx,
+            } = two_sessions();
+            a.set_peer_early(crate::l4_session::EARLY_MAX);
+            let switch = Switchable::default();
+            let streams = AcceptedStreams::new();
+            let handler = EarlyCountingHandler {
+                inner: EchoHandler {
+                    gated: true,
+                    ..EchoHandler::default()
+                },
+                delivered: Arc::new(AtomicUsize::new(0)),
+            };
+            let delivered = Arc::clone(&handler.delivered);
+            let (entered, release) = (
+                Arc::clone(&handler.inner.entered),
+                Arc::clone(&handler.inner.release),
+            );
+            let accept_task = {
+                let (switch, streams) = (switch.clone(), streams.clone());
+                tokio::spawn(async move {
+                    accept_loop_tracked(&mut b, switch, handler, streams).await;
+                })
+            };
+            let opener = {
+                let a = a.clone();
+                tokio::spawn(async move {
+                    open_early(&a, ssh(), None, |_| async {
+                        b"GET /secret HTTP/1.1\r\n\r\n".to_vec()
+                    })
+                    .await
+                })
+            };
+            tokio::time::timeout(STEP, entered.notified())
+                .await
+                .unwrap();
+            switch.deny(ssh());
+            assert_eq!(streams.recheck(&switch), 0);
+            release.notify_one();
+            let mut stream = tokio::time::timeout(STEP, opener)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            expect_reset(&mut stream).await;
+            wait_for_len(&streams, 0).await;
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            if delivered.load(Ordering::SeqCst) > 0 {
+                hits += 1;
+            }
+            accept_task.abort();
+        }
+        assert_eq!(
+            hits, 0,
+            "early bytes reached a target after the revoke in {hits} of {runs} runs"
+        );
     }
 }
