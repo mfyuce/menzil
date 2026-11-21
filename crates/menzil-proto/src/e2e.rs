@@ -268,6 +268,13 @@ pub struct E2eHandshakePayload {
     /// combination.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub held: Option<u32>,
+    /// The most application bytes the responder accepts on a stream right after the OPEN,
+    /// before it has answered OPEN_ACK ("early bytes", protocol.md 5.1, 5.3; TBD 112). Optional
+    /// on the wire: absent means 0 (an initiator sends none), and `None` is never written. An
+    /// older decoder ignores the key and so never sends early bytes; an older responder never
+    /// sends it. Never present together with `docs_only: true`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub early: Option<u32>,
 }
 
 fn is_false(value: &bool) -> bool {
@@ -299,6 +306,11 @@ impl E2eHandshakePayload {
         if self.held.is_some() && self.docs_only {
             return Err(ProtoError::MalformedRecord(
                 "handshake payload carries `held` together with `docs_only`".to_string(),
+            ));
+        }
+        if self.early.is_some() && self.docs_only {
+            return Err(ProtoError::MalformedRecord(
+                "handshake payload carries `early` together with `docs_only`".to_string(),
             ));
         }
         Ok(())
@@ -789,6 +801,7 @@ mod tests {
             e2e_protos: vec![0x01],
             docs_only: false,
             held: None,
+            early: None,
         };
         let encoded = payload.encode().unwrap();
         assert_eq!(E2eHandshakePayload::decode(&encoded).unwrap(), payload);
@@ -804,6 +817,7 @@ mod tests {
             e2e_protos: vec![0x01],
             docs_only: false,
             held: None,
+            early: None,
         };
         let plain = payload.encode().unwrap();
         payload.docs_only = true;
@@ -811,6 +825,61 @@ mod tests {
         assert!(flagged.len() > plain.len(), "false must be left out");
         assert!(E2eHandshakePayload::decode(&flagged).unwrap().docs_only);
         assert!(!E2eHandshakePayload::decode(&plain).unwrap().docs_only);
+    }
+
+    #[test]
+    fn early_round_trips_is_left_out_when_absent_and_never_comes_with_docs_only() {
+        let mut payload = E2eHandshakePayload {
+            v: crate::PROTOCOL_VERSION,
+            node_cert: sample_cert(),
+            roster_seq: 3,
+            policy_seq: 7,
+            e2e_protos: vec![0x01],
+            docs_only: false,
+            held: None,
+            early: None,
+        };
+        let plain = payload.encode().unwrap();
+        payload.early = Some(16_384);
+        let offered = payload.encode().unwrap();
+        assert!(offered.len() > plain.len(), "None must be left out");
+        assert!(
+            !plain.windows(5).any(|w| w == b"early"),
+            "an absent key is not written, not even as null"
+        );
+        assert_eq!(
+            E2eHandshakePayload::decode(&offered).unwrap().early,
+            Some(16_384)
+        );
+        assert_eq!(E2eHandshakePayload::decode(&plain).unwrap().early, None);
+        payload.docs_only = true;
+        assert!(payload.encode().is_err());
+    }
+
+    /// Mixed versions (TBD 112): a build that predates `early` has no such field and must still
+    /// decode a payload that carries it, ignoring the key, so it never sends early bytes.
+    #[test]
+    fn a_decoder_that_predates_early_ignores_the_key() {
+        #[derive(Debug, serde::Deserialize)]
+        struct Before {
+            v: u16,
+            roster_seq: u64,
+            #[serde(default)]
+            held: Option<u32>,
+        }
+        let payload = E2eHandshakePayload {
+            v: crate::PROTOCOL_VERSION,
+            node_cert: sample_cert(),
+            roster_seq: 3,
+            policy_seq: 7,
+            e2e_protos: vec![0x01],
+            docs_only: false,
+            held: Some(5),
+            early: Some(16_384),
+        };
+        let bytes = payload.encode().unwrap();
+        let before: Before = ciborium::from_reader(bytes.as_slice()).unwrap();
+        assert_eq!((before.v, before.roster_seq, before.held), (1, 3, Some(5)));
     }
 
     #[test]
@@ -960,6 +1029,7 @@ mod tests {
             e2e_protos: vec![0x01],
             docs_only,
             held,
+            early: None,
         }
     }
 

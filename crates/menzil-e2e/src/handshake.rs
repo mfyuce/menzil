@@ -276,9 +276,21 @@ pub struct E2eResponderHandshake {
     /// `resp`, and stamped as `receiver_index` on this side's `data`.
     initiator_index: u32,
     initiator_static: X25519PublicKey,
+    /// The early bytes this responder offers ([`Self::offer_early`]); `None` offers none.
+    early: Option<u32>,
 }
 
 impl E2eResponderHandshake {
+    /// Offers early bytes in the `resp` payload (protocol.md 5.1, 5.3; TBD 112): the initiator
+    /// may write up to `max_bytes` application bytes on a stream right after its OPEN, before
+    /// the OPEN_ACK. Not offered with a docs only answer ([`Self::finish_docs_only`] leaves it
+    /// out, the payload refuses the combination).
+    #[must_use]
+    pub fn offer_early(mut self, max_bytes: u32) -> Self {
+        self.early = Some(max_bytes);
+        self
+    }
+
     /// Starts a responder-side handshake by reading `init`'s message 1,
     /// which `IK` guarantees already reveals the initiator's Noise
     /// static key ([`Self::initiator_static`]) — available before any
@@ -331,6 +343,7 @@ impl E2eResponderHandshake {
             hs,
             initiator_index: sender_index,
             initiator_static,
+            early: None,
         })
     }
 
@@ -443,6 +456,7 @@ impl E2eResponderHandshake {
             e2e_protos,
             docs_only,
             held,
+            early: if docs_only { None } else { self.early },
         };
         let noise_msg2 = write(&mut self.hs, &payload.encode()?)?;
         let frame = E2eFrame::Resp {
@@ -956,6 +970,31 @@ mod tests {
         let (responder_transport, resp_frame) = finish(responder_hs);
         let (initiator_transport, payload, _) = initiator_hs.finish(&resp_frame, 65_535).unwrap();
         (payload, initiator_transport, responder_transport)
+    }
+
+    #[test]
+    fn early_reaches_the_initiator_only_when_offered_and_never_with_docs_only() {
+        let (payload, _, _) = live_with(|hs| {
+            hs.offer_early(16_384)
+                .finish(sample_cert(), 1, 2, vec![0x01], 99, 65_535)
+                .unwrap()
+        });
+        assert_eq!(payload.early, Some(16_384));
+        let (payload, _, _) = live_with(|hs| {
+            hs.finish(sample_cert(), 1, 2, vec![0x01], 99, 65_535)
+                .unwrap()
+        });
+        assert_eq!(
+            payload.early, None,
+            "a responder that offers nothing says nothing"
+        );
+        let (payload, _, _) = live_with(|hs| {
+            hs.offer_early(16_384)
+                .finish_docs_only(sample_cert(), 1, 2, vec![0x01], 99, 65_535)
+                .unwrap()
+        });
+        assert_eq!(payload.early, None, "docs only never offers early bytes");
+        assert!(payload.docs_only);
     }
 
     #[test]

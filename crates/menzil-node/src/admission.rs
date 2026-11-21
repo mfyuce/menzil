@@ -1622,6 +1622,7 @@ mod tests {
             e2e_protos: vec![0x01],
             docs_only: false,
             held: None,
+            early: None,
         }
     }
 
@@ -1709,6 +1710,7 @@ mod tests {
             e2e_protos: vec![],
             docs_only: false,
             held: None,
+            early: None,
         };
         assert_eq!(
             decide_initiator_admission(
@@ -1751,6 +1753,7 @@ mod tests {
             e2e_protos: vec![],
             docs_only: false,
             held: None,
+            early: None,
         };
 
         // Past the Roster/Policy's own `expires` (4_000_000_000, see
@@ -1812,6 +1815,7 @@ mod tests {
             e2e_protos: vec![],
             docs_only: false,
             held: None,
+            early: None,
         };
 
         match decide_initiator_admission(
