@@ -493,12 +493,12 @@ diff -ruN a/src/connection/rtt.rs b/src/connection/rtt.rs
 diff -ruN a/src/connection/stream/flow_control.rs b/src/connection/stream/flow_control.rs
 --- a/src/connection/stream/flow_control.rs
 +++ b/src/connection/stream/flow_control.rs
-@@ -53,6 +53,38 @@
+@@ -53,6 +53,41 @@
              return None;
          }
  
-+        // Patch 6 (menzil): give grown window back. Half a window took longer than
-+        // max(1 s, 4 x RTT) to arrive, so the stream is not using its grown maximum: the credit
++        // Patch 6 (menzil): give grown window back. The time since the previous shrink or grant
++        // (`last_window_update`) is at least max(1 s, 4 x RTT) and half a window is due, so the stream is not using its grown maximum: the credit
 +        // that would be granted now is not granted, and the maximum falls by that much, down to
 +        // `DEFAULT_CREDIT`. The bytes the sender already holds credit for stay valid (the maximum
 +        // never drops below credit outstanding plus data buffered), so an honest peer is never
@@ -518,11 +518,14 @@ diff -ruN a/src/connection/stream/flow_control.rs b/src/connection/stream/flow_c
 +                    reduce,
 +                    self.max_receive_window
 +                );
++                // The shrink is the answer to this interval: the next one is measured from now
++                // (opus round S-C2, M1), or one idle gap would walk the window down to
++                // `DEFAULT_CREDIT` on every later due update, however fast the stream runs.
++                self.last_window_update = Instant::now();
 +                if next_window_update == 0 {
 +                    self.assert_invariants(buffer_len);
 +                    return None;
 +                }
-+                self.last_window_update = Instant::now();
 +                self.receive_window += next_window_update;
 +                self.assert_invariants(buffer_len);
 +                return Some(next_window_update);
@@ -532,7 +535,7 @@ diff -ruN a/src/connection/stream/flow_control.rs b/src/connection/stream/flow_c
          log::trace!(
              "received {} mb in {} seconds ({} mbit/s)",
              next_window_update as f64 / crate::MIB as f64,
-@@ -208,7 +240,7 @@
+@@ -208,7 +243,7 @@
      }
  }
  
@@ -541,7 +544,7 @@ diff -ruN a/src/connection/stream/flow_control.rs b/src/connection/stream/flow_c
  mod tests {
      use super::*;
      use quickcheck::{GenRange, QuickCheck};
-@@ -300,3 +332,76 @@
+@@ -300,3 +335,148 @@
          QuickCheck::new().quickcheck(property as fn(_))
      }
  }
@@ -616,6 +619,78 @@ diff -ruN a/src/connection/stream/flow_control.rs b/src/connection/stream/flow_c
 +            c.max_receive_window >= 8 * mib,
 +            "300 ms is not idle at RTT 200 ms"
 +        );
++    }
++
++    #[test]
++    fn the_idle_threshold_scales_with_the_rtt_and_has_a_floor_of_one_second() {
++        let acc = Arc::new(Mutex::new(0usize));
++        let mib = 1024 * 1024u32;
++        // RTT 2 s: 5 s is below 4 x RTT = 8 s, so no shrink (kills rtt * 1, a dropped RTT term, min for max).
++        let mut c = controller(&acc, 2000, 8 * mib);
++        c.last_window_update = Instant::now() - Duration::from_secs(5);
++        c.next_window_update(0);
++        assert!(c.max_receive_window >= 8 * mib);
++        // RTT 10 ms: 1.5 s is above the 1 s floor, so it shrinks (kills a raised floor).
++        let acc2 = Arc::new(Mutex::new(0usize));
++        let mut c = controller(&acc2, 10, 8 * mib);
++        c.last_window_update = Instant::now() - Duration::from_millis(1500);
++        c.next_window_update(0);
++        assert_eq!(c.max_receive_window, DEFAULT_CREDIT);
++        // RTT 10 ms: 0.5 s is below the floor, no shrink.
++        let acc3 = Arc::new(Mutex::new(0usize));
++        let mut c = controller(&acc3, 10, 8 * mib);
++        c.last_window_update = Instant::now() - Duration::from_millis(500);
++        c.next_window_update(0);
++        assert!(c.max_receive_window >= 8 * mib);
++    }
++
++    #[test]
++    fn one_idle_gap_shrinks_once_and_a_fast_stream_then_keeps_its_window() {
++        let acc = Arc::new(Mutex::new(0usize));
++        let mib = 1024 * 1024u32;
++        let mut c = controller(&acc, 200, 8 * mib);
++        c.last_window_update = Instant::now() - Duration::from_secs(5);
++        c.receive_window = 4 * mib; // 4 MiB received and read, 4 MiB credit outstanding
++        assert_eq!(
++            c.next_window_update(0),
++            None,
++            "the whole due credit went to the shrink"
++        );
++        let after = c.max_receive_window;
++        assert_eq!(after, 4 * mib);
++        // The sender spends half of it at once; the update is due again right away.
++        c.receive_window = 2 * mib;
++        c.next_window_update(0);
++        assert!(
++            c.max_receive_window >= after,
++            "a fast interval must not shrink again"
++        );
++    }
++
++    #[test]
++    fn the_counter_matches_the_growth_over_a_random_sequence() {
++        let mib = 1024 * 1024u32;
++        let acc = Arc::new(Mutex::new(0usize));
++        let mut c = controller(&acc, 200, 8 * mib);
++        let mut x: u64 = 0x9e3779b97f4a7c15;
++        for _ in 0..400 {
++            x ^= x << 13;
++            x ^= x >> 7;
++            x ^= x << 17;
++            let idle = x % 3 == 0;
++            c.last_window_update =
++                Instant::now() - Duration::from_millis(if idle { 3000 } else { 50 });
++            let buffered = (x >> 8) as u32 % (c.max_receive_window / 2);
++            c.receive_window = (x >> 20) as u32 % (c.max_receive_window - buffered);
++            c.next_window_update(buffered as usize);
++            assert_eq!(
++                *acc.lock(),
++                (c.max_receive_window - DEFAULT_CREDIT) as usize
++            );
++            assert!(c.receive_window + buffered <= c.max_receive_window);
++        }
++        drop(c);
++        assert_eq!(*acc.lock(), 0);
 +    }
 +}
 diff -ruN a/src/connection/stream.rs b/src/connection/stream.rs

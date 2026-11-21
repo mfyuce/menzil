@@ -137,18 +137,30 @@ once moved a bulk transfer (an SSH session, a WebSocket) kept its grown maximum 
 `menzil-stream`'s per session growth budget (15.75 MiB) a few of them left every later stream at the
 initial 256 KiB (design note `docs/private/yamux-window-design.md`, section 2).
 
-Now, when a window update is due (half the maximum has been read) and the previous update was at
-least `max(1 s, 4 x RTT)` ago, the credit that would be granted is not granted: the maximum falls by
-that amount (not below `DEFAULT_CREDIT`) and the same amount goes back to the shared counter. The
+Now, when a window update is due (half the maximum has been read) and the time since the previous
+grant or shrink (`last_window_update`) is at least `max(1 s, 4 x RTT)`, the credit that would be
+granted is not granted: the maximum falls by that amount (not below `DEFAULT_CREDIT`), the same
+amount goes back to the shared counter, and the interval restarts (opus round S-C2, M1: without the
+restart one idle gap shrank every later due update down to 256 KiB, however fast the stream ran). The
 sender keeps every byte of credit it already holds; the maximum never drops below credit outstanding
 plus data buffered, so an honest peer is never cut off and `assert_invariants` still holds. A stream
-that fills half its window in less than that keeps it. Wire format unchanged, receiver only. One
-step per due update; a stream idle for long converges to 256 KiB over successive updates.
+that fills half its window in less than the threshold keeps it. Wire format unchanged, receiver only.
+A grant after a shrink can be small (the remainder of the due credit, down to a few bytes); that is
+legal on the wire.
 
-Tests (`shrink_tests` in the same file, in `cargo test --lib`): an idle grown window returns its whole
-growth to the counter and grants only `DEFAULT_CREDIT`; a shrink with credit outstanding and unread
-data stays at or above their sum; a fast stream keeps its window. Mutants: `if false &&` on the
-condition and dropping the counter return both fail the first test.
+Limits, stated: only a stream that still reads gives growth back (a stream whose sender is idle
+while holding all its credit keeps it: yamux cannot revoke credit, TBD 111). The "minimum RTT" of the
+design note was not built: the RTT is the latest Ping sample, so a peer that delays Pongs raises both
+the growth check (2 x RTT) and this threshold (4 x RTT), and can still hold the session budget with a
+slow stream; the damage stays inside that session.
+
+Tests (`shrink_tests` in the same file, in `cargo test --lib`, six): an idle grown window returns its
+whole growth to the counter and grants only `DEFAULT_CREDIT`; a shrink with credit outstanding and
+unread data stays at or above their sum; a fast stream keeps its window; the threshold scales with the
+RTT and has a floor of one second; one idle gap shrinks once and a fast interval then keeps the window;
+a pseudo random sequence keeps counter == sum of growth and 0 after the drop. Mutants killed: the
+condition off, no counter return, no interval restart, `rtt * 4` as `rtt * 1`, the floor raised, `max`
+as `min`. Not pinned: `>=` against `>` at the exact threshold.
 
 ## Memory this does not bound
 
@@ -185,8 +197,8 @@ a connection, and 256 connections at most unless configured otherwise).
   upstream_quickcheck))]` since 2026-11-15 (patch 5 follow up, round T1d N1): quickcheck is not a
   dependency of the published package (it needs `quickcheck-ext`, a path dependency of upstream's
   workspace), so without the gate `cargo test --lib` did not even compile and the unit tests above
-  never ran. Now `cd vendor/yamux && CARGO_TARGET_DIR=<own> cargo test --offline --lib` runs 18
-  tests (2 upstream, 12 chunks, 1 frame cap, 3 window shrink); `docs/private/tools/gate.sh` runs it after the
+  never ran. Now `cd vendor/yamux && CARGO_TARGET_DIR=<own> cargo test --offline --lib` runs 21
+  tests (2 upstream, 12 chunks, 1 frame cap, 6 window shrink); `docs/private/tools/gate.sh` runs it after the
   workspace tests. Remove the `Cargo.lock` cargo leaves in this directory (the directory is
   excluded from the workspace).
 - To run upstream's own suite against these sources, take the upstream commit above, replace its
