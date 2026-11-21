@@ -732,8 +732,12 @@ impl ForwardTable {
         let charge = (payload.len() as u32).max(MIN_FORWARD_CHARGE_BYTES);
         let reimburse = || {
             if reliable {
-                registry.deliver(
+                // Only to the session that spent the credit: a node that re-attached meanwhile
+                // never spent it, and a CREDIT to its new session would inflate that session's
+                // credit (review R-1, agy gemini).
+                registry.deliver_to_session(
                     src,
+                    src_session_id,
                     ForwardItem::Credit {
                         peer: *dst,
                         bytes: charge,
@@ -1064,8 +1068,11 @@ impl ForwardTable {
             }
         }
         if grant_now {
-            registry.deliver(
+            // Check and hand-off in one registry read: `is_current` above and this delivery are
+            // two reads, a re-attach between them must not get a CREDIT it did not spend.
+            registry.deliver_to_session(
                 src,
+                src_session_id,
                 ForwardItem::Credit {
                     peer: *dst,
                     bytes: charge,
@@ -1764,6 +1771,34 @@ mod tests {
 
     fn droppable_send(payload_len: usize) -> (u8, u8, Vec<u8>) {
         (0x01, 0x01, vec![0u8; payload_len])
+    }
+
+    #[test]
+    fn a_refusal_does_not_reimburse_a_session_that_did_not_send() {
+        let f = fixture(4_000_000_000);
+        let table = ForwardTable::new();
+        // The sender re-attaches (session 2) after the SEND of session 1 was read.
+        let mut new_handles = f.registry.attach(f.src, 7, vec![f.network_id]);
+        let (_, flags, payload) = reliable_send(10);
+        let outcome = table.forward_in_session(
+            &f.rosters,
+            &f.registry,
+            &f.labels,
+            &test_limits(),
+            &f.src,
+            1,
+            &[f.network_id],
+            &f.dst,
+            0x7f, // unknown e2e_proto: refused
+            flags,
+            payload,
+            1_000,
+        );
+        assert!(matches!(outcome, ForwardOutcome::Refused(_)));
+        assert!(
+            new_handles.2.try_recv().is_err(),
+            "the new session must not get a CREDIT for a SEND it never made"
+        );
     }
 
     #[test]
