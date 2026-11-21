@@ -751,6 +751,11 @@ fn process_response(
     if !upgrades.is_empty() || connection_upgrade {
         return None;
     }
+    // RFC 9110 8.6 and 9112 6.1: a 204 carries no framing header at all. A node that sends one
+    // is broken; a relay that passed it on would leave a chunked head with no terminator.
+    if code == 204 && (length.is_some() || chunked) {
+        return None;
+    }
     let no_body = is_head || code == 204 || code == 304;
     let body = if no_body {
         Framing::None
@@ -2013,6 +2018,36 @@ mod tests {
                 String::from_utf8_lossy(&out.client)
             );
         }
+    }
+
+    #[test]
+    fn a_204_with_a_framing_header_is_refused_while_head_and_304_keep_theirs() {
+        let plan =
+            |head: &str, is_head: bool| process_response(head.as_bytes(), is_head, "h", None);
+        assert!(
+            plan(
+                "HTTP/1.1 204 No Content\r\nContent-Length: 5\r\n\r\n",
+                false
+            )
+            .is_none()
+        );
+        assert!(
+            plan(
+                "HTTP/1.1 204 No Content\r\nTransfer-Encoding: chunked\r\n\r\n",
+                false
+            )
+            .is_none()
+        );
+        assert!(plan("HTTP/1.1 204 No Content\r\n\r\n", false).is_some());
+        // HEAD and 304 may state the length the body would have had.
+        assert!(plan("HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n", true).is_some());
+        assert!(
+            plan(
+                "HTTP/1.1 304 Not Modified\r\nContent-Length: 5\r\n\r\n",
+                false
+            )
+            .is_some()
+        );
     }
 
     #[tokio::test]

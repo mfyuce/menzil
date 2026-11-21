@@ -172,5 +172,5 @@ The tests that exercise each requirement are mapped in `threat-model-test-map.md
 2. Is a 14 day document expiry the right trade between revocation latency under a withholding relay and steward availability requirements?
 3. The share domain in ADVERTISE_ACK (protocol.md 14, item 4): without it the node cannot check the domain part of `meta.sni`.
 4. No test runs against a real CA or a deployed relay; the live tests use loopback and an in process fake CA (protocol.md 14, item 5).
-5. Node side ACME is a library that nothing starts, and a certificate it obtains is not handed to the service behind a blind share (protocol.md 14, item 6).
+5. Node side ACME runs when `config.toml` has an `[acme]` table (`menzil node`), and the certificate it obtains is written under `<home>/acme/certs/<domain>/`; it is not handed to the service behind a blind share, which has to read the file itself (protocol.md 6.2, 14 item 6).
 6. Whether public share clients need a rate figure of their own instead of the per address rate (2.7).
