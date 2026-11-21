@@ -980,6 +980,26 @@ impl Opener for NodeOpener {
         self.open_on(network_id, peer, service, None).await
     }
 
+    /// [`Opener::open`], handing the client's early bytes to the peer with the OPEN when it
+    /// offered them (protocol.md 5.3, 12; TBD 112).
+    async fn open_early(
+        &self,
+        target: &str,
+        mut early: agent::EarlyBytes<'_>,
+    ) -> Result<Stream, String> {
+        let (who, service) = split_target(target)?;
+        let (network_id, peer) = self.resolve_peer(who)?;
+        self.node
+            .open_stream_early(peer, network_id, service, None, |max| async move {
+                early.take(max).await
+            })
+            .await
+            .map_err(|error| {
+                let rejected = self.node.last_relay_error().map(rejected_of);
+                explain_with(&error, rejected.as_ref(), unix_now())
+            })
+    }
+
     /// The exit `who` is asked for `egress:*` with the destination as a name (protocol.md 8):
     /// nothing is resolved here, and what the exit refuses comes back by its code name
     /// ([`explain_with`]).

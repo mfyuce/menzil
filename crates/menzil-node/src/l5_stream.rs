@@ -240,26 +240,27 @@ pub async fn open(
     service: ServiceId,
     target: Option<OpenTarget>,
 ) -> Result<Stream, OpenStreamError> {
-    open_early(session, service, target, |_| Vec::new()).await
+    open_early(session, service, target, |_| async { Vec::new() }).await
 }
 
 /// [`open`], with early bytes (protocol.md 5.3, TBD 112): when the peer offered early bytes in
-/// its handshake ([`L4SessionHandle::peer_early`] above 0), `take_early(max)` is called once,
+/// its handshake ([`L4SessionHandle::peer_early`] above 0), `take_early(max)` is awaited once,
 /// after the raw stream exists and before the OPEN is written, and the bytes it returns (at most
-/// `max`, never waiting: only what the caller has in hand now) go out in the same write as the
+/// `max`, and it must not wait for any: only what the caller has in hand now) go out in the same write as the
 /// OPEN, so a request that is already there costs no extra round trip. A peer that offered none
 /// never has `take_early` called, so the caller still holds every byte it has. More than `max`
 /// bytes returned is an error ([`OpenStreamError::Channel`]), never a silent cut. If the OPEN
 /// is refused, the early bytes are gone with it: the caller reports the refusal and drops the
 /// local connection.
-pub async fn open_early<F>(
+pub async fn open_early<F, Fut>(
     session: &L4SessionHandle,
     service: ServiceId,
     target: Option<OpenTarget>,
     take_early: F,
 ) -> Result<Stream, OpenStreamError>
 where
-    F: FnOnce(usize) -> Vec<u8> + Send,
+    F: FnOnce(usize) -> Fut + Send,
+    Fut: std::future::Future<Output = Vec<u8>> + Send,
 {
     if target.is_some() && service != ServiceId::new(ServiceKind::Egress, "*") {
         return Err(OpenStreamError::InvalidTarget);
@@ -313,7 +314,7 @@ pub async fn open_udp(
     };
     let (stream, ack_channel) = match tokio::time::timeout(
         OPEN_TIMEOUT,
-        open_inner(session, service, Some(target), |_| Vec::new()),
+        open_inner(session, service, Some(target), |_| async { Vec::new() }),
     )
     .await
     {
@@ -343,14 +344,15 @@ pub async fn open_udp(
 /// [`open`]'s own body, run under its single [`OPEN_TIMEOUT`] deadline —
 /// split out only so that deadline can wrap `session.open_stream()` too,
 /// not just the exchange that follows it.
-async fn open_inner<F>(
+async fn open_inner<F, Fut>(
     session: &L4SessionHandle,
     service: ServiceId,
     target: Option<OpenTarget>,
     take_early: F,
 ) -> Result<(Stream, Option<u16>), OpenStreamError>
 where
-    F: FnOnce(usize) -> Vec<u8> + Send,
+    F: FnOnce(usize) -> Fut + Send,
+    Fut: std::future::Future<Output = Vec<u8>> + Send,
 {
     let mut stream = session.open_stream().await?;
     let open = OpenBody {
@@ -360,7 +362,11 @@ where
         meta: OpenMeta::default(),
     };
     let max = session.peer_early() as usize;
-    let early = if max > 0 { take_early(max) } else { Vec::new() };
+    let early = if max > 0 {
+        take_early(max).await
+    } else {
+        Vec::new()
+    };
     if early.len() > max {
         return Err(OpenStreamError::Channel(
             "more early bytes than the peer offered",
@@ -1237,7 +1243,7 @@ mod tests {
         });
         let asked = Arc::new(AtomicUsize::new(0));
         let asked_in = Arc::clone(&asked);
-        let _stream = open_early(&a, ssh(), None, move |max| {
+        let _stream = open_early(&a, ssh(), None, move |max| async move {
             asked_in.store(max, Ordering::SeqCst);
             b"hello early".to_vec()
         })
@@ -1282,7 +1288,7 @@ mod tests {
         });
         let called = Arc::new(AtomicUsize::new(0));
         let called_in = Arc::clone(&called);
-        let mut stream = open_early(&a, ssh(), None, move |_| {
+        let mut stream = open_early(&a, ssh(), None, move |_| async move {
             called_in.fetch_add(1, Ordering::SeqCst);
             b"never sent".to_vec()
         })
@@ -1316,7 +1322,7 @@ mod tests {
         a.set_peer_early(u32::MAX);
         assert_eq!(a.peer_early(), crate::l4_session::EARLY_MAX);
         let over = vec![0u8; crate::l4_session::EARLY_MAX as usize + 1];
-        let result = open_early(&a, ssh(), None, move |_| over).await;
+        let result = open_early(&a, ssh(), None, move |_| async move { over }).await;
         assert!(matches!(result, Err(OpenStreamError::Channel(_))));
     }
 
@@ -1341,7 +1347,7 @@ mod tests {
         });
         let result = tokio::time::timeout(
             Duration::from_secs(5),
-            open_early(&a, ssh(), None, |_| b"secret request".to_vec()),
+            open_early(&a, ssh(), None, |_| async { b"secret request".to_vec() }),
         )
         .await
         .expect("no hang");

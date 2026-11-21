@@ -183,6 +183,20 @@ pub trait Opener: Send + Sync + 'static {
     /// Opens a stream to `target`, which is `<who>/<service>` as the user typed it.
     fn open(&self, target: &str) -> impl Future<Output = Result<Stream, String>> + Send;
 
+    /// [`Self::open`] with early bytes (protocol.md 5.3 and 12, TBD 112): `early` holds what the
+    /// client already sent behind its request line. An opener that can hand them to the peer
+    /// with the OPEN takes what the peer offered ([`EarlyBytes::take`], never more, never
+    /// waiting); the rest stays unread and is bridged as usual after `ok`. The default ignores
+    /// `early`, which is always correct: every byte then simply goes after the OPEN_ACK.
+    fn open_early(
+        &self,
+        target: &str,
+        early: EarlyBytes<'_>,
+    ) -> impl Future<Output = Result<Stream, String>> + Send {
+        let _ = early;
+        self.open(target)
+    }
+
     /// Opens a stream to the egress exit `who` for the destination `host`:`port`, for the
     /// `connect` request. `host` and `port` have passed [`validate_target`]; the exit decides
     /// what it dials. The default says egress is not available, so that an opener that knows
@@ -972,8 +986,60 @@ async fn handle<O: Opener>(connection: UnixStream, opener: &O) -> Result<()> {
             return Ok(());
         }
     };
-    let opened = timeout(OPEN_TIMEOUT, opener.open(target)).await;
+    let opened = timeout(
+        OPEN_TIMEOUT,
+        opener.open_early(target, EarlyBytes { read: &mut read }),
+    )
+    .await;
     answer_open(opened, read, write).await
+}
+
+/// The data frames a client sent right behind its request line, still unread in the agent's
+/// buffer (protocol.md 12, TBD 112). The agent never waits for them: [`Self::take`] looks at what
+/// has arrived by now, takes whole `DATA` frames while they fit the offer, and leaves everything
+/// else (a frame that does not fit, an `END`, a `RESET`, bytes of a later frame) where it is, in
+/// order, for the bridge. A client that sends nothing early loses nothing.
+pub struct EarlyBytes<'a> {
+    read: &'a mut BufReader<crate::sock::OwnedReadHalf>,
+}
+
+impl EarlyBytes<'_> {
+    /// At most `max` payload bytes of the leading `DATA` frames that are already here.
+    pub async fn take(&mut self, max: usize) -> Vec<u8> {
+        use futures_util::FutureExt as _;
+        if self.read.buffer().is_empty() {
+            // Whatever the socket holds right now; no wait.
+            let _ = self.read.fill_buf().now_or_never();
+        }
+        let (bytes, used) = peel_data_frames(self.read.buffer(), max);
+        self.read.consume(used);
+        bytes
+    }
+}
+
+/// The payloads of the whole leading `DATA` frames of `buffer` that fit `max` together, and how
+/// many bytes of `buffer` they took (headers included). Stops at the first frame that is not
+/// `DATA`, is not whole yet, or would pass `max`.
+fn peel_data_frames(buffer: &[u8], max: usize) -> (Vec<u8>, usize) {
+    let mut bytes = Vec::new();
+    let mut used = 0;
+    while buffer.len() >= used + 5 && buffer[used] == FRAME_DATA {
+        let length = u32::from_be_bytes([
+            buffer[used + 1],
+            buffer[used + 2],
+            buffer[used + 3],
+            buffer[used + 4],
+        ]) as usize;
+        if length > MAX_FRAME_PAYLOAD
+            || buffer.len() < used + 5 + length
+            || bytes.len() + length > max
+        {
+            break;
+        }
+        bytes.extend_from_slice(&buffer[used + 5..used + 5 + length]);
+        used += 5 + length;
+    }
+    (bytes, used)
 }
 
 /// What a stream that was asked for came to: an error line, or `ok` and the bridge.
@@ -1109,7 +1175,12 @@ where
     R: AsyncRead + Unpin + Send,
     W: AsyncWrite + Unpin + Send,
 {
-    request_as(socket, &request_line(target), uid)
+    // Whatever the program has already sent goes behind the request line (protocol.md 12,
+    // TBD 112), so a node whose peer offered early bytes needs no round trip for it. The wait
+    // is a few milliseconds at most, and only for a program that speaks later (a server that
+    // speaks first, such as sshd, has nothing to send yet).
+    let early = grab_early(input).await;
+    request_as_with(socket, &request_line(target), uid, &early)
         .await?
         .bridge(input, output)
         .await
@@ -1161,6 +1232,32 @@ async fn open_connect_as(
 
 /// Connects to the agent, checks who runs it, sends `line` and reads the answer.
 async fn request_as(socket: &Path, line: &str, uid: u32) -> Result<Opened> {
+    request_as_with(socket, line, uid, &[]).await
+}
+
+/// How long a client waits for its program's first bytes before it asks without them.
+const EARLY_GRACE: Duration = Duration::from_millis(3);
+/// The most early bytes a client sends (the figure of `menzil_node::EARLY_MAX`).
+const EARLY_CLIENT_MAX: usize = 16 * 1024;
+
+/// What `input` delivers within [`EARLY_GRACE`], at most [`EARLY_CLIENT_MAX`] bytes; nothing at
+/// an end of file (the bridge reads it again and says `END`) or on an error (the bridge meets it
+/// again). Cancel safe: a read that did not finish consumed nothing.
+async fn grab_early<R: AsyncRead + Unpin>(input: &mut R) -> Vec<u8> {
+    let mut buffer = vec![0u8; EARLY_CLIENT_MAX];
+    match timeout(EARLY_GRACE, input.read(&mut buffer)).await {
+        Ok(Ok(n)) if n > 0 => {
+            buffer.truncate(n);
+            buffer
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// [`request_as`] with `early` bytes sent as one `DATA` frame in the same write as the request
+/// line. An agent that predates early bytes reads that frame after its `ok`, as any frame, so it
+/// is carried in order either way.
+async fn request_as_with(socket: &Path, line: &str, uid: u32, early: &[u8]) -> Result<Opened> {
     crate::node_cmd::check_socket_path_length(socket)?;
     let connection = UnixStream::connect(socket).await.with_context(|| {
         format!(
@@ -1180,7 +1277,13 @@ async fn request_as(socket: &Path, line: &str, uid: u32) -> Result<Opened> {
     }
     let (read, mut write) = connection.into_split();
     let mut read = BufReader::new(read);
-    write.write_all(line.as_bytes()).await?;
+    let mut first = line.as_bytes().to_vec();
+    if !early.is_empty() {
+        first.push(FRAME_DATA);
+        first.extend_from_slice(&(early.len() as u32).to_be_bytes());
+        first.extend_from_slice(early);
+    }
+    write.write_all(&first).await?;
     let reply = timeout(
         OPEN_TIMEOUT + Duration::from_secs(10),
         read_line(&mut read, MAX_REPLY_BYTES),

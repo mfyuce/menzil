@@ -664,6 +664,34 @@ impl Node {
         Ok(open(&session, service, target).await?)
     }
 
+    /// [`Self::open_stream`] with early bytes (protocol.md 5.3, TBD 112): if the peer offered
+    /// them, `take_early(max)` is awaited once, after the session is up and the raw stream is
+    /// open, and what it returns goes out with the OPEN ([`l5_stream::open_early`] has the
+    /// rules). It must not wait for bytes: only what the caller has in hand.
+    pub async fn open_stream_early<F, Fut>(
+        &self,
+        peer: NodeId,
+        network: NetworkId,
+        service: ServiceId,
+        target: Option<OpenTarget>,
+        take_early: F,
+    ) -> Result<Stream, NodeOpenError>
+    where
+        F: FnOnce(usize) -> Fut + Send,
+        Fut: std::future::Future<Output = Vec<u8>> + Send,
+    {
+        let started = tokio::time::Instant::now();
+        let session = match self.router.ensure_session(peer, network).await {
+            Err(EnsureError::DocsOnly)
+                if self.sync.wait_docs_only_push(peer, network, started).await =>
+            {
+                self.router.ensure_session(peer, network).await?
+            }
+            other => other?,
+        };
+        Ok(crate::l5_stream::open_early(&session, service, target, take_early).await?)
+    }
+
     /// The L3 records the router does not consume, and a copy of every
     /// `Attached` and `Detached` (see [`RouterParts::passthrough`]), for the
     /// consumers that need them (ADVERTISE_ACK for `expose`, ADMIT_* for

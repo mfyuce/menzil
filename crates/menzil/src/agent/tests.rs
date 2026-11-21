@@ -692,7 +692,13 @@ async fn an_agent_that_stops_reading_ends_the_client_as_a_reset_not_a_clean_end(
     });
     let (mut feed, mut stdin) = duplex(64 * 1024);
     let (mut stdout, _collect) = duplex(1024);
-    feed.write_all(&[1u8; 4096]).await.unwrap();
+    // The program speaks only after the request went out (not as early bytes, which ride the
+    // request's own write and are accepted by the kernel before the agent stops reading).
+    let late = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        feed.write_all(&[1u8; 4096]).await.unwrap();
+        feed
+    });
     let end = timeout(
         WAIT,
         connect_and_bridge(&socket, "peer/e", &mut stdin, &mut stdout),
@@ -700,6 +706,7 @@ async fn an_agent_that_stops_reading_ends_the_client_as_a_reset_not_a_clean_end(
     .await
     .unwrap()
     .unwrap();
+    drop(late);
     match end {
         End::Reset(why) => assert!(why.contains("agent went away"), "{why}"),
         End::Clean => panic!("the agent took none of the input, and the end was reported clean"),
@@ -2319,4 +2326,160 @@ async fn an_agent_that_manages_no_invites_says_so() {
     assert!(
         matches!(error, AskError::Failed(ref e) if format!("{e:#}").contains("does not manage invites"))
     );
+}
+
+// ---------------------------------------------------------------------------------------------
+// Early bytes (protocol.md 5.3 and 12, TBD 112)
+// ---------------------------------------------------------------------------------------------
+
+/// Takes what the client sent behind its request line, up to `offer`, and then opens an echo
+/// stream, writing the bytes it took first, the way the node does with the OPEN.
+struct EarlyOpener {
+    mux: StreamMux,
+    offer: usize,
+    took: Mutex<Option<Vec<u8>>>,
+}
+
+impl Opener for EarlyOpener {
+    async fn open(&self, _target: &str) -> Result<Stream, String> {
+        Err("`open_early` was expected".to_string())
+    }
+
+    async fn open_early(&self, _target: &str, mut early: EarlyBytes<'_>) -> Result<Stream, String> {
+        let took = early.take(self.offer).await;
+        let mut stream = self.mux.open().await.map_err(|e| e.to_string())?;
+        let mut first = b"e".to_vec();
+        first.extend_from_slice(&took);
+        stream.write_all(&first).await.map_err(|e| e.to_string())?;
+        *self.took.lock().unwrap() = Some(took);
+        Ok(stream)
+    }
+}
+
+fn early_opener(offer: usize) -> Arc<EarlyOpener> {
+    let (client_mux, _client_inbound, client_out, client_driver) =
+        menzil_stream::new(Mode::Client, 65_535);
+    let (server_mux, server_inbound, server_out, server_driver) =
+        menzil_stream::new(Mode::Server, 65_535);
+    tokio::spawn(client_driver);
+    tokio::spawn(server_driver);
+    tokio::spawn(pump(client_out, server_mux.clone()));
+    tokio::spawn(pump(server_out, client_mux.clone()));
+    let (seen_tx, _seen) = mpsc::unbounded_channel();
+    tokio::spawn(remote(server_inbound, seen_tx));
+    Arc::new(EarlyOpener {
+        mux: client_mux,
+        offer,
+        took: Mutex::new(None),
+    })
+}
+
+/// The client program has `first` ready when it asks and sends `later` after a pause; the
+/// echo that comes back and how the bridge ended.
+async fn echo_through(socket: &Path, uid: u32, first: &[u8], later: &[u8]) -> (Vec<u8>, End) {
+    let (mut feed, mut stdin) = duplex(64 * 1024);
+    let (mut stdout, mut collect) = duplex(1 << 20);
+    feed.write_all(first).await.unwrap();
+    let later = later.to_vec();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let _ = feed.write_all(&later).await;
+        let _ = feed.shutdown().await;
+    });
+    let end = bridge_as(socket, "who/e", &mut stdin, &mut stdout, uid)
+        .await
+        .unwrap();
+    drop(stdout);
+    let mut echoed = Vec::new();
+    collect.read_to_end(&mut echoed).await.unwrap();
+    (echoed, end)
+}
+
+#[tokio::test]
+async fn what_the_client_already_sent_reaches_the_opener_as_early_bytes_and_nothing_is_lost() {
+    let opener = early_opener(16 * 1024);
+    let seen = opener.clone();
+    let (echoed, end) = with_agent(opener, async |socket, uid| {
+        echo_through(socket, uid, b"hello ", b"world").await
+    })
+    .await;
+    assert!(matches!(end, End::Clean));
+    assert_eq!(seen.took.lock().unwrap().as_deref(), Some(&b"hello "[..]));
+    assert_eq!(
+        echoed, b"hello world",
+        "early and later bytes, once each, in order"
+    );
+}
+
+#[tokio::test]
+async fn an_offer_of_nothing_takes_none_and_every_byte_still_arrives_in_order() {
+    let opener = early_opener(0);
+    let seen = opener.clone();
+    let (echoed, end) = with_agent(opener, async |socket, uid| {
+        echo_through(socket, uid, b"hello ", b"world").await
+    })
+    .await;
+    assert!(matches!(end, End::Clean));
+    assert_eq!(seen.took.lock().unwrap().as_deref(), Some(&b""[..]));
+    assert_eq!(echoed, b"hello world");
+}
+
+/// An opener that knows nothing of early bytes (the default `open_early`) still carries the
+/// frame the client put behind its request line: the old path, byte for byte.
+#[tokio::test]
+async fn an_opener_without_early_support_still_carries_the_frame_behind_the_request() {
+    let (client_mux, _ci, client_out, client_driver) = menzil_stream::new(Mode::Client, 65_535);
+    let (server_mux, server_inbound, server_out, server_driver) =
+        menzil_stream::new(Mode::Server, 65_535);
+    tokio::spawn(client_driver);
+    tokio::spawn(server_driver);
+    tokio::spawn(pump(client_out, server_mux.clone()));
+    tokio::spawn(pump(server_out, client_mux.clone()));
+    let (seen_tx, _seen) = mpsc::unbounded_channel();
+    tokio::spawn(remote(server_inbound, seen_tx));
+    let opener = Arc::new(TestOpener { mux: client_mux });
+    let (echoed, end) = with_agent(opener, async |socket, uid| {
+        echo_through(socket, uid, b"hello ", b"world").await
+    })
+    .await;
+    assert!(matches!(end, End::Clean));
+    assert_eq!(echoed, b"hello world");
+}
+
+fn data_frame(payload: &[u8]) -> Vec<u8> {
+    let mut frame = vec![FRAME_DATA];
+    frame.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+    frame.extend_from_slice(payload);
+    frame
+}
+
+#[test]
+fn only_whole_leading_data_frames_that_fit_the_offer_are_peeled() {
+    let mut buffer = data_frame(b"abc");
+    buffer.extend(data_frame(b"defg"));
+    // Both fit.
+    assert_eq!(
+        peel_data_frames(&buffer, 7),
+        (b"abcdefg".to_vec(), buffer.len())
+    );
+    // The second would pass the offer: it stays.
+    assert_eq!(peel_data_frames(&buffer, 6), (b"abc".to_vec(), 8));
+    // An offer of nothing takes nothing, and an empty buffer is nothing.
+    assert_eq!(peel_data_frames(&buffer, 0), (Vec::new(), 0));
+    assert_eq!(peel_data_frames(&[], 100), (Vec::new(), 0));
+    // A frame that is not whole yet stays, header or body.
+    assert_eq!(
+        peel_data_frames(&buffer[..buffer.len() - 1], 100),
+        (b"abc".to_vec(), 8)
+    );
+    assert_eq!(peel_data_frames(&buffer[..4], 100), (Vec::new(), 0));
+    // The first frame that is not DATA stops it: an END is left for the bridge.
+    let mut with_end = data_frame(b"abc");
+    with_end.extend([FRAME_END, 0, 0, 0, 0]);
+    with_end.extend(data_frame(b"zzz"));
+    assert_eq!(peel_data_frames(&with_end, 100), (b"abc".to_vec(), 8));
+    // A frame longer than the protocol allows is never trusted.
+    let mut huge = vec![FRAME_DATA];
+    huge.extend(((MAX_FRAME_PAYLOAD + 1) as u32).to_be_bytes());
+    assert_eq!(peel_data_frames(&huge, usize::MAX), (Vec::new(), 0));
 }
