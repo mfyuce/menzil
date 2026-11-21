@@ -612,7 +612,8 @@ enum Early {
     /// The pair belongs to another session of the sender than the caller's. Session ids are a
     /// keyed permutation of a counter (equality is all they mean), so `admit` cannot tell which
     /// is newer: nothing was changed, and the caller asks the registry which one is current.
-    Mismatch,
+    /// Carries the other session's id, so the retry replaces exactly that pair and no other.
+    Mismatch(u32),
     CreditViolation(ErrorBody),
     OverQuota(TenantId, DataQuota),
 }
@@ -809,9 +810,9 @@ impl ForwardTable {
             reliable,
             charge,
             Instant::now(),
-            false,
+            None,
         );
-        if matches!(admitted, Err(Early::Mismatch)) {
+        if let Err(Early::Mismatch(seen)) = admitted {
             // The pair is another session's. If the caller is still the current one, the pair
             // is the superseded session's and is replaced; otherwise the caller is the stale one.
             if !registry.is_current(src, src_session_id) {
@@ -827,12 +828,12 @@ impl ForwardTable {
                 reliable,
                 charge,
                 Instant::now(),
-                true,
+                Some(seen),
             );
         }
         let (generation, shared, created) = match admitted {
             Ok(admitted) => admitted,
-            Err(Early::Dropped | Early::Mismatch) => return ForwardOutcome::Dropped,
+            Err(Early::Dropped | Early::Mismatch(_)) => return ForwardOutcome::Dropped,
             Err(Early::CreditViolation(error)) => return ForwardOutcome::CreditViolation(error),
             Err(Early::OverQuota(tenant, quota)) => {
                 reimburse();
@@ -1089,7 +1090,7 @@ impl ForwardTable {
         reliable: bool,
         charge: u32,
         now: Instant,
-        replace: bool,
+        replace: Option<u32>,
     ) -> Result<(u64, Arc<PairShared>, bool), Early> {
         let mut guard = self.table();
         let table = &mut *guard;
@@ -1104,8 +1105,11 @@ impl ForwardTable {
             && pair.counted
             && pair.src_session != src_session
         {
-            if !replace {
-                return Err(Early::Mismatch);
+            // Replace only the pair the caller saw: if it changed hands in between (another
+            // attach, another replacement), the caller's current-session answer is stale for
+            // it (opus recheck 2 of 050bef1, N2).
+            if replace != Some(pair.src_session) {
+                return Err(Early::Mismatch(pair.src_session));
             }
             if let Some(old) = table.pairs.remove(&key) {
                 old.shared.revoked.store(true, Ordering::Release);
@@ -3639,6 +3643,81 @@ mod tests {
         }
         // 900's item was revoked by the replacement, 5's item is live.
         assert_eq!(items, vec![true, false]);
+    }
+
+    /// N1 (opus recheck 2 of 050bef1): the attach-time `supersede_for` of an earlier attach that
+    /// a newer one has overtaken does not run, so it cannot revoke the newer session's pairs.
+    #[test]
+    fn the_supersede_of_an_overtaken_attach_does_not_run() {
+        let f = fixture(4_000_000_000);
+        let table = ForwardTable::new();
+        let limits = test_limits();
+        let (_s, _o, _dst_rx) = f.registry.attach(f.dst, 20, vec![f.network_id]);
+        let _first = f.registry.attach(f.src, 5, vec![f.network_id]);
+        let _second = f.registry.attach(f.src, 6, vec![f.network_id]);
+        let (e, fl, p) = reliable_send(1_000);
+        let outcome = table.forward_in_session(
+            &f.rosters,
+            &f.registry,
+            &f.labels,
+            &limits,
+            &f.src,
+            6,
+            &[f.network_id],
+            &f.dst,
+            e,
+            fl,
+            p,
+            1_000,
+        );
+        assert!(matches!(outcome, ForwardOutcome::Queued));
+        // The late call of session 5, as session.rs makes it: refused, nothing revoked.
+        let ran = f
+            .registry
+            .current_then(&f.src, 5, || table.supersede_for(&f.src, 5));
+        assert!(!ran);
+        assert_eq!(
+            table.remaining_credit(&f.src, &f.dst),
+            Some(limits.credit - 1_000)
+        );
+        // Session 6's own call runs.
+        assert!(
+            f.registry
+                .current_then(&f.src, 6, || table.supersede_for(&f.src, 6))
+        );
+        assert!(table.remaining_credit(&f.src, &f.dst).is_some());
+    }
+
+    /// N2: a replace is made only for the pair the caller saw. The pair on file belongs to 900;
+    /// a caller that saw 77 (stale) is refused with 900 and nothing changes, one that saw 900
+    /// replaces it.
+    #[test]
+    fn a_replace_acts_only_on_the_pair_that_was_seen() {
+        let f = fixture(4_000_000_000);
+        let table = ForwardTable::new();
+        let limits = test_limits();
+        let book = table.book();
+        let admit = |session: u32, replace: Option<u32>| {
+            table.admit(
+                &book,
+                &limits,
+                &f.src,
+                &f.dst,
+                session,
+                &f.network_id,
+                true,
+                1_000,
+                Instant::now(),
+                replace,
+            )
+        };
+        assert!(admit(900, None).is_ok());
+        assert!(matches!(admit(5, None), Err(Early::Mismatch(900))));
+        assert!(matches!(admit(5, Some(77)), Err(Early::Mismatch(900))));
+        assert_eq!(table.tenant_counts(&TenantId::Default).0, 1);
+        assert!(admit(5, Some(900)).is_ok());
+        assert_eq!(table.tenant_counts(&TenantId::Default).0, 1);
+        assert!(matches!(admit(900, Some(900)), Err(Early::Mismatch(5))));
     }
 }
 

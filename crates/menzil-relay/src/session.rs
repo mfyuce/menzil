@@ -1111,7 +1111,11 @@ async fn run_attached_loop(
     // review's finding H2): `node_id` needs clearing in both its possible
     // roles, see `ForwardTable::clear_for`'s own doc comment for why.
     relay.labels.clear_for(&node_id, unix_now());
-    relay.forwarding.supersede_for(&node_id, session_id);
+    // Only while this session is still the registered one, under the registry's lock: a late
+    // run of an overtaken attach would revoke the newer session's pairs (N1).
+    relay.registry.current_then(&node_id, session_id, || {
+        relay.forwarding.supersede_for(&node_id, session_id)
+    });
 
     // Attach-time catch-up (protocol.md 4.3, extended — see `crate::doc`'s
     // module doc comment for why): this node may be attaching already

@@ -314,6 +314,28 @@ impl SessionRegistry {
     /// this module's own doc comment on [`SessionRegistry::attach`]),
     /// and a record decrypted during that window is still genuinely
     /// authentic, just no longer current.
+    /// Runs `then` only if `session_id` is still `node_id`'s registration, with the registry's
+    /// read lock held across both (the order is registry, then the pair table, as in
+    /// [`Self::detach_then`]): the attach-time `supersede_for` of an earlier attach that a newer
+    /// one has overtaken must not run (opus recheck 2 of 050bef1, N1). `true` if it ran.
+    pub(crate) fn current_then(
+        &self,
+        node_id: &NodeId,
+        session_id: u32,
+        then: impl FnOnce(),
+    ) -> bool {
+        let guard = self.by_node.read().unwrap();
+        if guard
+            .get(node_id)
+            .is_some_and(|registration| registration.session_id == session_id)
+        {
+            then();
+            true
+        } else {
+            false
+        }
+    }
+
     pub fn is_current(&self, node_id: &NodeId, session_id: u32) -> bool {
         self.by_node
             .read()
