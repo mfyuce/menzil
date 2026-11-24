@@ -449,18 +449,21 @@ fn grant(registry: &SessionRegistry, due: Vec<(CreditKey, u32)>) {
         *by_key.entry(key).or_default() += u64::from(bytes);
     }
     for ((src, dst, session_id), mut bytes) in by_key {
-        if !registry.is_current(&src, session_id) {
-            continue;
-        }
+        // Check and hand-off in one registry read, for every part: a re-attach between a
+        // separate check and the delivery would give the new session a CREDIT it did not spend.
         while bytes > 0 {
             let part = u32::try_from(bytes).unwrap_or(u32::MAX);
-            registry.deliver(
+            let delivered = registry.deliver_to_session(
                 &src,
+                session_id,
                 ForwardItem::Credit {
                     peer: dst,
                     bytes: part,
                 },
             );
+            if !delivered {
+                break;
+            }
             bytes -= u64::from(part);
         }
     }
@@ -660,6 +663,32 @@ mod tests {
             }
         }
         total
+    }
+
+    /// Review R-1 (2026-11-25): a sender that re-attaches while its held CREDIT is being handed
+    /// out gets none of it on the new session. Many parts keep `grant` busy long enough for the
+    /// re-attach to land in the middle.
+    #[test]
+    fn a_reattach_during_a_grant_gives_the_new_session_no_credit() {
+        const PARTS: u64 = 500_000;
+        let registry = SessionRegistry::new();
+        let (_s1, _o1, mut old) = registry.attach(node(1), 1, vec![]);
+        let due = vec![((node(1), node(9), 1), u32::MAX); PARTS as usize];
+        let granting = std::thread::spawn({
+            let registry = registry.clone();
+            move || grant(&registry, due)
+        });
+        while old.try_recv().is_err() {
+            std::hint::spin_loop();
+        }
+        let (_s2, _o2, mut new) = registry.attach(node(1), 2, vec![]);
+        granting.join().unwrap();
+        assert!(new.try_recv().is_err(), "the new session got old CREDIT");
+        let mut at_old = 1;
+        while old.try_recv().is_ok() {
+            at_old += 1;
+        }
+        assert!(at_old < PARTS, "the re-attach landed after the grant ended");
     }
 
     /// Round T4, M3: the bytes the bucket pays off are shared equally among the senders that

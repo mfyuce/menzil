@@ -11,7 +11,7 @@
 //! are signed and verified, and the identifiers used to route them.
 //! Sessions, timeouts, rate limits, forwarding decisions, and actually
 //! running a Noise handshake or a mux belong to the relay, node, and (for
-//! L4/L5) the not-yet-built `menzil-e2e`/`menzil-stream` crates.
+//! L4/L5) the `menzil-e2e` and `menzil-stream` crates.
 
 #![forbid(unsafe_code)]
 

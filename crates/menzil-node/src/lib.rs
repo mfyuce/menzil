@@ -48,14 +48,13 @@
 //! session: the outbound OPEN/OPEN_ACK exchange ([`open_stream`]) and the
 //! inbound accept loop ([`accept_loop`]), both under protocol.md 5.3's
 //! OPEN timeout, the latter with its own per-session admission control.
-//! Not here: interpreting SEND/RECV/ADVERTISE*/PEER_STATE/ADMIT_*
-//! payloads themselves, the local service registry, the SOCKS executor,
-//! and the SSH stdio mode the client-side commands need (protocol.md 5,
-//! 8, 12) — those are still to come. Generating and persisting a node's
-//! own identity (protocol.md 2.2) is also a separate, not-yet-built
-//! concern; [`LocalIdentity`] only carries it, already assembled, the
-//! same way `menzil-relay` takes its TLS certificate material already
-//! loaded.
+//! The other modules do the rest of a node's work: `serve` (the local
+//! services), [`egress`] (the exit side of `egress:*` streams), the share
+//! and relay principal handling, invite redemption ([`admit_handler`]), the
+//! document exchange ([`docs`]) and the node's identity ([`LocalIdentity`]).
+//! The command line side (the agent, `stdio`, `reach`, `proxy`) is the
+//! `menzil` crate. Not built: acting on the direct addresses of PEER_STATE
+//! (phase 3, protocol.md 13).
 
 #![forbid(unsafe_code)]
 

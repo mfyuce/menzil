@@ -33,7 +33,7 @@
 //! to the destination's own connection to send (`crate::session`'s drain
 //! of [`ForwardItem`], via [`ForwardTable::drained`]), not merely
 //! admitted into this relay's internal accounting. The CREDIT record
-//! itself travels back to `src` over [`SessionRegistry::deliver`]'s
+//! itself travels back to `src` over [`SessionRegistry::deliver_to_session`]'s
 //! reliable, unbounded channel (via a [`ForwardItem::Credit`]), not
 //! [`SessionRegistry::send_to`]'s lossy, bounded control-plane one — a
 //! second red-team finding (H3): granting the ledger and then losing the
@@ -84,7 +84,7 @@
 //! against the raw cap let droppable fill nearly all of it and reliable
 //! then add its own full credit on top, overshooting the documented bound
 //! by up to `initial_credit`). The record itself travels straight to the
-//! destination's own outbound channel ([`SessionRegistry::deliver`]) —
+//! destination's own outbound channel ([`SessionRegistry::deliver_to_session`]) —
 //! "the queue" here is a byte budget gating admission into that channel,
 //! not a second buffer this module holds data in.
 //!
@@ -477,7 +477,7 @@ impl PairTable {
     }
 }
 
-/// One item handed to [`SessionRegistry::deliver`]: either a RECV record
+/// One item handed to [`SessionRegistry::deliver_to_session`]: either a RECV record
 /// to actually send, with enough bookkeeping for `crate::session`'s drain
 /// loop to call [`ForwardTable::drained`] once it is sent, or a CREDIT
 /// record to send as-is. Both travel the same reliable, unbounded channel
@@ -947,7 +947,7 @@ impl ForwardTable {
     /// ([`ForwardTable::forward`] always creates the pair, and so its
     /// generation, before a [`ForwardItem`] naming it can exist); a `src`
     /// no longer attached at all is the ordinary, harmless case
-    /// [`SessionRegistry::deliver`] already handles by silently dropping
+    /// [`SessionRegistry::deliver_to_session`] already handles by silently dropping
     /// the record — nothing left to tell.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn drained(
@@ -1714,7 +1714,7 @@ mod tests {
     }
 
     /// [`SessionRegistry::attach`]'s return value: dropping it closes the
-    /// receivers, which would make [`SessionRegistry::deliver`] report
+    /// receivers, which would make [`SessionRegistry::deliver_to_session`] report
     /// `dst` as unreachable even though it is still registered — [`Fixture`]
     /// holds one for `src` and one for `dst` for exactly as long as it
     /// itself lives, so a test's `table.forward(...)` calls see a real,

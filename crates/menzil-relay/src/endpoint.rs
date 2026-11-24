@@ -25,7 +25,7 @@
 //! node can neither learn that the relay has no expose principal nor park memory in it.
 //!
 //! Frames leave through an unbounded channel: its size is bounded by the credit above, not by
-//! the channel, for the same reason the data plane's `SessionRegistry::deliver` is unbounded.
+//! the channel, for the same reason the data plane's `SessionRegistry::deliver_to_session` is unbounded.
 
 use std::sync::{Arc, Mutex, PoisonError};
 

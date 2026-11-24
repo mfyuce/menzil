@@ -14,7 +14,7 @@
 //!   (protocol.md 4.3, TODO.md L3f) and ADVERTISE_ACK/control traffic,
 //!   where dropping an occasional message under backpressure is
 //!   acceptable and a resend or the next state sync recovers it.
-//! - [`SessionRegistry::deliver`] is the SEND->RECV data-plane path
+//! - [`SessionRegistry::deliver_to_session`] is the SEND->RECV data-plane path
 //!   (protocol.md 4.2's flow-control paragraph, TODO.md L3h,
 //!   `crate::forward`): unbounded, because `crate::forward::ForwardTable`
 //!   already performs its own credit/queue-budget/token-bucket admission
@@ -103,7 +103,7 @@ impl SessionRegistry {
     /// registration is later superseded (it is simply dropped, and never
     /// fires, if that never happens); a receiver of records handed to
     /// [`SessionRegistry::send_to`] for this NodeId; and a receiver of
-    /// items handed to [`SessionRegistry::deliver`] for this NodeId
+    /// items handed to [`SessionRegistry::deliver_to_session`] for this NodeId
     /// (TODO.md L3h) — the caller must keep polling both for as long as
     /// it stays attached, and actually send what they yield over its own
     /// connection.
@@ -245,11 +245,15 @@ impl SessionRegistry {
             .is_some_and(|registration| registration.outbound.try_send(record).is_ok())
     }
 
+    /// Tests only: everything outside them names the session it checked
+    /// ([`Self::deliver_to_session`]).
+    ///
     /// Hands `item` to `node_id`'s attached connection to send as a RECV
     /// record (TODO.md L3h's SEND->RECV data plane, `crate::forward`) —
     /// see this module's own doc comment for why this is a separate
     /// channel from [`SessionRegistry::send_to`], not the same one.
     /// Returns whether `node_id` was actually attached to receive it.
+    #[cfg(test)]
     pub(crate) fn deliver(&self, node_id: &NodeId, item: ForwardItem) -> bool {
         self.by_node
             .read()

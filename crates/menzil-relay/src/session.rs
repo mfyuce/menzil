@@ -25,7 +25,7 @@
 //! `crate::forward::ForwardTable`'s own drain (once a queued RECV record
 //! is actually handed to its destination's connection to send) is what
 //! grants credit back and sends the resulting CREDIT record, over
-//! [`crate::registry::SessionRegistry::deliver`], a channel kept
+//! [`crate::registry::SessionRegistry::deliver_to_session`], a channel kept
 //! separate from DOC/ADVERTISE_ACK's own for the reasons `crate::registry`'s
 //! module doc comment gives.
 //!
