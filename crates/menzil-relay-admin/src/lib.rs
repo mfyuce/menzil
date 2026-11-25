@@ -7,7 +7,11 @@
 //! * [`tls`]: the server (mutual TLS 1.3 only, client certificate required, one CA) and the check
 //!   of the key file's mode.
 //! * [`certs`]: `gen-certs`, a private CA with one server and one client certificate.
+//!
+//! Unix only: the key files are written with owner only modes and the server key's mode is
+//! checked before use; there is no equivalent here on other systems, so the crate is empty there.
 
+#![cfg(unix)]
 #![forbid(unsafe_code)]
 
 /// The generated protobuf and tonic code of `proto/menzil_admin.proto`.

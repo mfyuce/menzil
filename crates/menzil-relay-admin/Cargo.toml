@@ -22,9 +22,9 @@ path = "src/main.rs"
 [dependencies]
 anyhow = { workspace = true }
 clap = { workspace = true }
-menzil = { path = "../menzil" }
-menzil-proto = { path = "../menzil-proto" }
-menzil-relay = { path = "../menzil-relay" }
+menzil = { version = "0.0.1", path = "../menzil" }
+menzil-proto = { version = "0.0.1", path = "../menzil-proto" }
+menzil-relay = { version = "0.0.1", path = "../menzil-relay" }
 prost = "0.14"
 rcgen = "0.14.10"
 rustls = { workspace = true, features = ["aws-lc-rs"] }
@@ -44,5 +44,5 @@ tonic-prost-build = "0.14"
 [dev-dependencies]
 hyper-util = { version = "0.1", features = ["tokio"] }
 tempfile = "3"
-menzil-relay-admin = { path = ".", features = ["client"] }
+menzil-relay-admin = { version = "0.0.1", path = ".", features = ["client"] }
 tower = { version = "0.5", features = ["util"] }

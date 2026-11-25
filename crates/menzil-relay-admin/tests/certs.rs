@@ -1,5 +1,7 @@
 //! `gen-certs`: the files, their modes, and what the certificates say.
 
+#![cfg(unix)]
+
 use std::os::unix::fs::PermissionsExt;
 
 use menzil_relay_admin::certs::generate;

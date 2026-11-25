@@ -9,11 +9,11 @@ rust-version.workspace = true
 [dependencies]
 curve25519-dalek = "5.0.0"
 ed25519-dalek.workspace = true
-menzil-proto = { path = "../menzil-proto" }
+menzil-proto = { version = "0.0.1", path = "../menzil-proto" }
 rand = "0.10.3"
 thiserror.workspace = true
 zeroize = "1"
 
 [dev-dependencies]
-menzil-node = { path = "../menzil-node" }
+menzil-node = { version = "0.0.1", path = "../menzil-node" }
 snow = "0.10.0"

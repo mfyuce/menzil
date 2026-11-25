@@ -1,5 +1,6 @@
 //! Limits: token and message size, one change at a time, 32 RPCs at once, the 15 second deadline.
 #![allow(clippy::await_holding_lock)] // the tests hold the write mutex on purpose, across awaits
+#![cfg(unix)]
 
 mod common;
 

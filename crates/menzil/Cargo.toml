@@ -20,14 +20,14 @@ base64 = { workspace = true }
 ciborium = { workspace = true }
 clap = { workspace = true }
 ed25519-dalek = { workspace = true }
-menzil-admin = { path = "../menzil-admin" }
-menzil-audit = { path = "../menzil-audit" }
-menzil-carrier = { path = "../menzil-carrier" }
-menzil-node = { path = "../menzil-node" }
-menzil-relay = { path = "../menzil-relay" }
-menzil-stream = { path = "../menzil-stream" }
+menzil-admin = { version = "0.0.1", path = "../menzil-admin" }
+menzil-audit = { version = "0.0.1", path = "../menzil-audit" }
+menzil-carrier = { version = "0.0.1", path = "../menzil-carrier" }
+menzil-node = { version = "0.0.1", path = "../menzil-node" }
+menzil-relay = { version = "0.0.1", path = "../menzil-relay" }
+menzil-stream = { version = "0.0.1", path = "../menzil-stream" }
 futures-util = { version = "0.3.34", default-features = false, features = ["std", "io"] }
-menzil-proto = { path = "../menzil-proto" }
+menzil-proto = { version = "0.0.1", path = "../menzil-proto" }
 rand = "0.10.3"
 rustls = { workspace = true }
 rustix = { version = "1", default-features = false, features = ["std", "stdio", "process", "fs"] }
@@ -44,6 +44,6 @@ zeroize = "1"
 
 [dev-dependencies]
 # the in process CA the ACME wiring tests order from (no new code: the workspace's own crate).
-menzil-acme = { path = "../menzil-acme", default-features = false, features = ["testing"] }
+menzil-acme = { version = "0.0.1", path = "../menzil-acme", default-features = false, features = ["testing"] }
 rcgen = "0.14.10"
 tempfile = "3"

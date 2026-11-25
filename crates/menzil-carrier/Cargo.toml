@@ -19,7 +19,7 @@ base64.workspace = true
 fastrand.workspace = true
 futures-util.workspace = true
 httparse.workspace = true
-menzil-proto = { path = "../menzil-proto" }
+menzil-proto = { version = "0.0.1", path = "../menzil-proto" }
 rustls.workspace = true
 rustls-platform-verifier.workspace = true
 socket2.workspace = true

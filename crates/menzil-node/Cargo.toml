@@ -18,13 +18,13 @@ ciborium.workspace = true
 ed25519-dalek.workspace = true
 fastrand.workspace = true
 futures-util = { version = "0.3.34", default-features = false, features = ["std", "io"] }
-menzil-audit = { path = "../menzil-audit" }
-menzil-acme = { path = "../menzil-acme", default-features = false }
-menzil-carrier = { path = "../menzil-carrier" }
-menzil-e2e = { path = "../menzil-e2e" }
-menzil-proto = { path = "../menzil-proto" }
-menzil-session = { path = "../menzil-session" }
-menzil-stream = { path = "../menzil-stream" }
+menzil-audit = { version = "0.0.1", path = "../menzil-audit" }
+menzil-acme = { version = "0.0.1", path = "../menzil-acme", default-features = false }
+menzil-carrier = { version = "0.0.1", path = "../menzil-carrier" }
+menzil-e2e = { version = "0.0.1", path = "../menzil-e2e" }
+menzil-proto = { version = "0.0.1", path = "../menzil-proto" }
+menzil-session = { version = "0.0.1", path = "../menzil-session" }
+menzil-stream = { version = "0.0.1", path = "../menzil-stream" }
 rcgen = "0.14.10"
 rustls.workspace = true
 socket2.workspace = true
@@ -38,10 +38,10 @@ zeroize = "1"
 tempfile = "3"
 serde_json = "1"
 # the in process CA of the renewal wrapper test.
-menzil-acme = { path = "../menzil-acme", default-features = false, features = ["testing"] }
+menzil-acme = { version = "0.0.1", path = "../menzil-acme", default-features = false, features = ["testing"] }
 # menzil-relay, rcgen, rustls: tests/live_session.rs's in-process relay and
 # its self-signed test certificate.
-menzil-relay = { path = "../menzil-relay" }
+menzil-relay = { version = "0.0.1", path = "../menzil-relay" }
 rand = "0.10.3"
 # acme tests: the fake CA verifies the ES256 signature of each JWS.
 ring = "0.17.14"

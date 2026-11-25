@@ -1,5 +1,7 @@
 //! Every RPC against a real server over mutual TLS on 127.0.0.1, on a temporary relay home.
 
+#![cfg(unix)]
+
 mod common;
 
 use common::{Fixture, Owner};

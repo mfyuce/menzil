@@ -19,13 +19,13 @@ ed25519-dalek.workspace = true
 fastrand.workspace = true
 futures-util = { workspace = true, features = ["io"] }
 httparse.workspace = true
-menzil-audit = { path = "../menzil-audit" }
-menzil-acme = { path = "../menzil-acme", default-features = false }
-menzil-carrier = { path = "../menzil-carrier" }
-menzil-e2e = { path = "../menzil-e2e" }
-menzil-proto = { path = "../menzil-proto" }
-menzil-session = { path = "../menzil-session" }
-menzil-stream = { path = "../menzil-stream" }
+menzil-audit = { version = "0.0.1", path = "../menzil-audit" }
+menzil-acme = { version = "0.0.1", path = "../menzil-acme", default-features = false }
+menzil-carrier = { version = "0.0.1", path = "../menzil-carrier" }
+menzil-e2e = { version = "0.0.1", path = "../menzil-e2e" }
+menzil-proto = { version = "0.0.1", path = "../menzil-proto" }
+menzil-session = { version = "0.0.1", path = "../menzil-session" }
+menzil-stream = { version = "0.0.1", path = "../menzil-stream" }
 rustls.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["net", "io-util", "sync", "time"] }
@@ -37,7 +37,7 @@ zeroize = "1"
 [dev-dependencies]
 socket2.workspace = true
 # the in process CA of the ACME tests.
-menzil-acme = { path = "../menzil-acme", default-features = false, features = ["testing"] }
+menzil-acme = { version = "0.0.1", path = "../menzil-acme", default-features = false, features = ["testing"] }
 rand = "0.10.3"
 tempfile = "3"
 serde_json = "1"

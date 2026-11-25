@@ -7,7 +7,7 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-menzil-proto = { path = "../menzil-proto" }
+menzil-proto = { version = "0.0.1", path = "../menzil-proto" }
 yamux = { version = "0.14.1", path = "../../vendor/yamux" }
 futures-util = { version = "0.3.34", default-features = false, features = ["std", "io"] }
 futures-channel = "0.3.34"

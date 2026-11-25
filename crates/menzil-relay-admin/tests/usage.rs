@@ -2,6 +2,8 @@
 //! tenant asked for, zeros for what the relay has not listed yet, and a fixed FAILED_PRECONDITION
 //! when the relay is not exporting.
 
+#![cfg(unix)]
+
 mod common;
 
 use std::collections::BTreeMap;

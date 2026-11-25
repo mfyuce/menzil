@@ -455,12 +455,10 @@ async fn an_inspecting_proxy_sees_ciphertext_and_cannot_inject() {
             ("the receiver's NodeId", receiver.node_id.as_ref()),
             ("the relay's NodeId", relay.id.node_id.as_ref()),
         ];
-        for dir in 0..2 {
+        for (dir, payload) in seen.payloads.iter().enumerate() {
             for (what, needle) in needles {
                 assert!(
-                    !seen.payloads[dir]
-                        .windows(needle.len())
-                        .any(|window| window == needle),
+                    !payload.windows(needle.len()).any(|window| window == needle),
                     "{what} is visible to the proxy in direction {dir}"
                 );
             }

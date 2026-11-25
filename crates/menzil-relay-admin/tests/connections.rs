@@ -1,6 +1,8 @@
 //! Connection limits: peers that never finish a TLS handshake cannot keep a real client out
 //! (expose round 3, L2), and the cap on served connections still holds.
 
+#![cfg(unix)]
+
 mod common;
 
 use std::time::{Duration, Instant};

@@ -1124,14 +1124,14 @@ fn the_virtual_pair_takes_no_pair_or_destination_count_and_is_never_refused_for_
     assert!(queued(&w.send(&net, 1, 100)));
     assert_eq!(w.table.tenant_counts(&ali()).0, 1);
     // The relay talks to every node of the tenant: none of it is refused or counted.
-    for to in 0..4 {
+    for &node in net.nodes.iter().take(4) {
         for _ in 0..3 {
             assert_eq!(
-                w.relay_send(&ali(), net.nodes[to], true, 100),
+                w.relay_send(&ali(), node, true, 100),
                 RelaySendOutcome::Queued
             );
         }
-        let (_, _, counted) = w.table.pair_figures(&relay_id(), &net.nodes[to]).unwrap();
+        let (_, _, counted) = w.table.pair_figures(&relay_id(), &node).unwrap();
         assert!(!counted);
     }
     assert_eq!(
@@ -1159,9 +1159,9 @@ fn the_virtual_pair_takes_no_pair_or_destination_count_and_is_never_refused_for_
 fn the_virtual_pair_does_not_count_against_max_peers() {
     let mut w = World::new(1);
     let net = w.network(3);
-    for to in 0..3 {
+    for &node in net.nodes.iter().take(3) {
         assert_eq!(
-            w.relay_send(&TenantId::Default, net.nodes[to], true, 100),
+            w.relay_send(&TenantId::Default, node, true, 100),
             RelaySendOutcome::Queued
         );
     }

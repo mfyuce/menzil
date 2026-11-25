@@ -1,6 +1,8 @@
 //! The security of the listener: who is let in, and that nobody gets to a handler without a
 //! client certificate of the one CA, over TLS 1.3.
 
+#![cfg(unix)]
+
 mod common;
 
 use std::os::unix::fs::PermissionsExt;
