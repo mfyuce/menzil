@@ -103,6 +103,9 @@ fn a_steward_is_requested_listed_used_and_removed_from_the_command_line() {
         status.contains("steward") && status.contains("(this device)"),
         "{status}"
     );
+    // No node runs here: the status says that it could not ask one.
+    let note = ok(menzil(&steward, &["status"], None)).stderr;
+    assert!(note.contains("the node's state is not shown"), "{note}");
 
     // Days out of range and rights that do not exist are refused with a message.
     let bad_days = menzil(

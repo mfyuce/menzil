@@ -1114,27 +1114,31 @@ async fn run(cli: Cli) -> Result<()> {
             let home = home()?;
             print!("{}", local::status(&home)?.render(now()));
             // A running node knows what the files do not: whether the relay has it attached,
-            // and why it turned it away, and which certificate it uses. No node, or one that
-            // says nothing, adds nothing.
+            // and why it turned it away, and which certificate it uses. When none answers,
+            // say so (on standard error): silence reads as "nothing wrong", and the node may
+            // be running behind another socket (another user's XDG_RUNTIME_DIR).
             if let Ok(config) = Config::load(&home) {
                 let socket = node_cmd::agent_socket_path(&home, &config);
-                if let Ok(status) = agent::query_node_status(&socket).await {
-                    print!("{}", status.relay.render(now()));
-                    for relay in &status.known_relays {
-                        print!("{}", relay.render(now()));
+                match agent::query_node_status(&socket).await {
+                    Err(error) => eprintln!("note: the node's state is not shown: {error:#}"),
+                    Ok(status) => {
+                        print!("{}", status.relay.render(now()));
+                        for relay in &status.known_relays {
+                            print!("{}", relay.render(now()));
+                        }
+                        if let Some(cert) = status.cert {
+                            print!("{}", cert.render(now()));
+                        }
+                        let domain = config
+                            .share_domain()
+                            .ok()
+                            .flatten()
+                            .or_else(|| status.relay.usable_share_domain().map(str::to_string));
+                        print!(
+                            "{}",
+                            expose::render_status(&status.shares, domain.as_deref())
+                        );
                     }
-                    if let Some(cert) = status.cert {
-                        print!("{}", cert.render(now()));
-                    }
-                    let domain = config
-                        .share_domain()
-                        .ok()
-                        .flatten()
-                        .or_else(|| status.relay.usable_share_domain().map(str::to_string));
-                    print!(
-                        "{}",
-                        expose::render_status(&status.shares, domain.as_deref())
-                    );
                 }
             }
         }
