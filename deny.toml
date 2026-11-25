@@ -25,6 +25,9 @@ allow = [
     "OpenSSL",
 ]
 confidence-threshold = 0.8
+# CDLA-Permissive-2.0 is a permissive data licence; allowed for this one crate only, which
+# carries root certificate data (pulled in by rustls-platform-verifier off Linux). TBD 121.
+exceptions = [{ crate = "webpki-root-certs", allow = ["CDLA-Permissive-2.0"] }]
 
 [bans]
 multiple-versions = "warn"
