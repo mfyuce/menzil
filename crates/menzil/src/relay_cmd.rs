@@ -594,6 +594,8 @@ pub struct RunningRelay {
     keeper: Arc<Worker<(NetworkId, Roster, Option<Roster>)>>,
     /// Writes `relay/names.state` after every change of the name state (MT9).
     names_keeper: Arc<Worker<NameState>>,
+    /// The relay's audit file, flushed at a clean stop.
+    audit: Option<menzil_audit::AuditLog>,
 }
 
 impl RunningRelay {
@@ -692,6 +694,14 @@ pub async fn run_until<F: std::future::Future>(
     if let Some(line) = stop_notice(&unwritten) {
         tracing::warn!(unwritten = %unwritten.join(", "), "not on disk at the stop");
         eprintln!("{line}");
+    }
+    if let Some(audit) = relay.audit.clone() {
+        let flushed = tokio::task::spawn_blocking(move || audit.flush_within(STOP_GRACE))
+            .await
+            .unwrap_or(false);
+        if !flushed {
+            eprintln!("menzil: the audit lines may not have reached the disk");
+        }
     }
     match ended {
         Ok(out) => Ok(Some(out)),
@@ -863,10 +873,12 @@ pub(crate) async fn start_tuned(
     if let Some(limits) = options.redeem {
         relay = relay.with_redeem_limits(limits);
     }
+    let mut audit_log = None;
     if let Some(path) = &options.audit_file {
         let audit = menzil_audit::AuditLog::open(path, menzil_audit::Source::Relay, false)
             .with_context(|| format!("opening the audit file {}", path.display()))?;
         crate::signals::reopen_audit_on_usr1(&audit);
+        audit_log = Some(audit.clone());
         relay = relay.with_audit(audit);
     }
     if let Some(config) = front_door {
@@ -1062,6 +1074,7 @@ pub(crate) async fn start_tuned(
         running_lock: std::sync::Mutex::new(Some(running_lock)),
         keeper,
         names_keeper,
+        audit: audit_log,
     })
 }
 

@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
 use std::sync::{Arc, Mutex, PoisonError};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::{Map, Value};
 
@@ -319,6 +319,29 @@ impl AuditLog {
         }
     }
 
+    /// [`Self::flush`] that gives up after `timeout`: for a process about to exit, whose queued
+    /// lines are lost with the writer thread. False when not everything was written in time (or
+    /// the writer has stopped). A disabled log is always flushed.
+    pub fn flush_within(&self, timeout: Duration) -> bool {
+        let Some(sink) = &self.sink else { return true };
+        let deadline = Instant::now() + timeout;
+        let (done_tx, done_rx) = sync_channel(1);
+        let mut message = Msg::Flush(done_tx);
+        loop {
+            match sink.tx.try_send(message) {
+                Ok(()) => break,
+                Err(TrySendError::Full(back)) if Instant::now() < deadline => {
+                    message = back;
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(_) => return false,
+            }
+        }
+        done_rx
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            .is_ok()
+    }
+
     /// The same sink under another `by` (a process that is both, never both today).
     pub fn with_source(&self, source: Source) -> Self {
         Self {
@@ -433,6 +456,39 @@ mod tests {
         assert_eq!(all[1]["by"], "node");
         assert_eq!(all[1]["secs"], 1.5);
         assert!(again.include_ips() && !log.include_ips());
+    }
+
+    #[test]
+    fn flush_within_writes_what_is_queued_and_gives_up_on_a_stuck_writer() {
+        assert!(AuditLog::disabled(Source::Node).flush_within(Duration::ZERO));
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        let log = AuditLog::open(&path, Source::Relay, false).unwrap();
+        for n in 0..500u64 {
+            log.record("e", &[("n", n.into())]);
+        }
+        assert!(log.flush_within(Duration::from_secs(30)));
+        assert_eq!(lines(&path).len(), 500);
+
+        // A writer that never takes the message: the wait ends at the deadline.
+        let (tx, rx) = sync_channel(1);
+        let stuck = AuditLog {
+            sink: Some(Arc::new(Sink {
+                tx,
+                counters: Arc::new(Counters {
+                    errors: AtomicU64::new(0),
+                    dropped: AtomicU64::new(0),
+                    last_warned: Mutex::new(None),
+                }),
+            })),
+            source: Source::Relay,
+            include_ips: false,
+        };
+        // Queued but never answered, then a full queue.
+        assert!(!stuck.flush_within(Duration::from_millis(50)));
+        assert!(!stuck.flush_within(Duration::from_millis(50)));
+        drop(rx);
+        assert!(!stuck.flush_within(Duration::from_secs(30)));
     }
 
     #[test]

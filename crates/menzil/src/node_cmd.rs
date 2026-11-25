@@ -1161,6 +1161,8 @@ pub struct RunningNode {
     /// Writes the documents the node adopts over the network to disk (see
     /// [`keep_adopted_documents`]).
     keeper: Arc<Worker<AdoptedDocs>>,
+    /// The node's audit file (disabled without `[audit] file`), flushed at a clean stop.
+    audit: menzil_audit::AuditLog,
     /// Held while this node runs: one node per identity.
     _instance: FileLock,
 }
@@ -1243,6 +1245,7 @@ where
         None => menzil_audit::AuditLog::disabled(menzil_audit::Source::Node),
     };
     crate::signals::reopen_audit_on_usr1(&audit);
+    let audit_log = audit.clone();
     policies.set_audit(audit.clone());
     let services = match config.egress_enabled() {
         // The limits are in `services` already (`Config::local_services`); the node's own
@@ -1442,6 +1445,7 @@ where
             .chain(acme_task)
             .collect(),
         keeper,
+        audit: audit_log,
         _instance: instance,
     })
 }
@@ -1808,6 +1812,13 @@ pub async fn run(home: &Home) -> Result<()> {
     };
     if !flushed {
         eprintln!("menzil: the documents adopted last may not have reached the disk");
+    }
+    let audit = running.audit.clone();
+    if !tokio::task::spawn_blocking(move || audit.flush_within(STOP_GRACE))
+        .await
+        .unwrap_or(false)
+    {
+        eprintln!("menzil: the audit lines may not have reached the disk");
     }
     drop(running);
     Ok(())

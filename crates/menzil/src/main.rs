@@ -688,6 +688,9 @@ fn now() -> u64 {
         .unwrap_or(0)
 }
 
+/// How long a finished command waits for its audit lines to reach the disk.
+const AUDIT_FLUSH_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
 #[tokio::main]
 async fn main() {
     // Warnings from everything and progress from menzil itself, unless RUST_LOG says otherwise.
@@ -700,7 +703,12 @@ async fn main() {
         .init();
 
     let cli = Cli::parse();
-    if let Err(error) = run(cli).await {
+    let ran = run(cli).await;
+    // Also after an error: a command may have changed something before it failed.
+    if !relay_cmd::tenants::flush_audit(AUDIT_FLUSH_WAIT) {
+        eprintln!("menzil: the audit lines may not have reached the disk");
+    }
+    if let Err(error) = ran {
         eprintln!("menzil: {error:#}");
         std::process::exit(1);
     }

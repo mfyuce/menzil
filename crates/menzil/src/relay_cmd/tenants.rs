@@ -375,6 +375,13 @@ pub fn set_audit_from_env() -> Result<()> {
     }
 }
 
+/// Waits (at most `timeout`) until the audit lines of this process are on disk: they are
+/// written by a thread that dies with the process, so a command must call this before it ends.
+/// True when there is nothing left to write.
+pub fn flush_audit(timeout: std::time::Duration) -> bool {
+    AUDIT.get().is_none_or(|log| log.flush_within(timeout))
+}
+
 fn audit(ev: &str, fields: &[(&str, menzil_audit::Field)]) {
     if let Some(log) = AUDIT.get() {
         log.record(ev, fields);
