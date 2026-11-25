@@ -17,6 +17,7 @@ use menzil_cli::config::Config;
 use menzil_cli::home::Home;
 use menzil_cli::local::{admit, grant, init, join, network_create};
 use menzil_cli::node_cmd;
+use menzil_cli::reach;
 use menzil_cli::relay_cmd::{self, DEFAULT_PATH, RunOptions};
 use menzil_proto::ServiceId;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, duplex};
@@ -229,6 +230,45 @@ async fn a_phone_reaches_a_service_on_a_laptop_through_a_relay() {
         .unwrap();
     assert_eq!(output, b"partial");
     assert!(matches!(end, End::Reset(_)), "{end:?}");
+
+    // --- the same two ends through `menzil reach`: a real TCP connection sees FIN or RST ---
+    let through_reach = |target: &'static str| {
+        let socket = phone_socket.clone();
+        async move {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+            let running = tokio::spawn(async move {
+                reach::run(&socket, target, listener, async {
+                    let _ = stopped.await;
+                })
+                .await
+            });
+            let mut connection = TcpStream::connect(address).await.unwrap();
+            connection.write_all(b"x").await.unwrap();
+            if target == "laptop/echo" {
+                connection.shutdown().await.unwrap();
+            }
+            let mut got = Vec::new();
+            let end = timeout(WAIT, connection.read_to_end(&mut got))
+                .await
+                .expect("the connection must end");
+            let _ = stop.send(());
+            running.await.unwrap().unwrap();
+            (got, end.map(|_| ()))
+        }
+    };
+    let (got, end) = through_reach("laptop/echo").await;
+    assert_eq!(got, b"x");
+    assert!(end.is_ok(), "{end:?}");
+    let (got, end) = through_reach("laptop/failing").await;
+    // A reset may overtake bytes not yet read, never add any.
+    assert!(b"partial".starts_with(&got), "{got:?}");
+    assert_eq!(
+        end.expect_err("a truncated answer must not look complete")
+            .kind(),
+        io::ErrorKind::ConnectionReset
+    );
 
     // --- what is refused, in words ---
     let message = |result: anyhow::Result<(Vec<u8>, End)>| format!("{:#}", result.unwrap_err());

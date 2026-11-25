@@ -3262,7 +3262,7 @@ mod tests {
         while f._dst_handles.2.try_recv().is_ok() {}
 
         // `src` reconnects: a genuinely new registry session id.
-        let _new_src_handles =
+        let mut new_src_handles =
             f.registry
                 .attach(f.src, stale_src_session_id + 1, vec![f.network_id]);
 
@@ -3279,8 +3279,11 @@ mod tests {
 
         assert!(
             f._src_handles.2.try_recv().is_err(),
-            "the old, superseded src session must not receive a credit meant for whatever \
-             session is current"
+            "the old, superseded src session must not receive a credit"
+        );
+        assert!(
+            new_src_handles.2.try_recv().is_err(),
+            "the new src session must not receive a credit for what the old one spent"
         );
     }
 
