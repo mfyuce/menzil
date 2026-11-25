@@ -19,6 +19,33 @@ use menzil_cli::{node_cmd, proxy, reach, relay_cmd, signals, text, token};
 use menzil_proto::ServiceId;
 use tracing_subscriber::EnvFilter;
 
+// These two shadow the standard macros for the whole of this file: the standard ones panic when
+// the reader has gone (`menzil status | grep -q`, `| head`), see `emit`.
+macro_rules! print {
+    ($($arg:tt)*) => {
+        emit(&mut std::io::stdout(), format_args!($($arg)*))
+    };
+}
+macro_rules! println {
+    () => {
+        emit(&mut std::io::stdout(), format_args!("\n"))
+    };
+    ($($arg:tt)*) => {
+        emit(&mut std::io::stdout(), format_args!("{}\n", format_args!($($arg)*)))
+    };
+}
+
+/// Writes to standard output. A reader that closed the pipe has what it wanted, so that is not
+/// an error and the command goes on to its own exit status; any other failure (a full disk behind
+/// a redirect) still ends the command loudly.
+fn emit(out: &mut impl std::io::Write, text: std::fmt::Arguments<'_>) {
+    if let Err(error) = out.write_fmt(text)
+        && error.kind() != std::io::ErrorKind::BrokenPipe
+    {
+        panic!("failed printing to stdout: {error}");
+    }
+}
+
 /// Self hosted tunnel: relay, node, and client roles over WebSocket on TLS 443.
 #[derive(Parser)]
 #[command(name = "menzil", about, long_about = None)]
