@@ -30,12 +30,15 @@
 use std::future::Future;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::task::{Context as TaskContext, Poll};
 use std::time::{Duration, Instant};
 
 use crate::sock::{UnixListener, UnixStream};
 use anyhow::{Context, Result};
-use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Semaphore, watch};
 use tokio::task::JoinSet;
@@ -321,6 +324,62 @@ async fn run_on<L: Accept>(
     Ok(())
 }
 
+/// One half of a connection, noting that the program on it left: a read or a write of it failed
+/// because the other side closed or reset it. Only the local connection goes through here, so
+/// nothing the agent or the far side does sets the note.
+struct Watched<'a, T> {
+    half: T,
+    left: &'a AtomicBool,
+}
+
+impl<T> Watched<'_, T> {
+    fn note<V>(&self, result: Poll<io::Result<V>>) -> Poll<io::Result<V>> {
+        if let Poll::Ready(Err(error)) = &result
+            && matches!(
+                error.kind(),
+                io::ErrorKind::BrokenPipe
+                    | io::ErrorKind::ConnectionReset
+                    | io::ErrorKind::ConnectionAborted
+            )
+        {
+            self.left.store(true, Ordering::Relaxed);
+        }
+        result
+    }
+}
+
+impl<T: AsyncRead + Unpin> AsyncRead for Watched<'_, T> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        buffer: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let result = Pin::new(&mut self.half).poll_read(cx, buffer);
+        self.note(result)
+    }
+}
+
+impl<T: AsyncWrite + Unpin> AsyncWrite for Watched<'_, T> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        buffer: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let result = Pin::new(&mut self.half).poll_write(cx, buffer);
+        self.note(result)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
+        let result = Pin::new(&mut self.half).poll_flush(cx);
+        self.note(result)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
+        // Its failure is not noted: the bridge ignores it, the stream has ended by then.
+        Pin::new(&mut self.half).poll_shutdown(cx)
+    }
+}
+
 /// One connection, to its end.
 async fn carry<C: Connection>(
     mut connection: C,
@@ -329,9 +388,18 @@ async fn carry<C: Connection>(
     target: &str,
     stop: &mut watch::Receiver<bool>,
 ) {
+    let left = AtomicBool::new(false);
     let outcome = {
         // Borrowed halves: dropping an owned write half would shut it down (a FIN).
-        let (mut read, mut write) = tokio::io::split(&mut connection);
+        let (read, write) = tokio::io::split(&mut connection);
+        let mut read = Watched {
+            half: read,
+            left: &left,
+        };
+        let mut write = Watched {
+            half: write,
+            left: &left,
+        };
         tokio::select! {
             outcome = agent::connect_and_bridge(socket, target, &mut read, &mut write) => Some(outcome),
             _ = stop.wait_for(|stopped| *stopped) => None,
@@ -341,15 +409,27 @@ async fn carry<C: Connection>(
         // Both directions ended and the output was shut down: now, and only now, closing is a
         // clean end (a FIN after whatever is still queued).
         Some(Ok(End::Clean)) => connection.reset_on_close(false),
-        // Every other end leaves the connection as it was accepted: closing resets it.
+        // Every other end leaves the connection as it was accepted: closing resets it. A
+        // program that left is no failure to report (a poller that gave up, a closed tab).
+        Some(Ok(End::Reset(why))) if left.load(Ordering::Relaxed) => {
+            tracing::debug!(%peer, target = %text::one_line(target, 300), why = %text::one_line(&why, 300), "the program on a connection left");
+        }
+        Some(Err(error)) if left.load(Ordering::Relaxed) => {
+            tracing::debug!(%peer, target = %text::one_line(target, 300), error = %text::one_line(&format!("{error:#}"), 600), "the program on a connection left");
+        }
         Some(Ok(End::Reset(why))) => {
             eprintln!(
-                "menzil: a connection from {peer} was reset: {}",
+                "menzil: a connection from {peer} to {} was reset: {}",
+                text::one_line(target, 300),
                 text::one_line(&why, 300)
             );
         }
         Some(Err(error)) => {
-            eprintln!("menzil: {}", text::one_line(&format!("{error:#}"), 600));
+            eprintln!(
+                "menzil: a connection from {peer} to {} failed: {}",
+                text::one_line(target, 300),
+                text::one_line(&format!("{error:#}"), 600)
+            );
         }
         None => {}
     }
