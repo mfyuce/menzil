@@ -65,6 +65,8 @@ enum Cmd {
 #[tokio::main]
 pub async fn main() -> Result<()> {
     tracing_subscriber::fmt()
+        // Its report of a failed write panics when standard error has no reader either.
+        .log_internal_errors(false)
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),

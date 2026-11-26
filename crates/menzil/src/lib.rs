@@ -19,6 +19,10 @@
 
 #![forbid(unsafe_code)]
 
+// First, so that every module below sees its macro.
+#[macro_use]
+mod stderr;
+
 pub mod agent;
 pub mod cert_node;
 pub mod cert_renew;

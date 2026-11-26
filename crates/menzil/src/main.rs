@@ -19,6 +19,9 @@ use menzil_cli::{node_cmd, proxy, reach, relay_cmd, signals, text, token};
 use menzil_proto::ServiceId;
 use tracing_subscriber::EnvFilter;
 
+#[macro_use]
+mod stderr;
+
 // These two shadow the standard macros for the whole of this file: the standard ones panic when
 // the reader has gone (`menzil status | grep -q`, `| head`), see `emit`.
 macro_rules! print {
@@ -727,6 +730,8 @@ async fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_writer(std::io::stderr)
+        // Its own report of a failed write is the standard `eprintln!`, which panics.
+        .log_internal_errors(false)
         .init();
 
     let cli = Cli::parse();
