@@ -2266,6 +2266,32 @@ async fn an_invite_answer_line_over_the_limit_is_an_error_not_a_cut_line() {
     }
 }
 
+/// The client reads lines of [`MAX_REPLY_BYTES`] bytes, newline included, and drops a longer one:
+/// the agent's bound is the same one, in bytes, so that no line is lost without a word.
+#[tokio::test]
+async fn an_invite_answer_line_is_bounded_in_bytes_as_the_client_reads_it() {
+    let op = crate::invite::InviteOp::List { network: None };
+    let ask = async |line: String| {
+        with_agent(inviter(Ok(vec![line])), async |socket, uid| {
+            request_invite_as(socket, &op, uid).await
+        })
+        .await
+    };
+    let longest = "A".repeat(MAX_REPLY_BYTES - 1);
+    assert_eq!(ask(longest.clone()).await.unwrap(), vec![longest]);
+    // One byte more, and fewer characters than the bound that take more bytes than it.
+    for line in ["A".repeat(MAX_REPLY_BYTES), "é".repeat(MAX_REPLY_BYTES / 2)] {
+        match ask(line).await {
+            Err(AskError::Failed(e)) => {
+                let shown = format!("{e:#}");
+                assert!(shown.contains("longer than 4096"), "{shown:?}");
+            }
+            Err(AskError::NoAgent) => panic!("an agent answered"),
+            Ok(lines) => panic!("a line was lost or taken: {} lines", lines.len()),
+        }
+    }
+}
+
 #[tokio::test]
 async fn an_invite_refusal_is_one_line_and_a_bad_request_never_reaches_the_node() {
     let opener = inviter(Err("no steward key\nsecond line".to_string()));

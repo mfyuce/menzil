@@ -155,20 +155,20 @@ const EXPOSE_TIMEOUT: Duration = Duration::from_secs(15);
 /// How long the agent spends on an `invite-*` request: the wait for the network lock (ten
 /// seconds) and the write of the book.
 const INVITE_TIMEOUT: Duration = Duration::from_secs(15);
-/// The longest answer line of an `invite-*` request (a token is 600 to 800 characters). A line
-/// over it is an error, never cut: a cut token would be a damaged secret.
-const INVITE_LINE_CHARS: usize = 4096;
 /// The reply to a successful `invite-*` request: `ok` and the lines, each made printable, or one
-/// error when a line is longer than [`INVITE_LINE_CHARS`] (never cut).
+/// error when a line does not fit in the [`MAX_REPLY_BYTES`] the client reads (a token is 600 to
+/// 800 characters). Never cut: a cut token would be a damaged secret; and never sent over the
+/// bound, where the client would drop it without a word.
 fn invite_reply(lines: &[String]) -> String {
-    if lines.iter().any(|l| l.chars().count() > INVITE_LINE_CHARS) {
+    // Bytes, and one of them is the newline. Making a line printable never makes it longer.
+    if lines.iter().any(|l| l.len() >= MAX_REPLY_BYTES) {
         return format!(
-            "error an answer line is longer than {INVITE_LINE_CHARS} characters and was not sent\n"
+            "error an answer line is longer than {MAX_REPLY_BYTES} bytes with its newline and was not sent\n"
         );
     }
     let mut reply = "ok\n".to_string();
     for line in lines {
-        reply.push_str(&text::one_line(line, INVITE_LINE_CHARS));
+        reply.push_str(&text::one_line(line, MAX_REPLY_BYTES));
         reply.push('\n');
     }
     reply
